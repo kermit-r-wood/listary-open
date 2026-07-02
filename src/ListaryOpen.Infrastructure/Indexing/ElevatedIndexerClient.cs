@@ -1,3 +1,4 @@
+using System.ComponentModel;
 using System.Diagnostics;
 using System.IO;
 using System.Runtime.CompilerServices;
@@ -10,6 +11,23 @@ public interface IElevatedIndexerClient
     bool IsAvailable { get; }
 
     IAsyncEnumerable<FileRecord> ScanNtfsAsync(IndexRoot root, CancellationToken cancellationToken);
+}
+
+internal interface IElevatedIndexerProcess : IDisposable
+{
+    int ExitCode { get; }
+
+    bool HasExited { get; }
+
+    bool Start();
+
+    Task<string> ReadStandardOutputToEndAsync(CancellationToken cancellationToken);
+
+    Task<string> ReadStandardErrorToEndAsync(CancellationToken cancellationToken);
+
+    Task WaitForExitAsync(CancellationToken cancellationToken);
+
+    void Kill();
 }
 
 public sealed class DisabledElevatedIndexerClient : IElevatedIndexerClient
@@ -31,21 +49,31 @@ public sealed class ElevatedIndexerClient : IElevatedIndexerClient
     private const string HelperExecutableName = "ListaryOpen.Indexer.Elevated.exe";
 
     private readonly Func<string?> _resolveHelperPath;
+    private readonly Func<string, string, IElevatedIndexerProcess> _createProcess;
 
     public ElevatedIndexerClient()
-        : this(ResolveDefaultHelperPath)
+        : this(ResolveDefaultHelperPath, CreateProcess)
     {
     }
 
     public ElevatedIndexerClient(string helperPath)
-        : this(() => helperPath)
+        : this(() => helperPath, CreateProcess)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(helperPath);
     }
 
-    private ElevatedIndexerClient(Func<string?> resolveHelperPath)
+    internal ElevatedIndexerClient(string helperPath, Func<string, string, IElevatedIndexerProcess> createProcess)
+        : this(() => helperPath, createProcess)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(helperPath);
+    }
+
+    private ElevatedIndexerClient(
+        Func<string?> resolveHelperPath,
+        Func<string, string, IElevatedIndexerProcess> createProcess)
     {
         _resolveHelperPath = resolveHelperPath ?? throw new ArgumentNullException(nameof(resolveHelperPath));
+        _createProcess = createProcess ?? throw new ArgumentNullException(nameof(createProcess));
     }
 
     public bool IsAvailable
@@ -76,22 +104,9 @@ public sealed class ElevatedIndexerClient : IElevatedIndexerClient
         yield break;
     }
 
-    private static async Task RunHelperAsync(string helperPath, string rootPath, CancellationToken cancellationToken)
+    private async Task RunHelperAsync(string helperPath, string rootPath, CancellationToken cancellationToken)
     {
-        using var process = new Process
-        {
-            StartInfo = new ProcessStartInfo
-            {
-                FileName = helperPath,
-                UseShellExecute = false,
-                RedirectStandardOutput = true,
-                RedirectStandardError = true,
-                CreateNoWindow = true
-            }
-        };
-
-        process.StartInfo.ArgumentList.Add("scan");
-        process.StartInfo.ArgumentList.Add(rootPath);
+        using var process = _createProcess(helperPath, rootPath);
 
         try
         {
@@ -101,16 +116,19 @@ public sealed class ElevatedIndexerClient : IElevatedIndexerClient
                 return;
             }
         }
-        catch (Exception exception)
+        catch (Exception exception) when (exception is not OperationCanceledException)
         {
             Trace.TraceError("Failed to start elevated indexer helper '{0}': {1}", helperPath, exception);
             return;
         }
 
+        Task<string>? stdoutTask = null;
+        Task<string>? stderrTask = null;
+
         try
         {
-            var stdoutTask = process.StandardOutput.ReadToEndAsync(cancellationToken);
-            var stderrTask = process.StandardError.ReadToEndAsync(cancellationToken);
+            stdoutTask = process.ReadStandardOutputToEndAsync(cancellationToken);
+            stderrTask = process.ReadStandardErrorToEndAsync(cancellationToken);
 
             await process.WaitForExitAsync(cancellationToken).ConfigureAwait(false);
             await stdoutTask.ConfigureAwait(false);
@@ -125,14 +143,82 @@ public sealed class ElevatedIndexerClient : IElevatedIndexerClient
                     TrimDiagnostic(stderr));
             }
         }
-        catch (OperationCanceledException)
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
         {
-            TryKill(process);
+            await CleanupCanceledProcessAsync(process, stdoutTask, stderrTask).ConfigureAwait(false);
             throw;
         }
         catch (Exception exception)
         {
             Trace.TraceError("Elevated indexer helper '{0}' failed while running: {1}", helperPath, exception);
+        }
+    }
+
+    private static IElevatedIndexerProcess CreateProcess(string helperPath, string rootPath)
+    {
+        var process = new Process
+        {
+            StartInfo = new ProcessStartInfo
+            {
+                FileName = helperPath,
+                UseShellExecute = false,
+                RedirectStandardOutput = true,
+                RedirectStandardError = true,
+                CreateNoWindow = true
+            }
+        };
+
+        process.StartInfo.ArgumentList.Add("scan");
+        process.StartInfo.ArgumentList.Add(rootPath);
+
+        return new ElevatedIndexerProcess(process);
+    }
+
+    private static async Task CleanupCanceledProcessAsync(
+        IElevatedIndexerProcess process,
+        Task<string>? stdoutTask,
+        Task<string>? stderrTask)
+    {
+        TryKill(process);
+        await TryWaitForExitAsync(process).ConfigureAwait(false);
+        await ObserveCanceledReadAsync(stdoutTask).ConfigureAwait(false);
+        await ObserveCanceledReadAsync(stderrTask).ConfigureAwait(false);
+    }
+
+    private static async Task TryWaitForExitAsync(IElevatedIndexerProcess process)
+    {
+        try
+        {
+            await process.WaitForExitAsync(CancellationToken.None).ConfigureAwait(false);
+        }
+        catch (InvalidOperationException)
+        {
+        }
+    }
+
+    private static async Task ObserveCanceledReadAsync(Task<string>? readTask)
+    {
+        if (readTask is null)
+        {
+            return;
+        }
+
+        try
+        {
+            await readTask.ConfigureAwait(false);
+        }
+        catch (OperationCanceledException)
+        {
+        }
+        catch (ObjectDisposedException)
+        {
+        }
+        catch (IOException)
+        {
+        }
+        catch (Exception)
+        {
+            // The caller is already observing cancellation; this await exists to observe pipe-read task faults.
         }
     }
 
@@ -189,18 +275,61 @@ public sealed class ElevatedIndexerClient : IElevatedIndexerClient
         return trimmed.Length <= maxLength ? trimmed : trimmed[..maxLength];
     }
 
-    private static void TryKill(Process process)
+    private static void TryKill(IElevatedIndexerProcess process)
     {
         try
         {
             if (!process.HasExited)
             {
-                process.Kill(entireProcessTree: true);
+                process.Kill();
             }
         }
-        catch (Exception)
+        catch (InvalidOperationException)
         {
             // Cancellation is already being reported to the caller.
+        }
+        catch (Win32Exception)
+        {
+            // Cancellation is already being reported to the caller.
+        }
+        catch (NotSupportedException)
+        {
+            // Cancellation is already being reported to the caller.
+        }
+    }
+
+    private sealed class ElevatedIndexerProcess : IElevatedIndexerProcess
+    {
+        private readonly Process _process;
+
+        public ElevatedIndexerProcess(Process process)
+        {
+            _process = process ?? throw new ArgumentNullException(nameof(process));
+        }
+
+        public int ExitCode => _process.ExitCode;
+
+        public bool HasExited => _process.HasExited;
+
+        public bool Start() => _process.Start();
+
+        public Task<string> ReadStandardOutputToEndAsync(CancellationToken cancellationToken)
+            => _process.StandardOutput.ReadToEndAsync(cancellationToken);
+
+        public Task<string> ReadStandardErrorToEndAsync(CancellationToken cancellationToken)
+            => _process.StandardError.ReadToEndAsync(cancellationToken);
+
+        public Task WaitForExitAsync(CancellationToken cancellationToken)
+            => _process.WaitForExitAsync(cancellationToken);
+
+        public void Kill()
+        {
+            _process.Kill(entireProcessTree: true);
+        }
+
+        public void Dispose()
+        {
+            _process.Dispose();
         }
     }
 }

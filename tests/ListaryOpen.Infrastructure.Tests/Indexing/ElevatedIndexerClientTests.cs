@@ -7,6 +7,8 @@ namespace ListaryOpen.Infrastructure.Tests.Indexing;
 
 public sealed class ElevatedIndexerClientTests
 {
+    private static readonly SemaphoreSlim TraceGate = new(1, 1);
+
     [Fact]
     public void IsAvailableReturnsFalseWhenExplicitHelperPathIsMissing()
     {
@@ -43,21 +45,13 @@ public sealed class ElevatedIndexerClientTests
     {
         var helperPath = Path.Combine(Path.GetTempPath(), "listary-open-" + Guid.NewGuid(), "missing.exe");
         var client = new ElevatedIndexerClient(helperPath);
-        using var listener = new RecordingTraceListener();
+        await using var traceCapture = await TraceCapture.StartAsync();
 
-        Trace.Listeners.Add(listener);
-        try
-        {
-            var records = await CollectAsync(client.ScanNtfsAsync(new IndexRoot(Path.GetTempPath()), CancellationToken.None));
-            Trace.Flush();
+        var records = await CollectAsync(client.ScanNtfsAsync(new IndexRoot(Path.GetTempPath()), CancellationToken.None));
+        Trace.Flush();
 
-            Assert.Empty(records);
-            Assert.Contains("Elevated indexer helper is not available", listener.Messages);
-        }
-        finally
-        {
-            Trace.Listeners.Remove(listener);
-        }
+        Assert.Empty(records);
+        Assert.Contains("Elevated indexer helper is not available", traceCapture.Messages);
     }
 
     [Fact]
@@ -71,21 +65,51 @@ public sealed class ElevatedIndexerClientTests
             var helperPath = Path.Combine(tempDirectory, "ListaryOpen.Indexer.Elevated.exe");
             File.WriteAllText(helperPath, "not a portable executable");
             var client = new ElevatedIndexerClient(helperPath);
-            using var listener = new RecordingTraceListener();
+            await using var traceCapture = await TraceCapture.StartAsync();
 
-            Trace.Listeners.Add(listener);
-            try
-            {
-                var records = await CollectAsync(client.ScanNtfsAsync(new IndexRoot(Path.GetTempPath()), CancellationToken.None));
-                Trace.Flush();
+            var records = await CollectAsync(client.ScanNtfsAsync(new IndexRoot(Path.GetTempPath()), CancellationToken.None));
+            Trace.Flush();
 
-                Assert.Empty(records);
-                Assert.Contains("Failed to start elevated indexer helper", listener.Messages);
-            }
-            finally
+            Assert.Empty(records);
+            Assert.Contains("Failed to start elevated indexer helper", traceCapture.Messages);
+        }
+        finally
+        {
+            Directory.Delete(tempDirectory, recursive: true);
+        }
+    }
+
+    [Fact]
+    public async Task ScanNtfsAsyncThrowsCancellationAfterWaitingForKilledHelperAndObservingReads()
+    {
+        var tempDirectory = Path.Combine(Path.GetTempPath(), "listary-open-" + Guid.NewGuid());
+        Directory.CreateDirectory(tempDirectory);
+
+        try
+        {
+            var helperPath = Path.Combine(tempDirectory, "ListaryOpen.Indexer.Elevated.exe");
+            File.WriteAllText(helperPath, "placeholder");
+            var helperProcess = new RecordingElevatedIndexerProcess();
+            var client = new ElevatedIndexerClient(helperPath, (_, _) => helperProcess);
+            using var cancellation = new CancellationTokenSource();
+
+            var scanTask = Assert.ThrowsAnyAsync<OperationCanceledException>(async () =>
             {
-                Trace.Listeners.Remove(listener);
-            }
+                await foreach (var _ in client.ScanNtfsAsync(new IndexRoot(Path.GetTempPath()), cancellation.Token))
+                {
+                }
+            });
+
+            await helperProcess.WaitForCancelableWaitAsync();
+            await cancellation.CancelAsync();
+            await scanTask.WaitAsync(TimeSpan.FromSeconds(5));
+
+            Assert.True(helperProcess.KillCalled);
+            Assert.True(helperProcess.OutputReadObserved);
+            Assert.True(helperProcess.ErrorReadObserved);
+            Assert.Equal(2, helperProcess.WaitForExitTokens.Count);
+            Assert.True(helperProcess.WaitForExitTokens[0].CanBeCanceled);
+            Assert.False(helperProcess.WaitForExitTokens[1].CanBeCanceled);
         }
         finally
         {
@@ -102,6 +126,96 @@ public sealed class ElevatedIndexerClientTests
         }
 
         return collected;
+    }
+
+    private sealed class RecordingElevatedIndexerProcess : IElevatedIndexerProcess
+    {
+        private readonly TaskCompletionSource _cancelableWaitStarted = new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        public bool KillCalled { get; private set; }
+
+        public bool OutputReadObserved { get; private set; }
+
+        public bool ErrorReadObserved { get; private set; }
+
+        public List<CancellationToken> WaitForExitTokens { get; } = new();
+
+        public int ExitCode => 0;
+
+        public bool HasExited { get; private set; }
+
+        public bool Start() => true;
+
+        public Task<string> ReadStandardOutputToEndAsync(CancellationToken cancellationToken)
+            => ReadUntilCanceledAsync(cancellationToken, () => OutputReadObserved = true);
+
+        public Task<string> ReadStandardErrorToEndAsync(CancellationToken cancellationToken)
+            => ReadUntilCanceledAsync(cancellationToken, () => ErrorReadObserved = true);
+
+        public Task WaitForExitAsync(CancellationToken cancellationToken)
+        {
+            WaitForExitTokens.Add(cancellationToken);
+            if (!cancellationToken.CanBeCanceled)
+            {
+                HasExited = true;
+                return Task.CompletedTask;
+            }
+
+            _cancelableWaitStarted.SetResult();
+            return Task.Delay(Timeout.InfiniteTimeSpan, cancellationToken);
+        }
+
+        public Task WaitForCancelableWaitAsync() => _cancelableWaitStarted.Task;
+
+        public void Kill()
+        {
+            KillCalled = true;
+        }
+
+        public void Dispose()
+        {
+        }
+
+        private static async Task<string> ReadUntilCanceledAsync(CancellationToken cancellationToken, Action onObserved)
+        {
+            try
+            {
+                await Task.Delay(Timeout.InfiniteTimeSpan, cancellationToken);
+                return string.Empty;
+            }
+            finally
+            {
+                onObserved();
+            }
+        }
+    }
+
+    private sealed class TraceCapture : IAsyncDisposable
+    {
+        private readonly RecordingTraceListener _listener;
+
+        private TraceCapture(RecordingTraceListener listener)
+        {
+            _listener = listener;
+        }
+
+        public string Messages => _listener.Messages;
+
+        public static async Task<TraceCapture> StartAsync()
+        {
+            await TraceGate.WaitAsync();
+            var listener = new RecordingTraceListener();
+            Trace.Listeners.Add(listener);
+            return new TraceCapture(listener);
+        }
+
+        public ValueTask DisposeAsync()
+        {
+            Trace.Listeners.Remove(_listener);
+            _listener.Dispose();
+            TraceGate.Release();
+            return ValueTask.CompletedTask;
+        }
     }
 
     private sealed class RecordingTraceListener : TraceListener
