@@ -11,7 +11,16 @@
             <RowDefinition Height="Auto" />
             <RowDefinition Height="*" />
         </Grid.RowDefinitions>
-        <TextBox x:Name="QueryBox" FontSize="22" Margin="0,0,0,12" />
-        <ListBox x:Name="ResultsList" Grid.Row="1" />
+        <TextBox x:Name="QueryBox"
+                 FontSize="22"
+                 Margin="0,0,0,12"
+                 Text="{Binding QueryText, UpdateSourceTrigger=PropertyChanged}" />
+        <ListBox x:Name="ResultsList" Grid.Row="1" ItemsSource="{Binding Results}">
+            <ListBox.ItemTemplate>
+                <DataTemplate>
+                    <TextBlock Text="{Binding Record.FullPath}" />
+                </DataTemplate>
+            </ListBox.ItemTemplate>
+        </ListBox>
     </Grid>
 </Window>
