@@ -1,5 +1,6 @@
 using System.ComponentModel;
 using System.Diagnostics;
+using System.Diagnostics.CodeAnalysis;
 using System.IO;
 using System.Runtime.InteropServices;
 using System.Security;
@@ -11,6 +12,8 @@ namespace ListaryOpen.Infrastructure.Dialog;
 public sealed class WindowsDialogAutomation : IDialogAutomation
 {
     private const int AccessDeniedHResult = unchecked((int)0x80070005);
+    private const string FileNameAutomationId = "1148";
+    private const string CommitButtonAutomationId = "1";
 
     private AutomationElement? _activeDialog;
 
@@ -33,11 +36,7 @@ public sealed class WindowsDialogAutomation : IDialogAutomation
         NativeMethods.GetWindowThreadProcessId(handle, out var processId);
         try
         {
-            var process = Process.GetProcessById((int)processId);
-            if (process.MainWindowHandle == IntPtr.Zero)
-            {
-                return DialogProbeResult.Unsupported("Dialog process has no main window.");
-            }
+            using var process = Process.GetProcessById((int)processId);
 
             var activeDialog = AutomationElement.FromHandle(handle);
             if (activeDialog is null)
@@ -72,23 +71,56 @@ public sealed class WindowsDialogAutomation : IDialogAutomation
             return Task.FromResult(false);
         }
 
-        var edit = activeDialog.FindFirst(
-            TreeScope.Descendants,
-            new PropertyCondition(AutomationElement.ControlTypeProperty, ControlType.Edit));
-        if (edit is null)
+        cancellationToken.ThrowIfCancellationRequested();
+
+        if (!TryFindFirst(
+                activeDialog,
+                TreeScope.Descendants,
+                new AndCondition(
+                    new PropertyCondition(AutomationElement.AutomationIdProperty, FileNameAutomationId),
+                    new PropertyCondition(AutomationElement.ControlTypeProperty, ControlType.Edit)),
+                out var fileNameEdit))
         {
             return Task.FromResult(false);
         }
 
         cancellationToken.ThrowIfCancellationRequested();
 
-        if (edit.TryGetCurrentPattern(ValuePattern.Pattern, out var pattern) && pattern is ValuePattern valuePattern)
+        if (!TryGetValuePattern(fileNameEdit, out var valuePattern))
         {
-            valuePattern.SetValue(folderPath);
-            return Task.FromResult(true);
+            return Task.FromResult(false);
         }
 
-        return Task.FromResult(false);
+        cancellationToken.ThrowIfCancellationRequested();
+
+        if (!TrySetValue(valuePattern, folderPath))
+        {
+            return Task.FromResult(false);
+        }
+
+        cancellationToken.ThrowIfCancellationRequested();
+
+        if (!TryFindFirst(
+                activeDialog,
+                TreeScope.Descendants,
+                new AndCondition(
+                    new PropertyCondition(AutomationElement.AutomationIdProperty, CommitButtonAutomationId),
+                    new PropertyCondition(AutomationElement.ControlTypeProperty, ControlType.Button)),
+                out var commitButton))
+        {
+            return Task.FromResult(false);
+        }
+
+        cancellationToken.ThrowIfCancellationRequested();
+
+        if (!TryGetInvokePattern(commitButton, out var invokePattern))
+        {
+            return Task.FromResult(false);
+        }
+
+        cancellationToken.ThrowIfCancellationRequested();
+
+        return Task.FromResult(TryInvoke(invokePattern));
     }
 
     private static string GetClassName(IntPtr handle)
@@ -104,5 +136,95 @@ public sealed class WindowsDialogAutomation : IDialogAutomation
             or SecurityException
             or Win32Exception { NativeErrorCode: 5 }
             or COMException { HResult: AccessDeniedHResult };
+    }
+
+    private static bool TryFindFirst(
+        AutomationElement element,
+        TreeScope scope,
+        Condition condition,
+        [NotNullWhen(true)] out AutomationElement? result)
+    {
+        try
+        {
+            result = element.FindFirst(scope, condition);
+            return result is not null;
+        }
+        catch (Exception exception) when (IsExpectedAutomationException(exception))
+        {
+            result = null;
+            return false;
+        }
+    }
+
+    private static bool TryGetValuePattern(AutomationElement element, [NotNullWhen(true)] out ValuePattern? valuePattern)
+    {
+        try
+        {
+            if (element.TryGetCurrentPattern(ValuePattern.Pattern, out var pattern) && pattern is ValuePattern typedPattern)
+            {
+                valuePattern = typedPattern;
+                return true;
+            }
+        }
+        catch (Exception exception) when (IsExpectedAutomationException(exception))
+        {
+        }
+
+        valuePattern = null;
+        return false;
+    }
+
+    private static bool TryGetInvokePattern(AutomationElement element, [NotNullWhen(true)] out InvokePattern? invokePattern)
+    {
+        try
+        {
+            if (element.TryGetCurrentPattern(InvokePattern.Pattern, out var pattern) && pattern is InvokePattern typedPattern)
+            {
+                invokePattern = typedPattern;
+                return true;
+            }
+        }
+        catch (Exception exception) when (IsExpectedAutomationException(exception))
+        {
+        }
+
+        invokePattern = null;
+        return false;
+    }
+
+    private static bool TrySetValue(ValuePattern valuePattern, string value)
+    {
+        try
+        {
+            valuePattern.SetValue(value);
+            return true;
+        }
+        catch (Exception exception) when (IsExpectedAutomationException(exception))
+        {
+            return false;
+        }
+    }
+
+    private static bool TryInvoke(InvokePattern invokePattern)
+    {
+        try
+        {
+            invokePattern.Invoke();
+            return true;
+        }
+        catch (Exception exception) when (IsExpectedAutomationException(exception))
+        {
+            return false;
+        }
+    }
+
+    private static bool IsExpectedAutomationException(Exception exception)
+    {
+        return exception is ElementNotAvailableException
+            or InvalidOperationException
+            or UnauthorizedAccessException
+            or SecurityException
+            or Win32Exception { NativeErrorCode: 5 }
+            or COMException;
     }
 }
