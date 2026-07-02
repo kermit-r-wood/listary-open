@@ -317,6 +317,58 @@ public sealed class SqliteSearchIndexTests
         }
     }
 
+    [Fact]
+    public async Task OpenMigratesOldSchemaDatabaseBeforeSearchAndUpsert()
+    {
+        var dbPath = CreateTempDbPath();
+        var oldRecord = FileRecord.Create("C:\\Docs\\OldInvoice.xlsx", false, 10, DateTimeOffset.UtcNow);
+
+        try
+        {
+            await CreateOldSchemaDatabaseAsync(dbPath, oldRecord);
+
+            await using (var index = await SqliteSearchIndex.OpenAsync(dbPath, CancellationToken.None))
+            {
+                var oldResults = await index.SearchAsync(new SearchQuery("oldinvoice", SearchMode.FilesAndFolders), CancellationToken.None);
+
+                Assert.Equal("OldInvoice.xlsx", Assert.Single(oldResults).Record.Name);
+
+                await index.UpsertAsync(FileRecord.Create("C:\\Docs\\NewInvoice.xlsx", false, 10, DateTimeOffset.UtcNow), CancellationToken.None);
+
+                var newResults = await index.SearchAsync(new SearchQuery("newinvoice", SearchMode.FilesAndFolders), CancellationToken.None);
+
+                Assert.Equal("NewInvoice.xlsx", Assert.Single(newResults).Record.Name);
+            }
+        }
+        finally
+        {
+            DeleteIfExists(dbPath);
+        }
+    }
+
+    [Fact]
+    public async Task SearchReturnsExactMatchAfterMoreThanFiveThousandEarlierFuzzyCandidates()
+    {
+        var dbPath = CreateTempDbPath();
+
+        try
+        {
+            await using (var index = await SqliteSearchIndex.OpenAsync(dbPath, CancellationToken.None))
+            {
+                await InsertAlphabeticallyEarlierFuzzyInvoiceRowsAsync(index);
+                await index.UpsertAsync(FileRecord.Create("C:\\Docs\\Invoice.xlsx", false, 10, DateTimeOffset.UtcNow), CancellationToken.None);
+
+                var results = await index.SearchAsync(new SearchQuery("invoice", SearchMode.FilesAndFolders), CancellationToken.None);
+
+                Assert.Equal("Invoice.xlsx", results[0].Record.Name);
+            }
+        }
+        finally
+        {
+            DeleteIfExists(dbPath);
+        }
+    }
+
     private static async Task InsertAlphabeticallyEarlierRowsAsync(SqliteSearchIndex index)
     {
         var lastWriteTime = DateTimeOffset.UtcNow;
@@ -325,6 +377,80 @@ public sealed class SqliteSearchIndexTests
             .Select(i => FileRecord.Create($"C:\\Docs\\A{i:D4}.txt", false, 1, lastWriteTime));
 
         await index.UpsertManyAsync(records, CancellationToken.None);
+    }
+
+    private static async Task InsertAlphabeticallyEarlierFuzzyInvoiceRowsAsync(SqliteSearchIndex index)
+    {
+        var lastWriteTime = DateTimeOffset.UtcNow;
+        var records = Enumerable
+            .Range(0, EarlierRowCount)
+            .Select(i => FileRecord.Create($"C:\\Docs\\A-i-n-v-o-i-c-e-fragment-{i:D4}.txt", false, 1, lastWriteTime));
+
+        await index.UpsertManyAsync(records, CancellationToken.None);
+    }
+
+    private static async Task CreateOldSchemaDatabaseAsync(string dbPath, FileRecord record)
+    {
+        var connectionString = new SqliteConnectionStringBuilder
+        {
+            DataSource = dbPath,
+            Pooling = false
+        }.ToString();
+
+        await using var connection = new SqliteConnection(connectionString);
+        await connection.OpenAsync();
+
+        using var createCommand = connection.CreateCommand();
+        createCommand.CommandText = """
+            create table files(
+                full_path text,
+                path_key text primary key,
+                name text,
+                parent_path text,
+                is_directory integer,
+                size_bytes integer,
+                last_write_time text
+            );
+
+            create table usage(
+                full_path text,
+                path_key text primary key,
+                open_count integer,
+                last_used_at text
+            );
+            """;
+        await createCommand.ExecuteNonQueryAsync();
+
+        using var insertCommand = connection.CreateCommand();
+        insertCommand.CommandText = """
+            insert into files(
+                full_path,
+                path_key,
+                name,
+                parent_path,
+                is_directory,
+                size_bytes,
+                last_write_time
+            )
+            values (
+                $full_path,
+                $path_key,
+                $name,
+                $parent_path,
+                $is_directory,
+                $size_bytes,
+                $last_write_time
+            );
+            """;
+        insertCommand.Parameters.AddWithValue("$full_path", record.FullPath);
+        insertCommand.Parameters.AddWithValue("$path_key", record.PathKey);
+        insertCommand.Parameters.AddWithValue("$name", record.Name);
+        insertCommand.Parameters.AddWithValue("$parent_path", record.ParentPath);
+        insertCommand.Parameters.AddWithValue("$is_directory", record.IsDirectory ? 1 : 0);
+        insertCommand.Parameters.AddWithValue("$size_bytes", record.SizeBytes);
+        insertCommand.Parameters.AddWithValue("$last_write_time", record.LastWriteTime.ToString("O"));
+
+        await insertCommand.ExecuteNonQueryAsync();
     }
 
     private static async Task AssertSqliteConstraintAsync(string dbPath, string commandText)
