@@ -31,9 +31,11 @@ public static class ResultRanker
             .Select(CreatePathKey)
             .ToHashSet(StringComparer.Ordinal);
 
+        var now = DateTimeOffset.UtcNow;
+
         return records
             .Where(record => query.Mode == SearchMode.FilesAndFolders || record.IsDirectory)
-            .Select(record => ScoreRecord(query, record, usage, pinned))
+            .Select(record => ScoreRecord(query, record, usage, pinned, now))
             .Where(result => result.Score > 0)
             .OrderByDescending(result => result.Score)
             .ThenBy(result => result.Record.Name, StringComparer.OrdinalIgnoreCase)
@@ -48,7 +50,8 @@ public static class ResultRanker
         SearchQuery query,
         FileRecord record,
         IReadOnlyDictionary<string, UsageRecord> usage,
-        IReadOnlySet<string> pinned)
+        IReadOnlySet<string> pinned,
+        DateTimeOffset now)
     {
         var queryText = query.NormalizedText;
         var nameScore = FuzzyMatcher.Score(queryText, record.Name);
@@ -70,10 +73,15 @@ public static class ResultRanker
             reason = "pinyin";
         }
 
+        if (score <= 0)
+        {
+            return new SearchResult(record, 0, reason);
+        }
+
         if (usage.TryGetValue(record.PathKey, out var used))
         {
             score += Math.Min(50, used.OpenCount * 5);
-            score += RecencyBoost(used.LastUsedAt);
+            score += RecencyBoost(used.LastUsedAt, now);
             reason = "usage";
         }
 
@@ -86,9 +94,9 @@ public static class ResultRanker
         return new SearchResult(record, score, reason);
     }
 
-    private static double RecencyBoost(DateTimeOffset lastUsedAt)
+    private static double RecencyBoost(DateTimeOffset lastUsedAt, DateTimeOffset now)
     {
-        var daysSinceUse = (DateTimeOffset.UtcNow - lastUsedAt).TotalDays;
+        var daysSinceUse = (now - lastUsedAt).TotalDays;
         return Math.Clamp(20 - daysSinceUse, 0, 20);
     }
 
