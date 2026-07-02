@@ -36,6 +36,25 @@ public sealed class PinyinMatcherTests
         Assert.True(score > 50);
     }
 
+    [Fact]
+    public void CreateSearchTextIncludesKnownPinyinAndInitials()
+    {
+        var searchText = PinyinMatcher.CreateSearchText("合同.docx");
+
+        Assert.Contains("合同.docx", searchText);
+        Assert.Contains("hetong.docx", searchText);
+        Assert.Contains("ht.docx", searchText);
+    }
+
+    [Theory]
+    [InlineData(null)]
+    [InlineData("")]
+    [InlineData(" ")]
+    public void CreateSearchTextReturnsEmptyForBlankInput(string? value)
+    {
+        Assert.Equal(string.Empty, PinyinMatcher.CreateSearchText(value));
+    }
+
     [Theory]
     [InlineData(null, "发票2026.xlsx")]
     [InlineData("", "发票2026.xlsx")]

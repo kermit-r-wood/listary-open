@@ -35,6 +35,24 @@ public static class PinyinMatcher
         return Math.Max(FuzzyMatcher.Score(query, pinyin), FuzzyMatcher.Score(query, initials));
     }
 
+    public static string CreateSearchText(string? value)
+    {
+        if (string.IsNullOrWhiteSpace(value))
+        {
+            return string.Empty;
+        }
+
+        var normalized = value.Trim().ToLowerInvariant();
+        var forms = new[]
+        {
+            normalized,
+            ToPinyin(normalized).ToLowerInvariant(),
+            ToInitials(normalized).ToLowerInvariant()
+        };
+
+        return string.Join(' ', forms.Distinct(StringComparer.Ordinal));
+    }
+
     private static string ToPinyin(string value)
     {
         return string.Concat(value.Select(ch => KnownPinyin.TryGetValue(ch, out var pinyin)
