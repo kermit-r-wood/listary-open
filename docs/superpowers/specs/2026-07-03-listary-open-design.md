@@ -114,6 +114,9 @@ Implements Quick Save / Open.
 - Uses Win32 and UI Automation to locate the target controls.
 - Changes the dialog's current folder to a selected directory.
 - Can use the active Explorer folder as a jump target when the user invokes Quick Save / Open after working in an Explorer window.
+- Runs without elevation by default and controls only same-user, same-or-lower integrity windows.
+- Does not try to automate administrator-elevated dialogs from the normal user process because Windows UIPI can block cross-integrity messages and UI Automation actions.
+- Reports elevated target dialogs as permission-limited and can offer a user-approved elevated helper path later.
 - Reports unsupported custom dialogs and automation failures clearly.
 - Records successful jumps as recent folder usage.
 
@@ -197,6 +200,7 @@ Cases to handle:
 - Hotkey registration conflicts with another app.
 - Search result was deleted before activation.
 - Active dialog is not a standard Windows open/save dialog.
+- Active dialog belongs to a higher-integrity administrator process.
 - UI Automation cannot locate the needed control.
 - Dialog folder jump fails.
 
@@ -229,6 +233,7 @@ Manual Windows acceptance tests:
 - Open Notepad Save As dialog, press `Ctrl+G`, select a folder, and verify the dialog changes location.
 - Open a standard Open dialog from a common Win32/.NET app and verify folder jump.
 - Open Explorer at a folder, invoke Quick Save / Open from a standard dialog, and verify the Explorer folder is offered as the primary target.
+- Open an administrator-elevated app's file dialog from the normal app process and verify the app reports a permission-limited target instead of silently failing.
 - Open a custom or unsupported dialog and verify the app reports it as unsupported.
 
 ## Version 1 Acceptance Criteria
@@ -246,6 +251,7 @@ Manual Windows acceptance tests:
 - Detects standard Windows open/save dialogs.
 - Jumps standard open/save dialogs to a selected folder.
 - Offers the most recent active Explorer folder as a Quick Save / Open jump target.
+- Does not require elevation for normal dialog jumps and reports elevated target dialogs clearly.
 - Shows clear user feedback for unsupported dialogs or failed automation.
 - Provides diagnostics for indexing and dialog integration failures.
 
