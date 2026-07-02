@@ -1,0 +1,64 @@
+﻿
+Microsoft Visual Studio Solution File, Format Version 12.00
+# Visual Studio Version 17
+VisualStudioVersion = 17.0.31903.59
+MinimumVisualStudioVersion = 10.0.40219.1
+Project("{2150E333-8FDC-42A3-9474-1A3956D46DE8}") = "src", "src", "{522194D0-B069-4775-9D9E-4E0245EBE60B}"
+EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "ListaryOpen.Core", "src\ListaryOpen.Core\ListaryOpen.Core.csproj", "{F9F063AF-99D0-42E3-BC90-E2452E6364B6}"
+EndProject
+Project("{2150E333-8FDC-42A3-9474-1A3956D46DE8}") = "tests", "tests", "{0B5DC35C-D315-44E8-992A-1357EA5820DD}"
+EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "ListaryOpen.Core.Tests", "tests\ListaryOpen.Core.Tests\ListaryOpen.Core.Tests.csproj", "{67426172-D128-427E-BF0E-CF46931FB7FF}"
+EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "ListaryOpen.Infrastructure", "src\ListaryOpen.Infrastructure\ListaryOpen.Infrastructure.csproj", "{7F4E82A0-0B77-49AC-8BF2-1D6806FDF17E}"
+EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "ListaryOpen.App", "src\ListaryOpen.App\ListaryOpen.App.csproj", "{0EA44071-CBFB-4176-8CDD-E46B3395097F}"
+EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "ListaryOpen.Indexer.Elevated", "src\ListaryOpen.Indexer.Elevated\ListaryOpen.Indexer.Elevated.csproj", "{D895B149-EE12-4B78-9996-D852CBDAD756}"
+EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "ListaryOpen.Infrastructure.Tests", "tests\ListaryOpen.Infrastructure.Tests\ListaryOpen.Infrastructure.Tests.csproj", "{5931A42B-0504-4AD2-B660-FFC746ADC458}"
+EndProject
+Global
+	GlobalSection(SolutionConfigurationPlatforms) = preSolution
+		Debug|Any CPU = Debug|Any CPU
+		Release|Any CPU = Release|Any CPU
+	EndGlobalSection
+	GlobalSection(SolutionProperties) = preSolution
+		HideSolutionNode = FALSE
+	EndGlobalSection
+	GlobalSection(ProjectConfigurationPlatforms) = postSolution
+		{F9F063AF-99D0-42E3-BC90-E2452E6364B6}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{F9F063AF-99D0-42E3-BC90-E2452E6364B6}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{F9F063AF-99D0-42E3-BC90-E2452E6364B6}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{F9F063AF-99D0-42E3-BC90-E2452E6364B6}.Release|Any CPU.Build.0 = Release|Any CPU
+		{67426172-D128-427E-BF0E-CF46931FB7FF}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{67426172-D128-427E-BF0E-CF46931FB7FF}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{67426172-D128-427E-BF0E-CF46931FB7FF}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{67426172-D128-427E-BF0E-CF46931FB7FF}.Release|Any CPU.Build.0 = Release|Any CPU
+		{7F4E82A0-0B77-49AC-8BF2-1D6806FDF17E}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{7F4E82A0-0B77-49AC-8BF2-1D6806FDF17E}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{7F4E82A0-0B77-49AC-8BF2-1D6806FDF17E}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{7F4E82A0-0B77-49AC-8BF2-1D6806FDF17E}.Release|Any CPU.Build.0 = Release|Any CPU
+		{0EA44071-CBFB-4176-8CDD-E46B3395097F}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{0EA44071-CBFB-4176-8CDD-E46B3395097F}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{0EA44071-CBFB-4176-8CDD-E46B3395097F}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{0EA44071-CBFB-4176-8CDD-E46B3395097F}.Release|Any CPU.Build.0 = Release|Any CPU
+		{D895B149-EE12-4B78-9996-D852CBDAD756}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{D895B149-EE12-4B78-9996-D852CBDAD756}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{D895B149-EE12-4B78-9996-D852CBDAD756}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{D895B149-EE12-4B78-9996-D852CBDAD756}.Release|Any CPU.Build.0 = Release|Any CPU
+		{5931A42B-0504-4AD2-B660-FFC746ADC458}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{5931A42B-0504-4AD2-B660-FFC746ADC458}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{5931A42B-0504-4AD2-B660-FFC746ADC458}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{5931A42B-0504-4AD2-B660-FFC746ADC458}.Release|Any CPU.Build.0 = Release|Any CPU
+	EndGlobalSection
+	GlobalSection(NestedProjects) = preSolution
+		{F9F063AF-99D0-42E3-BC90-E2452E6364B6} = {522194D0-B069-4775-9D9E-4E0245EBE60B}
+		{67426172-D128-427E-BF0E-CF46931FB7FF} = {0B5DC35C-D315-44E8-992A-1357EA5820DD}
+		{7F4E82A0-0B77-49AC-8BF2-1D6806FDF17E} = {522194D0-B069-4775-9D9E-4E0245EBE60B}
+		{0EA44071-CBFB-4176-8CDD-E46B3395097F} = {522194D0-B069-4775-9D9E-4E0245EBE60B}
+		{D895B149-EE12-4B78-9996-D852CBDAD756} = {522194D0-B069-4775-9D9E-4E0245EBE60B}
+		{5931A42B-0504-4AD2-B660-FFC746ADC458} = {0B5DC35C-D315-44E8-992A-1357EA5820DD}
+	EndGlobalSection
+EndGlobal
