@@ -1,5 +1,5 @@
-using System.ComponentModel;
 using System.Text.Json;
+using ListaryOpen.Indexer.Elevated;
 using ListaryOpen.Indexer.Elevated.Ntfs;
 
 if (args.Length == 2 && args[0] == "scan")
@@ -34,7 +34,7 @@ if (args.Length == 2 && args[0] == "scan")
 
         return 0;
     }
-    catch (Exception exception) when (IsNtfsAccessFailure(exception))
+    catch (Exception exception) when (ElevatedHelperExitCodeClassifier.IsNtfsAccessFailure(exception))
     {
         Console.Error.WriteLine(exception.Message);
         return 5;
@@ -43,13 +43,6 @@ if (args.Length == 2 && args[0] == "scan")
 
 Console.Error.WriteLine("Usage: ListaryOpen.Indexer.Elevated scan <root>");
 return 2;
-
-static bool IsNtfsAccessFailure(Exception exception)
-{
-    return exception is Win32Exception
-        or IOException
-        or UnauthorizedAccessException;
-}
 
 internal static class JsonOptions
 {
