@@ -10,7 +10,6 @@ namespace ListaryOpen.Infrastructure.Search;
 
 public sealed class SqliteSearchIndex : ISearchIndex, IAsyncDisposable
 {
-    private const int QueryCandidateLimit = 5000;
     private const int FallbackCandidateLimit = 200;
 
     private readonly SqliteConnection _connection;
@@ -330,11 +329,9 @@ public sealed class SqliteSearchIndex : ISearchIndex, IAsyncDisposable
                 last_write_time
             from files
             where search_text like $ordered escape '\'
-            order by name
-            limit $limit;
+            order by name;
             """;
         command.Parameters.AddWithValue("$ordered", orderedPattern);
-        command.Parameters.AddWithValue("$limit", QueryCandidateLimit);
 
         await AddRecordsAsync(command, records, cancellationToken);
     }

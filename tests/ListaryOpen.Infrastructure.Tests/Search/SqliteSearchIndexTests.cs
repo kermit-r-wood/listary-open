@@ -369,6 +369,35 @@ public sealed class SqliteSearchIndexTests
         }
     }
 
+    [Fact]
+    public async Task SearchReturnsHighQualityAbbreviationMatchAfterMoreThanFiveThousandEarlierWeakFuzzyCandidates()
+    {
+        var dbPath = CreateTempDbPath();
+        const string weakName = "Aaaaaiaaaavaaaa2aaaa6-fragment-0000.txt";
+        const string targetName = "ZInvoice 2026.xlsx";
+
+        Assert.True(
+            FuzzyMatcher.Score("iv26", targetName) > FuzzyMatcher.Score("iv26", weakName),
+            "The target fixture must score higher than the earlier fuzzy filler rows.");
+
+        try
+        {
+            await using (var index = await SqliteSearchIndex.OpenAsync(dbPath, CancellationToken.None))
+            {
+                await InsertAlphabeticallyEarlierWeakIv26RowsAsync(index);
+                await index.UpsertAsync(FileRecord.Create($"C:\\Docs\\{targetName}", false, 10, DateTimeOffset.UtcNow), CancellationToken.None);
+
+                var results = await index.SearchAsync(new SearchQuery("iv26", SearchMode.FilesAndFolders), CancellationToken.None);
+
+                Assert.Equal(targetName, results[0].Record.Name);
+            }
+        }
+        finally
+        {
+            DeleteIfExists(dbPath);
+        }
+    }
+
     private static async Task InsertAlphabeticallyEarlierRowsAsync(SqliteSearchIndex index)
     {
         var lastWriteTime = DateTimeOffset.UtcNow;
@@ -385,6 +414,16 @@ public sealed class SqliteSearchIndexTests
         var records = Enumerable
             .Range(0, EarlierRowCount)
             .Select(i => FileRecord.Create($"C:\\Docs\\A-i-n-v-o-i-c-e-fragment-{i:D4}.txt", false, 1, lastWriteTime));
+
+        await index.UpsertManyAsync(records, CancellationToken.None);
+    }
+
+    private static async Task InsertAlphabeticallyEarlierWeakIv26RowsAsync(SqliteSearchIndex index)
+    {
+        var lastWriteTime = DateTimeOffset.UtcNow;
+        var records = Enumerable
+            .Range(0, EarlierRowCount)
+            .Select(i => FileRecord.Create($"C:\\Docs\\Aaaaaiaaaavaaaa2aaaa6-fragment-{i:D4}.txt", false, 1, lastWriteTime));
 
         await index.UpsertManyAsync(records, CancellationToken.None);
     }
