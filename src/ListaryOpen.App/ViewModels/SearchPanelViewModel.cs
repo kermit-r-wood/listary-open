@@ -1,5 +1,6 @@
 using System.Collections.ObjectModel;
 using System.ComponentModel;
+using System.Diagnostics;
 using System.Runtime.CompilerServices;
 using ListaryOpen.Core.Search;
 
@@ -13,7 +14,7 @@ public sealed class SearchPanelViewModel : INotifyPropertyChanged
 
     public SearchPanelViewModel(ISearchIndex index)
     {
-        _index = index;
+        _index = index ?? throw new ArgumentNullException(nameof(index));
     }
 
     public event PropertyChangedEventHandler? PropertyChanged;
@@ -54,8 +55,10 @@ public sealed class SearchPanelViewModel : INotifyPropertyChanged
                 new SearchQuery(queryText, SearchMode.FilesAndFolders),
                 CancellationToken.None);
         }
-        catch
+        catch (Exception exception)
         {
+            Trace.TraceError(exception.ToString());
+
             if (version == _refreshVersion)
             {
                 Results.Clear();

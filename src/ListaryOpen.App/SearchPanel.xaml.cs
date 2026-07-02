@@ -20,6 +20,8 @@ public partial class SearchPanel : Window
 
     public SearchPanel(SearchPanelViewModel viewModel)
     {
+        ArgumentNullException.ThrowIfNull(viewModel);
+
         InitializeComponent();
         DataContext = viewModel;
     }
