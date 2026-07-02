@@ -4,5 +4,15 @@ namespace ListaryOpen.App.ViewModels;
 
 public sealed class SettingsViewModel
 {
-    public AppSettings Settings { get; } = AppSettings.Defaults();
+    public SettingsViewModel()
+        : this(AppSettings.Defaults())
+    {
+    }
+
+    public SettingsViewModel(AppSettings settings)
+    {
+        Settings = settings;
+    }
+
+    public AppSettings Settings { get; }
 }
