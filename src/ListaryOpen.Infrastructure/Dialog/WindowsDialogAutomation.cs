@@ -4,7 +4,6 @@ using System.Diagnostics.CodeAnalysis;
 using System.IO;
 using System.Runtime.InteropServices;
 using System.Security;
-using System.Text;
 using System.Windows.Automation;
 using ListaryOpen.Infrastructure.Windows;
 
@@ -12,18 +11,7 @@ namespace ListaryOpen.Infrastructure.Dialog;
 
 public sealed class WindowsDialogAutomation : IDialogAutomation
 {
-    private enum CurrentFolderQueryStatus
-    {
-        Unavailable,
-        Failed,
-        Available
-    }
-
     private const int AccessDeniedHResult = unchecked((int)0x80070005);
-    private const int WM_USER = 0x0400;
-    private const int CDM_FIRST = WM_USER + 100;
-    private const int CDM_GETFOLDERPATH = CDM_FIRST + 0x0002;
-    private const int FolderPathBufferCapacity = 32768;
     private static readonly TimeSpan NavigationConfirmationTimeout = TimeSpan.FromSeconds(2);
     private static readonly TimeSpan NavigationConfirmationPollInterval = TimeSpan.FromMilliseconds(100);
     private const string FileNameAutomationId = "1148";
@@ -144,7 +132,6 @@ public sealed class WindowsDialogAutomation : IDialogAutomation
         }
 
         return await ConfirmFolderNavigationAsync(
-                activeDialogHandle,
                 valuePattern,
                 folderPath,
                 cancellationToken)
@@ -152,35 +139,23 @@ public sealed class WindowsDialogAutomation : IDialogAutomation
     }
 
     private static async Task<bool> ConfirmFolderNavigationAsync(
-        IntPtr dialogHandle,
         ValuePattern fileNameValuePattern,
         string targetFolderPath,
         CancellationToken cancellationToken)
     {
         var normalizedTargetFolderPath = NormalizeFolderPath(targetFolderPath);
         var deadline = DateTimeOffset.UtcNow + NavigationConfirmationTimeout;
-        var currentFolderQueryReturnedPath = false;
 
         do
         {
             cancellationToken.ThrowIfCancellationRequested();
 
-            var currentFolderQueryStatus = TryGetCurrentFolderPath(dialogHandle, out var currentFolderPath);
-            if (currentFolderQueryStatus == CurrentFolderQueryStatus.Available)
-            {
-                currentFolderQueryReturnedPath = true;
-                if (MatchesSubmittedFolderValue(currentFolderPath!, normalizedTargetFolderPath))
-                {
-                    return true;
-                }
-            }
-            else if (currentFolderQueryStatus == CurrentFolderQueryStatus.Failed)
+            if (!TryGetValue(fileNameValuePattern, out var currentFileNameValue))
             {
                 return false;
             }
-            else if (!currentFolderQueryReturnedPath
-                && TryGetValue(fileNameValuePattern, out var currentFileNameValue)
-                && !MatchesSubmittedFolderValue(currentFileNameValue, normalizedTargetFolderPath))
+
+            if (!MatchesSubmittedFolderValue(currentFileNameValue, normalizedTargetFolderPath))
             {
                 return true;
             }
@@ -193,40 +168,6 @@ public sealed class WindowsDialogAutomation : IDialogAutomation
             await Task.Delay(NavigationConfirmationPollInterval, cancellationToken).ConfigureAwait(false);
         }
         while (true);
-    }
-
-    private static CurrentFolderQueryStatus TryGetCurrentFolderPath(
-        IntPtr dialogHandle,
-        out string? folderPath)
-    {
-        try
-        {
-            var buffer = new StringBuilder(FolderPathBufferCapacity);
-            var result = NativeMethods.SendMessage(
-                dialogHandle,
-                CDM_GETFOLDERPATH,
-                new IntPtr(buffer.Capacity),
-                buffer);
-
-            if (result.ToInt64() > 0 && result.ToInt64() < buffer.Capacity)
-            {
-                folderPath = buffer.ToString();
-                return string.IsNullOrWhiteSpace(folderPath)
-                    ? CurrentFolderQueryStatus.Unavailable
-                    : CurrentFolderQueryStatus.Available;
-            }
-        }
-        catch (Exception exception) when (IsPermissionException(exception) || exception is COMException)
-        {
-            folderPath = null;
-            return CurrentFolderQueryStatus.Failed;
-        }
-        catch (Exception exception) when (exception is InvalidOperationException or NotSupportedException)
-        {
-        }
-
-        folderPath = null;
-        return CurrentFolderQueryStatus.Unavailable;
     }
 
     private static string NormalizeFolderPath(string folderPath)
