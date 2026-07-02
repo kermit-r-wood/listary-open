@@ -18,6 +18,7 @@ public sealed class DisabledElevatedIndexerClient : IElevatedIndexerClient
         IndexRoot root,
         [EnumeratorCancellation] CancellationToken cancellationToken)
     {
+        cancellationToken.ThrowIfCancellationRequested();
         await Task.CompletedTask;
         yield break;
     }

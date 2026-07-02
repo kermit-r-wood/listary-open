@@ -8,13 +8,18 @@ public sealed class VolumeIndexer
 
     public VolumeIndexer(IEnumerable<IIndexProvider> providers)
     {
-        _providers = providers.ToArray();
+        if (providers is null)
+        {
+            throw new ArgumentNullException(nameof(providers));
+        }
+
+        _providers = providers.Select(provider => provider ?? throw new ArgumentNullException(nameof(providers))).ToArray();
     }
 
     public IIndexProvider SelectProvider(VolumeInfo volume)
     {
         return _providers
-            .OrderByDescending(provider => provider.Name == "NTFS")
+            .OrderByDescending(provider => provider.Name == NtfsIndexProvider.ProviderName)
             .First(provider => provider.CanIndex(volume));
     }
 }
