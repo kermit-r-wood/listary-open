@@ -786,7 +786,7 @@ Implementation rules:
 - Create tables `files(full_path text primary key, name text, parent_path text, is_directory integer, size_bytes integer, last_write_time text)` and `usage(full_path text primary key, open_count integer, last_used_at text)`.
 - `UpsertAsync` uses `insert ... on conflict(full_path) do update`.
 - `DeleteAsync` deletes by `full_path`.
-- `SearchAsync` reads a bounded candidate set using `where name like @term or full_path like @term limit 1000`, maps rows to `FileRecord`, reads usage rows, and calls `ResultRanker.Rank`.
+- `SearchAsync` reads a bounded candidate set large enough for ranker-compatible matching instead of relying only on SQL `LIKE`. For version 1, query recent rows plus a broad ordered slice such as `select ... from files order by name limit 5000`, map rows to `FileRecord`, read usage rows, and call `ResultRanker.Rank`. This keeps fuzzy, abbreviation, and pinyin matching inside the ranker effective until a dedicated trigram/pinyin candidate table is added.
 
 - [ ] **Step 4: Verify green**
 
