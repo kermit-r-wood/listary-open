@@ -28,6 +28,20 @@ public partial class SearchPanel : Window
 
     public void ActivateSearch()
     {
+        _ = ViewModel.ActivateFilesAndFoldersSearchAsync();
+        ShowAndFocusQuery();
+    }
+
+    public void ActivateFolderSearch(string? trackedFolder)
+    {
+        _ = ViewModel.ActivateFolderSearchAsync(trackedFolder);
+        ShowAndFocusQuery();
+    }
+
+    private SearchPanelViewModel ViewModel => (SearchPanelViewModel)DataContext;
+
+    private void ShowAndFocusQuery()
+    {
         Show();
         Activate();
         QueryBox.Focus();

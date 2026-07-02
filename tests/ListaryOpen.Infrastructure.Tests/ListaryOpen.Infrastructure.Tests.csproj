@@ -23,6 +23,7 @@
 
   <ItemGroup>
     <ProjectReference Include="..\..\src\ListaryOpen.Core\ListaryOpen.Core.csproj" />
+    <ProjectReference Include="..\..\src\ListaryOpen.App\ListaryOpen.App.csproj" />
     <ProjectReference Include="..\..\src\ListaryOpen.Infrastructure\ListaryOpen.Infrastructure.csproj" />
   </ItemGroup>
 
