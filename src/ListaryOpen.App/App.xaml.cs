@@ -47,6 +47,17 @@ public partial class App : Application
 
     private void OnHotkeyPressed(object? sender, string name)
     {
+        if (!Dispatcher.CheckAccess())
+        {
+            Dispatcher.BeginInvoke(new Action(() => HandleHotkeyPressed(name)));
+            return;
+        }
+
+        HandleHotkeyPressed(name);
+    }
+
+    private void HandleHotkeyPressed(string name)
+    {
         if (string.Equals(name, "Search", StringComparison.OrdinalIgnoreCase))
         {
             _searchPanel?.ActivateSearch();

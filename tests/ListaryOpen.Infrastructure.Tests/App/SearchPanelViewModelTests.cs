@@ -67,6 +67,24 @@ public sealed class SearchPanelViewModelTests
         }
     }
 
+    [Fact]
+    public async Task ActivateFolderSearchAsyncUsesFallbackTimestampWhenTrackedFolderTimestampFails()
+    {
+        var index = new RecordingSearchIndex(Array.Empty<SearchResult>());
+        var viewModel = new SearchPanelViewModel(
+            index,
+            _ => "C:\\Tracked",
+            _ => true,
+            _ => throw new UnauthorizedAccessException("Folder metadata is unavailable."));
+
+        await viewModel.ActivateFolderSearchAsync("C:\\Tracked");
+
+        var result = Assert.Single(viewModel.Results);
+        Assert.Equal("C:\\Tracked", result.Record.FullPath);
+        Assert.Equal(DateTimeOffset.UnixEpoch, result.Record.LastWriteTime);
+        Assert.Empty(index.ObservedQueries);
+    }
+
     private sealed class RecordingSearchIndex : ISearchIndex
     {
         private readonly object _lock = new();

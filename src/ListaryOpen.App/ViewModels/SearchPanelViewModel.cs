@@ -11,14 +11,29 @@ namespace ListaryOpen.App.ViewModels;
 public sealed class SearchPanelViewModel : INotifyPropertyChanged
 {
     private readonly ISearchIndex _index;
+    private readonly Func<string?, string?> _normalizeExistingFolder;
+    private readonly Func<string, bool> _folderExists;
+    private readonly Func<string, DateTimeOffset> _getFolderLastWriteTime;
     private int _refreshVersion;
     private string _queryText = string.Empty;
     private SearchMode _searchMode = SearchMode.FilesAndFolders;
     private string? _trackedFolder;
 
     public SearchPanelViewModel(ISearchIndex index)
+        : this(index, NormalizeExistingFolder, Directory.Exists, GetFolderLastWriteTime)
+    {
+    }
+
+    internal SearchPanelViewModel(
+        ISearchIndex index,
+        Func<string?, string?> normalizeExistingFolder,
+        Func<string, bool> folderExists,
+        Func<string, DateTimeOffset> getFolderLastWriteTime)
     {
         _index = index ?? throw new ArgumentNullException(nameof(index));
+        _normalizeExistingFolder = normalizeExistingFolder ?? throw new ArgumentNullException(nameof(normalizeExistingFolder));
+        _folderExists = folderExists ?? throw new ArgumentNullException(nameof(folderExists));
+        _getFolderLastWriteTime = getFolderLastWriteTime ?? throw new ArgumentNullException(nameof(getFolderLastWriteTime));
     }
 
     public event PropertyChangedEventHandler? PropertyChanged;
@@ -51,7 +66,7 @@ public sealed class SearchPanelViewModel : INotifyPropertyChanged
     public Task ActivateFolderSearchAsync(string? trackedFolder)
     {
         _searchMode = SearchMode.FoldersOnly;
-        _trackedFolder = NormalizeExistingFolder(trackedFolder);
+        _trackedFolder = TryNormalizeExistingFolder(trackedFolder);
         return RefreshAsync();
     }
 
@@ -62,7 +77,7 @@ public sealed class SearchPanelViewModel : INotifyPropertyChanged
         var searchMode = _searchMode;
         var trackedFolder = _trackedFolder;
         var trackedFolderResult = searchMode == SearchMode.FoldersOnly
-            ? CreateTrackedFolderResult(trackedFolder)
+            ? TryCreateTrackedFolderResult(trackedFolder)
             : null;
 
         Results.Clear();
@@ -125,20 +140,59 @@ public sealed class SearchPanelViewModel : INotifyPropertyChanged
         }
     }
 
-    private static SearchResult? CreateTrackedFolderResult(string? folderPath)
+    private SearchResult? TryCreateTrackedFolderResult(string? folderPath)
     {
-        if (folderPath is null || !Directory.Exists(folderPath))
+        if (folderPath is null)
         {
             return null;
         }
 
-        var record = FileRecord.Create(
-            folderPath,
-            isDirectory: true,
-            sizeBytes: 0,
-            new DateTimeOffset(Directory.GetLastWriteTimeUtc(folderPath), TimeSpan.Zero));
+        try
+        {
+            if (!_folderExists(folderPath))
+            {
+                return null;
+            }
 
-        return new SearchResult(record, double.MaxValue, "explorer");
+            var record = FileRecord.Create(
+                folderPath,
+                isDirectory: true,
+                sizeBytes: 0,
+                TryGetFolderLastWriteTime(folderPath));
+
+            return new SearchResult(record, double.MaxValue, "explorer");
+        }
+        catch (Exception exception) when (IsExpectedFolderPathException(exception))
+        {
+            Trace.TraceError(exception.ToString());
+            return null;
+        }
+    }
+
+    private string? TryNormalizeExistingFolder(string? folderPath)
+    {
+        try
+        {
+            return _normalizeExistingFolder(folderPath);
+        }
+        catch (Exception exception) when (IsExpectedFolderPathException(exception))
+        {
+            Trace.TraceError(exception.ToString());
+            return null;
+        }
+    }
+
+    private DateTimeOffset TryGetFolderLastWriteTime(string folderPath)
+    {
+        try
+        {
+            return _getFolderLastWriteTime(folderPath);
+        }
+        catch (Exception exception) when (IsExpectedFolderPathException(exception))
+        {
+            Trace.TraceError(exception.ToString());
+            return DateTimeOffset.UnixEpoch;
+        }
     }
 
     private static string? NormalizeExistingFolder(string? folderPath)
@@ -149,6 +203,16 @@ public sealed class SearchPanelViewModel : INotifyPropertyChanged
         }
 
         return Path.TrimEndingDirectorySeparator(Path.GetFullPath(folderPath.Trim()));
+    }
+
+    private static DateTimeOffset GetFolderLastWriteTime(string folderPath)
+    {
+        return new DateTimeOffset(Directory.GetLastWriteTimeUtc(folderPath), TimeSpan.Zero);
+    }
+
+    private static bool IsExpectedFolderPathException(Exception exception)
+    {
+        return exception is ArgumentException or IOException or NotSupportedException or UnauthorizedAccessException;
     }
 
     private void OnPropertyChanged([CallerMemberName] string? name = null)
