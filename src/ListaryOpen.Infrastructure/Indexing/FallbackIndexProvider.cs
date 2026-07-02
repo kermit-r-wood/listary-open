@@ -1,5 +1,6 @@
 using System.IO;
 using System.Runtime.CompilerServices;
+using System.Security;
 using ListaryOpen.Core.Indexing;
 
 namespace ListaryOpen.Infrastructure.Indexing;
@@ -8,6 +9,7 @@ public sealed class FallbackIndexProvider : IIndexProvider
 {
     private static readonly EnumerationOptions EnumerationOptions = new()
     {
+        AttributesToSkip = 0,
         IgnoreInaccessible = true,
         RecurseSubdirectories = false
     };
@@ -29,61 +31,124 @@ public sealed class FallbackIndexProvider : IIndexProvider
 
             var current = pending.Pop();
 
-            foreach (var directory in EnumerateDirectories(current))
+            foreach (var directory in EnumerateDirectories(current, cancellationToken))
             {
                 cancellationToken.ThrowIfCancellationRequested();
 
-                var info = new DirectoryInfo(directory);
-                if (info.Attributes.HasFlag(FileAttributes.ReparsePoint))
+                if (!TryCreateDirectoryRecord(directory, out var record, out var fullName))
                 {
                     continue;
                 }
 
-                yield return FileRecord.Create(info.FullName, true, 0, new DateTimeOffset(info.LastWriteTimeUtc));
-                pending.Push(info.FullName);
+                yield return record;
+                pending.Push(fullName);
                 await Task.Yield();
             }
 
-            foreach (var file in EnumerateFiles(current))
+            foreach (var file in EnumerateFiles(current, cancellationToken))
             {
                 cancellationToken.ThrowIfCancellationRequested();
 
-                var info = new FileInfo(file);
-                yield return FileRecord.Create(info.FullName, false, info.Length, new DateTimeOffset(info.LastWriteTimeUtc));
+                if (!TryCreateFileRecord(file, out var record))
+                {
+                    continue;
+                }
+
+                yield return record;
                 await Task.Yield();
             }
         }
     }
 
-    private static IEnumerable<string> EnumerateDirectories(string path)
+    private static IEnumerable<string> EnumerateDirectories(string path, CancellationToken cancellationToken)
+        => EnumerateEntries(() => Directory.EnumerateDirectories(path, "*", EnumerationOptions), cancellationToken);
+
+    private static IEnumerable<string> EnumerateFiles(string path, CancellationToken cancellationToken)
+        => EnumerateEntries(() => Directory.EnumerateFiles(path, "*", EnumerationOptions), cancellationToken);
+
+    private static IEnumerable<string> EnumerateEntries(
+        Func<IEnumerable<string>> enumerate,
+        CancellationToken cancellationToken)
     {
+        IEnumerator<string> enumerator;
         try
         {
-            return Directory.EnumerateDirectories(path, "*", EnumerationOptions).ToArray();
+            enumerator = enumerate().GetEnumerator();
         }
-        catch (IOException)
+        catch (Exception exception) when (IsExpectedFileSystemException(exception))
         {
-            return [];
+            yield break;
         }
-        catch (UnauthorizedAccessException)
+
+        using (enumerator)
         {
-            return [];
+            while (true)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+
+                string current;
+                try
+                {
+                    if (!enumerator.MoveNext())
+                    {
+                        yield break;
+                    }
+
+                    current = enumerator.Current;
+                }
+                catch (Exception exception) when (IsExpectedFileSystemException(exception))
+                {
+                    yield break;
+                }
+
+                yield return current;
+            }
         }
     }
 
-    private static IEnumerable<string> EnumerateFiles(string path)
+    private static bool TryCreateDirectoryRecord(string path, out FileRecord record, out string fullName)
     {
+        record = null!;
+        fullName = string.Empty;
+
         try
         {
-            return Directory.EnumerateFiles(path, "*", EnumerationOptions).ToArray();
+            var info = new DirectoryInfo(path);
+            if (info.Attributes.HasFlag(FileAttributes.ReparsePoint))
+            {
+                return false;
+            }
+
+            fullName = info.FullName;
+            record = FileRecord.Create(fullName, true, 0, new DateTimeOffset(info.LastWriteTimeUtc));
+            return true;
         }
-        catch (IOException)
+        catch (Exception exception) when (IsExpectedFileSystemException(exception))
         {
-            return [];
+            return false;
         }
-        catch (UnauthorizedAccessException)
+    }
+
+    private static bool TryCreateFileRecord(string path, out FileRecord record)
+    {
+        record = null!;
+
+        try
         {
-            return [];
+            var info = new FileInfo(path);
+            record = FileRecord.Create(info.FullName, false, info.Length, new DateTimeOffset(info.LastWriteTimeUtc));
+            return true;
         }
+        catch (Exception exception) when (IsExpectedFileSystemException(exception))
+        {
+            return false;
+        }
+    }
+
+    private static bool IsExpectedFileSystemException(Exception exception)
+    {
+        return exception is IOException
+            or UnauthorizedAccessException
+            or SecurityException;
     }
 }
