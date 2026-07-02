@@ -25,7 +25,7 @@ public sealed class HotkeyServiceTests
         var messageSource = new RecordingHotkeyMessageSource();
         using var service = new HotkeyService(registrar, messageSource);
 
-        service.RegisterDefaults();
+        var result = service.RegisterDefaults();
 
         Assert.Equal(
             new[]
@@ -34,7 +34,53 @@ public sealed class HotkeyServiceTests
                 new ObservedHotkey(2, HotkeyModifiers.Control | HotkeyModifiers.NoRepeat, (uint)KeyCodes.G)
             },
             registrar.RegisteredHotkeys);
+        Assert.True(result.AllRegistered);
+        Assert.True(result.AnyRegistered);
+        Assert.Equal(
+            new[]
+            {
+                new HotkeyRegistration("Ctrl+Space", true),
+                new HotkeyRegistration("Ctrl+G", true)
+            },
+            result.Hotkeys);
         Assert.Equal(1, messageSource.AttachCount);
+    }
+
+    [Fact]
+    public void RegisterDefaultsReportsPartialRegistrationFailure()
+    {
+        var registrar = new RecordingHotkeyRegistrar
+        {
+            FailedRegistrationIds = { 1 }
+        };
+        var messageSource = new RecordingHotkeyMessageSource();
+        using var service = new HotkeyService(registrar, messageSource);
+
+        var result = service.RegisterDefaults();
+
+        Assert.False(result.AllRegistered);
+        Assert.True(result.AnyRegistered);
+        Assert.Equal(new[] { "Ctrl+Space" }, result.FailedHotkeys.Select(hotkey => hotkey.Name));
+        Assert.Equal(new[] { "Ctrl+G" }, result.RegisteredHotkeys.Select(hotkey => hotkey.Name));
+        Assert.Equal(1, messageSource.AttachCount);
+    }
+
+    [Fact]
+    public void RegisterDefaultsReportsTotalRegistrationFailureWithoutMessageHook()
+    {
+        var registrar = new RecordingHotkeyRegistrar
+        {
+            FailedRegistrationIds = { 1, 2 }
+        };
+        var messageSource = new RecordingHotkeyMessageSource();
+        using var service = new HotkeyService(registrar, messageSource);
+
+        var result = service.RegisterDefaults();
+
+        Assert.False(result.AllRegistered);
+        Assert.False(result.AnyRegistered);
+        Assert.Equal(new[] { "Ctrl+Space", "Ctrl+G" }, result.FailedHotkeys.Select(hotkey => hotkey.Name));
+        Assert.Equal(0, messageSource.AttachCount);
     }
 
     [Fact]
@@ -62,10 +108,12 @@ public sealed class HotkeyServiceTests
         var messageSource = new RecordingHotkeyMessageSource();
         var service = new HotkeyService(registrar, messageSource);
 
-        service.RegisterDefaults();
+        var result = service.RegisterDefaults();
+        var repeatedResult = service.RegisterDefaults();
         service.Dispose();
         service.Dispose();
 
+        Assert.Same(result, repeatedResult);
         Assert.Equal(new[] { 1 }, registrar.UnregisteredIds);
         Assert.Equal(1, messageSource.AttachCount);
         Assert.Equal(1, messageSource.DetachCount);

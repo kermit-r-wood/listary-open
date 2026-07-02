@@ -19,6 +19,7 @@ public sealed class HotkeyService : IDisposable
     private bool _disposed;
     private bool _messageHookAttached;
     private bool _registrationAttempted;
+    private HotkeyRegistrationResult? _registrationResult;
 
     public HotkeyService()
         : this(new Win32HotkeyRegistrar(), new ComponentDispatcherHotkeyMessageSource())
@@ -33,19 +34,23 @@ public sealed class HotkeyService : IDisposable
 
     public event EventHandler<string>? HotkeyPressed;
 
-    public void RegisterDefaults()
+    public HotkeyRegistrationResult RegisterDefaults()
     {
         ObjectDisposedException.ThrowIf(_disposed, this);
         if (_registrationAttempted)
         {
-            return;
+            return _registrationResult ?? HotkeyRegistrationResult.Empty;
         }
 
         _registrationAttempted = true;
 
+        var registrations = new List<HotkeyRegistration>(DefaultHotkeys.Length);
         foreach (var hotkey in DefaultHotkeys)
         {
-            if (!_registrar.Register(hotkey.Id, hotkey.Modifiers, hotkey.VirtualKey))
+            var registered = _registrar.Register(hotkey.Id, hotkey.Modifiers, hotkey.VirtualKey);
+            registrations.Add(new HotkeyRegistration(hotkey.Name, registered));
+
+            if (!registered)
             {
                 Trace.TraceWarning("Failed to register global hotkey '{0}'. Another application may already own it.", hotkey.Name);
                 continue;
@@ -59,6 +64,9 @@ public sealed class HotkeyService : IDisposable
             _messageSource.Attach(OnThreadPreprocessMessage);
             _messageHookAttached = true;
         }
+
+        _registrationResult = new HotkeyRegistrationResult(registrations);
+        return _registrationResult;
     }
 
     public void RaiseForTests(string name)
@@ -106,6 +114,32 @@ public sealed class HotkeyService : IDisposable
     }
 
     private sealed record HotkeyDefinition(int Id, string Name, HotkeyModifiers Modifiers, uint VirtualKey);
+}
+
+public sealed record HotkeyRegistration(string Name, bool IsRegistered);
+
+public sealed class HotkeyRegistrationResult
+{
+    public static HotkeyRegistrationResult Empty { get; } = new(Array.Empty<HotkeyRegistration>());
+
+    public HotkeyRegistrationResult(IEnumerable<HotkeyRegistration> hotkeys)
+    {
+        ArgumentNullException.ThrowIfNull(hotkeys);
+
+        Hotkeys = hotkeys.ToArray();
+        RegisteredHotkeys = Hotkeys.Where(hotkey => hotkey.IsRegistered).ToArray();
+        FailedHotkeys = Hotkeys.Where(hotkey => !hotkey.IsRegistered).ToArray();
+    }
+
+    public IReadOnlyList<HotkeyRegistration> Hotkeys { get; }
+
+    public IReadOnlyList<HotkeyRegistration> RegisteredHotkeys { get; }
+
+    public IReadOnlyList<HotkeyRegistration> FailedHotkeys { get; }
+
+    public bool AnyRegistered => RegisteredHotkeys.Count > 0;
+
+    public bool AllRegistered => Hotkeys.Count > 0 && FailedHotkeys.Count == 0;
 }
 
 [Flags]

@@ -34,13 +34,16 @@ public partial class App : Application
 
         try
         {
-            await InitializeApplicationServicesAsync();
+            if (!await InitializeApplicationServicesAsync())
+            {
+                Shutdown(1);
+            }
         }
         catch (Exception exception)
         {
             Trace.TraceError(exception.ToString());
             MessageBox.Show(
-                "ListaryOpen could not start. Check the application logs for details.",
+                "ListaryOpen could not start.",
                 "ListaryOpen",
                 MessageBoxButton.OK,
                 MessageBoxImage.Error);
@@ -62,7 +65,7 @@ public partial class App : Application
         base.OnExit(e);
     }
 
-    private async Task InitializeApplicationServicesAsync()
+    private async Task<bool> InitializeApplicationServicesAsync()
     {
         _searchIndex = await SqliteSearchIndex.OpenAsync(CreateIndexDatabasePath(), CancellationToken.None);
         _fallbackIndexProvider = new FallbackIndexProvider();
@@ -82,10 +85,54 @@ public partial class App : Application
         _trayController = new TrayController(settingsWindow);
         _hotkeyService = new HotkeyService();
         _hotkeyService.HotkeyPressed += OnHotkeyPressed;
-        _hotkeyService.RegisterDefaults();
+        var hotkeyStartupDecision = CreateHotkeyStartupDecision(_hotkeyService.RegisterDefaults());
+        if (hotkeyStartupDecision.Message is not null)
+        {
+            MessageBox.Show(
+                hotkeyStartupDecision.Message,
+                "ListaryOpen Hotkeys",
+                MessageBoxButton.OK,
+                hotkeyStartupDecision.Image);
+        }
+
+        if (!hotkeyStartupDecision.ShouldContinue)
+        {
+            return false;
+        }
 
         MainWindow = settingsWindow;
         settingsWindow.Show();
+        return true;
+    }
+
+    internal static HotkeyStartupDecision CreateHotkeyStartupDecision(HotkeyRegistrationResult registrationResult)
+    {
+        ArgumentNullException.ThrowIfNull(registrationResult);
+
+        if (registrationResult.AllRegistered)
+        {
+            return new HotkeyStartupDecision(true, null, MessageBoxImage.None);
+        }
+
+        var failedHotkeys = JoinHotkeyNames(registrationResult.FailedHotkeys);
+        if (!registrationResult.AnyRegistered)
+        {
+            return new HotkeyStartupDecision(
+                false,
+                $"ListaryOpen could not register any global hotkeys: {failedHotkeys}. They may already be in use by another application. ListaryOpen will exit.",
+                MessageBoxImage.Error);
+        }
+
+        var registeredHotkeys = JoinHotkeyNames(registrationResult.RegisteredHotkeys);
+        return new HotkeyStartupDecision(
+            true,
+            $"ListaryOpen could not register these global hotkeys: {failedHotkeys}. Registered hotkeys: {registeredHotkeys}. The app will keep running with the registered hotkeys.",
+            MessageBoxImage.Warning);
+    }
+
+    private static string JoinHotkeyNames(IEnumerable<HotkeyRegistration> hotkeys)
+    {
+        return string.Join(", ", hotkeys.Select(hotkey => hotkey.Name));
     }
 
     private static string CreateIndexDatabasePath()
@@ -191,3 +238,5 @@ public partial class App : Application
             string.Equals(name, "Ctrl+G", StringComparison.OrdinalIgnoreCase);
     }
 }
+
+internal sealed record HotkeyStartupDecision(bool ShouldContinue, string? Message, MessageBoxImage Image);
