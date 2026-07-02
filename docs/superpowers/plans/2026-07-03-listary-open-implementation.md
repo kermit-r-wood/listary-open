@@ -140,11 +140,11 @@ Run:
 ```powershell
 dotnet new sln -n ListaryOpen
 dotnet new classlib -n ListaryOpen.Core -o src/ListaryOpen.Core -f net8.0
-dotnet new classlib -n ListaryOpen.Infrastructure -o src/ListaryOpen.Infrastructure -f net8.0-windows
-dotnet new wpf -n ListaryOpen.App -o src/ListaryOpen.App -f net8.0-windows
-dotnet new console -n ListaryOpen.Indexer.Elevated -o src/ListaryOpen.Indexer.Elevated -f net8.0-windows
+dotnet new classlib -n ListaryOpen.Infrastructure -o src/ListaryOpen.Infrastructure -f net8.0
+dotnet new wpf -n ListaryOpen.App -o src/ListaryOpen.App -f net8.0
+dotnet new console -n ListaryOpen.Indexer.Elevated -o src/ListaryOpen.Indexer.Elevated -f net8.0
 dotnet new xunit -n ListaryOpen.Core.Tests -o tests/ListaryOpen.Core.Tests -f net8.0
-dotnet new xunit -n ListaryOpen.Infrastructure.Tests -o tests/ListaryOpen.Infrastructure.Tests -f net8.0-windows
+dotnet new xunit -n ListaryOpen.Infrastructure.Tests -o tests/ListaryOpen.Infrastructure.Tests -f net8.0
 dotnet sln add src/ListaryOpen.Core/ListaryOpen.Core.csproj
 dotnet sln add src/ListaryOpen.Infrastructure/ListaryOpen.Infrastructure.csproj
 dotnet sln add src/ListaryOpen.App/ListaryOpen.App.csproj
@@ -178,7 +178,7 @@ dotnet add src/ListaryOpen.App/ListaryOpen.App.csproj package Hardcodet.NotifyIc
 dotnet add tests/ListaryOpen.Infrastructure.Tests/ListaryOpen.Infrastructure.Tests.csproj package Microsoft.Data.Sqlite
 ```
 
-- [ ] **Step 4: Enable Windows desktop references for infrastructure**
+- [ ] **Step 4: Enable Windows target frameworks**
 
 Update the first `PropertyGroup` in `src/ListaryOpen.Infrastructure/ListaryOpen.Infrastructure.csproj` so it contains these properties while keeping the `PackageReference` entries created by `dotnet add package`:
 
@@ -188,6 +188,29 @@ Update the first `PropertyGroup` in `src/ListaryOpen.Infrastructure/ListaryOpen.
   <ImplicitUsings>enable</ImplicitUsings>
   <Nullable>enable</Nullable>
   <UseWPF>true</UseWPF>
+</PropertyGroup>
+```
+
+Update the first `PropertyGroup` in `src/ListaryOpen.Indexer.Elevated/ListaryOpen.Indexer.Elevated.csproj`:
+
+```xml
+<PropertyGroup>
+  <OutputType>Exe</OutputType>
+  <TargetFramework>net8.0-windows</TargetFramework>
+  <ImplicitUsings>enable</ImplicitUsings>
+  <Nullable>enable</Nullable>
+</PropertyGroup>
+```
+
+Update the first `PropertyGroup` in `tests/ListaryOpen.Infrastructure.Tests/ListaryOpen.Infrastructure.Tests.csproj`:
+
+```xml
+<PropertyGroup>
+  <TargetFramework>net8.0-windows</TargetFramework>
+  <ImplicitUsings>enable</ImplicitUsings>
+  <Nullable>enable</Nullable>
+  <IsPackable>false</IsPackable>
+  <IsTestProject>true</IsTestProject>
 </PropertyGroup>
 ```
 
