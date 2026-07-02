@@ -2,6 +2,9 @@ namespace ListaryOpen.Core.Search;
 
 public static class FuzzyMatcher
 {
+    private const double ContiguousMatchBaseScore = 200;
+    private const double MaximumFragmentedMatchScore = ContiguousMatchBaseScore - 1;
+
     public static double Score(string? query, string? candidate)
     {
         var normalizedQuery = Normalize(query);
@@ -14,7 +17,7 @@ public static class FuzzyMatcher
 
         if (normalizedCandidate.Contains(normalizedQuery, StringComparison.Ordinal))
         {
-            return 200 + normalizedQuery.Length;
+            return ContiguousMatchBaseScore + normalizedQuery.Length;
         }
 
         var queryIndex = 0;
@@ -41,7 +44,7 @@ public static class FuzzyMatcher
             }
         }
 
-        return queryIndex == normalizedQuery.Length ? score : 0;
+        return queryIndex == normalizedQuery.Length ? Math.Min(score, MaximumFragmentedMatchScore) : 0;
     }
 
     private static string Normalize(string? value)

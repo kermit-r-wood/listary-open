@@ -36,6 +36,15 @@ public sealed class FuzzyMatcherTests
     }
 
     [Fact]
+    public void ScoreRanksLongContiguousMatchAboveFragmentedSeparatorMatch()
+    {
+        var contiguous = FuzzyMatcher.Score("abcdefghijk", "abcdefghijk.txt");
+        var fragmented = FuzzyMatcher.Score("abcdefghijk", "a-b-c-d-e-f-g-h-i-j-k.txt");
+
+        Assert.True(contiguous > fragmented);
+    }
+
+    [Fact]
     public void ScoreTreatsPathSeparatorsAsBoundaries()
     {
         var pathBoundary = FuzzyMatcher.Score("di", "C:\\Docs\\Invoice.pdf");
