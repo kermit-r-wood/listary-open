@@ -5,7 +5,7 @@
 - Open Save As.
 - Press Ctrl+G.
 - Choose a known folder.
-- Verify the Save As dialog changes to that folder.
+- Verify the Save As dialog changes to that exact folder, not just that the file-name field submitted successfully.
 - Start a non-elevated Win32 or .NET application with an Open dialog.
 - Press Ctrl+G and verify folder jump.
 - Start an administrator-elevated app with an Open dialog.
