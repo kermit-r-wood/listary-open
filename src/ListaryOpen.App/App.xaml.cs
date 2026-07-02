@@ -10,6 +10,10 @@ public partial class App : Application
     private SearchPanel? _searchPanel;
     private TrayController? _trayController;
 
+    internal static bool IsShuttingDown =>
+        Current?.Dispatcher.HasShutdownStarted == true ||
+        Current?.Dispatcher.HasShutdownFinished == true;
+
     protected override void OnStartup(StartupEventArgs e)
     {
         base.OnStartup(e);

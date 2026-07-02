@@ -10,7 +10,11 @@ public sealed class TrayController : IDisposable
     public TrayController(Window settingsWindow)
     {
         _icon = new TaskbarIcon { ToolTipText = "ListaryOpen" };
-        _icon.TrayMouseDoubleClick += (_, _) => settingsWindow.Show();
+        _icon.TrayMouseDoubleClick += (_, _) =>
+        {
+            settingsWindow.Show();
+            settingsWindow.Activate();
+        };
     }
 
     public void Dispose()
