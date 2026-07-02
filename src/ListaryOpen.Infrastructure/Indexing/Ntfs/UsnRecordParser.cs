@@ -37,6 +37,16 @@ public static class UsnRecordParser
         var fileAttributes = BinaryPrimitives.ReadUInt32LittleEndian(record[52..56]);
         var fileNameLength = BinaryPrimitives.ReadUInt16LittleEndian(record[56..58]);
         var fileNameOffset = BinaryPrimitives.ReadUInt16LittleEndian(record[58..60]);
+        if (fileNameOffset < UsnRecordV2HeaderLength)
+        {
+            throw new ArgumentException("USN record file name offset is below the V2 header length.", nameof(record));
+        }
+
+        if ((fileNameLength & 1) != 0)
+        {
+            throw new ArgumentException("USN record file name length must be UTF-16 aligned.", nameof(record));
+        }
+
         if (fileNameOffset > recordLength || fileNameLength > recordLength - fileNameOffset)
         {
             throw new ArgumentException("USN record file name exceeds record bounds.", nameof(record));

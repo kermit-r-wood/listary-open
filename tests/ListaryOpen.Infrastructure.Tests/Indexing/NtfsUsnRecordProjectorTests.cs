@@ -1,0 +1,229 @@
+using ListaryOpen.Indexer.Elevated.Ntfs;
+
+namespace ListaryOpen.Infrastructure.Tests.Indexing;
+
+public sealed class NtfsUsnRecordProjectorTests
+{
+    private static readonly DateTimeOffset Timestamp = new(2026, 7, 3, 0, 0, 0, TimeSpan.Zero);
+
+    [Fact]
+    public void ScanRootCreatePreservesRequestedRootSeparatelyFromVolumeRoot()
+    {
+        var root = NtfsScanRoot.Create("C:\\Docs");
+
+        Assert.Equal("C:\\Docs", root.RequestedRoot);
+        Assert.Equal("C:\\", root.VolumeRoot);
+        Assert.Equal(@"\\.\C:", root.VolumePath);
+    }
+
+    [Fact]
+    public void CreateFileRecordsIncludesRequestedRootItself()
+    {
+        var metadata = new StubMetadataReader();
+        metadata.Add("C:\\", isDirectory: true, sizeBytes: 0, Timestamp);
+
+        var records = Project(
+            "C:\\",
+            "C:\\",
+            metadata,
+            new NtfsUsnEntry(5, 5, ".", IsDirectory: true));
+
+        var record = Assert.Single(records);
+        Assert.Equal("C:\\", record.FullPath);
+        Assert.True(record.IsDirectory);
+    }
+
+    [Fact]
+    public void CreateFileRecordsIncludesChildUnderRequestedRoot()
+    {
+        var metadata = new StubMetadataReader();
+        metadata.Add("C:\\Docs", isDirectory: true, sizeBytes: 0, Timestamp);
+        metadata.Add("C:\\Docs\\Invoice.txt", isDirectory: false, sizeBytes: 42, Timestamp);
+
+        var records = Project(
+            "C:\\",
+            "C:\\Docs",
+            metadata,
+            new NtfsUsnEntry(5, 5, ".", IsDirectory: true),
+            new NtfsUsnEntry(10, 5, "Docs", IsDirectory: true),
+            new NtfsUsnEntry(11, 10, "Invoice.txt", IsDirectory: false));
+
+        Assert.Collection(
+            records,
+            record => Assert.Equal("C:\\Docs", record.FullPath),
+            record =>
+            {
+                Assert.Equal("C:\\Docs\\Invoice.txt", record.FullPath);
+                Assert.False(record.IsDirectory);
+                Assert.Equal(42, record.SizeBytes);
+            });
+    }
+
+    [Fact]
+    public void CreateFileRecordsExcludesSiblingPrefix()
+    {
+        var metadata = new StubMetadataReader();
+        metadata.Add("C:\\Docs", isDirectory: true, sizeBytes: 0, Timestamp);
+        metadata.Add("C:\\Docs2", isDirectory: true, sizeBytes: 0, Timestamp);
+
+        var records = Project(
+            "C:\\",
+            "C:\\Docs",
+            metadata,
+            new NtfsUsnEntry(5, 5, ".", IsDirectory: true),
+            new NtfsUsnEntry(10, 5, "Docs", IsDirectory: true),
+            new NtfsUsnEntry(20, 5, "Docs2", IsDirectory: true));
+
+        var record = Assert.Single(records);
+        Assert.Equal("C:\\Docs", record.FullPath);
+    }
+
+    [Fact]
+    public void CreateFileRecordsMatchesRequestedRootCaseInsensitively()
+    {
+        var metadata = new StubMetadataReader();
+        metadata.Add("C:\\Docs", isDirectory: true, sizeBytes: 0, Timestamp);
+
+        var records = Project(
+            "C:\\",
+            "c:\\docs",
+            metadata,
+            new NtfsUsnEntry(5, 5, ".", IsDirectory: true),
+            new NtfsUsnEntry(10, 5, "Docs", IsDirectory: true));
+
+        var record = Assert.Single(records);
+        Assert.Equal("C:\\Docs", record.FullPath);
+    }
+
+    [Fact]
+    public void CreateFileRecordsSkipsUnresolvedParent()
+    {
+        var metadata = new StubMetadataReader();
+        metadata.Add("C:\\Missing\\Invoice.txt", isDirectory: false, sizeBytes: 42, Timestamp);
+
+        var records = Project(
+            "C:\\",
+            "C:\\Missing",
+            metadata,
+            new NtfsUsnEntry(11, 10, "Invoice.txt", IsDirectory: false));
+
+        Assert.Empty(records);
+    }
+
+    [Fact]
+    public void CreateFileRecordsSkipsCycles()
+    {
+        var metadata = new StubMetadataReader();
+        metadata.Add("C:\\CycleA\\CycleB", isDirectory: true, sizeBytes: 0, Timestamp);
+
+        var records = Project(
+            "C:\\",
+            "C:\\CycleA",
+            metadata,
+            new NtfsUsnEntry(10, 11, "CycleA", IsDirectory: true),
+            new NtfsUsnEntry(11, 10, "CycleB", IsDirectory: true));
+
+        Assert.Empty(records);
+    }
+
+    [Fact]
+    public void CreateFileRecordsResolvesOutOfOrderRecords()
+    {
+        var metadata = new StubMetadataReader();
+        metadata.Add("C:\\Docs", isDirectory: true, sizeBytes: 0, Timestamp);
+        metadata.Add("C:\\Docs\\Invoice.txt", isDirectory: false, sizeBytes: 42, Timestamp);
+
+        var records = Project(
+            "C:\\",
+            "C:\\Docs",
+            metadata,
+            new NtfsUsnEntry(11, 10, "Invoice.txt", IsDirectory: false),
+            new NtfsUsnEntry(10, 5, "Docs", IsDirectory: true),
+            new NtfsUsnEntry(5, 5, ".", IsDirectory: true));
+
+        Assert.Collection(
+            records,
+            record => Assert.Equal("C:\\Docs\\Invoice.txt", record.FullPath),
+            record => Assert.Equal("C:\\Docs", record.FullPath));
+    }
+
+    [Fact]
+    public void CreateFileRecordsSkipsRecordsWhenMetadataCannotBeRead()
+    {
+        var metadata = new StubMetadataReader();
+        metadata.Add("C:\\Docs", isDirectory: true, sizeBytes: 0, Timestamp);
+
+        var records = Project(
+            "C:\\",
+            "C:\\Docs",
+            metadata,
+            new NtfsUsnEntry(5, 5, ".", IsDirectory: true),
+            new NtfsUsnEntry(10, 5, "Docs", IsDirectory: true),
+            new NtfsUsnEntry(11, 10, "Missing.txt", IsDirectory: false));
+
+        var record = Assert.Single(records);
+        Assert.Equal("C:\\Docs", record.FullPath);
+    }
+
+    [Fact]
+    public void NtfsFileMetadataReaderReadsRealFileMetadata()
+    {
+        var directory = Directory.CreateTempSubdirectory("listary-open-ntfs-reader-");
+        try
+        {
+            var filePath = Path.Combine(directory.FullName, "Invoice.txt");
+            File.WriteAllText(filePath, "hello");
+            var lastWriteTime = new DateTimeOffset(2026, 7, 3, 1, 2, 3, TimeSpan.Zero);
+            File.SetLastWriteTimeUtc(filePath, lastWriteTime.UtcDateTime);
+            var reader = new NtfsFileMetadataReader();
+
+            var success = reader.TryRead(filePath, isDirectory: false, CancellationToken.None, out var metadata);
+
+            Assert.True(success);
+            Assert.Equal(5, metadata.SizeBytes);
+            Assert.Equal(lastWriteTime, metadata.LastWriteTime);
+        }
+        finally
+        {
+            directory.Delete(recursive: true);
+        }
+    }
+
+    private static List<ListaryOpen.Core.Indexing.FileRecord> Project(
+        string volumeRoot,
+        string requestedRoot,
+        INtfsFileMetadataReader metadataReader,
+        params NtfsUsnEntry[] entries)
+    {
+        return NtfsUsnRecordProjector
+            .CreateFileRecords(volumeRoot, requestedRoot, entries, metadataReader, CancellationToken.None)
+            .ToList();
+    }
+
+    private sealed class StubMetadataReader : INtfsFileMetadataReader
+    {
+        private readonly Dictionary<string, NtfsFileMetadata> _metadata = new(StringComparer.OrdinalIgnoreCase);
+
+        public void Add(string fullPath, bool isDirectory, long sizeBytes, DateTimeOffset lastWriteTime)
+        {
+            _metadata[Path.TrimEndingDirectorySeparator(fullPath)] = new NtfsFileMetadata(sizeBytes, lastWriteTime);
+        }
+
+        public bool TryRead(
+            string fullPath,
+            bool isDirectory,
+            CancellationToken cancellationToken,
+            out NtfsFileMetadata metadata)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            if (_metadata.TryGetValue(Path.TrimEndingDirectorySeparator(fullPath), out var storedMetadata))
+            {
+                metadata = storedMetadata;
+                return true;
+            }
+
+            metadata = default!;
+            return false;
+        }
+    }
+}

@@ -17,14 +17,18 @@ public sealed class NtfsUsnJournalReader
         string volumeRoot,
         [EnumeratorCancellation] CancellationToken cancellationToken)
     {
-        var normalizedRoot = NormalizeVolumeRoot(volumeRoot);
-        var volumePath = ToVolumePath(normalizedRoot);
-        var handle = OpenVolume(volumePath);
+        var scanRoot = NtfsScanRoot.Create(volumeRoot);
+        var handle = OpenVolume(scanRoot.VolumePath);
 
         try
         {
             var entries = ReadEntries(handle, cancellationToken);
-            foreach (var record in CreateFileRecords(normalizedRoot, entries, cancellationToken))
+            foreach (var record in NtfsUsnRecordProjector.CreateFileRecords(
+                         scanRoot.VolumeRoot,
+                         scanRoot.RequestedRoot,
+                         entries.Values,
+                         new NtfsFileMetadataReader(),
+                         cancellationToken))
             {
                 yield return record;
                 await Task.Yield();
@@ -55,7 +59,7 @@ public sealed class NtfsUsnJournalReader
         return handle;
     }
 
-    private static Dictionary<ulong, UsnEntry> ReadEntries(IntPtr handle, CancellationToken cancellationToken)
+    private static Dictionary<ulong, NtfsUsnEntry> ReadEntries(IntPtr handle, CancellationToken cancellationToken)
     {
         var journalData = QueryJournal(handle);
         var enumData = new NtfsNativeMethods.MftEnumDataV0
@@ -65,7 +69,7 @@ public sealed class NtfsUsnJournalReader
             HighUsn = journalData.NextUsn
         };
 
-        var entries = new Dictionary<ulong, UsnEntry>();
+        var entries = new Dictionary<ulong, NtfsUsnEntry>();
         var buffer = new byte[UsnBufferLength];
         var enumDataSize = Marshal.SizeOf<NtfsNativeMethods.MftEnumDataV0>();
 
@@ -127,7 +131,7 @@ public sealed class NtfsUsnJournalReader
         return journalData;
     }
 
-    private static void ReadEntriesFromBuffer(ReadOnlySpan<byte> recordsBuffer, Dictionary<ulong, UsnEntry> entries)
+    private static void ReadEntriesFromBuffer(ReadOnlySpan<byte> recordsBuffer, Dictionary<ulong, NtfsUsnEntry> entries)
     {
         var offset = 0;
         while (offset < recordsBuffer.Length)
@@ -135,152 +139,30 @@ public sealed class NtfsUsnJournalReader
             var remaining = recordsBuffer[offset..];
             if (remaining.Length < UsnRecordV2HeaderLength)
             {
-                throw new IOException("NTFS USN data ended in the middle of a record.");
+                throw new InvalidDataException("NTFS USN data ended in the middle of a record.");
             }
 
             var recordLength = BinaryPrimitives.ReadUInt32LittleEndian(remaining[0..4]);
             if (recordLength == 0 || recordLength > remaining.Length)
             {
-                throw new IOException("NTFS USN record length exceeds the returned buffer.");
+                throw new InvalidDataException("NTFS USN record length exceeds the returned buffer.");
             }
 
             var record = remaining[..(int)recordLength];
             var parsed = UsnRecordParser.ParseV2(record);
-            var entry = new UsnEntry(
+            var entry = new NtfsUsnEntry(
                 BinaryPrimitives.ReadUInt64LittleEndian(record[8..16]),
                 BinaryPrimitives.ReadUInt64LittleEndian(record[16..24]),
                 parsed.Name,
-                parsed.IsDirectory,
-                ReadTimestamp(record));
+                parsed.IsDirectory);
 
             entries[entry.FileReferenceNumber] = entry;
             offset += (int)recordLength;
         }
     }
 
-    private static IEnumerable<FileRecord> CreateFileRecords(
-        string volumeRoot,
-        IReadOnlyDictionary<ulong, UsnEntry> entries,
-        CancellationToken cancellationToken)
-    {
-        var resolvedPaths = new Dictionary<ulong, string>();
-
-        foreach (var entry in entries.Values)
-        {
-            cancellationToken.ThrowIfCancellationRequested();
-            if (!TryResolvePath(entry, volumeRoot, entries, resolvedPaths, new HashSet<ulong>(), out var fullPath))
-            {
-                continue;
-            }
-
-            yield return FileRecord.Create(fullPath, entry.IsDirectory, 0, entry.LastWriteTime);
-        }
-    }
-
-    private static bool TryResolvePath(
-        UsnEntry entry,
-        string volumeRoot,
-        IReadOnlyDictionary<ulong, UsnEntry> entries,
-        IDictionary<ulong, string> resolvedPaths,
-        ISet<ulong> resolving,
-        out string fullPath)
-    {
-        if (resolvedPaths.TryGetValue(entry.FileReferenceNumber, out fullPath!))
-        {
-            return true;
-        }
-
-        if (!resolving.Add(entry.FileReferenceNumber))
-        {
-            fullPath = string.Empty;
-            return false;
-        }
-
-        try
-        {
-            if (IsRootEntry(entry))
-            {
-                fullPath = volumeRoot;
-                resolvedPaths[entry.FileReferenceNumber] = fullPath;
-                return true;
-            }
-
-            if (!entries.TryGetValue(entry.ParentFileReferenceNumber, out var parent)
-                || !TryResolvePath(parent, volumeRoot, entries, resolvedPaths, resolving, out var parentPath)
-                || string.IsNullOrWhiteSpace(entry.Name)
-                || entry.Name == ".")
-            {
-                fullPath = string.Empty;
-                return false;
-            }
-
-            fullPath = Path.Combine(parentPath, entry.Name);
-            resolvedPaths[entry.FileReferenceNumber] = fullPath;
-            return true;
-        }
-        finally
-        {
-            resolving.Remove(entry.FileReferenceNumber);
-        }
-    }
-
-    private static bool IsRootEntry(UsnEntry entry)
-    {
-        return entry.FileReferenceNumber == entry.ParentFileReferenceNumber
-            || entry.Name == ".";
-    }
-
-    private static DateTimeOffset ReadTimestamp(ReadOnlySpan<byte> record)
-    {
-        var fileTime = BinaryPrimitives.ReadInt64LittleEndian(record[32..40]);
-        if (fileTime <= 0)
-        {
-            return DateTimeOffset.UnixEpoch;
-        }
-
-        try
-        {
-            return new DateTimeOffset(DateTime.FromFileTimeUtc(fileTime), TimeSpan.Zero);
-        }
-        catch (ArgumentOutOfRangeException)
-        {
-            return DateTimeOffset.UnixEpoch;
-        }
-    }
-
-    private static string NormalizeVolumeRoot(string volumeRoot)
-    {
-        ArgumentException.ThrowIfNullOrWhiteSpace(volumeRoot);
-
-        var trimmed = volumeRoot.Trim();
-        if (!Path.IsPathFullyQualified(trimmed))
-        {
-            throw new ArgumentException("Volume root must be fully qualified.", nameof(volumeRoot));
-        }
-
-        var root = Path.GetPathRoot(Path.GetFullPath(trimmed));
-        if (string.IsNullOrWhiteSpace(root) || root.Length < 3 || root[1] != ':')
-        {
-            throw new ArgumentException("Volume root must be a drive-letter path.", nameof(volumeRoot));
-        }
-
-        return Path.TrimEndingDirectorySeparator(root) + Path.DirectorySeparatorChar;
-    }
-
-    private static string ToVolumePath(string volumeRoot)
-    {
-        return @"\\.\" + volumeRoot[..2];
-    }
-
     private static Win32Exception CreateWin32Exception(string message)
     {
         return new Win32Exception(Marshal.GetLastWin32Error(), message);
     }
-
-    private sealed record UsnEntry(
-        ulong FileReferenceNumber,
-        ulong ParentFileReferenceNumber,
-        string Name,
-        bool IsDirectory,
-        DateTimeOffset LastWriteTime);
 }

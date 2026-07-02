@@ -79,6 +79,26 @@ public sealed class UsnRecordParserTests
         Assert.Throws<ArgumentException>(() => UsnRecordParser.ParseV2(buffer));
     }
 
+    [Fact]
+    public void ParseV2RejectsFileNameOffsetBelowHeader()
+    {
+        var name = Encoding.Unicode.GetBytes("Invoice.txt");
+        var buffer = CreateRecordBuffer(name, fileAttributes: 0x80u);
+        BitConverter.GetBytes((ushort)58).CopyTo(buffer, 58);
+
+        Assert.Throws<ArgumentException>(() => UsnRecordParser.ParseV2(buffer));
+    }
+
+    [Fact]
+    public void ParseV2RejectsOddFileNameLength()
+    {
+        var name = Encoding.Unicode.GetBytes("Invoice.txt");
+        var buffer = CreateRecordBuffer(name, fileAttributes: 0x80u);
+        BitConverter.GetBytes((ushort)(name.Length - 1)).CopyTo(buffer, 56);
+
+        Assert.Throws<ArgumentException>(() => UsnRecordParser.ParseV2(buffer));
+    }
+
     private static byte[] CreateRecordBuffer(byte[] name, uint fileAttributes)
     {
         var buffer = new byte[60 + name.Length];

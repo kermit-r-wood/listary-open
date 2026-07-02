@@ -5,8 +5,13 @@ using ListaryOpen.Indexer.Elevated.Ntfs;
 if (args.Length == 2 && args[0] == "scan")
 {
     var root = args[1];
-    if (!Path.IsPathFullyQualified(root))
+    try
     {
+        _ = NtfsScanRoot.Create(root);
+    }
+    catch (ArgumentException exception)
+    {
+        Console.Error.WriteLine(exception.Message);
         Console.Error.WriteLine("Usage: ListaryOpen.Indexer.Elevated scan <root>");
         return 2;
     }
@@ -29,12 +34,6 @@ if (args.Length == 2 && args[0] == "scan")
 
         return 0;
     }
-    catch (ArgumentException exception)
-    {
-        Console.Error.WriteLine(exception.Message);
-        Console.Error.WriteLine("Usage: ListaryOpen.Indexer.Elevated scan <root>");
-        return 2;
-    }
     catch (Exception exception) when (IsNtfsAccessFailure(exception))
     {
         Console.Error.WriteLine(exception.Message);
@@ -49,8 +48,7 @@ static bool IsNtfsAccessFailure(Exception exception)
 {
     return exception is Win32Exception
         or IOException
-        or UnauthorizedAccessException
-        or NotSupportedException;
+        or UnauthorizedAccessException;
 }
 
 internal static class JsonOptions
