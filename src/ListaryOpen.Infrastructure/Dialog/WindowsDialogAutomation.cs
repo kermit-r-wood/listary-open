@@ -40,6 +40,11 @@ public sealed class WindowsDialogAutomation : IDialogAutomation
             }
 
             var activeDialog = AutomationElement.FromHandle(handle);
+            if (activeDialog is null)
+            {
+                return DialogProbeResult.Unsupported("Dialog automation tree is unavailable.");
+            }
+
             _ = activeDialog.Current.ControlType;
             _activeDialog = activeDialog;
         }
