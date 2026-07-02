@@ -1,12 +1,25 @@
-﻿<Window x:Class="ListaryOpen.App.MainWindow"
+<Window x:Class="ListaryOpen.App.MainWindow"
         xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
         xmlns:d="http://schemas.microsoft.com/expression/blend/2008"
         xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"
         xmlns:local="clr-namespace:ListaryOpen.App"
         mc:Ignorable="d"
-        Title="MainWindow" Height="450" Width="800">
-    <Grid>
-
+        Title="ListaryOpen Settings"
+        Height="360"
+        Width="520"
+        MinHeight="300"
+        MinWidth="420"
+        WindowStartupLocation="CenterScreen">
+    <Grid Margin="20">
+        <StackPanel>
+            <TextBlock Text="ListaryOpen Settings"
+                       FontSize="24"
+                       FontWeight="SemiBold"
+                       Margin="0,0,0,12" />
+            <TextBlock Text="Settings will appear here in a later task."
+                       FontSize="14"
+                       Foreground="{DynamicResource {x:Static SystemColors.GrayTextBrushKey}}" />
+        </StackPanel>
     </Grid>
 </Window>
