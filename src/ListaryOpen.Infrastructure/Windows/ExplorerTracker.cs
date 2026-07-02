@@ -12,7 +12,7 @@ public sealed class ExplorerTracker
     {
         if (Directory.Exists(folderPath))
         {
-            _lastFolder = Path.TrimEndingDirectorySeparator(Path.GetFullPath(folderPath.Trim()));
+            _lastFolder = folderPath;
         }
     }
 }

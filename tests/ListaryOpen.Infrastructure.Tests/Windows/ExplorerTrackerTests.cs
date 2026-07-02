@@ -5,7 +5,7 @@ namespace ListaryOpen.Infrastructure.Tests.Windows;
 public sealed class ExplorerTrackerTests
 {
     [Fact]
-    public void ObserveFolderForTestsStoresExistingFolderAsFullyQualifiedPath()
+    public void ObserveFolderForTestsStoresExistingFolderPathExactly()
     {
         var folder = Directory.CreateTempSubdirectory("listary-open-explorer-");
 
@@ -13,11 +13,11 @@ public sealed class ExplorerTrackerTests
         {
             var tracker = new ExplorerTracker();
 
-            tracker.ObserveFolderForTests(folder.FullName + Path.DirectorySeparatorChar);
+            var observedPath = folder.FullName + Path.DirectorySeparatorChar;
 
-            Assert.Equal(
-                Path.TrimEndingDirectorySeparator(Path.GetFullPath(folder.FullName)),
-                tracker.LastFolder);
+            tracker.ObserveFolderForTests(observedPath);
+
+            Assert.Equal(observedPath, tracker.LastFolder);
         }
         finally
         {
@@ -34,13 +34,12 @@ public sealed class ExplorerTrackerTests
         try
         {
             var tracker = new ExplorerTracker();
-            tracker.ObserveFolderForTests(folder.FullName);
+            var observedPath = folder.FullName + Path.DirectorySeparatorChar;
+            tracker.ObserveFolderForTests(observedPath);
 
             tracker.ObserveFolderForTests(missingFolder);
 
-            Assert.Equal(
-                Path.TrimEndingDirectorySeparator(Path.GetFullPath(folder.FullName)),
-                tracker.LastFolder);
+            Assert.Equal(observedPath, tracker.LastFolder);
         }
         finally
         {
