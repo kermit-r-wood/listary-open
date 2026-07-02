@@ -2,7 +2,7 @@ namespace ListaryOpen.Core.Search;
 
 public static class FuzzyMatcher
 {
-    public static double Score(string query, string candidate)
+    public static double Score(string? query, string? candidate)
     {
         var normalizedQuery = Normalize(query);
         var normalizedCandidate = Normalize(candidate);
@@ -14,7 +14,7 @@ public static class FuzzyMatcher
 
         if (normalizedCandidate.Contains(normalizedQuery, StringComparison.Ordinal))
         {
-            return 100 + normalizedQuery.Length;
+            return 200 + normalizedQuery.Length;
         }
 
         var queryIndex = 0;
@@ -44,7 +44,10 @@ public static class FuzzyMatcher
         return queryIndex == normalizedQuery.Length ? score : 0;
     }
 
-    private static string Normalize(string value) => value.Trim().ToLowerInvariant();
+    private static string Normalize(string? value)
+    {
+        return string.IsNullOrWhiteSpace(value) ? string.Empty : value.Trim().ToLowerInvariant();
+    }
 
-    private static bool IsSeparator(char value) => value is ' ' or '-' or '_' or '.';
+    private static bool IsSeparator(char value) => value is ' ' or '-' or '_' or '.' or '\\' or '/';
 }

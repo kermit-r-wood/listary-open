@@ -6,6 +6,14 @@ public static class PinyinMatcher
     {
         ['发'] = "fa",
         ['票'] = "piao",
+        ['合'] = "he",
+        ['同'] = "tong",
+        ['报'] = "bao",
+        ['告'] = "gao",
+        ['资'] = "zi",
+        ['料'] = "liao",
+        ['下'] = "xia",
+        ['载'] = "zai",
         ['文'] = "wen",
         ['件'] = "jian",
         ['图'] = "tu",
@@ -14,8 +22,13 @@ public static class PinyinMatcher
         ['目'] = "mu"
     };
 
-    public static double Score(string query, string candidate)
+    public static double Score(string? query, string? candidate)
     {
+        if (string.IsNullOrWhiteSpace(query) || string.IsNullOrWhiteSpace(candidate))
+        {
+            return 0;
+        }
+
         var pinyin = ToPinyin(candidate);
         var initials = ToInitials(candidate);
 
