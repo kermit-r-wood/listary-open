@@ -11,14 +11,71 @@
         MinWidth="420"
         WindowStartupLocation="CenterScreen">
     <Grid Margin="20">
-        <StackPanel>
-            <TextBlock Text="ListaryOpen Settings"
-                       FontSize="24"
-                       FontWeight="SemiBold"
-                       Margin="0,0,0,12" />
-            <TextBlock Text="Settings will appear here in a later task."
-                       FontSize="14"
-                       Foreground="{DynamicResource {x:Static SystemColors.GrayTextBrushKey}}" />
-        </StackPanel>
+        <Grid.RowDefinitions>
+            <RowDefinition Height="Auto" />
+            <RowDefinition Height="*" />
+        </Grid.RowDefinitions>
+
+        <TextBlock Text="ListaryOpen Settings"
+                   FontSize="22"
+                   FontWeight="SemiBold"
+                   Margin="0,0,0,16" />
+
+        <ScrollViewer Grid.Row="1"
+                      VerticalScrollBarVisibility="Auto">
+            <StackPanel>
+                <TextBlock Text="Indexed roots"
+                           FontSize="14"
+                           FontWeight="SemiBold"
+                           Margin="0,0,0,6" />
+                <Border BorderBrush="{DynamicResource {x:Static SystemColors.ControlDarkBrushKey}}"
+                        BorderThickness="1"
+                        Padding="10"
+                        Margin="0,0,0,16">
+                    <ItemsControl ItemsSource="{Binding Settings.IndexedRoots}">
+                        <ItemsControl.ItemTemplate>
+                            <DataTemplate>
+                                <TextBlock Text="{Binding}"
+                                           TextWrapping="Wrap"
+                                           Margin="0,2" />
+                            </DataTemplate>
+                        </ItemsControl.ItemTemplate>
+                    </ItemsControl>
+                </Border>
+
+                <Grid Margin="0,0,0,16">
+                    <Grid.ColumnDefinitions>
+                        <ColumnDefinition Width="*" />
+                        <ColumnDefinition Width="*" />
+                    </Grid.ColumnDefinitions>
+
+                    <StackPanel Grid.Column="0"
+                                Margin="0,0,10,0">
+                        <TextBlock Text="Search hotkey"
+                                   FontSize="14"
+                                   FontWeight="SemiBold"
+                                   Margin="0,0,0,6" />
+                        <TextBlock Text="{Binding Settings.SearchHotkey}"
+                                   FontSize="16"
+                                   TextWrapping="Wrap" />
+                    </StackPanel>
+
+                    <StackPanel Grid.Column="1"
+                                Margin="10,0,0,0">
+                        <TextBlock Text="Dialog hotkey"
+                                   FontSize="14"
+                                   FontWeight="SemiBold"
+                                   Margin="0,0,0,6" />
+                        <TextBlock Text="{Binding Settings.DialogHotkey}"
+                                   FontSize="16"
+                                   TextWrapping="Wrap" />
+                    </StackPanel>
+                </Grid>
+
+                <CheckBox Content="Quick Save / Open enabled"
+                          IsChecked="{Binding Settings.QuickSaveOpenEnabled}"
+                          IsEnabled="False" />
+            </StackPanel>
+        </ScrollViewer>
     </Grid>
 </Window>

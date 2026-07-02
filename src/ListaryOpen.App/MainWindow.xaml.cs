@@ -1,5 +1,6 @@
 using System.ComponentModel;
 using System.Windows;
+using ListaryOpen.App.ViewModels;
 
 namespace ListaryOpen.App;
 
@@ -11,6 +12,7 @@ public partial class MainWindow : Window
     public MainWindow()
     {
         InitializeComponent();
+        DataContext = new SettingsViewModel();
     }
 
     protected override void OnClosing(CancelEventArgs e)
