@@ -352,7 +352,7 @@ public sealed class SqliteSearchIndex : ISearchIndex, IAsyncDisposable
 
         await AddExactCandidatesAsync(query, candidateLimit, records, cancellationToken).ConfigureAwait(false);
         await AddFuzzyCandidatesAsync(query, candidateLimit, records, cancellationToken).ConfigureAwait(false);
-        await AddFallbackCandidatesAsync(records, cancellationToken).ConfigureAwait(false);
+        await AddFallbackCandidatesAsync(query, records, cancellationToken).ConfigureAwait(false);
 
         return records.Values.ToArray();
     }
@@ -365,16 +365,17 @@ public sealed class SqliteSearchIndex : ISearchIndex, IAsyncDisposable
     {
         var normalizedQuery = NormalizeSearchText(query.NormalizedText);
         var containsPattern = $"%{EscapeLike(normalizedQuery)}%";
+        var directoryFilter = CreateDirectoryFilter(query);
 
         using var command = _connection.CreateCommand();
-        command.CommandText = """
+        command.CommandText = $"""
             select
                 full_path,
                 is_directory,
                 size_bytes,
                 last_write_time
             from files
-            where search_text like $contains escape '\'
+            where search_text like $contains escape '\'{directoryFilter}
             order by
                 case
                     when name = $query then 0
@@ -403,17 +404,27 @@ public sealed class SqliteSearchIndex : ISearchIndex, IAsyncDisposable
     {
         var normalizedQuery = NormalizeSearchText(query.NormalizedText);
         var orderedPattern = CreateOrderedLikePattern(normalizedQuery);
+        var directoryFilter = CreateDirectoryFilter(query);
 
         using var command = _connection.CreateCommand();
-        command.CommandText = """
+        command.CommandText = $"""
             select
                 full_path,
                 is_directory,
                 size_bytes,
                 last_write_time
             from files
-            where search_text like $ordered escape '\'
+            where search_text like $ordered escape '\'{directoryFilter}
             order by
+                case
+                    when name like $query_prefix escape '\' then 0
+                    when name like $first_character_prefix escape '\' then 1
+                    else 2
+                end,
+                case
+                    when instr(lower(name), $first_character) > 0 then instr(lower(name), $first_character)
+                    else 2147483647
+                end,
                 length(name),
                 name,
                 length(full_path),
@@ -421,23 +432,32 @@ public sealed class SqliteSearchIndex : ISearchIndex, IAsyncDisposable
             limit $limit;
             """;
         command.Parameters.AddWithValue("$ordered", orderedPattern);
+        command.Parameters.AddWithValue("$query_prefix", $"{EscapeLike(normalizedQuery)}%");
+        command.Parameters.AddWithValue("$first_character_prefix", $"{EscapeLike(normalizedQuery[0].ToString())}%");
+        command.Parameters.AddWithValue("$first_character", normalizedQuery[0].ToString());
         command.Parameters.AddWithValue("$limit", candidateLimit);
 
         await AddRecordsAsync(command, records, cancellationToken).ConfigureAwait(false);
     }
 
     private async Task AddFallbackCandidatesAsync(
+        SearchQuery query,
         IDictionary<string, FileRecord> records,
         CancellationToken cancellationToken)
     {
+        var whereClause = query.Mode == SearchMode.FoldersOnly
+            ? "where is_directory = 1"
+            : string.Empty;
+
         using var command = _connection.CreateCommand();
-        command.CommandText = """
+        command.CommandText = $"""
             select
                 full_path,
                 is_directory,
                 size_bytes,
                 last_write_time
             from files
+            {whereClause}
             order by
                 name,
                 full_path
@@ -524,6 +544,11 @@ public sealed class SqliteSearchIndex : ISearchIndex, IAsyncDisposable
     private static int CreateCandidateLimit(SearchQuery query)
     {
         return Math.Clamp(query.Limit * CandidateLimitMultiplier, MinimumCandidateLimit, MaximumCandidateLimit);
+    }
+
+    private static string CreateDirectoryFilter(SearchQuery query)
+    {
+        return query.Mode == SearchMode.FoldersOnly ? " and is_directory = 1" : string.Empty;
     }
 
     private static string CreatePathKey(string fullPath)
