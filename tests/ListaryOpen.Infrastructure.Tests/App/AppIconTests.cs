@@ -8,6 +8,7 @@ public sealed class AppIconTests
         var project = File.ReadAllText(GetRepositoryPath("src", "ListaryOpen.App", "ListaryOpen.App.csproj"));
 
         Assert.Contains("<ApplicationIcon>Assets\\ListaryOpen.ico</ApplicationIcon>", project);
+        Assert.Contains("<Resource Include=\"Assets\\ListaryOpen.ico\" />", project);
         Assert.True(File.Exists(GetRepositoryPath("src", "ListaryOpen.App", "Assets", "ListaryOpen.ico")));
     }
 
@@ -17,7 +18,7 @@ public sealed class AppIconTests
         var appXaml = File.ReadAllText(GetRepositoryPath("src", "ListaryOpen.App", "App.xaml"));
 
         Assert.Contains("ListaryOpenIcon", appXaml);
-        Assert.Contains("Assets/ListaryOpen.ico", appXaml);
+        Assert.Contains("pack://application:,,,/Assets/ListaryOpen.ico", appXaml);
     }
 
     [Theory]

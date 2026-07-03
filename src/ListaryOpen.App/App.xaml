@@ -4,6 +4,6 @@
              ShutdownMode="OnExplicitShutdown">
     <Application.Resources>
         <BitmapImage x:Key="ListaryOpenIcon"
-                     UriSource="Assets/ListaryOpen.ico" />
+                     UriSource="pack://application:,,,/Assets/ListaryOpen.ico" />
     </Application.Resources>
 </Application>

@@ -37,6 +37,7 @@ public sealed class WindowsDialogAutomation : IDialogAutomation
             handle,
             GetClassName,
             GetProcessName,
+            GetOwnerWindow,
             EnumerateVisibleTopLevelWindows);
         if (dialogHandle == IntPtr.Zero)
         {
@@ -219,6 +220,11 @@ public sealed class WindowsDialogAutomation : IDialogAutomation
         }
     }
 
+    private static IntPtr GetOwnerWindow(IntPtr handle)
+    {
+        return NativeMethods.GetWindow(handle, NativeMethods.GW_OWNER);
+    }
+
     private static IReadOnlyList<IntPtr> EnumerateVisibleTopLevelWindows()
     {
         var windows = new List<IntPtr>();
@@ -241,10 +247,12 @@ public sealed class WindowsDialogAutomation : IDialogAutomation
         IntPtr foregroundHandle,
         Func<IntPtr, string> classNameProvider,
         Func<IntPtr, string?> processNameProvider,
+        Func<IntPtr, IntPtr> ownerWindowProvider,
         Func<IEnumerable<IntPtr>> topLevelWindowProvider)
     {
         ArgumentNullException.ThrowIfNull(classNameProvider);
         ArgumentNullException.ThrowIfNull(processNameProvider);
+        ArgumentNullException.ThrowIfNull(ownerWindowProvider);
         ArgumentNullException.ThrowIfNull(topLevelWindowProvider);
 
         if (foregroundHandle == IntPtr.Zero)
@@ -271,7 +279,8 @@ public sealed class WindowsDialogAutomation : IDialogAutomation
             }
 
             var candidateProcessName = processNameProvider(candidateHandle);
-            if (ProcessNamesEqual(candidateProcessName, foregroundProcessName))
+            if (ProcessNamesEqual(candidateProcessName, foregroundProcessName) &&
+                ownerWindowProvider(candidateHandle) == foregroundHandle)
             {
                 return candidateHandle;
             }

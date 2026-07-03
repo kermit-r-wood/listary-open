@@ -30,6 +30,7 @@ public sealed class WindowsDialogAutomationTests
             foregroundDialog,
             handle => handle == foregroundDialog ? "#32770" : string.Empty,
             _ => "firefox",
+            _ => IntPtr.Zero,
             () => Array.Empty<IntPtr>());
 
         Assert.Equal(foregroundDialog, resolved);
@@ -45,9 +46,26 @@ public sealed class WindowsDialogAutomationTests
             foregroundBrowser,
             handle => handle == browserDialog ? "#32770" : "MozillaWindowClass",
             handle => handle == browserDialog ? "firefox" : "firefox",
+            handle => handle == browserDialog ? foregroundBrowser : IntPtr.Zero,
             () => new[] { browserDialog });
 
         Assert.Equal(browserDialog, resolved);
+    }
+
+    [Fact]
+    public void ResolveActiveDialogHandleIgnoresSameProcessDialogWhenBrowserDoesNotOwnIt()
+    {
+        var foregroundBrowser = new IntPtr(10);
+        var unrelatedDialog = new IntPtr(20);
+
+        var resolved = WindowsDialogAutomation.ResolveActiveDialogHandle(
+            foregroundBrowser,
+            handle => handle == unrelatedDialog ? "#32770" : "MozillaWindowClass",
+            _ => "firefox",
+            _ => IntPtr.Zero,
+            () => new[] { unrelatedDialog });
+
+        Assert.Equal(IntPtr.Zero, resolved);
     }
 
     [Fact]
@@ -65,6 +83,7 @@ public sealed class WindowsDialogAutomationTests
                 : handle == firefoxDialog
                     ? "firefox"
                     : "chrome",
+            _ => IntPtr.Zero,
             () => new[] { firefoxDialog, chromeDialog });
 
         Assert.Equal(IntPtr.Zero, resolved);

@@ -6,11 +6,16 @@ internal static partial class NativeMethods
 {
     internal delegate bool EnumWindowsProc(IntPtr hWnd, IntPtr lParam);
 
+    internal const uint GW_OWNER = 4;
+
     [DllImport("user32.dll")]
     internal static extern bool EnumWindows(EnumWindowsProc lpEnumFunc, IntPtr lParam);
 
     [LibraryImport("user32.dll")]
     internal static partial IntPtr GetForegroundWindow();
+
+    [LibraryImport("user32.dll")]
+    internal static partial IntPtr GetWindow(IntPtr hWnd, uint uCmd);
 
     [LibraryImport("user32.dll")]
     [return: MarshalAs(UnmanagedType.Bool)]
