@@ -147,7 +147,7 @@ public sealed class SearchPanelViewModel : INotifyPropertyChanged
         return RefreshAsync();
     }
 
-    public Task ActivateFolderSearchAsync(IReadOnlyList<QuickSwitchFolderCandidate> candidates)
+    public Task ActivateQuickSwitchFolderSearchAsync(IReadOnlyList<QuickSwitchFolderCandidate> candidates)
     {
         ArgumentNullException.ThrowIfNull(candidates);
 

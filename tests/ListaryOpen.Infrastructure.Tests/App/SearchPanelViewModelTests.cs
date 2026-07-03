@@ -136,7 +136,7 @@ public sealed class SearchPanelViewModelTests
         };
         viewModel.Results.Add(result);
 
-        await viewModel.ActivateFolderSearchAsync((string?)null);
+        await viewModel.ActivateFolderSearchAsync(null);
         viewModel.Results.Add(result);
         viewModel.SelectedResult = result;
 
@@ -162,7 +162,7 @@ public sealed class SearchPanelViewModelTests
             new RecordingSearchIndex(Array.Empty<SearchResult>()),
             new RecordingActivationService(),
             dialogActivation.ActivateAsync);
-        await viewModel.ActivateFolderSearchAsync((string?)null);
+        await viewModel.ActivateFolderSearchAsync(null);
         viewModel.Results.Add(result);
         viewModel.SelectedResult = result;
 
@@ -183,7 +183,7 @@ public sealed class SearchPanelViewModelTests
             new RecordingSearchIndex(Array.Empty<SearchResult>()),
             new RecordingActivationService(),
             dialogActivation.ActivateAsync);
-        await viewModel.ActivateFolderSearchAsync((string?)null);
+        await viewModel.ActivateFolderSearchAsync(null);
         viewModel.Results.Add(result);
         viewModel.SelectedResult = result;
 
@@ -205,7 +205,7 @@ public sealed class SearchPanelViewModelTests
             new RecordingSearchIndex(Array.Empty<SearchResult>()),
             activation,
             dialogActivation.ActivateAsync);
-        await viewModel.ActivateFolderSearchAsync((string?)null);
+        await viewModel.ActivateFolderSearchAsync(null);
         viewModel.Results.Add(result);
         viewModel.SelectedResult = result;
 
@@ -467,7 +467,7 @@ public sealed class SearchPanelViewModelTests
         await index.WaitForSearchCountAsync(1);
         index.ClearObservedQueries();
 
-        await viewModel.ActivateFolderSearchAsync(new[]
+        await viewModel.ActivateQuickSwitchFolderSearchAsync(new[]
         {
             CreateCandidate(firstPinnedFolder),
             CreateCandidate(secondPinnedFolder)
@@ -483,19 +483,31 @@ public sealed class SearchPanelViewModelTests
     }
 
     [Fact]
-    public void FolderSearchQuickSwitchApisUseExplicitCandidateListOverloads()
+    public void FolderSearchQuickSwitchApisAvoidSameNameCandidateListOverloads()
     {
-        Assert.Contains(
+        Assert.DoesNotContain(
             typeof(SearchPanelViewModel).GetMethods(),
             method =>
                 method.Name == nameof(SearchPanelViewModel.ActivateFolderSearchAsync) &&
+                method.GetParameters() is [{ ParameterType: var parameterType }] &&
+                parameterType == typeof(IReadOnlyList<QuickSwitchFolderCandidate>));
+        Assert.Contains(
+            typeof(SearchPanelViewModel).GetMethods(),
+            method =>
+                method.Name == nameof(SearchPanelViewModel.ActivateQuickSwitchFolderSearchAsync) &&
                 !method.IsGenericMethod &&
+                method.GetParameters() is [{ ParameterType: var parameterType }] &&
+                parameterType == typeof(IReadOnlyList<QuickSwitchFolderCandidate>));
+        Assert.DoesNotContain(
+            typeof(SearchPanel).GetMethods(),
+            method =>
+                method.Name == nameof(SearchPanel.ActivateFolderSearch) &&
                 method.GetParameters() is [{ ParameterType: var parameterType }] &&
                 parameterType == typeof(IReadOnlyList<QuickSwitchFolderCandidate>));
         Assert.Contains(
             typeof(SearchPanel).GetMethods(),
             method =>
-                method.Name == nameof(SearchPanel.ActivateFolderSearch) &&
+                method.Name == nameof(SearchPanel.ActivateQuickSwitchFolderSearch) &&
                 !method.IsGenericMethod &&
                 method.GetParameters() is [{ ParameterType: var parameterType }] &&
                 parameterType == typeof(IReadOnlyList<QuickSwitchFolderCandidate>));
@@ -532,7 +544,7 @@ public sealed class SearchPanelViewModelTests
         await index.WaitForSearchCountAsync(1);
         index.ClearObservedQueries();
 
-        await viewModel.ActivateFolderSearchAsync(new[]
+        await viewModel.ActivateQuickSwitchFolderSearchAsync(new[]
         {
             CreateCandidate("C:\\Projects\\Missing"),
             CreateCandidate("C:\\Projects\\Alpha\\"),
