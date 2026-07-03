@@ -115,7 +115,7 @@ public partial class App : Application
         _settingsViewModel = new SettingsViewModel(AppSettings.Defaults());
         var settingsWindow = new MainWindow(_settingsViewModel);
         _explorerTracker = new ExplorerTracker();
-        _searchPanel = new SearchPanel(new SearchPanelViewModel(searchIndex));
+        _searchPanel = new SearchPanel(new SearchPanelViewModel(searchIndex, JumpDialogToFolderAsync));
         _trayController = new TrayController(settingsWindow, RequestReindex);
         _hotkeyService = new HotkeyService();
         _hotkeyService.HotkeyPressed += OnHotkeyPressed;
@@ -374,43 +374,26 @@ public partial class App : Application
 
     private void HandleDialogHotkey()
     {
-        var lastFolder = GetExistingTrackedFolder();
-        if (lastFolder is not null)
-        {
-            _ = JumpDialogToFolderAsync(lastFolder);
-        }
-
+        var lastFolder = ObserveAndGetExistingTrackedFolder(_explorerTracker);
         _searchPanel?.ActivateFolderSearch(lastFolder);
     }
 
-    private string? GetExistingTrackedFolder()
+    internal static string? ObserveAndGetExistingTrackedFolder(ExplorerTracker? explorerTracker)
     {
-        var lastFolder = _explorerTracker?.LastFolder;
+        explorerTracker?.ObserveForegroundExplorerFolder();
+
+        var lastFolder = explorerTracker?.LastFolder;
         return !string.IsNullOrWhiteSpace(lastFolder) && Directory.Exists(lastFolder)
             ? lastFolder
             : null;
     }
 
-    private async Task JumpDialogToFolderAsync(string folderPath)
+    private Task<DialogJumpResult> JumpDialogToFolderAsync(string folderPath, CancellationToken cancellationToken)
     {
-        try
-        {
-            var dialogBridge = _dialogBridge;
-            if (dialogBridge is null)
-            {
-                return;
-            }
-
-            var result = await dialogBridge.JumpToFolderAsync(folderPath, CancellationToken.None);
-            if (result.Status != DialogJumpStatus.Success)
-            {
-                Trace.TraceInformation("Dialog folder jump did not complete: {0}: {1}", result.Status, result.Message);
-            }
-        }
-        catch (Exception exception)
-        {
-            Trace.TraceError(exception.ToString());
-        }
+        var dialogBridge = _dialogBridge;
+        return dialogBridge is null
+            ? Task.FromResult(new DialogJumpResult(DialogJumpStatus.Failed, "Dialog integration is not available."))
+            : dialogBridge.JumpToFolderAsync(folderPath, cancellationToken);
     }
 
     private static bool IsSearchHotkey(string name)

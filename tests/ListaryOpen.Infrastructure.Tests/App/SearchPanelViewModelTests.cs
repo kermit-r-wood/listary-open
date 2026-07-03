@@ -3,6 +3,7 @@ using ListaryOpen.App.Search;
 using ListaryOpen.App.ViewModels;
 using ListaryOpen.Core.Indexing;
 using ListaryOpen.Core.Search;
+using ListaryOpen.Infrastructure.Dialog;
 
 namespace ListaryOpen.Infrastructure.Tests.App;
 
@@ -116,6 +117,123 @@ public sealed class SearchPanelViewModelTests
         {
             folder.Delete(recursive: true);
         }
+    }
+
+    [Fact]
+    public async Task ActivateSelectedAsyncInFolderSearchModeJumpsDialogToSelectedDirectory()
+    {
+        var result = CreateResult("C:\\Docs\\Invoices", isDirectory: true);
+        var activation = new RecordingActivationService();
+        var dialogActivation = new RecordingDialogFolderActivation(
+            new DialogJumpResult(DialogJumpStatus.Success, "Dialog folder changed."));
+        var viewModel = new SearchPanelViewModel(
+            new RecordingSearchIndex(Array.Empty<SearchResult>()),
+            activation,
+            dialogActivation.ActivateAsync)
+        {
+            SelectedResult = result
+        };
+        viewModel.Results.Add(result);
+
+        await viewModel.ActivateFolderSearchAsync(null);
+        viewModel.Results.Add(result);
+        viewModel.SelectedResult = result;
+
+        await viewModel.ActivateSelectedAsync();
+
+        Assert.Equal(new[] { result.Record.FullPath }, dialogActivation.Paths);
+        Assert.Empty(activation.OpenedPaths);
+        Assert.Equal("Dialog folder changed.", viewModel.StatusText);
+    }
+
+    [Theory]
+    [InlineData(DialogJumpStatus.PermissionLimited, "Permission denied.")]
+    [InlineData(DialogJumpStatus.UnsupportedDialog, "No standard file dialog is active.")]
+    [InlineData(DialogJumpStatus.Failed, "Dialog folder could not be changed.")]
+    public async Task ActivateSelectedAsyncInFolderSearchModeSurfacesDialogJumpFailure(
+        DialogJumpStatus status,
+        string message)
+    {
+        var result = CreateResult("C:\\Docs\\Invoices", isDirectory: true);
+        var dialogActivation = new RecordingDialogFolderActivation(new DialogJumpResult(status, message));
+        var viewModel = new SearchPanelViewModel(
+            new RecordingSearchIndex(Array.Empty<SearchResult>()),
+            new RecordingActivationService(),
+            dialogActivation.ActivateAsync);
+        await viewModel.ActivateFolderSearchAsync(null);
+        viewModel.Results.Add(result);
+        viewModel.SelectedResult = result;
+
+        await viewModel.ActivateSelectedAsync();
+
+        Assert.Equal(new[] { result.Record.FullPath }, dialogActivation.Paths);
+        Assert.Contains(status.ToString(), viewModel.StatusText);
+        Assert.Contains(message, viewModel.StatusText);
+    }
+
+    [Fact]
+    public async Task ActivateSelectedAsyncInFolderSearchModeSurfacesDialogJumpException()
+    {
+        var result = CreateResult("C:\\Docs\\Invoices", isDirectory: true);
+        var dialogActivation = new RecordingDialogFolderActivation(
+            _ => throw new InvalidOperationException("Dialog automation failed."));
+        var viewModel = new SearchPanelViewModel(
+            new RecordingSearchIndex(Array.Empty<SearchResult>()),
+            new RecordingActivationService(),
+            dialogActivation.ActivateAsync);
+        await viewModel.ActivateFolderSearchAsync(null);
+        viewModel.Results.Add(result);
+        viewModel.SelectedResult = result;
+
+        await viewModel.ActivateSelectedAsync();
+
+        Assert.Equal(new[] { result.Record.FullPath }, dialogActivation.Paths);
+        Assert.Contains("Dialog jump failed", viewModel.StatusText);
+        Assert.Contains("Dialog automation failed.", viewModel.StatusText);
+    }
+
+    [Fact]
+    public async Task ActivateSelectedAsyncInFolderSearchModeIgnoresSelectedFile()
+    {
+        var result = CreateResult("C:\\Docs\\Invoice.xlsx", isDirectory: false);
+        var activation = new RecordingActivationService();
+        var dialogActivation = new RecordingDialogFolderActivation(
+            new DialogJumpResult(DialogJumpStatus.Success, "Dialog folder changed."));
+        var viewModel = new SearchPanelViewModel(
+            new RecordingSearchIndex(Array.Empty<SearchResult>()),
+            activation,
+            dialogActivation.ActivateAsync);
+        await viewModel.ActivateFolderSearchAsync(null);
+        viewModel.Results.Add(result);
+        viewModel.SelectedResult = result;
+
+        await viewModel.ActivateSelectedAsync();
+
+        Assert.Empty(dialogActivation.Paths);
+        Assert.Empty(activation.OpenedPaths);
+        Assert.Contains("folder", viewModel.StatusText, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public async Task ActivateSelectedAsyncInFilesAndFoldersModeOpensDirectoryWithoutDialogJump()
+    {
+        var result = CreateResult("C:\\Docs\\Invoices", isDirectory: true);
+        var activation = new RecordingActivationService();
+        var dialogActivation = new RecordingDialogFolderActivation(
+            new DialogJumpResult(DialogJumpStatus.Success, "Dialog folder changed."));
+        var viewModel = new SearchPanelViewModel(
+            new RecordingSearchIndex(Array.Empty<SearchResult>()),
+            activation,
+            dialogActivation.ActivateAsync)
+        {
+            SelectedResult = result
+        };
+        viewModel.Results.Add(result);
+
+        await viewModel.ActivateSelectedAsync();
+
+        Assert.Equal(new[] { result.Record.FullPath }, activation.OpenedPaths);
+        Assert.Empty(dialogActivation.Paths);
     }
 
     [Fact]
@@ -380,6 +498,29 @@ public sealed class SearchPanelViewModelTests
         public void CopyPath(string path)
         {
             CopiedPaths.Add(path);
+        }
+    }
+
+    private sealed class RecordingDialogFolderActivation
+    {
+        private readonly Func<string, DialogJumpResult> _activate;
+
+        public RecordingDialogFolderActivation(DialogJumpResult result)
+            : this(_ => result)
+        {
+        }
+
+        public RecordingDialogFolderActivation(Func<string, DialogJumpResult> activate)
+        {
+            _activate = activate;
+        }
+
+        public List<string> Paths { get; } = new();
+
+        public Task<DialogJumpResult> ActivateAsync(string path, CancellationToken cancellationToken)
+        {
+            Paths.Add(path);
+            return Task.FromResult(_activate(path));
         }
     }
 

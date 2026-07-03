@@ -6,6 +6,7 @@ using System.Runtime.CompilerServices;
 using ListaryOpen.App.Search;
 using ListaryOpen.Core.Indexing;
 using ListaryOpen.Core.Search;
+using ListaryOpen.Infrastructure.Dialog;
 
 namespace ListaryOpen.App.ViewModels;
 
@@ -16,6 +17,7 @@ public sealed class SearchPanelViewModel : INotifyPropertyChanged
     private readonly Func<string, bool> _folderExists;
     private readonly Func<string, DateTimeOffset> _getFolderLastWriteTime;
     private readonly ISearchResultActivationService _activationService;
+    private readonly Func<string, CancellationToken, Task<DialogJumpResult>> _dialogFolderActivation;
     private int _refreshVersion;
     private string _queryText = string.Empty;
     private string _statusText = string.Empty;
@@ -24,14 +26,29 @@ public sealed class SearchPanelViewModel : INotifyPropertyChanged
     private string? _trackedFolder;
 
     public SearchPanelViewModel(ISearchIndex index)
-        : this(index, NormalizeExistingFolder, Directory.Exists, GetFolderLastWriteTime, new SearchResultActivator())
+        : this(index, NormalizeExistingFolder, Directory.Exists, GetFolderLastWriteTime, new SearchResultActivator(), DialogJumpNotConfiguredAsync)
     {
     }
 
     internal SearchPanelViewModel(
         ISearchIndex index,
         ISearchResultActivationService activationService)
-        : this(index, NormalizeExistingFolder, Directory.Exists, GetFolderLastWriteTime, activationService)
+        : this(index, NormalizeExistingFolder, Directory.Exists, GetFolderLastWriteTime, activationService, DialogJumpNotConfiguredAsync)
+    {
+    }
+
+    internal SearchPanelViewModel(
+        ISearchIndex index,
+        Func<string, CancellationToken, Task<DialogJumpResult>> dialogFolderActivation)
+        : this(index, NormalizeExistingFolder, Directory.Exists, GetFolderLastWriteTime, new SearchResultActivator(), dialogFolderActivation)
+    {
+    }
+
+    internal SearchPanelViewModel(
+        ISearchIndex index,
+        ISearchResultActivationService activationService,
+        Func<string, CancellationToken, Task<DialogJumpResult>> dialogFolderActivation)
+        : this(index, NormalizeExistingFolder, Directory.Exists, GetFolderLastWriteTime, activationService, dialogFolderActivation)
     {
     }
 
@@ -40,7 +57,7 @@ public sealed class SearchPanelViewModel : INotifyPropertyChanged
         Func<string?, string?> normalizeExistingFolder,
         Func<string, bool> folderExists,
         Func<string, DateTimeOffset> getFolderLastWriteTime)
-        : this(index, normalizeExistingFolder, folderExists, getFolderLastWriteTime, new SearchResultActivator())
+        : this(index, normalizeExistingFolder, folderExists, getFolderLastWriteTime, new SearchResultActivator(), DialogJumpNotConfiguredAsync)
     {
     }
 
@@ -49,13 +66,15 @@ public sealed class SearchPanelViewModel : INotifyPropertyChanged
         Func<string?, string?> normalizeExistingFolder,
         Func<string, bool> folderExists,
         Func<string, DateTimeOffset> getFolderLastWriteTime,
-        ISearchResultActivationService activationService)
+        ISearchResultActivationService activationService,
+        Func<string, CancellationToken, Task<DialogJumpResult>> dialogFolderActivation)
     {
         _index = index ?? throw new ArgumentNullException(nameof(index));
         _normalizeExistingFolder = normalizeExistingFolder ?? throw new ArgumentNullException(nameof(normalizeExistingFolder));
         _folderExists = folderExists ?? throw new ArgumentNullException(nameof(folderExists));
         _getFolderLastWriteTime = getFolderLastWriteTime ?? throw new ArgumentNullException(nameof(getFolderLastWriteTime));
         _activationService = activationService ?? throw new ArgumentNullException(nameof(activationService));
+        _dialogFolderActivation = dialogFolderActivation ?? throw new ArgumentNullException(nameof(dialogFolderActivation));
     }
 
     public event PropertyChangedEventHandler? PropertyChanged;
@@ -120,7 +139,7 @@ public sealed class SearchPanelViewModel : INotifyPropertyChanged
     {
         _searchMode = SearchMode.FoldersOnly;
         _trackedFolder = TryNormalizeExistingFolder(trackedFolder);
-        StatusText = "Select a folder to jump after dialog integration is enabled.";
+        StatusText = "Select a folder to jump the dialog.";
         return RefreshAsync();
     }
 
@@ -133,9 +152,15 @@ public sealed class SearchPanelViewModel : INotifyPropertyChanged
         }
 
         var path = selected.Record.FullPath;
-        if (_searchMode == SearchMode.FoldersOnly && selected.Record.IsDirectory)
+        if (_searchMode == SearchMode.FoldersOnly)
         {
-            StatusText = "Select a folder to jump after dialog integration is enabled.";
+            if (!selected.Record.IsDirectory)
+            {
+                StatusText = "Select a folder result to jump the dialog.";
+                return;
+            }
+
+            await ActivateDialogFolderAsync(path);
             return;
         }
 
@@ -224,7 +249,7 @@ public sealed class SearchPanelViewModel : INotifyPropertyChanged
         if (!hasQuery)
         {
             StatusText = searchMode == SearchMode.FoldersOnly
-                ? "Select a folder to jump after dialog integration is enabled."
+                ? "Select a folder to jump the dialog."
                 : "Type to search.";
             return;
         }
@@ -397,6 +422,34 @@ public sealed class SearchPanelViewModel : INotifyPropertyChanged
     private static DateTimeOffset GetFolderLastWriteTime(string folderPath)
     {
         return new DateTimeOffset(Directory.GetLastWriteTimeUtc(folderPath), TimeSpan.Zero);
+    }
+
+    private async Task ActivateDialogFolderAsync(string folderPath)
+    {
+        try
+        {
+            var result = await _dialogFolderActivation(folderPath, CancellationToken.None);
+            StatusText = result.Status == DialogJumpStatus.Success
+                ? (string.IsNullOrWhiteSpace(result.Message) ? "Dialog folder changed." : result.Message)
+                : FormatDialogJumpFailure(result);
+        }
+        catch (Exception exception)
+        {
+            Trace.TraceError(exception.ToString());
+            StatusText = $"Dialog jump failed: {exception.Message}";
+        }
+    }
+
+    private static Task<DialogJumpResult> DialogJumpNotConfiguredAsync(string folderPath, CancellationToken cancellationToken)
+    {
+        return Task.FromResult(new DialogJumpResult(DialogJumpStatus.Failed, "Dialog jump is not configured."));
+    }
+
+    private static string FormatDialogJumpFailure(DialogJumpResult result)
+    {
+        return string.IsNullOrWhiteSpace(result.Message)
+            ? $"Dialog jump failed: {result.Status}."
+            : $"Dialog jump failed: {result.Status}: {result.Message}";
     }
 
     private static bool IsExpectedFolderPathException(Exception exception)
