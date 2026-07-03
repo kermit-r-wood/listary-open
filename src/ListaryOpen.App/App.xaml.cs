@@ -20,6 +20,7 @@ public partial class App : Application
     private readonly SemaphoreSlim _indexingRunLock = new(1, 1);
 
     private DialogBridge? _dialogBridge;
+    private ExplorerObservationScheduler? _explorerObservationScheduler;
     private FallbackIndexProvider? _fallbackIndexProvider;
     private ExplorerTracker? _explorerTracker;
     private HotkeyService? _hotkeyService;
@@ -79,6 +80,7 @@ public partial class App : Application
             _hotkeyService.Dispose();
         }
 
+        _explorerObservationScheduler?.Dispose();
         _trayController?.Dispose();
         DisposeSearchIndex();
         _shutdownCancellation.Dispose();
@@ -115,6 +117,9 @@ public partial class App : Application
         _settingsViewModel = new SettingsViewModel(AppSettings.Defaults());
         var settingsWindow = new MainWindow(_settingsViewModel);
         _explorerTracker = new ExplorerTracker();
+        _explorerObservationScheduler = StartPeriodicExplorerObservation(
+            _explorerTracker,
+            () => new DispatcherExplorerObservationTimer());
         _searchPanel = new SearchPanel(new SearchPanelViewModel(searchIndex, JumpDialogToFolderAsync));
         _trayController = new TrayController(settingsWindow, RequestReindex);
         _hotkeyService = new HotkeyService();
@@ -209,6 +214,25 @@ public partial class App : Application
         }
 
         return roots;
+    }
+
+    internal static ExplorerObservationScheduler? StartPeriodicExplorerObservation(
+        ExplorerTracker? explorerTracker,
+        Func<IExplorerObservationTimer> timerFactory)
+    {
+        ArgumentNullException.ThrowIfNull(timerFactory);
+
+        if (explorerTracker is null)
+        {
+            return null;
+        }
+
+        var scheduler = new ExplorerObservationScheduler(
+            explorerTracker.ObserveForegroundExplorerFolder,
+            TimeSpan.FromSeconds(2),
+            timerFactory);
+        scheduler.Start();
+        return scheduler;
     }
 
     private static string JoinHotkeyNames(IEnumerable<HotkeyRegistration> hotkeys)
