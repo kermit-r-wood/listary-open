@@ -73,7 +73,7 @@
                 </Grid>
 
                 <CheckBox Content="Quick Save / Open enabled"
-                          IsChecked="{Binding Settings.QuickSaveOpenEnabled}"
+                          IsChecked="{Binding Settings.QuickSaveOpenEnabled, Mode=OneWay}"
                           IsEnabled="False" />
             </StackPanel>
         </ScrollViewer>

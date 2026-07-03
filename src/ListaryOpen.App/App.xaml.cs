@@ -8,6 +8,7 @@ using ListaryOpen.Infrastructure.Windows;
 using System.Diagnostics;
 using System.IO;
 using System.Windows;
+using System.Windows.Threading;
 
 namespace ListaryOpen.App;
 
@@ -34,20 +35,23 @@ public partial class App : Application
 
         try
         {
-            if (!await InitializeApplicationServicesAsync())
+            if (!await InitializeApplicationServicesAsync().ConfigureAwait(false))
             {
-                Shutdown(1);
+                await InvokeOnDispatcherAsync(Dispatcher, () => Shutdown(1)).ConfigureAwait(false);
             }
         }
         catch (Exception exception)
         {
             Trace.TraceError(exception.ToString());
-            MessageBox.Show(
-                "ListaryOpen could not start.",
-                "ListaryOpen",
-                MessageBoxButton.OK,
-                MessageBoxImage.Error);
-            Shutdown(1);
+            await InvokeOnDispatcherAsync(Dispatcher, () =>
+            {
+                MessageBox.Show(
+                    "ListaryOpen could not start.",
+                    "ListaryOpen",
+                    MessageBoxButton.OK,
+                    MessageBoxImage.Error);
+                Shutdown(1);
+            }).ConfigureAwait(false);
         }
     }
 
@@ -67,7 +71,17 @@ public partial class App : Application
 
     private async Task<bool> InitializeApplicationServicesAsync()
     {
-        _searchIndex = await SqliteSearchIndex.OpenAsync(CreateIndexDatabasePath(), CancellationToken.None);
+        _searchIndex = await SqliteSearchIndex.OpenAsync(CreateIndexDatabasePath(), CancellationToken.None)
+            .ConfigureAwait(false);
+
+        return await InvokeOnDispatcherAsync(
+                Dispatcher,
+                () => InitializeApplicationServices(_searchIndex))
+            .ConfigureAwait(false);
+    }
+
+    private bool InitializeApplicationServices(SqliteSearchIndex searchIndex)
+    {
         _fallbackIndexProvider = new FallbackIndexProvider();
         _ntfsIndexProvider = new NtfsIndexProvider(new ElevatedIndexerClient());
         _volumeIndexer = new VolumeIndexer(new IIndexProvider[]
@@ -81,7 +95,7 @@ public partial class App : Application
 
         var settingsWindow = new MainWindow();
         _explorerTracker = new ExplorerTracker();
-        _searchPanel = new SearchPanel(new SearchPanelViewModel(_searchIndex));
+        _searchPanel = new SearchPanel(new SearchPanelViewModel(searchIndex));
         _trayController = new TrayController(settingsWindow);
         _hotkeyService = new HotkeyService();
         _hotkeyService.HotkeyPressed += OnHotkeyPressed;
@@ -103,6 +117,32 @@ public partial class App : Application
         MainWindow = settingsWindow;
         settingsWindow.Show();
         return true;
+    }
+
+    internal static Task InvokeOnDispatcherAsync(Dispatcher dispatcher, Action action)
+    {
+        ArgumentNullException.ThrowIfNull(action);
+
+        return InvokeOnDispatcherAsync(
+            dispatcher,
+            () =>
+            {
+                action();
+                return true;
+            });
+    }
+
+    internal static Task<T> InvokeOnDispatcherAsync<T>(Dispatcher dispatcher, Func<T> action)
+    {
+        ArgumentNullException.ThrowIfNull(dispatcher);
+        ArgumentNullException.ThrowIfNull(action);
+
+        if (dispatcher.CheckAccess())
+        {
+            return Task.FromResult(action());
+        }
+
+        return dispatcher.InvokeAsync(action).Task;
     }
 
     internal static HotkeyStartupDecision CreateHotkeyStartupDecision(HotkeyRegistrationResult registrationResult)
