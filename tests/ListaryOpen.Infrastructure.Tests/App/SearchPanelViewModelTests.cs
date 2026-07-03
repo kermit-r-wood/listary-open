@@ -4,6 +4,7 @@ using ListaryOpen.App.ViewModels;
 using ListaryOpen.Core.Indexing;
 using ListaryOpen.Core.Search;
 using ListaryOpen.Infrastructure.Dialog;
+using ListaryOpen.Infrastructure.Windows;
 
 namespace ListaryOpen.Infrastructure.Tests.App;
 
@@ -441,6 +442,94 @@ public sealed class SearchPanelViewModelTests
     }
 
     [Fact]
+    public async Task ActivateFolderSearchAsyncPinsQuickSwitchCandidatesAboveIndexResults()
+    {
+        var now = DateTimeOffset.UtcNow;
+        var firstPinnedFolder = "C:\\Projects\\Beta";
+        var secondPinnedFolder = "C:\\Projects\\Alpha";
+        var duplicateIndexedFolder = FileRecord.Create(secondPinnedFolder, true, 0, now);
+        var indexedFolder = FileRecord.Create("C:\\Projects\\Gamma", true, 0, now);
+        var indexedFile = FileRecord.Create("C:\\Projects\\Report.txt", false, 10, now);
+        var index = new RecordingSearchIndex(new[]
+        {
+            new SearchResult(duplicateIndexedFolder, 300, "index"),
+            new SearchResult(indexedFile, 200, "index"),
+            new SearchResult(indexedFolder, 100, "index")
+        });
+        var viewModel = new SearchPanelViewModel(
+            index,
+            NormalizeTestFolder,
+            _ => true,
+            _ => now)
+        {
+            QueryText = "project"
+        };
+        await index.WaitForSearchCountAsync(1);
+        index.ClearObservedQueries();
+
+        await viewModel.ActivateFolderSearchAsync(new[]
+        {
+            CreateCandidate(firstPinnedFolder),
+            CreateCandidate(secondPinnedFolder)
+        });
+
+        var query = Assert.Single(index.ObservedQueries);
+        Assert.Equal(SearchMode.FoldersOnly, query.Mode);
+        Assert.Equal("project", query.NormalizedText);
+        Assert.Equal(
+            new[] { firstPinnedFolder, secondPinnedFolder, indexedFolder.FullPath },
+            viewModel.Results.Select(result => result.Record.FullPath));
+        Assert.Equal(firstPinnedFolder, viewModel.SelectedResult?.Record.FullPath);
+    }
+
+    [Fact]
+    public async Task ActivateFolderSearchAsyncSkipsMissingInvalidAndDuplicateQuickSwitchCandidates()
+    {
+        var now = DateTimeOffset.UtcNow;
+        var alphaFolder = "C:\\Projects\\Alpha";
+        var betaFolder = "C:\\Projects\\Beta";
+        var existingFolders = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+        {
+            alphaFolder,
+            betaFolder
+        };
+        var index = new RecordingSearchIndex(Array.Empty<SearchResult>());
+        var viewModel = new SearchPanelViewModel(
+            index,
+            folderPath =>
+            {
+                if (string.Equals(folderPath, "not-a-folder", StringComparison.Ordinal))
+                {
+                    throw new ArgumentException("Folder path is invalid.", nameof(folderPath));
+                }
+
+                return NormalizeTestFolder(folderPath);
+            },
+            existingFolders.Contains,
+            _ => now)
+        {
+            QueryText = "project"
+        };
+        await index.WaitForSearchCountAsync(1);
+        index.ClearObservedQueries();
+
+        await viewModel.ActivateFolderSearchAsync(new[]
+        {
+            CreateCandidate("C:\\Projects\\Missing"),
+            CreateCandidate("C:\\Projects\\Alpha\\"),
+            CreateCandidate("C:\\PROJECTS\\ALPHA"),
+            CreateCandidate("not-a-folder"),
+            CreateCandidate(betaFolder)
+        });
+
+        Assert.Single(index.ObservedQueries);
+        Assert.Equal(
+            new[] { alphaFolder, betaFolder },
+            viewModel.Results.Select(result => result.Record.FullPath));
+        Assert.Equal(alphaFolder, viewModel.SelectedResult?.Record.FullPath);
+    }
+
+    [Fact]
     public async Task ActivateFolderSearchAsyncUsesFallbackTimestampWhenTrackedFolderTimestampFails()
     {
         var index = new RecordingSearchIndex(Array.Empty<SearchResult>());
@@ -458,12 +547,27 @@ public sealed class SearchPanelViewModelTests
         Assert.Empty(index.ObservedQueries);
     }
 
+    private static QuickSwitchFolderCandidate CreateCandidate(string folderPath)
+    {
+        return new QuickSwitchFolderCandidate(folderPath, "Explorer", IntPtr.Zero, false);
+    }
+
     private static SearchResult CreateResult(string fullPath, bool isDirectory)
     {
         return new SearchResult(
             FileRecord.Create(fullPath, isDirectory, isDirectory ? 0 : 10, DateTimeOffset.UtcNow),
             100,
             "test");
+    }
+
+    private static string? NormalizeTestFolder(string? folderPath)
+    {
+        if (string.IsNullOrWhiteSpace(folderPath))
+        {
+            return null;
+        }
+
+        return Path.TrimEndingDirectorySeparator(Path.GetFullPath(folderPath.Trim()));
     }
 
     private static async Task WaitUntilAsync(Func<bool> condition)

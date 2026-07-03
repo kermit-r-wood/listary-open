@@ -7,6 +7,7 @@ using System.Windows.Media;
 using ListaryOpen.App.ViewModels;
 using ListaryOpen.Core.Indexing;
 using ListaryOpen.Core.Search;
+using ListaryOpen.Infrastructure.Windows;
 
 namespace ListaryOpen.App;
 
@@ -39,6 +40,13 @@ public partial class SearchPanel : Window
     public void ActivateFolderSearch(string? trackedFolder)
     {
         _ = ViewModel.ActivateFolderSearchAsync(trackedFolder);
+        ShowAndFocusQuery();
+    }
+
+    public void ActivateFolderSearch<TCandidates>(TCandidates candidates)
+        where TCandidates : IReadOnlyList<QuickSwitchFolderCandidate>
+    {
+        _ = ViewModel.ActivateFolderSearchAsync(candidates);
         ShowAndFocusQuery();
     }
 

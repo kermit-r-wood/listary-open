@@ -7,6 +7,7 @@ using ListaryOpen.App.Search;
 using ListaryOpen.Core.Indexing;
 using ListaryOpen.Core.Search;
 using ListaryOpen.Infrastructure.Dialog;
+using ListaryOpen.Infrastructure.Windows;
 
 namespace ListaryOpen.App.ViewModels;
 
@@ -23,7 +24,7 @@ public sealed class SearchPanelViewModel : INotifyPropertyChanged
     private string _statusText = string.Empty;
     private SearchMode _searchMode = SearchMode.FilesAndFolders;
     private SearchResult? _selectedResult;
-    private string? _trackedFolder;
+    private IReadOnlyList<string> _pinnedFolderPaths = Array.Empty<string>();
 
     public SearchPanelViewModel(ISearchIndex index)
         : this(index, NormalizeExistingFolder, Directory.Exists, GetFolderLastWriteTime, new SearchResultActivator(), DialogJumpNotConfiguredAsync)
@@ -130,7 +131,7 @@ public sealed class SearchPanelViewModel : INotifyPropertyChanged
     public Task ActivateFilesAndFoldersSearchAsync()
     {
         _searchMode = SearchMode.FilesAndFolders;
-        _trackedFolder = null;
+        _pinnedFolderPaths = Array.Empty<string>();
         StatusText = "Search files and folders.";
         return RefreshAsync();
     }
@@ -138,7 +139,22 @@ public sealed class SearchPanelViewModel : INotifyPropertyChanged
     public Task ActivateFolderSearchAsync(string? trackedFolder)
     {
         _searchMode = SearchMode.FoldersOnly;
-        _trackedFolder = TryNormalizeExistingFolder(trackedFolder);
+        var normalizedFolder = TryNormalizeExistingFolder(trackedFolder);
+        _pinnedFolderPaths = normalizedFolder is null
+            ? Array.Empty<string>()
+            : new[] { normalizedFolder };
+        StatusText = "Select a folder to jump the dialog.";
+        return RefreshAsync();
+    }
+
+    public Task ActivateFolderSearchAsync<TCandidates>(TCandidates candidates)
+        where TCandidates : IReadOnlyList<QuickSwitchFolderCandidate>
+    {
+        ArgumentNullException.ThrowIfNull(candidates);
+
+        _searchMode = SearchMode.FoldersOnly;
+        _pinnedFolderPaths = NormalizePinnedFolderPaths(candidates);
+        SelectedResult = null;
         StatusText = "Select a folder to jump the dialog.";
         return RefreshAsync();
     }
@@ -231,10 +247,12 @@ public sealed class SearchPanelViewModel : INotifyPropertyChanged
         var version = Interlocked.Increment(ref _refreshVersion);
         var queryText = _queryText;
         var searchMode = _searchMode;
-        var trackedFolder = _trackedFolder;
-        var trackedFolderResult = searchMode == SearchMode.FoldersOnly
-            ? TryCreateTrackedFolderResult(trackedFolder)
-            : null;
+        var pinnedFolderResults = searchMode == SearchMode.FoldersOnly
+            ? CreatePinnedFolderResults(_pinnedFolderPaths)
+            : Array.Empty<SearchResult>();
+        var pinnedFolderPathKeys = new HashSet<string>(
+            pinnedFolderResults.Select(result => result.Record.PathKey),
+            StringComparer.Ordinal);
         var hasQuery = !string.IsNullOrWhiteSpace(queryText);
 
         if (hasQuery)
@@ -243,7 +261,7 @@ public sealed class SearchPanelViewModel : INotifyPropertyChanged
         }
 
         Results.Clear();
-        AddTrackedFolderResult(trackedFolderResult);
+        AddPinnedFolderResults(pinnedFolderResults);
         UpdateSelectedResultAfterRefresh();
 
         if (!hasQuery)
@@ -268,7 +286,7 @@ public sealed class SearchPanelViewModel : INotifyPropertyChanged
             if (version == _refreshVersion)
             {
                 Results.Clear();
-                AddTrackedFolderResult(trackedFolderResult);
+                AddPinnedFolderResults(pinnedFolderResults);
                 UpdateSelectedResultAfterRefresh();
                 StatusText = $"Search failed: {exception.Message}";
             }
@@ -282,7 +300,7 @@ public sealed class SearchPanelViewModel : INotifyPropertyChanged
         }
 
         Results.Clear();
-        AddTrackedFolderResult(trackedFolderResult);
+        AddPinnedFolderResults(pinnedFolderResults);
         foreach (var result in results)
         {
             if (searchMode == SearchMode.FoldersOnly && !result.Record.IsDirectory)
@@ -290,8 +308,7 @@ public sealed class SearchPanelViewModel : INotifyPropertyChanged
                 continue;
             }
 
-            if (trackedFolderResult is not null &&
-                string.Equals(result.Record.PathKey, trackedFolderResult.Record.PathKey, StringComparison.Ordinal))
+            if (pinnedFolderPathKeys.Contains(result.Record.PathKey))
             {
                 continue;
             }
@@ -346,12 +363,46 @@ public sealed class SearchPanelViewModel : INotifyPropertyChanged
         return current;
     }
 
-    private void AddTrackedFolderResult(SearchResult? result)
+    private void AddPinnedFolderResults(IReadOnlyList<SearchResult> results)
     {
-        if (result is not null)
+        foreach (var result in results)
         {
             Results.Add(result);
         }
+    }
+
+    private IReadOnlyList<SearchResult> CreatePinnedFolderResults(IReadOnlyList<string> folderPaths)
+    {
+        var results = new List<SearchResult>(folderPaths.Count);
+        var pathKeys = new HashSet<string>(StringComparer.Ordinal);
+
+        foreach (var folderPath in folderPaths)
+        {
+            var result = TryCreateTrackedFolderResult(folderPath);
+            if (result is null || !pathKeys.Add(result.Record.PathKey))
+            {
+                continue;
+            }
+
+            results.Add(result);
+        }
+
+        return results;
+    }
+
+    private IReadOnlyList<string> NormalizePinnedFolderPaths(IReadOnlyList<QuickSwitchFolderCandidate> candidates)
+    {
+        var normalizedFolders = new List<string>(candidates.Count);
+        foreach (var candidate in candidates)
+        {
+            var normalizedFolder = TryNormalizeExistingFolder(candidate.FolderPath);
+            if (normalizedFolder is not null)
+            {
+                normalizedFolders.Add(normalizedFolder);
+            }
+        }
+
+        return normalizedFolders;
     }
 
     private SearchResult? TryCreateTrackedFolderResult(string? folderPath)
