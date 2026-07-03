@@ -4,6 +4,92 @@ namespace ListaryOpen.Infrastructure.Tests.Dialog;
 
 public sealed class WindowsDialogAutomationTests
 {
+    [Fact]
+    public async Task RunWithoutDialogRedrawRestoresRedrawAfterSuccessfulOperation()
+    {
+        var dialogHandle = new IntPtr(42);
+        var redrawStates = new List<bool>();
+        var invalidatedHandles = new List<IntPtr>();
+
+        var result = await WindowsDialogAutomation.RunWithoutDialogRedrawAsync(
+            dialogHandle,
+            (handle, enabled) =>
+            {
+                Assert.Equal(dialogHandle, handle);
+                redrawStates.Add(enabled);
+            },
+            handle => invalidatedHandles.Add(handle),
+            () => Task.FromResult(true));
+
+        Assert.True(result);
+        Assert.Equal(new[] { false, true }, redrawStates);
+        Assert.Equal(new[] { dialogHandle }, invalidatedHandles);
+    }
+
+    [Fact]
+    public async Task RunWithoutDialogRedrawDisablesDialogAndChildWindows()
+    {
+        var dialogHandle = new IntPtr(42);
+        var childEditHandle = new IntPtr(43);
+        var childButtonHandle = new IntPtr(44);
+        var redrawStates = new List<(IntPtr Handle, bool Enabled)>();
+
+        var result = await WindowsDialogAutomation.RunWithoutDialogRedrawAsync(
+            dialogHandle,
+            _ => new[] { dialogHandle, childEditHandle, childButtonHandle },
+            (handle, enabled) => redrawStates.Add((handle, enabled)),
+            _ => { },
+            () => Task.FromResult(true));
+
+        Assert.True(result);
+        Assert.Equal(
+            new[]
+            {
+                (dialogHandle, false),
+                (childEditHandle, false),
+                (childButtonHandle, false),
+                (childButtonHandle, true),
+                (childEditHandle, true),
+                (dialogHandle, true)
+            },
+            redrawStates);
+    }
+
+    [Fact]
+    public async Task RunWithoutDialogRedrawRestoresRedrawAfterFailedOperation()
+    {
+        var dialogHandle = new IntPtr(42);
+        var redrawStates = new List<bool>();
+        var invalidatedHandles = new List<IntPtr>();
+
+        var result = await WindowsDialogAutomation.RunWithoutDialogRedrawAsync(
+            dialogHandle,
+            (_, enabled) => redrawStates.Add(enabled),
+            handle => invalidatedHandles.Add(handle),
+            () => Task.FromResult(false));
+
+        Assert.False(result);
+        Assert.Equal(new[] { false, true }, redrawStates);
+        Assert.Equal(new[] { dialogHandle }, invalidatedHandles);
+    }
+
+    [Fact]
+    public async Task RunWithoutDialogRedrawRestoresRedrawWhenOperationThrows()
+    {
+        var dialogHandle = new IntPtr(42);
+        var redrawStates = new List<bool>();
+        var invalidatedHandles = new List<IntPtr>();
+
+        await Assert.ThrowsAsync<InvalidOperationException>(() => WindowsDialogAutomation.RunWithoutDialogRedrawAsync(
+            dialogHandle,
+            (_, enabled) => redrawStates.Add(enabled),
+            handle => invalidatedHandles.Add(handle),
+            () => throw new InvalidOperationException("jump failed")));
+
+        Assert.Equal(new[] { false, true }, redrawStates);
+        Assert.Equal(new[] { dialogHandle }, invalidatedHandles);
+    }
+
     [Theory]
     [InlineData("#32770")]
     [InlineData("MozillaDialogClass")]

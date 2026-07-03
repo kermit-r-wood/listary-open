@@ -100,13 +100,6 @@ public sealed class WindowsDialogAutomation : IDialogAutomation
 
         cancellationToken.ThrowIfCancellationRequested();
 
-        if (!TrySetValue(valuePattern, folderPath))
-        {
-            return false;
-        }
-
-        cancellationToken.ThrowIfCancellationRequested();
-
         if (!TryFindCommitButton(activeDialog, out var commitButton))
         {
             return false;
@@ -119,18 +112,150 @@ public sealed class WindowsDialogAutomation : IDialogAutomation
             return false;
         }
 
-        cancellationToken.ThrowIfCancellationRequested();
+        return await RunWithoutDialogRedrawAsync(
+                activeDialogHandle,
+                EnumerateDialogRedrawHandles,
+                SetDialogRedrawEnabled,
+                InvalidateDialogWindow,
+                async () =>
+                {
+                    cancellationToken.ThrowIfCancellationRequested();
 
-        if (!TryInvoke(invokePattern))
+                    if (!TrySetValue(valuePattern, folderPath))
+                    {
+                        return false;
+                    }
+
+                    cancellationToken.ThrowIfCancellationRequested();
+
+                    if (!TryInvoke(invokePattern))
+                    {
+                        return false;
+                    }
+
+                    return await ConfirmFolderNavigationAsync(
+                            valuePattern,
+                            folderPath,
+                            cancellationToken)
+                        .ConfigureAwait(false);
+                })
+            .ConfigureAwait(false);
+    }
+
+    internal static async Task<bool> RunWithoutDialogRedrawAsync(
+        IntPtr dialogHandle,
+        Action<IntPtr, bool> setRedrawEnabled,
+        Action<IntPtr> redrawWindow,
+        Func<Task<bool>> operation)
+    {
+        return await RunWithoutDialogRedrawAsync(
+                dialogHandle,
+                handle => new[] { handle },
+                setRedrawEnabled,
+                redrawWindow,
+                operation)
+            .ConfigureAwait(false);
+    }
+
+    internal static async Task<bool> RunWithoutDialogRedrawAsync(
+        IntPtr dialogHandle,
+        Func<IntPtr, IReadOnlyList<IntPtr>> redrawHandleProvider,
+        Action<IntPtr, bool> setRedrawEnabled,
+        Action<IntPtr> redrawWindow,
+        Func<Task<bool>> operation)
+    {
+        ArgumentNullException.ThrowIfNull(redrawHandleProvider);
+        ArgumentNullException.ThrowIfNull(setRedrawEnabled);
+        ArgumentNullException.ThrowIfNull(redrawWindow);
+        ArgumentNullException.ThrowIfNull(operation);
+
+        if (dialogHandle == IntPtr.Zero)
         {
-            return false;
+            return await operation().ConfigureAwait(false);
         }
 
-        return await ConfirmFolderNavigationAsync(
-                valuePattern,
-                folderPath,
-                cancellationToken)
-            .ConfigureAwait(false);
+        var redrawHandles = NormalizeRedrawHandles(redrawHandleProvider(dialogHandle), dialogHandle);
+        foreach (var handle in redrawHandles)
+        {
+            setRedrawEnabled(handle, false);
+        }
+
+        try
+        {
+            return await operation().ConfigureAwait(false);
+        }
+        finally
+        {
+            for (var index = redrawHandles.Count - 1; index >= 0; index--)
+            {
+                setRedrawEnabled(redrawHandles[index], true);
+            }
+
+            redrawWindow(dialogHandle);
+        }
+    }
+
+    private static IReadOnlyList<IntPtr> NormalizeRedrawHandles(
+        IReadOnlyList<IntPtr>? handles,
+        IntPtr fallbackHandle)
+    {
+        if (handles is null || handles.Count == 0)
+        {
+            return new[] { fallbackHandle };
+        }
+
+        var normalizedHandles = new List<IntPtr>(handles.Count);
+        foreach (var handle in handles)
+        {
+            if (handle != IntPtr.Zero && !normalizedHandles.Contains(handle))
+            {
+                normalizedHandles.Add(handle);
+            }
+        }
+
+        if (normalizedHandles.Count == 0)
+        {
+            normalizedHandles.Add(fallbackHandle);
+        }
+
+        return normalizedHandles;
+    }
+
+    private static IReadOnlyList<IntPtr> EnumerateDialogRedrawHandles(IntPtr dialogHandle)
+    {
+        var handles = new List<IntPtr> { dialogHandle };
+        NativeMethods.EnumChildWindows(
+            dialogHandle,
+            (childHandle, _) =>
+            {
+                if (childHandle != IntPtr.Zero)
+                {
+                    handles.Add(childHandle);
+                }
+
+                return true;
+            },
+            IntPtr.Zero);
+
+        return handles;
+    }
+
+    private static void SetDialogRedrawEnabled(IntPtr dialogHandle, bool enabled)
+    {
+        _ = NativeMethods.SendMessage(
+            dialogHandle,
+            NativeMethods.WM_SETREDRAW,
+            enabled ? new UIntPtr(1) : UIntPtr.Zero,
+            IntPtr.Zero);
+    }
+
+    private static void InvalidateDialogWindow(IntPtr dialogHandle)
+    {
+        _ = NativeMethods.RedrawWindow(
+            dialogHandle,
+            IntPtr.Zero,
+            IntPtr.Zero,
+            NativeMethods.RDW_INVALIDATE | NativeMethods.RDW_ALLCHILDREN | NativeMethods.RDW_UPDATENOW);
     }
 
     private static async Task<bool> ConfirmFolderNavigationAsync(
