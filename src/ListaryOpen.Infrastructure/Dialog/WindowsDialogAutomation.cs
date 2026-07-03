@@ -16,6 +16,8 @@ public sealed class WindowsDialogAutomation : IDialogAutomation
     private static readonly TimeSpan NavigationConfirmationPollInterval = TimeSpan.FromMilliseconds(100);
     private const string FileNameAutomationId = "1148";
     private const string CommitButtonAutomationId = "1";
+    private const string StandardDialogClassName = "#32770";
+    private const string FirefoxDialogClassName = "MozillaDialogClass";
 
     private AutomationElement? _activeDialog;
     private IntPtr _activeDialogHandle;
@@ -31,18 +33,22 @@ public sealed class WindowsDialogAutomation : IDialogAutomation
             return DialogProbeResult.Unsupported("No foreground window.");
         }
 
-        var className = GetClassName(handle);
-        if (!string.Equals(className, "#32770", StringComparison.Ordinal))
+        var dialogHandle = ResolveActiveDialogHandle(
+            handle,
+            GetClassName,
+            GetProcessName,
+            EnumerateVisibleTopLevelWindows);
+        if (dialogHandle == IntPtr.Zero)
         {
             return DialogProbeResult.Unsupported("The active window is not a standard dialog.");
         }
 
-        NativeMethods.GetWindowThreadProcessId(handle, out var processId);
+        NativeMethods.GetWindowThreadProcessId(dialogHandle, out var processId);
         try
         {
             using var process = Process.GetProcessById((int)processId);
 
-            var activeDialog = AutomationElement.FromHandle(handle);
+            var activeDialog = AutomationElement.FromHandle(dialogHandle);
             if (activeDialog is null)
             {
                 return DialogProbeResult.Unsupported("Dialog automation tree is unavailable.");
@@ -50,7 +56,7 @@ public sealed class WindowsDialogAutomation : IDialogAutomation
 
             _ = activeDialog.Current.ControlType;
             _activeDialog = activeDialog;
-            _activeDialogHandle = handle;
+            _activeDialogHandle = dialogHandle;
         }
         catch (ArgumentException)
         {
@@ -79,13 +85,7 @@ public sealed class WindowsDialogAutomation : IDialogAutomation
 
         cancellationToken.ThrowIfCancellationRequested();
 
-        if (!TryFindFirst(
-                activeDialog,
-                TreeScope.Descendants,
-                new AndCondition(
-                    new PropertyCondition(AutomationElement.AutomationIdProperty, FileNameAutomationId),
-                    new PropertyCondition(AutomationElement.ControlTypeProperty, ControlType.Edit)),
-                out var fileNameEdit))
+        if (!TryFindFileNameEdit(activeDialog, out var fileNameEdit))
         {
             return false;
         }
@@ -106,13 +106,7 @@ public sealed class WindowsDialogAutomation : IDialogAutomation
 
         cancellationToken.ThrowIfCancellationRequested();
 
-        if (!TryFindFirst(
-                activeDialog,
-                TreeScope.Descendants,
-                new AndCondition(
-                    new PropertyCondition(AutomationElement.AutomationIdProperty, CommitButtonAutomationId),
-                    new PropertyCondition(AutomationElement.ControlTypeProperty, ControlType.Button)),
-                out var commitButton))
+        if (!TryFindCommitButton(activeDialog, out var commitButton))
         {
             return false;
         }
@@ -206,6 +200,119 @@ public sealed class WindowsDialogAutomation : IDialogAutomation
         return length <= 0 ? string.Empty : new string(buffer, 0, length);
     }
 
+    private static string? GetProcessName(IntPtr handle)
+    {
+        NativeMethods.GetWindowThreadProcessId(handle, out var processId);
+        if (processId == 0)
+        {
+            return null;
+        }
+
+        try
+        {
+            using var process = Process.GetProcessById((int)processId);
+            return process.ProcessName;
+        }
+        catch (Exception exception) when (exception is ArgumentException or InvalidOperationException or Win32Exception)
+        {
+            return null;
+        }
+    }
+
+    private static IReadOnlyList<IntPtr> EnumerateVisibleTopLevelWindows()
+    {
+        var windows = new List<IntPtr>();
+        NativeMethods.EnumWindows(
+            (handle, _) =>
+            {
+                if (NativeMethods.IsWindowVisible(handle))
+                {
+                    windows.Add(handle);
+                }
+
+                return true;
+            },
+            IntPtr.Zero);
+
+        return windows;
+    }
+
+    internal static IntPtr ResolveActiveDialogHandle(
+        IntPtr foregroundHandle,
+        Func<IntPtr, string> classNameProvider,
+        Func<IntPtr, string?> processNameProvider,
+        Func<IEnumerable<IntPtr>> topLevelWindowProvider)
+    {
+        ArgumentNullException.ThrowIfNull(classNameProvider);
+        ArgumentNullException.ThrowIfNull(processNameProvider);
+        ArgumentNullException.ThrowIfNull(topLevelWindowProvider);
+
+        if (foregroundHandle == IntPtr.Zero)
+        {
+            return IntPtr.Zero;
+        }
+
+        if (IsSupportedFileDialogClass(classNameProvider(foregroundHandle)))
+        {
+            return foregroundHandle;
+        }
+
+        var foregroundProcessName = processNameProvider(foregroundHandle);
+        var browserDialogFallback = IntPtr.Zero;
+        foreach (var candidateHandle in topLevelWindowProvider())
+        {
+            if (candidateHandle == IntPtr.Zero || candidateHandle == foregroundHandle)
+            {
+                continue;
+            }
+
+            if (!IsSupportedFileDialogClass(classNameProvider(candidateHandle)))
+            {
+                continue;
+            }
+
+            var candidateProcessName = processNameProvider(candidateHandle);
+            if (ProcessNamesEqual(candidateProcessName, foregroundProcessName))
+            {
+                return candidateHandle;
+            }
+
+            if (browserDialogFallback == IntPtr.Zero && IsKnownBrowserProcessName(candidateProcessName))
+            {
+                browserDialogFallback = candidateHandle;
+            }
+        }
+
+        return IsListaryProcessName(foregroundProcessName)
+            ? browserDialogFallback
+            : IntPtr.Zero;
+    }
+
+    internal static bool IsSupportedFileDialogClass(string? className)
+    {
+        return string.Equals(className, StandardDialogClassName, StringComparison.Ordinal) ||
+            string.Equals(className, FirefoxDialogClassName, StringComparison.Ordinal);
+    }
+
+    internal static bool IsKnownBrowserProcessName(string? processName)
+    {
+        return string.Equals(processName, "firefox", StringComparison.OrdinalIgnoreCase) ||
+            string.Equals(processName, "chrome", StringComparison.OrdinalIgnoreCase) ||
+            string.Equals(processName, "msedge", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static bool IsListaryProcessName(string? processName)
+    {
+        return string.Equals(processName, "ListaryOpen.App", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static bool ProcessNamesEqual(string? left, string? right)
+    {
+        return !string.IsNullOrWhiteSpace(left) &&
+            !string.IsNullOrWhiteSpace(right) &&
+            string.Equals(left, right, StringComparison.OrdinalIgnoreCase);
+    }
+
     private static bool IsPermissionException(Exception exception)
     {
         return exception is UnauthorizedAccessException
@@ -232,6 +339,130 @@ public sealed class WindowsDialogAutomation : IDialogAutomation
         }
     }
 
+    private static bool TryFindFileNameEdit(
+        AutomationElement activeDialog,
+        [NotNullWhen(true)] out AutomationElement? fileNameEdit)
+    {
+        if (TryFindFirst(
+                activeDialog,
+                TreeScope.Descendants,
+                new AndCondition(
+                    new PropertyCondition(AutomationElement.AutomationIdProperty, FileNameAutomationId),
+                    new PropertyCondition(AutomationElement.ControlTypeProperty, ControlType.Edit)),
+                out fileNameEdit))
+        {
+            return true;
+        }
+
+        return TryFindFirstValueElement(
+            activeDialog,
+            new PropertyCondition(AutomationElement.ControlTypeProperty, ControlType.Edit),
+            out fileNameEdit);
+    }
+
+    private static bool TryFindCommitButton(
+        AutomationElement activeDialog,
+        [NotNullWhen(true)] out AutomationElement? commitButton)
+    {
+        if (TryFindFirst(
+                activeDialog,
+                TreeScope.Descendants,
+                new AndCondition(
+                    new PropertyCondition(AutomationElement.AutomationIdProperty, CommitButtonAutomationId),
+                    new PropertyCondition(AutomationElement.ControlTypeProperty, ControlType.Button)),
+                out commitButton))
+        {
+            return true;
+        }
+
+        if (!TryFindAll(
+                activeDialog,
+                TreeScope.Descendants,
+                new PropertyCondition(AutomationElement.ControlTypeProperty, ControlType.Button),
+                out var buttons))
+        {
+            return false;
+        }
+
+        foreach (AutomationElement button in buttons)
+        {
+            if (IsCommitButtonName(GetAutomationName(button)) &&
+                TryGetInvokePattern(button, out _))
+            {
+                commitButton = button;
+                return true;
+            }
+        }
+
+        commitButton = null;
+        return false;
+    }
+
+    private static bool TryFindFirstValueElement(
+        AutomationElement root,
+        Condition condition,
+        [NotNullWhen(true)] out AutomationElement? result)
+    {
+        if (!TryFindAll(root, TreeScope.Descendants, condition, out var elements))
+        {
+            result = null;
+            return false;
+        }
+
+        foreach (AutomationElement element in elements)
+        {
+            if (TryGetValuePattern(element, out var valuePattern) && !IsReadOnly(valuePattern))
+            {
+                result = element;
+                return true;
+            }
+        }
+
+        result = null;
+        return false;
+    }
+
+    private static bool TryFindAll(
+        AutomationElement element,
+        TreeScope scope,
+        Condition condition,
+        [NotNullWhen(true)] out AutomationElementCollection? results)
+    {
+        try
+        {
+            results = element.FindAll(scope, condition);
+            return results.Count > 0;
+        }
+        catch (Exception exception) when (IsExpectedAutomationException(exception))
+        {
+            results = null;
+            return false;
+        }
+    }
+
+    private static string GetAutomationName(AutomationElement element)
+    {
+        try
+        {
+            return element.Current.Name ?? string.Empty;
+        }
+        catch (Exception exception) when (IsExpectedAutomationException(exception))
+        {
+            return string.Empty;
+        }
+    }
+
+    private static bool IsCommitButtonName(string name)
+    {
+        return name.Contains("Open", StringComparison.OrdinalIgnoreCase) ||
+            name.Contains("Choose", StringComparison.OrdinalIgnoreCase) ||
+            name.Contains("Select", StringComparison.OrdinalIgnoreCase) ||
+            name.Contains("Save", StringComparison.OrdinalIgnoreCase) ||
+            name.Contains("打开", StringComparison.OrdinalIgnoreCase) ||
+            name.Contains("选择", StringComparison.OrdinalIgnoreCase) ||
+            name.Contains("保存", StringComparison.OrdinalIgnoreCase);
+    }
+
     private static bool TryGetValuePattern(AutomationElement element, [NotNullWhen(true)] out ValuePattern? valuePattern)
     {
         try
@@ -248,6 +479,18 @@ public sealed class WindowsDialogAutomation : IDialogAutomation
 
         valuePattern = null;
         return false;
+    }
+
+    private static bool IsReadOnly(ValuePattern valuePattern)
+    {
+        try
+        {
+            return valuePattern.Current.IsReadOnly;
+        }
+        catch (Exception exception) when (IsExpectedAutomationException(exception))
+        {
+            return true;
+        }
     }
 
     private static bool TryGetInvokePattern(AutomationElement element, [NotNullWhen(true)] out InvokePattern? invokePattern)
