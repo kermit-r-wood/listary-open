@@ -48,6 +48,31 @@ public sealed class AppDialogHotkeyTests
     }
 
     [Fact]
+    public void ObserveQuickSwitchFolderCandidatesFallsBackToRememberedExplorerFolder()
+    {
+        var rememberedFolder = Directory.CreateTempSubdirectory("listary-open-remembered-");
+
+        try
+        {
+            var tracker = new ExplorerTracker(
+                () => IntPtr.Zero,
+                new RecordingExplorerShellWindowsProvider(Array.Empty<ExplorerShellWindow>()));
+            tracker.ObserveFolderForTests(rememberedFolder.FullName);
+
+            var candidate = Assert.Single(ListaryOpen.App.App.ObserveQuickSwitchFolderCandidates(tracker));
+
+            Assert.Equal(rememberedFolder.FullName, candidate.FolderPath);
+            Assert.Equal("Explorer", candidate.SourceName);
+            Assert.Equal(IntPtr.Zero, candidate.WindowHandle);
+            Assert.False(candidate.IsForeground);
+        }
+        finally
+        {
+            rememberedFolder.Delete(recursive: true);
+        }
+    }
+
+    [Fact]
     public void ObserveAndGetExistingTrackedFolderRefreshesExplorerTrackerBeforeReadingLastFolder()
     {
         var staleFolder = Directory.CreateTempSubdirectory("listary-open-stale-");

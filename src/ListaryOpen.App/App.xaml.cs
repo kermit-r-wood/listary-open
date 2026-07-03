@@ -425,7 +425,23 @@ public partial class App : Application
         }
 
         explorerTracker.ObserveForegroundExplorerFolder();
-        return explorerTracker.GetFolderCandidates();
+        var candidates = explorerTracker.GetFolderCandidates();
+        if (candidates.Count > 0)
+        {
+            return candidates;
+        }
+
+        var lastFolder = explorerTracker.LastFolder;
+        return !string.IsNullOrWhiteSpace(lastFolder) && Directory.Exists(lastFolder)
+            ? new[]
+            {
+                new QuickSwitchFolderCandidate(
+                    lastFolder,
+                    "Explorer",
+                    IntPtr.Zero,
+                    false)
+            }
+            : Array.Empty<QuickSwitchFolderCandidate>();
     }
 
     internal static string? ObserveAndGetExistingTrackedFolder(ExplorerTracker? explorerTracker)
