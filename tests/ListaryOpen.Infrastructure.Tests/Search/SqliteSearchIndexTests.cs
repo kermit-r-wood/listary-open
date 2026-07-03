@@ -569,6 +569,43 @@ public sealed class SqliteSearchIndexTests
     }
 
     [Fact]
+    public async Task SearchIncludesRecentCappedUsageMatchAfterManyStaleHigherOpenCountMatches()
+    {
+        var dbPath = CreateTempDbPath();
+        var now = DateTimeOffset.UtcNow;
+        var staleLastUsedAt = now.AddDays(-90);
+        var target = FileRecord.Create("C:\\Docs\\ZRecentInvoiceUsageTarget.xlsx", false, 10, now);
+
+        try
+        {
+            await using (var index = await SqliteSearchIndex.OpenAsync(dbPath, CancellationToken.None))
+            {
+                var staleRecords = Enumerable
+                    .Range(0, 250)
+                    .Select(i => FileRecord.Create($"C:\\Docs\\AInvoiceStaleUsage-{i:D4}.txt", false, 1, now))
+                    .ToArray();
+
+                await index.UpsertManyAsync(staleRecords, CancellationToken.None);
+                await index.UpsertAsync(target, CancellationToken.None);
+
+                var usageRows = staleRecords
+                    .Select(record => (record.FullPath, OpenCount: 100, LastUsedAt: staleLastUsedAt))
+                    .Append((target.FullPath, OpenCount: 10, LastUsedAt: now));
+                await InsertUsageRowsAsync(dbPath, usageRows);
+
+                var results = await index.SearchAsync(new SearchQuery("invoice", SearchMode.FilesAndFolders, limit: 10), CancellationToken.None);
+
+                Assert.Equal(target.Name, results[0].Record.Name);
+                Assert.Equal("usage", results[0].MatchReason);
+            }
+        }
+        finally
+        {
+            DeleteIfExists(dbPath);
+        }
+    }
+
+    [Fact]
     public async Task SearchLargeIndexReturnsTargetWithinPerformanceBudget()
     {
         var dbPath = CreateTempDbPath();

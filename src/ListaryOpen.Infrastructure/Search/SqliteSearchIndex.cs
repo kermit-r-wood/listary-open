@@ -457,7 +457,7 @@ public sealed class SqliteSearchIndex : ISearchIndex, IAsyncDisposable
                 or files.search_text like $ordered escape '\'
             ){directoryFilter}
             order by
-                usage.open_count desc,
+                min(usage.open_count * 5, 50) desc,
                 usage.last_used_at desc,
                 files.name,
                 files.full_path
