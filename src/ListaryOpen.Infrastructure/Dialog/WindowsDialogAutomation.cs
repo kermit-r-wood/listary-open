@@ -343,20 +343,10 @@ public sealed class WindowsDialogAutomation : IDialogAutomation
         AutomationElement activeDialog,
         [NotNullWhen(true)] out AutomationElement? fileNameEdit)
     {
-        if (TryFindFirst(
-                activeDialog,
-                TreeScope.Descendants,
-                new AndCondition(
-                    new PropertyCondition(AutomationElement.AutomationIdProperty, FileNameAutomationId),
-                    new PropertyCondition(AutomationElement.ControlTypeProperty, ControlType.Edit)),
-                out fileNameEdit))
-        {
-            return true;
-        }
-
         return TryFindFirstValueElement(
             activeDialog,
-            new PropertyCondition(AutomationElement.ControlTypeProperty, ControlType.Edit),
+            Condition.TrueCondition,
+            IsFileNameElement,
             out fileNameEdit);
     }
 
@@ -364,45 +354,21 @@ public sealed class WindowsDialogAutomation : IDialogAutomation
         AutomationElement activeDialog,
         [NotNullWhen(true)] out AutomationElement? commitButton)
     {
-        if (TryFindFirst(
-                activeDialog,
-                TreeScope.Descendants,
-                new AndCondition(
-                    new PropertyCondition(AutomationElement.AutomationIdProperty, CommitButtonAutomationId),
-                    new PropertyCondition(AutomationElement.ControlTypeProperty, ControlType.Button)),
-                out commitButton))
-        {
-            return true;
-        }
-
-        if (!TryFindAll(
-                activeDialog,
-                TreeScope.Descendants,
-                new PropertyCondition(AutomationElement.ControlTypeProperty, ControlType.Button),
-                out var buttons))
-        {
-            return false;
-        }
-
-        foreach (AutomationElement button in buttons)
-        {
-            if (IsCommitButtonName(GetAutomationName(button)) &&
-                TryGetInvokePattern(button, out _))
-            {
-                commitButton = button;
-                return true;
-            }
-        }
-
-        commitButton = null;
-        return false;
+        return TryFindFirstInvokeElement(
+            activeDialog,
+            Condition.TrueCondition,
+            IsCommitButtonElement,
+            out commitButton);
     }
 
     private static bool TryFindFirstValueElement(
         AutomationElement root,
         Condition condition,
+        Func<AutomationElement, bool> candidatePredicate,
         [NotNullWhen(true)] out AutomationElement? result)
     {
+        ArgumentNullException.ThrowIfNull(candidatePredicate);
+
         if (!TryFindAll(root, TreeScope.Descendants, condition, out var elements))
         {
             result = null;
@@ -411,7 +377,36 @@ public sealed class WindowsDialogAutomation : IDialogAutomation
 
         foreach (AutomationElement element in elements)
         {
-            if (TryGetValuePattern(element, out var valuePattern) && !IsReadOnly(valuePattern))
+            if (candidatePredicate(element) &&
+                TryGetValuePattern(element, out var valuePattern) &&
+                !IsReadOnly(valuePattern))
+            {
+                result = element;
+                return true;
+            }
+        }
+
+        result = null;
+        return false;
+    }
+
+    private static bool TryFindFirstInvokeElement(
+        AutomationElement root,
+        Condition condition,
+        Func<AutomationElement, bool> candidatePredicate,
+        [NotNullWhen(true)] out AutomationElement? result)
+    {
+        ArgumentNullException.ThrowIfNull(candidatePredicate);
+
+        if (!TryFindAll(root, TreeScope.Descendants, condition, out var elements))
+        {
+            result = null;
+            return false;
+        }
+
+        foreach (AutomationElement element in elements)
+        {
+            if (candidatePredicate(element) && TryGetInvokePattern(element, out _))
             {
                 result = element;
                 return true;
@@ -450,6 +445,102 @@ public sealed class WindowsDialogAutomation : IDialogAutomation
         {
             return string.Empty;
         }
+    }
+
+    private static bool IsFileNameElement(AutomationElement element)
+    {
+        try
+        {
+            return IsFileNameControlCandidate(
+                element.Current.AutomationId,
+                element.Current.Name,
+                element.Current.ClassName,
+                element.Current.ControlType.ProgrammaticName);
+        }
+        catch (Exception exception) when (IsExpectedAutomationException(exception))
+        {
+            return false;
+        }
+    }
+
+    private static bool IsCommitButtonElement(AutomationElement element)
+    {
+        try
+        {
+            return IsCommitButtonCandidate(
+                element.Current.AutomationId,
+                element.Current.Name,
+                element.Current.ClassName,
+                element.Current.ControlType.ProgrammaticName);
+        }
+        catch (Exception exception) when (IsExpectedAutomationException(exception))
+        {
+            return false;
+        }
+    }
+
+    internal static bool IsFileNameControlCandidate(
+        string? automationId,
+        string? name,
+        string? className,
+        string? controlTypeProgrammaticName)
+    {
+        if (string.Equals(automationId, "System.ItemNameDisplay", StringComparison.OrdinalIgnoreCase))
+        {
+            return false;
+        }
+
+        if (string.Equals(automationId, FileNameAutomationId, StringComparison.Ordinal))
+        {
+            return IsTextEntryClassOrType(className, controlTypeProgrammaticName);
+        }
+
+        if (!string.IsNullOrWhiteSpace(automationId) &&
+            automationId.Contains("FileName", StringComparison.OrdinalIgnoreCase))
+        {
+            return true;
+        }
+
+        return ContainsFileNameLabel(name) && IsTextEntryClassOrType(className, controlTypeProgrammaticName);
+    }
+
+    internal static bool IsCommitButtonCandidate(
+        string? automationId,
+        string? name,
+        string? className,
+        string? controlTypeProgrammaticName)
+    {
+        if (string.Equals(automationId, CommitButtonAutomationId, StringComparison.Ordinal) &&
+            IsButtonClassOrType(className, controlTypeProgrammaticName))
+        {
+            return true;
+        }
+
+        return IsButtonClassOrType(className, controlTypeProgrammaticName) && IsCommitButtonName(name ?? string.Empty);
+    }
+
+    private static bool IsTextEntryClassOrType(string? className, string? controlTypeProgrammaticName)
+    {
+        return string.Equals(className, "Edit", StringComparison.OrdinalIgnoreCase) ||
+            string.Equals(className, "ComboBox", StringComparison.OrdinalIgnoreCase) ||
+            string.Equals(className, "ComboBoxEx32", StringComparison.OrdinalIgnoreCase) ||
+            string.Equals(controlTypeProgrammaticName, "ControlType.Edit", StringComparison.Ordinal) ||
+            string.Equals(controlTypeProgrammaticName, "ControlType.ComboBox", StringComparison.Ordinal) ||
+            string.Equals(controlTypeProgrammaticName, "ControlType.Pane", StringComparison.Ordinal);
+    }
+
+    private static bool IsButtonClassOrType(string? className, string? controlTypeProgrammaticName)
+    {
+        return string.Equals(className, "Button", StringComparison.OrdinalIgnoreCase) ||
+            string.Equals(controlTypeProgrammaticName, "ControlType.Button", StringComparison.Ordinal) ||
+            string.Equals(controlTypeProgrammaticName, "ControlType.Pane", StringComparison.Ordinal);
+    }
+
+    private static bool ContainsFileNameLabel(string? name)
+    {
+        return !string.IsNullOrWhiteSpace(name) &&
+            (name.Contains("File name", StringComparison.OrdinalIgnoreCase) ||
+                name.Contains("文件名", StringComparison.OrdinalIgnoreCase));
     }
 
     private static bool IsCommitButtonName(string name)

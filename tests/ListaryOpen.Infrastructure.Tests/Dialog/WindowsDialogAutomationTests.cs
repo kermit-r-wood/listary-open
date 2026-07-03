@@ -78,4 +78,34 @@ public sealed class WindowsDialogAutomationTests
     {
         Assert.True(WindowsDialogAutomation.IsKnownBrowserProcessName(processName));
     }
+
+    [Fact]
+    public void IsFileNameControlCandidateAcceptsFirefoxUploadEditPane()
+    {
+        Assert.True(WindowsDialogAutomation.IsFileNameControlCandidate(
+            "1148",
+            string.Empty,
+            "Edit",
+            "ControlType.Pane"));
+    }
+
+    [Fact]
+    public void IsFileNameControlCandidateRejectsShellItemNameEdits()
+    {
+        Assert.False(WindowsDialogAutomation.IsFileNameControlCandidate(
+            "System.ItemNameDisplay",
+            "Name",
+            "UIProperty",
+            "ControlType.Edit"));
+    }
+
+    [Fact]
+    public void IsCommitButtonCandidateAcceptsFirefoxUploadOpenButtonPane()
+    {
+        Assert.True(WindowsDialogAutomation.IsCommitButtonCandidate(
+            "1",
+            "Open",
+            "Button",
+            "ControlType.Pane"));
+    }
 }
