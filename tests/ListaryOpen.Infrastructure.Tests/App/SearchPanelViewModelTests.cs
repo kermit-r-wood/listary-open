@@ -136,7 +136,7 @@ public sealed class SearchPanelViewModelTests
         };
         viewModel.Results.Add(result);
 
-        await viewModel.ActivateFolderSearchAsync(null);
+        await viewModel.ActivateFolderSearchAsync((string?)null);
         viewModel.Results.Add(result);
         viewModel.SelectedResult = result;
 
@@ -162,7 +162,7 @@ public sealed class SearchPanelViewModelTests
             new RecordingSearchIndex(Array.Empty<SearchResult>()),
             new RecordingActivationService(),
             dialogActivation.ActivateAsync);
-        await viewModel.ActivateFolderSearchAsync(null);
+        await viewModel.ActivateFolderSearchAsync((string?)null);
         viewModel.Results.Add(result);
         viewModel.SelectedResult = result;
 
@@ -183,7 +183,7 @@ public sealed class SearchPanelViewModelTests
             new RecordingSearchIndex(Array.Empty<SearchResult>()),
             new RecordingActivationService(),
             dialogActivation.ActivateAsync);
-        await viewModel.ActivateFolderSearchAsync(null);
+        await viewModel.ActivateFolderSearchAsync((string?)null);
         viewModel.Results.Add(result);
         viewModel.SelectedResult = result;
 
@@ -205,7 +205,7 @@ public sealed class SearchPanelViewModelTests
             new RecordingSearchIndex(Array.Empty<SearchResult>()),
             activation,
             dialogActivation.ActivateAsync);
-        await viewModel.ActivateFolderSearchAsync(null);
+        await viewModel.ActivateFolderSearchAsync((string?)null);
         viewModel.Results.Add(result);
         viewModel.SelectedResult = result;
 
@@ -480,6 +480,25 @@ public sealed class SearchPanelViewModelTests
             new[] { firstPinnedFolder, secondPinnedFolder, indexedFolder.FullPath },
             viewModel.Results.Select(result => result.Record.FullPath));
         Assert.Equal(firstPinnedFolder, viewModel.SelectedResult?.Record.FullPath);
+    }
+
+    [Fact]
+    public void FolderSearchQuickSwitchApisUseExplicitCandidateListOverloads()
+    {
+        Assert.Contains(
+            typeof(SearchPanelViewModel).GetMethods(),
+            method =>
+                method.Name == nameof(SearchPanelViewModel.ActivateFolderSearchAsync) &&
+                !method.IsGenericMethod &&
+                method.GetParameters() is [{ ParameterType: var parameterType }] &&
+                parameterType == typeof(IReadOnlyList<QuickSwitchFolderCandidate>));
+        Assert.Contains(
+            typeof(SearchPanel).GetMethods(),
+            method =>
+                method.Name == nameof(SearchPanel.ActivateFolderSearch) &&
+                !method.IsGenericMethod &&
+                method.GetParameters() is [{ ParameterType: var parameterType }] &&
+                parameterType == typeof(IReadOnlyList<QuickSwitchFolderCandidate>));
     }
 
     [Fact]

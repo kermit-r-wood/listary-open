@@ -43,8 +43,7 @@ public partial class SearchPanel : Window
         ShowAndFocusQuery();
     }
 
-    public void ActivateFolderSearch<TCandidates>(TCandidates candidates)
-        where TCandidates : IReadOnlyList<QuickSwitchFolderCandidate>
+    public void ActivateFolderSearch(IReadOnlyList<QuickSwitchFolderCandidate> candidates)
     {
         _ = ViewModel.ActivateFolderSearchAsync(candidates);
         ShowAndFocusQuery();
