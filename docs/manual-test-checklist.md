@@ -3,10 +3,11 @@
 Run date: 2026-07-03
 
 - [x] Run automated tests.
-  - PASS: `dotnet test ListaryOpen.sln` passed 224/224 tests.
+  - PASS: `dotnet test ListaryOpen.sln` passed 242/242 tests.
   - PASS: `dotnet build ListaryOpen.sln --no-restore` completed with 0 warnings and 0 errors.
   - PASS: SQLite performance regressions are covered by large-index, bounded-candidate, usage-window, combined-ranking-window, folder-only, and fuzzy-prefilter tests.
   - PASS: Quick Switch multi-Explorer candidate ordering, remembered-folder fallback, app routing helper, and folder-mode pinning are covered by unit tests.
+  - PASS: Browser upload file picker dialog resolution for Firefox/Chrome process cases is covered by `WindowsDialogAutomationTests`.
 - [x] Start ListaryOpen.
   - PASS: `src/ListaryOpen.App/bin/Debug/net8.0-windows/ListaryOpen.App.exe` launched and remained alive during a 12 second smoke run.
   - PASS: `%LocalAppData%\ListaryOpen\index.db` existed after startup.
@@ -25,7 +26,9 @@ Run date: 2026-07-03
 - [x] Start a non-elevated Win32 or .NET application with an Open/Save dialog.
   - PARTIAL PASS from earlier smoke: a non-elevated .NET `SaveFileDialog` opened a standard `#32770` file dialog.
 - [ ] Press Ctrl+G and verify folder jump.
-  - NOT VERIFIED manually in this final smoke run: `Ctrl+G` dialog-mode routing and folder jump paths are covered by app/search/dialog tests.
+  - NOT VERIFIED manually in this final smoke run: direct `Ctrl+G` Quick Switch jump routing and dialog jump paths are covered by app/search/dialog tests.
+- [ ] Open Firefox and Chrome upload file pickers and press Ctrl+G.
+  - NOT VERIFIED manually in this final smoke run: browser upload file picker detection is covered by automation helper tests, but this run did not complete an interactive Firefox/Chrome upload picker session.
 - [ ] Open multiple Explorer windows and press Ctrl+G over a standard dialog.
   - NOT VERIFIED manually in this final smoke run: multiple Explorer candidates are covered through `ExplorerTracker`, app routing, and `SearchPanelViewModel` tests, but this run did not complete an end-to-end desktop multi-window Quick Switch session.
 - [ ] Start an administrator-elevated app with an Open dialog.
