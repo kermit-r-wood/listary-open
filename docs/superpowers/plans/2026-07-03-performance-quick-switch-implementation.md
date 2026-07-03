@@ -19,7 +19,7 @@
 - Modify: `src/ListaryOpen.App/App.xaml.cs`
   - Route dialog hotkey to multiple candidates.
 - Modify: `src/ListaryOpen.App/SearchPanel.xaml.cs`
-  - Add `ActivateFolderSearch(IReadOnlyList<QuickSwitchFolderCandidate>)`.
+  - Add `ActivateQuickSwitchFolderSearch(IReadOnlyList<QuickSwitchFolderCandidate>)`.
 - Modify: `src/ListaryOpen.App/ViewModels/SearchPanelViewModel.cs`
   - Pin multiple Quick Switch folder results above indexed folder results.
 - Modify: `src/ListaryOpen.Infrastructure/Search/SqliteSearchIndex.cs`
@@ -217,7 +217,7 @@ Add test:
 
 ```csharp
 [Fact]
-public async Task ActivateFolderSearchAsyncPinsMultipleQuickSwitchCandidatesAboveIndexResults()
+public async Task ActivateQuickSwitchFolderSearchAsyncPinsMultipleQuickSwitchCandidatesAboveIndexResults()
 {
     var first = Directory.CreateTempSubdirectory("listary-open-first-");
     var second = Directory.CreateTempSubdirectory("listary-open-second-");
@@ -233,7 +233,7 @@ public async Task ActivateFolderSearchAsyncPinsMultipleQuickSwitchCandidatesAbov
         await index.WaitForSearchCountAsync(1);
         index.ClearObservedQueries();
 
-        await viewModel.ActivateFolderSearchAsync(new[]
+        await viewModel.ActivateQuickSwitchFolderSearchAsync(new[]
         {
             new QuickSwitchFolderCandidate(first.FullName, "Explorer", new IntPtr(1), isForeground: true),
             new QuickSwitchFolderCandidate(second.FullName, "Explorer", new IntPtr(2), isForeground: false)
@@ -260,10 +260,10 @@ Add `using ListaryOpen.Infrastructure.Windows;` to the test file.
 Run:
 
 ```powershell
-dotnet test tests\ListaryOpen.Infrastructure.Tests\ListaryOpen.Infrastructure.Tests.csproj --filter FullyQualifiedName~ActivateFolderSearchAsyncPinsMultipleQuickSwitchCandidatesAboveIndexResults --no-restore
+dotnet test tests\ListaryOpen.Infrastructure.Tests\ListaryOpen.Infrastructure.Tests.csproj --filter FullyQualifiedName~ActivateQuickSwitchFolderSearchAsyncPinsMultipleQuickSwitchCandidatesAboveIndexResults --no-restore
 ```
 
-Expected: compile failure because the overload does not exist.
+Expected: compile failure because the quick-switch method does not exist.
 
 - [ ] **Step 3: Implement multi-candidate folder mode**
 
@@ -275,22 +275,22 @@ In `SearchPanelViewModel`:
 private IReadOnlyList<QuickSwitchFolderCandidate> _quickSwitchCandidates = Array.Empty<QuickSwitchFolderCandidate>();
 ```
 
-- Keep existing single-folder overload by converting to one candidate:
+- Keep existing single-folder method by converting to one candidate internally:
 
 ```csharp
 public Task ActivateFolderSearchAsync(string? trackedFolder)
 {
     var normalized = TryNormalizeExistingFolder(trackedFolder);
-    return ActivateFolderSearchAsync(normalized is null
+    return ActivateQuickSwitchFolderSearchAsync(normalized is null
         ? Array.Empty<QuickSwitchFolderCandidate>()
         : new[] { new QuickSwitchFolderCandidate(normalized, "Explorer", IntPtr.Zero, true) });
 }
 ```
 
-- Add overload:
+- Add separate quick-switch method:
 
 ```csharp
-public Task ActivateFolderSearchAsync(IReadOnlyList<QuickSwitchFolderCandidate> candidates)
+public Task ActivateQuickSwitchFolderSearchAsync(IReadOnlyList<QuickSwitchFolderCandidate> candidates)
 {
     ArgumentNullException.ThrowIfNull(candidates);
 
@@ -305,14 +305,14 @@ public Task ActivateFolderSearchAsync(IReadOnlyList<QuickSwitchFolderCandidate> 
 - Deduplicate pinned candidates by `PathKey`.
 - Preserve first candidate selection through existing `UpdateSelectedResultAfterRefresh`.
 
-- [ ] **Step 4: Add SearchPanel window overload**
+- [ ] **Step 4: Add SearchPanel window quick-switch method**
 
 In `SearchPanel.xaml.cs` add:
 
 ```csharp
-public void ActivateFolderSearch(IReadOnlyList<QuickSwitchFolderCandidate> candidates)
+public void ActivateQuickSwitchFolderSearch(IReadOnlyList<QuickSwitchFolderCandidate> candidates)
 {
-    _ = ViewModel.ActivateFolderSearchAsync(candidates);
+    _ = ViewModel.ActivateQuickSwitchFolderSearchAsync(candidates);
     ShowAndFocusQuery();
 }
 ```
@@ -396,7 +396,7 @@ In `App.xaml.cs`:
 private void HandleDialogHotkey()
 {
     var candidates = ObserveQuickSwitchFolderCandidates(_explorerTracker);
-    _searchPanel?.ActivateFolderSearch(candidates);
+    _searchPanel?.ActivateQuickSwitchFolderSearch(candidates);
 }
 
 internal static IReadOnlyList<QuickSwitchFolderCandidate> ObserveQuickSwitchFolderCandidates(ExplorerTracker? explorerTracker)
@@ -739,4 +739,4 @@ Expected: tests pass, build has 0 warnings/errors, working tree is clean.
 
 - Spec coverage: Tasks 1-3 cover Quick Switch multi-window candidates. Task 4 covers SQLite candidate/usage performance. Task 5 covers complete validation and manual checklist.
 - Completion-marker scan: no unfinished markers are intentionally left.
-- Type consistency: `QuickSwitchFolderCandidate` and `IQuickSwitchWindowProvider` are defined before all callers. `SearchPanelViewModel` keeps the single-folder overload for existing tests and adds a candidate-list overload for new routing.
+- Type consistency: `QuickSwitchFolderCandidate` and `IQuickSwitchWindowProvider` are defined before all callers. `SearchPanelViewModel` keeps the single-folder method for existing tests and adds a separately named candidate-list method for new routing so `null` calls remain source-compatible.

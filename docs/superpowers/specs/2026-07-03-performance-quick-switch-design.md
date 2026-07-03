@@ -92,8 +92,8 @@ The first production provider is Explorer-backed:
 
 `SearchPanelViewModel` changes:
 
-- `ActivateFolderSearchAsync(string? trackedFolder)` remains as a compatibility overload.
-- Add `ActivateFolderSearchAsync(IReadOnlyList<QuickSwitchFolderCandidate> candidates)`.
+- `ActivateFolderSearchAsync(string? trackedFolder)` remains the single-folder compatibility entry point. Bare `ActivateFolderSearchAsync(null)` must keep compiling.
+- Add `ActivateQuickSwitchFolderSearchAsync(IReadOnlyList<QuickSwitchFolderCandidate> candidates)` for multiple candidates. A separate method name avoids C# null overload ambiguity.
 - It creates pinned folder search results for every existing candidate.
 - It deduplicates pinned candidates against SQLite results.
 - It keeps the first candidate selected by default.
