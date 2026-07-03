@@ -67,8 +67,10 @@ public sealed class ExplorerTracker : IQuickSwitchWindowProvider
                 candidates.Add(candidate);
             }
 
+            var rememberedFolderPath = NormalizeExistingFolderPath(_lastFolder);
             return candidates
                 .OrderByDescending(candidate => candidate.IsForeground)
+                .ThenByDescending(candidate => IsRememberedFolderCandidate(candidate, rememberedFolderPath))
                 .ToArray();
         }
         catch (Exception exception) when (IsExpectedExplorerObservationException(exception))
@@ -112,6 +114,31 @@ public sealed class ExplorerTracker : IQuickSwitchWindowProvider
         if (Directory.Exists(folderPath))
         {
             _lastFolder = folderPath;
+        }
+    }
+
+    private static bool IsRememberedFolderCandidate(
+        QuickSwitchFolderCandidate candidate,
+        string? rememberedFolderPath)
+    {
+        return !string.IsNullOrWhiteSpace(rememberedFolderPath) &&
+            string.Equals(candidate.FolderPath, rememberedFolderPath, StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static string? NormalizeExistingFolderPath(string? folderPath)
+    {
+        if (string.IsNullOrWhiteSpace(folderPath) || !Directory.Exists(folderPath))
+        {
+            return null;
+        }
+
+        try
+        {
+            return Path.TrimEndingDirectorySeparator(Path.GetFullPath(folderPath));
+        }
+        catch (Exception exception) when (exception is ArgumentException or IOException or NotSupportedException or UnauthorizedAccessException or SecurityException)
+        {
+            return null;
         }
     }
 

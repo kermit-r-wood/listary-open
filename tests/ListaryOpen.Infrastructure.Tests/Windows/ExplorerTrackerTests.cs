@@ -210,6 +210,35 @@ public sealed class ExplorerTrackerTests
         }
     }
 
+    [Fact]
+    public void GetFolderCandidatesPrefersRememberedFolderWhenNoExplorerWindowIsForeground()
+    {
+        var remembered = Directory.CreateTempSubdirectory("listary-open-remembered-");
+        var firstEnumerated = Directory.CreateTempSubdirectory("listary-open-first-");
+
+        try
+        {
+            var tracker = new ExplorerTracker(
+                () => new IntPtr(9999),
+                new RecordingExplorerShellWindowsProvider(new[]
+                {
+                    new ExplorerShellWindow(new IntPtr(1111), firstEnumerated.FullName),
+                    new ExplorerShellWindow(new IntPtr(2222), remembered.FullName)
+                }));
+            tracker.ObserveFolderForTests(remembered.FullName);
+
+            var candidates = tracker.GetFolderCandidates();
+
+            Assert.Equal(remembered.FullName, candidates[0].FolderPath);
+            Assert.False(candidates[0].IsForeground);
+        }
+        finally
+        {
+            remembered.Delete(recursive: true);
+            firstEnumerated.Delete(recursive: true);
+        }
+    }
+
     private sealed class RecordingExplorerShellWindowsProvider : IExplorerShellWindowsProvider
     {
         private readonly IReadOnlyList<ExplorerShellWindow> _windows;

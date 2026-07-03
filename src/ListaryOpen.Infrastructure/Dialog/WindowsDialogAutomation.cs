@@ -258,7 +258,6 @@ public sealed class WindowsDialogAutomation : IDialogAutomation
         }
 
         var foregroundProcessName = processNameProvider(foregroundHandle);
-        var browserDialogFallback = IntPtr.Zero;
         foreach (var candidateHandle in topLevelWindowProvider())
         {
             if (candidateHandle == IntPtr.Zero || candidateHandle == foregroundHandle)
@@ -276,16 +275,9 @@ public sealed class WindowsDialogAutomation : IDialogAutomation
             {
                 return candidateHandle;
             }
-
-            if (browserDialogFallback == IntPtr.Zero && IsKnownBrowserProcessName(candidateProcessName))
-            {
-                browserDialogFallback = candidateHandle;
-            }
         }
 
-        return IsListaryProcessName(foregroundProcessName)
-            ? browserDialogFallback
-            : IntPtr.Zero;
+        return IntPtr.Zero;
     }
 
     internal static bool IsSupportedFileDialogClass(string? className)
@@ -299,11 +291,6 @@ public sealed class WindowsDialogAutomation : IDialogAutomation
         return string.Equals(processName, "firefox", StringComparison.OrdinalIgnoreCase) ||
             string.Equals(processName, "chrome", StringComparison.OrdinalIgnoreCase) ||
             string.Equals(processName, "msedge", StringComparison.OrdinalIgnoreCase);
-    }
-
-    private static bool IsListaryProcessName(string? processName)
-    {
-        return string.Equals(processName, "ListaryOpen.App", StringComparison.OrdinalIgnoreCase);
     }
 
     private static bool ProcessNamesEqual(string? left, string? right)

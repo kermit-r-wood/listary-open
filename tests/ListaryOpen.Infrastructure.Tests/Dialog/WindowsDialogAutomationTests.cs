@@ -51,7 +51,7 @@ public sealed class WindowsDialogAutomationTests
     }
 
     [Fact]
-    public void ResolveActiveDialogHandleFindsBrowserDialogWhenSearchPanelIsForeground()
+    public void ResolveActiveDialogHandleDoesNotTargetUnrelatedBrowserDialogWhenListaryIsForeground()
     {
         var searchPanel = new IntPtr(10);
         var firefoxDialog = new IntPtr(20);
@@ -67,7 +67,7 @@ public sealed class WindowsDialogAutomationTests
                     : "chrome",
             () => new[] { firefoxDialog, chromeDialog });
 
-        Assert.Equal(firefoxDialog, resolved);
+        Assert.Equal(IntPtr.Zero, resolved);
     }
 
     [Theory]

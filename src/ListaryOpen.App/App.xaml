@@ -3,19 +3,7 @@
              xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
              ShutdownMode="OnExplicitShutdown">
     <Application.Resources>
-        <DrawingImage x:Key="ListaryOpenIcon">
-            <DrawingImage.Drawing>
-                <DrawingGroup>
-                    <GeometryDrawing Brush="#20242A"
-                                     Geometry="M 2,2 L 30,2 L 30,30 L 2,30 Z" />
-                    <GeometryDrawing Brush="#2FA876"
-                                     Geometry="M 7,7 L 13,7 L 13,21 L 23,21 L 23,26 L 7,26 Z" />
-                    <GeometryDrawing Brush="#FFFFFF"
-                                     Geometry="M 16,7 L 25,7 L 25,12 L 16,12 Z" />
-                    <GeometryDrawing Brush="#FFFFFF"
-                                     Geometry="M 16,14 L 25,14 L 25,19 L 16,19 Z" />
-                </DrawingGroup>
-            </DrawingImage.Drawing>
-        </DrawingImage>
+        <BitmapImage x:Key="ListaryOpenIcon"
+                     UriSource="Assets/ListaryOpen.ico" />
     </Application.Resources>
 </Application>

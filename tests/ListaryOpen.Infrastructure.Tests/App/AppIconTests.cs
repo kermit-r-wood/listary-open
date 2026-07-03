@@ -3,12 +3,21 @@ namespace ListaryOpen.Infrastructure.Tests.App;
 public sealed class AppIconTests
 {
     [Fact]
+    public void AppProjectDefinesExecutableIcon()
+    {
+        var project = File.ReadAllText(GetRepositoryPath("src", "ListaryOpen.App", "ListaryOpen.App.csproj"));
+
+        Assert.Contains("<ApplicationIcon>Assets\\ListaryOpen.ico</ApplicationIcon>", project);
+        Assert.True(File.Exists(GetRepositoryPath("src", "ListaryOpen.App", "Assets", "ListaryOpen.ico")));
+    }
+
+    [Fact]
     public void AppDefinesSharedIconResource()
     {
         var appXaml = File.ReadAllText(GetRepositoryPath("src", "ListaryOpen.App", "App.xaml"));
 
         Assert.Contains("ListaryOpenIcon", appXaml);
-        Assert.Contains("DrawingImage", appXaml);
+        Assert.Contains("Assets/ListaryOpen.ico", appXaml);
     }
 
     [Theory]
