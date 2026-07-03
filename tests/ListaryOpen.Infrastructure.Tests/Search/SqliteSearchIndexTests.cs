@@ -542,6 +542,33 @@ public sealed class SqliteSearchIndexTests
     }
 
     [Fact]
+    public async Task SearchIncludesUsageBoostedMatchOutsideNameOrderedCandidateWindow()
+    {
+        var dbPath = CreateTempDbPath();
+        var now = DateTimeOffset.UtcNow;
+        var usedRecord = FileRecord.Create("C:\\Docs\\ZUsedInvoiceRecord.xlsx", false, 10, now);
+
+        try
+        {
+            await using (var index = await SqliteSearchIndex.OpenAsync(dbPath, CancellationToken.None))
+            {
+                await InsertMatchingInvoiceFilesAsync(index, 250);
+                await index.UpsertAsync(usedRecord, CancellationToken.None);
+                await InsertUsageRowsAsync(dbPath, new[] { (usedRecord.FullPath, 25, now) });
+
+                var results = await index.SearchAsync(new SearchQuery("invoice", SearchMode.FilesAndFolders, limit: 10), CancellationToken.None);
+
+                Assert.Equal(usedRecord.Name, results[0].Record.Name);
+                Assert.Equal("usage", results[0].MatchReason);
+            }
+        }
+        finally
+        {
+            DeleteIfExists(dbPath);
+        }
+    }
+
+    [Fact]
     public async Task SearchLargeIndexReturnsTargetWithinPerformanceBudget()
     {
         var dbPath = CreateTempDbPath();
@@ -588,6 +615,35 @@ public sealed class SqliteSearchIndexTests
             await using (var index = await SqliteSearchIndex.OpenAsync(dbPath, CancellationToken.None))
             {
                 await InsertShorterWeakIv26RowsAsync(index, 1_001);
+                await index.UpsertAsync(FileRecord.Create($"C:\\Docs\\{targetName}", false, 10, DateTimeOffset.UtcNow), CancellationToken.None);
+
+                var results = await index.SearchAsync(new SearchQuery("iv26", SearchMode.FilesAndFolders, limit: 10), CancellationToken.None);
+
+                Assert.Equal(targetName, results[0].Record.Name);
+            }
+        }
+        finally
+        {
+            DeleteIfExists(dbPath);
+        }
+    }
+
+    [Fact]
+    public async Task SearchReturnsHighQualityFuzzyMatchAfterManySameBucketWeakCandidates()
+    {
+        var dbPath = CreateTempDbPath();
+        const string weakName = "Ivx26-0000.txt";
+        const string targetName = "Z-Invoice 2026.xlsx";
+
+        Assert.True(
+            FuzzyMatcher.Score("iv26", targetName) > FuzzyMatcher.Score("iv26", weakName),
+            "The target fixture must score higher than the same-bucket weak fuzzy filler rows.");
+
+        try
+        {
+            await using (var index = await SqliteSearchIndex.OpenAsync(dbPath, CancellationToken.None))
+            {
+                await InsertSameBucketWeakIv26RowsAsync(index, 250);
                 await index.UpsertAsync(FileRecord.Create($"C:\\Docs\\{targetName}", false, 10, DateTimeOffset.UtcNow), CancellationToken.None);
 
                 var results = await index.SearchAsync(new SearchQuery("iv26", SearchMode.FilesAndFolders, limit: 10), CancellationToken.None);
@@ -680,6 +736,16 @@ public sealed class SqliteSearchIndexTests
         var records = Enumerable
             .Range(0, count)
             .Select(i => FileRecord.Create($"C:\\Docs\\Aivx26-{i:D4}.txt", false, 1, lastWriteTime));
+
+        await index.UpsertManyAsync(records, CancellationToken.None);
+    }
+
+    private static async Task InsertSameBucketWeakIv26RowsAsync(SqliteSearchIndex index, int count)
+    {
+        var lastWriteTime = DateTimeOffset.UtcNow;
+        var records = Enumerable
+            .Range(0, count)
+            .Select(i => FileRecord.Create($"C:\\Docs\\Ivx26-{i:D4}.txt", false, 1, lastWriteTime));
 
         await index.UpsertManyAsync(records, CancellationToken.None);
     }

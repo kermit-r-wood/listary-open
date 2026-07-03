@@ -49,6 +49,7 @@ public sealed class SqliteSearchIndex : ISearchIndex, IAsyncDisposable
 
         try
         {
+            RegisterSearchFunctions(connection);
             await CreateSchemaAsync(connection, cancellationToken).ConfigureAwait(false);
             await MigrateSchemaAsync(connection, cancellationToken).ConfigureAwait(false);
             return new SqliteSearchIndex(connection);
@@ -352,6 +353,7 @@ public sealed class SqliteSearchIndex : ISearchIndex, IAsyncDisposable
 
         await AddExactCandidatesAsync(query, candidateLimit, records, cancellationToken).ConfigureAwait(false);
         await AddFuzzyCandidatesAsync(query, candidateLimit, records, cancellationToken).ConfigureAwait(false);
+        await AddUsageCandidatesAsync(query, candidateLimit, records, cancellationToken).ConfigureAwait(false);
         await AddFallbackCandidatesAsync(query, records, cancellationToken).ConfigureAwait(false);
 
         return records.Values.ToArray();
@@ -416,15 +418,7 @@ public sealed class SqliteSearchIndex : ISearchIndex, IAsyncDisposable
             from files
             where search_text like $ordered escape '\'{directoryFilter}
             order by
-                case
-                    when name like $query_prefix escape '\' then 0
-                    when name like $first_character_prefix escape '\' then 1
-                    else 2
-                end,
-                case
-                    when instr(lower(name), $first_character) > 0 then instr(lower(name), $first_character)
-                    else 2147483647
-                end,
+                listary_rank_score($query, full_path, name) desc,
                 length(name),
                 name,
                 length(full_path),
@@ -432,9 +426,45 @@ public sealed class SqliteSearchIndex : ISearchIndex, IAsyncDisposable
             limit $limit;
             """;
         command.Parameters.AddWithValue("$ordered", orderedPattern);
-        command.Parameters.AddWithValue("$query_prefix", $"{EscapeLike(normalizedQuery)}%");
-        command.Parameters.AddWithValue("$first_character_prefix", $"{EscapeLike(normalizedQuery[0].ToString())}%");
-        command.Parameters.AddWithValue("$first_character", normalizedQuery[0].ToString());
+        command.Parameters.AddWithValue("$query", query.NormalizedText);
+        command.Parameters.AddWithValue("$limit", candidateLimit);
+
+        await AddRecordsAsync(command, records, cancellationToken).ConfigureAwait(false);
+    }
+
+    private async Task AddUsageCandidatesAsync(
+        SearchQuery query,
+        int candidateLimit,
+        IDictionary<string, FileRecord> records,
+        CancellationToken cancellationToken)
+    {
+        var normalizedQuery = NormalizeSearchText(query.NormalizedText);
+        var containsPattern = $"%{EscapeLike(normalizedQuery)}%";
+        var orderedPattern = CreateOrderedLikePattern(normalizedQuery);
+        var directoryFilter = CreateDirectoryFilter(query, "files.");
+
+        using var command = _connection.CreateCommand();
+        command.CommandText = $"""
+            select
+                files.full_path,
+                files.is_directory,
+                files.size_bytes,
+                files.last_write_time
+            from files
+            inner join usage on usage.path_key = files.path_key
+            where (
+                files.search_text like $contains escape '\'
+                or files.search_text like $ordered escape '\'
+            ){directoryFilter}
+            order by
+                usage.open_count desc,
+                usage.last_used_at desc,
+                files.name,
+                files.full_path
+            limit $limit;
+            """;
+        command.Parameters.AddWithValue("$contains", containsPattern);
+        command.Parameters.AddWithValue("$ordered", orderedPattern);
         command.Parameters.AddWithValue("$limit", candidateLimit);
 
         await AddRecordsAsync(command, records, cancellationToken).ConfigureAwait(false);
@@ -546,9 +576,26 @@ public sealed class SqliteSearchIndex : ISearchIndex, IAsyncDisposable
         return Math.Clamp(query.Limit * CandidateLimitMultiplier, MinimumCandidateLimit, MaximumCandidateLimit);
     }
 
-    private static string CreateDirectoryFilter(SearchQuery query)
+    private static string CreateDirectoryFilter(SearchQuery query, string tablePrefix = "")
     {
-        return query.Mode == SearchMode.FoldersOnly ? " and is_directory = 1" : string.Empty;
+        return query.Mode == SearchMode.FoldersOnly ? $" and {tablePrefix}is_directory = 1" : string.Empty;
+    }
+
+    private static void RegisterSearchFunctions(SqliteConnection connection)
+    {
+        connection.CreateFunction<string, string, string, double>(
+            "listary_rank_score",
+            CalculateSqlRankScore,
+            isDeterministic: true);
+    }
+
+    private static double CalculateSqlRankScore(string query, string fullPath, string name)
+    {
+        var nameScore = FuzzyMatcher.Score(query, name);
+        var pathScore = FuzzyMatcher.Score(query, fullPath) * 0.6;
+        var pinyinScore = PinyinMatcher.Score(query, name) * 0.9;
+
+        return Math.Max(nameScore, Math.Max(pathScore, pinyinScore));
     }
 
     private static string CreatePathKey(string fullPath)
