@@ -1,5 +1,9 @@
 using System.ComponentModel;
 using System.Windows;
+using System.Windows.Controls;
+using System.Windows.Controls.Primitives;
+using System.Windows.Input;
+using System.Windows.Media;
 using ListaryOpen.App.ViewModels;
 using ListaryOpen.Core.Indexing;
 using ListaryOpen.Core.Search;
@@ -57,6 +61,91 @@ public partial class SearchPanel : Window
         }
 
         base.OnClosing(e);
+    }
+
+    protected override void OnPreviewKeyDown(KeyEventArgs e)
+    {
+        base.OnPreviewKeyDown(e);
+
+        if (e.Handled)
+        {
+            return;
+        }
+
+        var isControlPressed = Keyboard.Modifiers.HasFlag(ModifierKeys.Control);
+        if (e.Key == Key.Enter && isControlPressed)
+        {
+            e.Handled = true;
+            _ = RunInteractionAsync(ViewModel, viewModel => viewModel.RevealSelectedAsync());
+            return;
+        }
+
+        if (e.Key == Key.Enter)
+        {
+            e.Handled = true;
+            _ = RunInteractionAsync(ViewModel, viewModel => viewModel.ActivateSelectedAsync());
+            return;
+        }
+
+        var focusedElement = Keyboard.FocusedElement as DependencyObject;
+        if (e.Key == Key.C &&
+            isControlPressed &&
+            ShouldCopySelectedResultPath(IsFocusWithin(QueryBox, focusedElement), IsTextInputFocus(focusedElement)))
+        {
+            e.Handled = true;
+            _ = RunInteractionAsync(
+                ViewModel,
+                viewModel =>
+                {
+                    viewModel.CopySelectedPath();
+                    return Task.CompletedTask;
+                });
+        }
+    }
+
+    private void ResultsList_MouseDoubleClick(object sender, MouseButtonEventArgs e)
+    {
+        _ = RunInteractionAsync(ViewModel, viewModel => viewModel.ActivateSelectedAsync());
+    }
+
+    internal static bool ShouldCopySelectedResultPath(bool focusIsQueryBox, bool focusIsTextInput)
+    {
+        return !focusIsQueryBox && !focusIsTextInput;
+    }
+
+    internal static async Task RunInteractionAsync(
+        SearchPanelViewModel viewModel,
+        Func<SearchPanelViewModel, Task> interaction)
+    {
+        try
+        {
+            await interaction(viewModel);
+        }
+        catch (Exception exception)
+        {
+            viewModel.ReportUnexpectedInteractionError(exception);
+        }
+    }
+
+    private static bool IsTextInputFocus(DependencyObject? focusedElement)
+    {
+        return focusedElement is TextBoxBase or PasswordBox;
+    }
+
+    private static bool IsFocusWithin(DependencyObject ancestor, DependencyObject? focusedElement)
+    {
+        var current = focusedElement;
+        while (current is not null)
+        {
+            if (ReferenceEquals(current, ancestor))
+            {
+                return true;
+            }
+
+            current = LogicalTreeHelper.GetParent(current) ?? VisualTreeHelper.GetParent(current);
+        }
+
+        return false;
     }
 
     private sealed class EmptySearchIndex : ISearchIndex

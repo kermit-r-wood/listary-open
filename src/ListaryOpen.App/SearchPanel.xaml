@@ -10,17 +10,27 @@
         <Grid.RowDefinitions>
             <RowDefinition Height="Auto" />
             <RowDefinition Height="*" />
+            <RowDefinition Height="Auto" />
         </Grid.RowDefinitions>
         <TextBox x:Name="QueryBox"
                  FontSize="22"
                  Margin="0,0,0,12"
                  Text="{Binding QueryText, UpdateSourceTrigger=PropertyChanged}" />
-        <ListBox x:Name="ResultsList" Grid.Row="1" ItemsSource="{Binding Results}">
+        <ListBox x:Name="ResultsList"
+                 Grid.Row="1"
+                 ItemsSource="{Binding Results}"
+                 MouseDoubleClick="ResultsList_MouseDoubleClick"
+                 SelectedItem="{Binding SelectedResult, Mode=TwoWay}">
             <ListBox.ItemTemplate>
                 <DataTemplate>
                     <TextBlock Text="{Binding Record.FullPath}" />
                 </DataTemplate>
             </ListBox.ItemTemplate>
         </ListBox>
+        <TextBlock Grid.Row="2"
+                   Margin="0,8,0,0"
+                   MinHeight="18"
+                   Foreground="{DynamicResource {x:Static SystemColors.GrayTextBrushKey}}"
+                   Text="{Binding StatusText}" />
     </Grid>
 </Window>
