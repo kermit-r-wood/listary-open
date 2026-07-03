@@ -1,9 +1,19 @@
+using System.Runtime.InteropServices;
 using ListaryOpen.Infrastructure.Dialog;
+using ListaryOpen.Infrastructure.Windows;
 
 namespace ListaryOpen.Infrastructure.Tests.Dialog;
 
 public sealed class WindowsDialogAutomationTests
 {
+    [Fact]
+    public void SendInputInputStructMatchesNativeWin32Size()
+    {
+        var expectedSize = IntPtr.Size == 8 ? 40 : 28;
+
+        Assert.Equal(expectedSize, Marshal.SizeOf<NativeMethods.Input>());
+    }
+
     [Theory]
     [InlineData("Address: C:\\Users\\paulx\\Downloads", "C:\\Users\\paulx\\Downloads")]
     [InlineData("C:\\Users\\paulx\\Downloads", "C:\\Users\\paulx\\Downloads\\")]
@@ -62,6 +72,81 @@ public sealed class WindowsDialogAutomationTests
                 "confirm-address"
             },
             events);
+    }
+
+    [Fact]
+    public void TryFocusFileNameEditWindowRejectsUnchangedForegroundWindow()
+    {
+        var dialogHandle = new IntPtr(100);
+        var fileNameEditHandle = new IntPtr(200);
+        var otherForegroundHandle = new IntPtr(300);
+        var events = new List<string>();
+
+        var result = WindowsDialogAutomation.TryFocusFileNameEditWindow(
+            dialogHandle,
+            fileNameEditHandle,
+            handle =>
+            {
+                events.Add("set-foreground:" + handle);
+                return false;
+            },
+            handle =>
+            {
+                events.Add("set-focus:" + handle);
+                return IntPtr.Zero;
+            },
+            () =>
+            {
+                events.Add("get-foreground");
+                return otherForegroundHandle;
+            },
+            () =>
+            {
+                events.Add("get-focused-window");
+                return IntPtr.Zero;
+            },
+            _ => IntPtr.Zero,
+            () => events.Add("wait"));
+
+        Assert.False(result);
+        Assert.DoesNotContain("set-focus:" + fileNameEditHandle, events);
+    }
+
+    [Fact]
+    public void TryFocusFileNameEditWindowAcceptsFocusedFileNameEditWindow()
+    {
+        var dialogHandle = new IntPtr(100);
+        var fileNameEditHandle = new IntPtr(200);
+        var events = new List<string>();
+
+        var result = WindowsDialogAutomation.TryFocusFileNameEditWindow(
+            dialogHandle,
+            fileNameEditHandle,
+            handle =>
+            {
+                events.Add("set-foreground:" + handle);
+                return true;
+            },
+            handle =>
+            {
+                events.Add("set-focus:" + handle);
+                return IntPtr.Zero;
+            },
+            () =>
+            {
+                events.Add("get-foreground");
+                return dialogHandle;
+            },
+            () =>
+            {
+                events.Add("get-focused-window");
+                return fileNameEditHandle;
+            },
+            _ => IntPtr.Zero,
+            () => events.Add("wait"));
+
+        Assert.True(result);
+        Assert.Contains("set-focus:" + fileNameEditHandle, events);
     }
 
     [Fact]

@@ -87,18 +87,12 @@ public sealed class WindowsDialogAutomation : IDialogAutomation
 
         cancellationToken.ThrowIfCancellationRequested();
 
-        if (!TryFindFileNameEdit(activeDialog, out var fileNameEdit))
-        {
-            return false;
-        }
-
-        cancellationToken.ThrowIfCancellationRequested();
-
-        if (TryGetValuePattern(fileNameEdit, out var valuePattern) &&
-            !IsReadOnly(valuePattern) &&
+        var fileNameEdit = default(AutomationElement);
+        if (TryFindWritableFileNameEdit(activeDialog, out var writableFileNameEdit, out var valuePattern) &&
             TryFindCommitButton(activeDialog, out var commitButton) &&
             TryGetInvokePattern(commitButton, out var invokePattern))
         {
+            fileNameEdit = writableFileNameEdit;
             return await SubmitFolderNavigationAsync(
                     activeDialogHandle,
                     () =>
@@ -121,13 +115,21 @@ public sealed class WindowsDialogAutomation : IDialogAutomation
                 .ConfigureAwait(false);
         }
 
+        fileNameEdit ??= writableFileNameEdit;
+        if (fileNameEdit is null && !TryFindFileNameEdit(activeDialog, out fileNameEdit))
+        {
+            return false;
+        }
+
+        cancellationToken.ThrowIfCancellationRequested();
+
         return await SubmitFolderNavigationWithKeyboardAsync(
                 activeDialogHandle,
                 folderPath,
                 () =>
                 {
                     cancellationToken.ThrowIfCancellationRequested();
-                    return TryFocusFileNameEditWindow(activeDialogHandle);
+                    return TryFocusFileNameEditWindow(activeDialogHandle, fileNameEdit);
                 },
                 path =>
                 {
@@ -328,18 +330,115 @@ public sealed class WindowsDialogAutomation : IDialogAutomation
             NativeMethods.RDW_INVALIDATE | NativeMethods.RDW_ALLCHILDREN | NativeMethods.RDW_UPDATENOW);
     }
 
-    private static bool TryFocusFileNameEditWindow(IntPtr dialogHandle)
+    private static bool TryFocusFileNameEditWindow(IntPtr dialogHandle, AutomationElement fileNameEdit)
     {
         if (!TryFindFileNameEditWindowHandle(dialogHandle, out var fileNameEditHandle))
         {
             return false;
         }
 
-        _ = NativeMethods.SetForegroundWindow(dialogHandle);
-        Thread.Sleep(KeyboardFocusDelay);
-        _ = NativeMethods.SetFocus(fileNameEditHandle);
-        Thread.Sleep(KeyboardFocusDelay);
-        return true;
+        return TryFocusFileNameEditWindow(
+            dialogHandle,
+            fileNameEditHandle,
+            NativeMethods.SetForegroundWindow,
+            handle =>
+            {
+                TrySetAutomationFocus(fileNameEdit);
+                return NativeMethods.SetFocus(handle);
+            },
+            NativeMethods.GetForegroundWindow,
+            () => GetFocusedWindowForDialog(dialogHandle),
+            GetOwnerWindow,
+            () => Thread.Sleep(KeyboardFocusDelay));
+    }
+
+    internal static bool TryFocusFileNameEditWindow(
+        IntPtr dialogHandle,
+        IntPtr fileNameEditHandle,
+        Func<IntPtr, bool> setForegroundWindow,
+        Func<IntPtr, IntPtr> setFocus,
+        Func<IntPtr> getForegroundWindow,
+        Func<IntPtr> getFocusedWindow,
+        Func<IntPtr, IntPtr> getOwnerWindow,
+        Action waitForFocus)
+    {
+        ArgumentNullException.ThrowIfNull(setForegroundWindow);
+        ArgumentNullException.ThrowIfNull(setFocus);
+        ArgumentNullException.ThrowIfNull(getForegroundWindow);
+        ArgumentNullException.ThrowIfNull(getFocusedWindow);
+        ArgumentNullException.ThrowIfNull(getOwnerWindow);
+        ArgumentNullException.ThrowIfNull(waitForFocus);
+
+        if (dialogHandle == IntPtr.Zero || fileNameEditHandle == IntPtr.Zero)
+        {
+            return false;
+        }
+
+        var foregroundRequested = setForegroundWindow(dialogHandle);
+        waitForFocus();
+        if (!foregroundRequested &&
+            !IsDialogOrOwnedWindow(getForegroundWindow(), dialogHandle, getOwnerWindow))
+        {
+            return false;
+        }
+
+        if (!IsDialogOrOwnedWindow(getForegroundWindow(), dialogHandle, getOwnerWindow))
+        {
+            return false;
+        }
+
+        _ = setFocus(fileNameEditHandle);
+        waitForFocus();
+        return getFocusedWindow() == fileNameEditHandle;
+    }
+
+    private static bool IsDialogOrOwnedWindow(
+        IntPtr windowHandle,
+        IntPtr dialogHandle,
+        Func<IntPtr, IntPtr> getOwnerWindow)
+    {
+        var currentHandle = windowHandle;
+        for (var depth = 0; depth < 16 && currentHandle != IntPtr.Zero; depth++)
+        {
+            if (currentHandle == dialogHandle)
+            {
+                return true;
+            }
+
+            currentHandle = getOwnerWindow(currentHandle);
+        }
+
+        return false;
+    }
+
+    private static void TrySetAutomationFocus(AutomationElement element)
+    {
+        try
+        {
+            element.SetFocus();
+        }
+        catch (Exception exception) when (IsExpectedAutomationException(exception) || exception is InvalidOperationException)
+        {
+            Trace.TraceError(exception.ToString());
+        }
+    }
+
+    private static IntPtr GetFocusedWindowForDialog(IntPtr dialogHandle)
+    {
+        var threadId = NativeMethods.GetWindowThreadProcessId(dialogHandle, out _);
+        if (threadId == 0)
+        {
+            return IntPtr.Zero;
+        }
+
+        var guiThreadInfo = new NativeMethods.GuiThreadInfo
+        {
+            Size = Marshal.SizeOf<NativeMethods.GuiThreadInfo>()
+        };
+
+        return NativeMethods.GetGUIThreadInfo(threadId, ref guiThreadInfo)
+            ? guiThreadInfo.FocusWindow
+            : IntPtr.Zero;
     }
 
     private static bool TryFindFileNameEditWindowHandle(IntPtr dialogHandle, out IntPtr fileNameEditHandle)
@@ -793,6 +892,26 @@ public sealed class WindowsDialogAutomation : IDialogAutomation
             Condition.TrueCondition,
             IsFileNameElement,
             out fileNameEdit);
+    }
+
+    private static bool TryFindWritableFileNameEdit(
+        AutomationElement activeDialog,
+        [NotNullWhen(true)] out AutomationElement? fileNameEdit,
+        [NotNullWhen(true)] out ValuePattern? valuePattern)
+    {
+        if (TryFindFirstValueElement(
+                activeDialog,
+                Condition.TrueCondition,
+                IsFileNameElement,
+                out fileNameEdit) &&
+            TryGetValuePattern(fileNameEdit, out valuePattern) &&
+            !IsReadOnly(valuePattern))
+        {
+            return true;
+        }
+
+        valuePattern = null;
+        return false;
     }
 
     private static bool TryFindCommitButton(
