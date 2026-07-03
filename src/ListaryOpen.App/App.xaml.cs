@@ -412,13 +412,31 @@ public partial class App : Application
 
     private void HandleDialogHotkey()
     {
-        var lastFolder = ObserveAndGetExistingTrackedFolder(_explorerTracker);
-        _searchPanel?.ActivateFolderSearch(lastFolder);
+        var candidates = ObserveQuickSwitchFolderCandidates(_explorerTracker);
+        _searchPanel?.ActivateQuickSwitchFolderSearch(candidates);
+    }
+
+    internal static IReadOnlyList<QuickSwitchFolderCandidate> ObserveQuickSwitchFolderCandidates(
+        ExplorerTracker? explorerTracker)
+    {
+        if (explorerTracker is null)
+        {
+            return Array.Empty<QuickSwitchFolderCandidate>();
+        }
+
+        explorerTracker.ObserveForegroundExplorerFolder();
+        return explorerTracker.GetFolderCandidates();
     }
 
     internal static string? ObserveAndGetExistingTrackedFolder(ExplorerTracker? explorerTracker)
     {
-        explorerTracker?.ObserveForegroundExplorerFolder();
+        var candidateFolder = ObserveQuickSwitchFolderCandidates(explorerTracker)
+            .FirstOrDefault()
+            ?.FolderPath;
+        if (!string.IsNullOrWhiteSpace(candidateFolder) && Directory.Exists(candidateFolder))
+        {
+            return candidateFolder;
+        }
 
         var lastFolder = explorerTracker?.LastFolder;
         return !string.IsNullOrWhiteSpace(lastFolder) && Directory.Exists(lastFolder)
