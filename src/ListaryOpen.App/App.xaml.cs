@@ -29,6 +29,7 @@ public partial class App : Application
     private SearchPanel? _searchPanel;
     private SqliteSearchIndex? _searchIndex;
     private SettingsViewModel? _settingsViewModel;
+    private SingleInstanceGuard? _singleInstanceGuard;
     private TrayController? _trayController;
     private VolumeIndexer? _volumeIndexer;
     private WindowsDialogAutomation? _dialogAutomation;
@@ -43,6 +44,18 @@ public partial class App : Application
 
         try
         {
+            _singleInstanceGuard = SingleInstanceGuard.TryAcquire();
+            if (!_singleInstanceGuard.IsOwner)
+            {
+                MessageBox.Show(
+                    "ListaryOpen is already running.",
+                    "ListaryOpen",
+                    MessageBoxButton.OK,
+                    MessageBoxImage.Information);
+                Shutdown();
+                return;
+            }
+
             if (!await InitializeApplicationServicesAsync().ConfigureAwait(false))
             {
                 await InvokeOnDispatcherAsync(Dispatcher, () => Shutdown(1)).ConfigureAwait(false);
@@ -83,6 +96,7 @@ public partial class App : Application
         _explorerObservationScheduler?.Dispose();
         _trayController?.Dispose();
         DisposeSearchIndex();
+        _singleInstanceGuard?.Dispose();
         _shutdownCancellation.Dispose();
 
         base.OnExit(e);
