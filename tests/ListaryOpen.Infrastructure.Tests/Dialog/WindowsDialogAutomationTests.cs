@@ -56,6 +56,88 @@ public sealed class WindowsDialogAutomationTests
     }
 
     [Fact]
+    public async Task RunWithoutDialogRedrawRestoresAllHandlesWhenDisablingAChildThrows()
+    {
+        var dialogHandle = new IntPtr(42);
+        var childEditHandle = new IntPtr(43);
+        var childButtonHandle = new IntPtr(44);
+        var redrawStates = new List<(IntPtr Handle, bool Enabled)>();
+        var operationRan = false;
+        var invalidatedHandles = new List<IntPtr>();
+
+        var result = await WindowsDialogAutomation.RunWithoutDialogRedrawAsync(
+            dialogHandle,
+            _ => new[] { dialogHandle, childEditHandle, childButtonHandle },
+            (handle, enabled) =>
+            {
+                redrawStates.Add((handle, enabled));
+                if (handle == childEditHandle && !enabled)
+                {
+                    throw new InvalidOperationException("disable failed");
+                }
+            },
+            handle => invalidatedHandles.Add(handle),
+            () =>
+            {
+                operationRan = true;
+                return Task.FromResult(true);
+            });
+
+        Assert.True(result);
+        Assert.True(operationRan);
+        Assert.Equal(
+            new[]
+            {
+                (dialogHandle, false),
+                (childEditHandle, false),
+                (childButtonHandle, false),
+                (childButtonHandle, true),
+                (childEditHandle, true),
+                (dialogHandle, true)
+            },
+            redrawStates);
+        Assert.Equal(new[] { dialogHandle }, invalidatedHandles);
+    }
+
+    [Fact]
+    public async Task RunWithoutDialogRedrawRestoresRemainingHandlesWhenRestoreThrows()
+    {
+        var dialogHandle = new IntPtr(42);
+        var childEditHandle = new IntPtr(43);
+        var childButtonHandle = new IntPtr(44);
+        var redrawStates = new List<(IntPtr Handle, bool Enabled)>();
+        var invalidatedHandles = new List<IntPtr>();
+
+        var result = await WindowsDialogAutomation.RunWithoutDialogRedrawAsync(
+            dialogHandle,
+            _ => new[] { dialogHandle, childEditHandle, childButtonHandle },
+            (handle, enabled) =>
+            {
+                redrawStates.Add((handle, enabled));
+                if (handle == childEditHandle && enabled)
+                {
+                    throw new InvalidOperationException("restore failed");
+                }
+            },
+            handle => invalidatedHandles.Add(handle),
+            () => Task.FromResult(true));
+
+        Assert.True(result);
+        Assert.Equal(
+            new[]
+            {
+                (dialogHandle, false),
+                (childEditHandle, false),
+                (childButtonHandle, false),
+                (childButtonHandle, true),
+                (childEditHandle, true),
+                (dialogHandle, true)
+            },
+            redrawStates);
+        Assert.Equal(new[] { dialogHandle }, invalidatedHandles);
+    }
+
+    [Fact]
     public async Task RunWithoutDialogRedrawRestoresRedrawAfterFailedOperation()
     {
         var dialogHandle = new IntPtr(42);

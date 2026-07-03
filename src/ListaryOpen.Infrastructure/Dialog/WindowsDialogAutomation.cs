@@ -177,7 +177,7 @@ public sealed class WindowsDialogAutomation : IDialogAutomation
         var redrawHandles = NormalizeRedrawHandles(redrawHandleProvider(dialogHandle), dialogHandle);
         foreach (var handle in redrawHandles)
         {
-            setRedrawEnabled(handle, false);
+            TrySetRedrawEnabled(handle, enabled: false, setRedrawEnabled);
         }
 
         try
@@ -188,10 +188,25 @@ public sealed class WindowsDialogAutomation : IDialogAutomation
         {
             for (var index = redrawHandles.Count - 1; index >= 0; index--)
             {
-                setRedrawEnabled(redrawHandles[index], true);
+                TrySetRedrawEnabled(redrawHandles[index], enabled: true, setRedrawEnabled);
             }
 
             redrawWindow(dialogHandle);
+        }
+    }
+
+    private static void TrySetRedrawEnabled(
+        IntPtr handle,
+        bool enabled,
+        Action<IntPtr, bool> setRedrawEnabled)
+    {
+        try
+        {
+            setRedrawEnabled(handle, enabled);
+        }
+        catch (Exception exception)
+        {
+            Trace.TraceError(exception.ToString());
         }
     }
 
