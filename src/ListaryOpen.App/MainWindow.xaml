@@ -5,6 +5,7 @@
         xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"
         mc:Ignorable="d"
         Title="ListaryOpen Settings"
+        Icon="{StaticResource ListaryOpenIcon}"
         Height="360"
         Width="520"
         MinHeight="300"

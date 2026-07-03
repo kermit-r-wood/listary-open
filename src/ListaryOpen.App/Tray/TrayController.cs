@@ -2,6 +2,7 @@ using Hardcodet.Wpf.TaskbarNotification;
 using System.Diagnostics;
 using System.Windows;
 using System.Windows.Controls;
+using System.Windows.Media;
 
 namespace ListaryOpen.App.Tray;
 
@@ -28,6 +29,7 @@ public sealed class TrayController : IDisposable
 
         _icon = new TaskbarIcon
         {
+            IconSource = Application.Current.TryFindResource("ListaryOpenIcon") as ImageSource,
             ToolTipText = "ListaryOpen",
             ContextMenu = CreateContextMenu()
         };
