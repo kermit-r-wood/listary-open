@@ -2,6 +2,8 @@ using System.ComponentModel;
 using System.Diagnostics;
 using System.IO;
 using System.Runtime.CompilerServices;
+using System.Text.Json;
+using System.Text.Json.Serialization;
 using ListaryOpen.Core.Indexing;
 
 namespace ListaryOpen.Infrastructure.Indexing;
@@ -100,11 +102,18 @@ public sealed class ElevatedIndexerClient : IElevatedIndexerClient
             yield break;
         }
 
-        await RunHelperAsync(helperPath!, root.Path, cancellationToken).ConfigureAwait(false);
-        yield break;
+        var records = await RunHelperAsync(helperPath!, root.Path, cancellationToken).ConfigureAwait(false);
+        foreach (var record in records)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            yield return record;
+        }
     }
 
-    private async Task RunHelperAsync(string helperPath, string rootPath, CancellationToken cancellationToken)
+    private async Task<IReadOnlyList<FileRecord>> RunHelperAsync(
+        string helperPath,
+        string rootPath,
+        CancellationToken cancellationToken)
     {
         using var process = _createProcess(helperPath, rootPath);
 
@@ -113,13 +122,13 @@ public sealed class ElevatedIndexerClient : IElevatedIndexerClient
             if (!process.Start())
             {
                 Trace.TraceError("Failed to start elevated indexer helper '{0}'.", helperPath);
-                return;
+                return Array.Empty<FileRecord>();
             }
         }
         catch (Exception exception) when (exception is not OperationCanceledException)
         {
             Trace.TraceError("Failed to start elevated indexer helper '{0}': {1}", helperPath, exception);
-            return;
+            return Array.Empty<FileRecord>();
         }
 
         Task<string>? stdoutTask = null;
@@ -131,7 +140,7 @@ public sealed class ElevatedIndexerClient : IElevatedIndexerClient
             stderrTask = process.ReadStandardErrorToEndAsync(cancellationToken);
 
             await process.WaitForExitAsync(cancellationToken).ConfigureAwait(false);
-            await stdoutTask.ConfigureAwait(false);
+            var stdout = await stdoutTask.ConfigureAwait(false);
             var stderr = await stderrTask.ConfigureAwait(false);
 
             if (process.ExitCode != 0)
@@ -141,16 +150,83 @@ public sealed class ElevatedIndexerClient : IElevatedIndexerClient
                     helperPath,
                     process.ExitCode,
                     TrimDiagnostic(stderr));
+                return Array.Empty<FileRecord>();
             }
+
+            return ParseOutput(stdout);
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
         {
             await CleanupCanceledProcessAsync(process, stdoutTask, stderrTask).ConfigureAwait(false);
             throw;
         }
+        catch (InvalidDataException)
+        {
+            throw;
+        }
         catch (Exception exception)
         {
             Trace.TraceError("Elevated indexer helper '{0}' failed while running: {1}", helperPath, exception);
+            return Array.Empty<FileRecord>();
+        }
+    }
+
+    private static IReadOnlyList<FileRecord> ParseOutput(string stdout)
+    {
+        var records = new List<FileRecord>();
+        using var reader = new StringReader(stdout);
+        var lineNumber = 0;
+
+        while (reader.ReadLine() is { } line)
+        {
+            lineNumber++;
+            if (string.IsNullOrWhiteSpace(line))
+            {
+                continue;
+            }
+
+            records.Add(ParseRecord(line, lineNumber));
+        }
+
+        return records;
+    }
+
+    private static FileRecord ParseRecord(string line, int lineNumber)
+    {
+        try
+        {
+            var dto = JsonSerializer.Deserialize<ElevatedIndexerRecordDto>(line);
+            if (dto is null)
+            {
+                throw new InvalidDataException("Record was empty.");
+            }
+
+            ValidateRequiredFields(dto);
+            return FileRecord.Create(
+                dto.FullPath!,
+                dto.IsDirectory.GetValueOrDefault(),
+                dto.SizeBytes.GetValueOrDefault(),
+                dto.LastWriteTime.GetValueOrDefault());
+        }
+        catch (Exception exception) when (exception is JsonException
+                                          or InvalidDataException
+                                          or ArgumentException
+                                          or ArgumentOutOfRangeException)
+        {
+            throw new InvalidDataException(
+                $"Invalid elevated indexer output on line {lineNumber}.",
+                exception);
+        }
+    }
+
+    private static void ValidateRequiredFields(ElevatedIndexerRecordDto dto)
+    {
+        if (dto.FullPath is null
+            || dto.IsDirectory is null
+            || dto.SizeBytes is null
+            || dto.LastWriteTime is null)
+        {
+            throw new InvalidDataException("Record is missing one or more required fields.");
         }
     }
 
@@ -273,6 +349,21 @@ public sealed class ElevatedIndexerClient : IElevatedIndexerClient
         const int maxLength = 1024;
         var trimmed = value.Trim();
         return trimmed.Length <= maxLength ? trimmed : trimmed[..maxLength];
+    }
+
+    private sealed class ElevatedIndexerRecordDto
+    {
+        [JsonPropertyName("fullPath")]
+        public string? FullPath { get; init; }
+
+        [JsonPropertyName("isDirectory")]
+        public bool? IsDirectory { get; init; }
+
+        [JsonPropertyName("sizeBytes")]
+        public long? SizeBytes { get; init; }
+
+        [JsonPropertyName("lastWriteTime")]
+        public DateTimeOffset? LastWriteTime { get; init; }
     }
 
     private static void TryKill(IElevatedIndexerProcess process)

@@ -80,6 +80,101 @@ public sealed class ElevatedIndexerClientTests
     }
 
     [Fact]
+    public async Task ScanNtfsAsyncParsesJsonRecordsFromHelperOutput()
+    {
+        var tempDirectory = Path.Combine(Path.GetTempPath(), "listary-open-" + Guid.NewGuid());
+        Directory.CreateDirectory(tempDirectory);
+
+        try
+        {
+            var helperPath = Path.Combine(tempDirectory, "ListaryOpen.Indexer.Elevated.exe");
+            File.WriteAllText(helperPath, "placeholder");
+            var stdout = string.Join(
+                Environment.NewLine,
+                "{\"fullPath\":\"C:\\\\Docs\\\\Invoice.xlsx\",\"isDirectory\":false,\"sizeBytes\":12,\"lastWriteTime\":\"2026-07-03T00:00:00+00:00\"}",
+                "{\"fullPath\":\"C:\\\\Docs\\\\Projects\",\"isDirectory\":true,\"sizeBytes\":0,\"lastWriteTime\":\"2026-07-03T00:01:00+00:00\"}");
+            var client = new ElevatedIndexerClient(
+                helperPath,
+                (_, _) => new CompletedElevatedIndexerProcess(stdout, stderr: string.Empty, exitCode: 0));
+
+            var records = await CollectAsync(client.ScanNtfsAsync(new IndexRoot("C:\\Docs"), CancellationToken.None));
+
+            Assert.Collection(
+                records,
+                record =>
+                {
+                    Assert.Equal("C:\\Docs\\Invoice.xlsx", record.FullPath);
+                    Assert.False(record.IsDirectory);
+                    Assert.Equal(12, record.SizeBytes);
+                    Assert.Equal(new DateTimeOffset(2026, 7, 3, 0, 0, 0, TimeSpan.Zero), record.LastWriteTime);
+                },
+                record =>
+                {
+                    Assert.Equal("C:\\Docs\\Projects", record.FullPath);
+                    Assert.True(record.IsDirectory);
+                    Assert.Equal(0, record.SizeBytes);
+                    Assert.Equal(new DateTimeOffset(2026, 7, 3, 0, 1, 0, TimeSpan.Zero), record.LastWriteTime);
+                });
+        }
+        finally
+        {
+            Directory.Delete(tempDirectory, recursive: true);
+        }
+    }
+
+    [Fact]
+    public async Task ScanNtfsAsyncThrowsInvalidDataExceptionWhenHelperOutputIsMalformed()
+    {
+        var tempDirectory = Path.Combine(Path.GetTempPath(), "listary-open-" + Guid.NewGuid());
+        Directory.CreateDirectory(tempDirectory);
+
+        try
+        {
+            var helperPath = Path.Combine(tempDirectory, "ListaryOpen.Indexer.Elevated.exe");
+            File.WriteAllText(helperPath, "placeholder");
+            var client = new ElevatedIndexerClient(
+                helperPath,
+                (_, _) => new CompletedElevatedIndexerProcess("{not-json}", stderr: string.Empty, exitCode: 0));
+
+            await Assert.ThrowsAsync<InvalidDataException>(
+                () => CollectAsync(client.ScanNtfsAsync(new IndexRoot("C:\\Docs"), CancellationToken.None)));
+        }
+        finally
+        {
+            Directory.Delete(tempDirectory, recursive: true);
+        }
+    }
+
+    [Theory]
+    [InlineData("{\"fullPath\":\"C:\\\\Docs\\\\Invoice.xlsx\",\"sizeBytes\":12,\"lastWriteTime\":\"2026-07-03T00:00:00+00:00\"}")]
+    [InlineData("{\"fullPath\":\"C:\\\\Docs\\\\Invoice.xlsx\",\"isDirectory\":false,\"lastWriteTime\":\"2026-07-03T00:00:00+00:00\"}")]
+    [InlineData("{\"fullPath\":\"C:\\\\Docs\\\\Invoice.xlsx\",\"isDirectory\":false,\"sizeBytes\":12}")]
+    public async Task ScanNtfsAsyncThrowsInvalidDataExceptionWithLineNumberWhenRequiredPrimitiveFieldIsMissing(
+        string stdout)
+    {
+        var tempDirectory = Path.Combine(Path.GetTempPath(), "listary-open-" + Guid.NewGuid());
+        Directory.CreateDirectory(tempDirectory);
+
+        try
+        {
+            var helperPath = Path.Combine(tempDirectory, "ListaryOpen.Indexer.Elevated.exe");
+            File.WriteAllText(helperPath, "placeholder");
+            var client = new ElevatedIndexerClient(
+                helperPath,
+                (_, _) => new CompletedElevatedIndexerProcess(stdout, stderr: string.Empty, exitCode: 0));
+
+            var exception = await Assert.ThrowsAsync<InvalidDataException>(
+                () => CollectAsync(client.ScanNtfsAsync(new IndexRoot("C:\\Docs"), CancellationToken.None)));
+
+            Assert.Contains("line 1", exception.Message);
+        }
+        finally
+        {
+            Directory.Delete(tempDirectory, recursive: true);
+        }
+    }
+
+    [Fact]
     public async Task ScanNtfsAsyncThrowsCancellationAfterWaitingForKilledHelperAndObservingReads()
     {
         var tempDirectory = Path.Combine(Path.GetTempPath(), "listary-open-" + Guid.NewGuid());
@@ -126,6 +221,42 @@ public sealed class ElevatedIndexerClientTests
         }
 
         return collected;
+    }
+
+    private sealed class CompletedElevatedIndexerProcess : IElevatedIndexerProcess
+    {
+        private readonly string _stdout;
+        private readonly string _stderr;
+
+        public CompletedElevatedIndexerProcess(string stdout, string stderr, int exitCode)
+        {
+            _stdout = stdout;
+            _stderr = stderr;
+            ExitCode = exitCode;
+        }
+
+        public int ExitCode { get; }
+
+        public bool HasExited => true;
+
+        public bool Start() => true;
+
+        public Task<string> ReadStandardOutputToEndAsync(CancellationToken cancellationToken)
+            => Task.FromResult(_stdout);
+
+        public Task<string> ReadStandardErrorToEndAsync(CancellationToken cancellationToken)
+            => Task.FromResult(_stderr);
+
+        public Task WaitForExitAsync(CancellationToken cancellationToken)
+            => Task.CompletedTask;
+
+        public void Kill()
+        {
+        }
+
+        public void Dispose()
+        {
+        }
     }
 
     private sealed class RecordingElevatedIndexerProcess : IElevatedIndexerProcess
