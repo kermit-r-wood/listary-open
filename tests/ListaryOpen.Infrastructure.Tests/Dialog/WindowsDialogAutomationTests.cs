@@ -5,6 +5,47 @@ namespace ListaryOpen.Infrastructure.Tests.Dialog;
 public sealed class WindowsDialogAutomationTests
 {
     [Fact]
+    public async Task SubmitFolderNavigationConfirmsAfterRedrawIsRestored()
+    {
+        var dialogHandle = new IntPtr(42);
+        var events = new List<string>();
+
+        var result = await WindowsDialogAutomation.SubmitFolderNavigationAsync(
+            dialogHandle,
+            () =>
+            {
+                events.Add("set-value");
+                return true;
+            },
+            () =>
+            {
+                events.Add("invoke-open");
+                return true;
+            },
+            () =>
+            {
+                events.Add("confirm-navigation");
+                return Task.FromResult(true);
+            },
+            _ => new[] { dialogHandle },
+            (_, enabled) => events.Add(enabled ? "redraw-on" : "redraw-off"),
+            _ => events.Add("redraw-window"));
+
+        Assert.True(result);
+        Assert.Equal(
+            new[]
+            {
+                "redraw-off",
+                "set-value",
+                "invoke-open",
+                "redraw-on",
+                "redraw-window",
+                "confirm-navigation"
+            },
+            events);
+    }
+
+    [Fact]
     public async Task RunWithoutDialogRedrawRestoresRedrawAfterSuccessfulOperation()
     {
         var dialogHandle = new IntPtr(42);

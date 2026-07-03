@@ -112,34 +112,54 @@ public sealed class WindowsDialogAutomation : IDialogAutomation
             return false;
         }
 
-        return await RunWithoutDialogRedrawAsync(
+        return await SubmitFolderNavigationAsync(
                 activeDialogHandle,
-                EnumerateDialogRedrawHandles,
-                SetDialogRedrawEnabled,
-                InvalidateDialogWindow,
-                async () =>
+                () =>
                 {
                     cancellationToken.ThrowIfCancellationRequested();
-
-                    if (!TrySetValue(valuePattern, folderPath))
-                    {
-                        return false;
-                    }
-
+                    return TrySetValue(valuePattern, folderPath);
+                },
+                () =>
+                {
                     cancellationToken.ThrowIfCancellationRequested();
-
-                    if (!TryInvoke(invokePattern))
-                    {
-                        return false;
-                    }
-
-                    return await ConfirmFolderNavigationAsync(
-                            valuePattern,
-                            folderPath,
-                            cancellationToken)
-                        .ConfigureAwait(false);
-                })
+                    return TryInvoke(invokePattern);
+                },
+                () => ConfirmFolderNavigationAsync(
+                    valuePattern,
+                    folderPath,
+                    cancellationToken),
+                EnumerateDialogRedrawHandles,
+                SetDialogRedrawEnabled,
+                InvalidateDialogWindow)
             .ConfigureAwait(false);
+    }
+
+    internal static async Task<bool> SubmitFolderNavigationAsync(
+        IntPtr dialogHandle,
+        Func<bool> setFolderValue,
+        Func<bool> invokeCommit,
+        Func<Task<bool>> confirmNavigation,
+        Func<IntPtr, IReadOnlyList<IntPtr>> redrawHandleProvider,
+        Action<IntPtr, bool> setRedrawEnabled,
+        Action<IntPtr> redrawWindow)
+    {
+        ArgumentNullException.ThrowIfNull(setFolderValue);
+        ArgumentNullException.ThrowIfNull(invokeCommit);
+        ArgumentNullException.ThrowIfNull(confirmNavigation);
+
+        var submitted = await RunWithoutDialogRedrawAsync(
+                dialogHandle,
+                redrawHandleProvider,
+                setRedrawEnabled,
+                redrawWindow,
+                () => Task.FromResult(setFolderValue() && invokeCommit()))
+            .ConfigureAwait(false);
+        if (!submitted)
+        {
+            return false;
+        }
+
+        return await confirmNavigation().ConfigureAwait(false);
     }
 
     internal static async Task<bool> RunWithoutDialogRedrawAsync(
