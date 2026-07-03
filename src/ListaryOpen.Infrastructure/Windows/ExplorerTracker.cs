@@ -31,7 +31,7 @@ public sealed class ExplorerTracker : IQuickSwitchWindowProvider
         {
             var foregroundHandle = _foregroundWindowProvider();
             var candidates = new List<QuickSwitchFolderCandidate>();
-            var seenFolderPaths = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            var candidateIndexesByFolderPath = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
 
             foreach (var window in _shellWindowsProvider.EnumerateWindows())
             {
@@ -41,16 +41,30 @@ public sealed class ExplorerTracker : IQuickSwitchWindowProvider
                 }
 
                 var folderPath = Path.TrimEndingDirectorySeparator(Path.GetFullPath(window.FolderPath));
-                if (!Directory.Exists(folderPath) || !seenFolderPaths.Add(folderPath))
+                if (!Directory.Exists(folderPath))
                 {
                     continue;
                 }
 
-                candidates.Add(new QuickSwitchFolderCandidate(
+                var isForeground = window.Handle == foregroundHandle;
+                var candidate = new QuickSwitchFolderCandidate(
                     folderPath,
                     "Explorer",
                     window.Handle,
-                    window.Handle == foregroundHandle));
+                    isForeground);
+
+                if (candidateIndexesByFolderPath.TryGetValue(folderPath, out var candidateIndex))
+                {
+                    if (isForeground && !candidates[candidateIndex].IsForeground)
+                    {
+                        candidates[candidateIndex] = candidate;
+                    }
+
+                    continue;
+                }
+
+                candidateIndexesByFolderPath.Add(folderPath, candidates.Count);
+                candidates.Add(candidate);
             }
 
             return candidates

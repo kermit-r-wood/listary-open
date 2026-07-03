@@ -156,6 +156,34 @@ public sealed class ExplorerTrackerTests
     }
 
     [Fact]
+    public void GetFolderCandidatesPrefersLaterForegroundDuplicateFolder()
+    {
+        var folder = Directory.CreateTempSubdirectory("listary-open-duplicate-");
+
+        try
+        {
+            var foregroundHandle = new IntPtr(2222);
+            var tracker = new ExplorerTracker(
+                () => foregroundHandle,
+                new RecordingExplorerShellWindowsProvider(new[]
+                {
+                    new ExplorerShellWindow(new IntPtr(1111), folder.FullName),
+                    new ExplorerShellWindow(foregroundHandle, folder.FullName + Path.DirectorySeparatorChar)
+                }));
+
+            var candidate = Assert.Single(tracker.GetFolderCandidates());
+
+            Assert.True(candidate.IsForeground);
+            Assert.Equal(foregroundHandle, candidate.WindowHandle);
+            Assert.Equal(folder.FullName, candidate.FolderPath);
+        }
+        finally
+        {
+            folder.Delete(recursive: true);
+        }
+    }
+
+    [Fact]
     public void GetFolderCandidatesSkipsMissingFolders()
     {
         var existing = Directory.CreateTempSubdirectory("listary-open-existing-");
