@@ -3,7 +3,7 @@
 Run date: 2026-07-03
 
 - [x] Run automated tests.
-  - PASS: `dotnet test ListaryOpen.sln` passed 248/248 tests.
+  - PASS: `dotnet test ListaryOpen.sln` passed 250/250 tests.
   - PASS: `dotnet build ListaryOpen.sln --no-restore` completed with 0 warnings and 0 errors.
   - PASS: SQLite performance regressions are covered by large-index, bounded-candidate, usage-window, combined-ranking-window, folder-only, and fuzzy-prefilter tests.
   - PASS: Quick Switch multi-Explorer candidate ordering, remembered-folder fallback, app routing helper, and folder-mode pinning are covered by unit tests.

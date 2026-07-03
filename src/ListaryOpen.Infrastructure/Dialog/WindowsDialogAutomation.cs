@@ -260,12 +260,16 @@ public sealed class WindowsDialogAutomation : IDialogAutomation
             return IntPtr.Zero;
         }
 
-        if (IsSupportedFileDialogClass(classNameProvider(foregroundHandle)))
+        var foregroundClassName = classNameProvider(foregroundHandle);
+        if (IsSupportedFileDialogClass(foregroundClassName))
         {
             return foregroundHandle;
         }
 
         var foregroundProcessName = processNameProvider(foregroundHandle);
+        var browserOwnedDialogs = IsListaryOpenWindow(foregroundClassName, foregroundProcessName)
+            ? new List<IntPtr>()
+            : null;
         foreach (var candidateHandle in topLevelWindowProvider())
         {
             if (candidateHandle == IntPtr.Zero || candidateHandle == foregroundHandle)
@@ -284,6 +288,17 @@ public sealed class WindowsDialogAutomation : IDialogAutomation
             {
                 return candidateHandle;
             }
+
+            if (browserOwnedDialogs is not null &&
+                IsBrowserOwnedDialog(candidateHandle, candidateProcessName, ownerWindowProvider, processNameProvider))
+            {
+                browserOwnedDialogs.Add(candidateHandle);
+            }
+        }
+
+        if (browserOwnedDialogs?.Count == 1)
+        {
+            return browserOwnedDialogs[0];
         }
 
         return IntPtr.Zero;
@@ -300,6 +315,32 @@ public sealed class WindowsDialogAutomation : IDialogAutomation
         return string.Equals(processName, "firefox", StringComparison.OrdinalIgnoreCase) ||
             string.Equals(processName, "chrome", StringComparison.OrdinalIgnoreCase) ||
             string.Equals(processName, "msedge", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static bool IsListaryOpenWindow(string? className, string? processName)
+    {
+        return (!string.IsNullOrWhiteSpace(processName) &&
+                processName.StartsWith("ListaryOpen", StringComparison.OrdinalIgnoreCase)) ||
+            (!string.IsNullOrWhiteSpace(className) &&
+                className.Contains("HwndWrapper[ListaryOpen", StringComparison.Ordinal));
+    }
+
+    private static bool IsBrowserOwnedDialog(
+        IntPtr candidateHandle,
+        string? candidateProcessName,
+        Func<IntPtr, IntPtr> ownerWindowProvider,
+        Func<IntPtr, string?> processNameProvider)
+    {
+        var ownerHandle = ownerWindowProvider(candidateHandle);
+        if (ownerHandle == IntPtr.Zero)
+        {
+            return false;
+        }
+
+        var ownerProcessName = processNameProvider(ownerHandle);
+        return IsKnownBrowserProcessName(candidateProcessName) &&
+            IsKnownBrowserProcessName(ownerProcessName) &&
+            ProcessNamesEqual(candidateProcessName, ownerProcessName);
     }
 
     private static bool ProcessNamesEqual(string? left, string? right)

@@ -89,6 +89,62 @@ public sealed class WindowsDialogAutomationTests
         Assert.Equal(IntPtr.Zero, resolved);
     }
 
+    [Fact]
+    public void ResolveActiveDialogHandleFindsSingleBrowserOwnedDialogWhenListaryIsForeground()
+    {
+        var searchPanel = new IntPtr(10);
+        var firefoxDialog = new IntPtr(20);
+        var firefoxWindow = new IntPtr(30);
+
+        var resolved = WindowsDialogAutomation.ResolveActiveDialogHandle(
+            searchPanel,
+            handle => handle == searchPanel
+                ? "HwndWrapper[ListaryOpen.App;;]"
+                : handle == firefoxWindow
+                    ? "MozillaWindowClass"
+                    : "#32770",
+            handle => handle == searchPanel
+                ? "ListaryOpen.App"
+                : "firefox",
+            handle => handle == firefoxDialog ? firefoxWindow : IntPtr.Zero,
+            () => new[] { firefoxDialog, firefoxWindow });
+
+        Assert.Equal(firefoxDialog, resolved);
+    }
+
+    [Fact]
+    public void ResolveActiveDialogHandleIgnoresListaryForegroundWhenMultipleBrowserOwnedDialogsExist()
+    {
+        var searchPanel = new IntPtr(10);
+        var firefoxDialog = new IntPtr(20);
+        var firefoxWindow = new IntPtr(30);
+        var chromeDialog = new IntPtr(40);
+        var chromeWindow = new IntPtr(50);
+
+        var resolved = WindowsDialogAutomation.ResolveActiveDialogHandle(
+            searchPanel,
+            handle => handle == searchPanel
+                ? "HwndWrapper[ListaryOpen.App;;]"
+                : handle == firefoxWindow
+                    ? "MozillaWindowClass"
+                    : handle == chromeWindow
+                        ? "Chrome_WidgetWin_1"
+                        : "#32770",
+            handle => handle == searchPanel
+                ? "ListaryOpen.App"
+                : handle == chromeDialog || handle == chromeWindow
+                    ? "chrome"
+                    : "firefox",
+            handle => handle == firefoxDialog
+                ? firefoxWindow
+                : handle == chromeDialog
+                    ? chromeWindow
+                    : IntPtr.Zero,
+            () => new[] { firefoxDialog, firefoxWindow, chromeDialog, chromeWindow });
+
+        Assert.Equal(IntPtr.Zero, resolved);
+    }
+
     [Theory]
     [InlineData("firefox")]
     [InlineData("chrome")]
