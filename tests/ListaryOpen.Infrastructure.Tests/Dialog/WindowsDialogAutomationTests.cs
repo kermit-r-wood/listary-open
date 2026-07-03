@@ -46,6 +46,123 @@ public sealed class WindowsDialogAutomationTests
     }
 
     [Fact]
+    public async Task SubmitFolderNavigationSkipsInvokeAndConfirmWhenSetValueFails()
+    {
+        var dialogHandle = new IntPtr(42);
+        var events = new List<string>();
+
+        var result = await WindowsDialogAutomation.SubmitFolderNavigationAsync(
+            dialogHandle,
+            () =>
+            {
+                events.Add("set-value");
+                return false;
+            },
+            () =>
+            {
+                events.Add("invoke-open");
+                return true;
+            },
+            () =>
+            {
+                events.Add("confirm-navigation");
+                return Task.FromResult(true);
+            },
+            _ => new[] { dialogHandle },
+            (_, enabled) => events.Add(enabled ? "redraw-on" : "redraw-off"),
+            _ => events.Add("redraw-window"));
+
+        Assert.False(result);
+        Assert.Equal(
+            new[]
+            {
+                "redraw-off",
+                "set-value",
+                "redraw-on",
+                "redraw-window"
+            },
+            events);
+    }
+
+    [Fact]
+    public async Task SubmitFolderNavigationSkipsConfirmWhenInvokeFails()
+    {
+        var dialogHandle = new IntPtr(42);
+        var events = new List<string>();
+
+        var result = await WindowsDialogAutomation.SubmitFolderNavigationAsync(
+            dialogHandle,
+            () =>
+            {
+                events.Add("set-value");
+                return true;
+            },
+            () =>
+            {
+                events.Add("invoke-open");
+                return false;
+            },
+            () =>
+            {
+                events.Add("confirm-navigation");
+                return Task.FromResult(true);
+            },
+            _ => new[] { dialogHandle },
+            (_, enabled) => events.Add(enabled ? "redraw-on" : "redraw-off"),
+            _ => events.Add("redraw-window"));
+
+        Assert.False(result);
+        Assert.Equal(
+            new[]
+            {
+                "redraw-off",
+                "set-value",
+                "invoke-open",
+                "redraw-on",
+                "redraw-window"
+            },
+            events);
+    }
+
+    [Fact]
+    public async Task SubmitFolderNavigationRestoresRedrawWhenSetValueThrows()
+    {
+        var dialogHandle = new IntPtr(42);
+        var events = new List<string>();
+
+        await Assert.ThrowsAsync<OperationCanceledException>(() => WindowsDialogAutomation.SubmitFolderNavigationAsync(
+            dialogHandle,
+            () =>
+            {
+                events.Add("set-value");
+                throw new OperationCanceledException();
+            },
+            () =>
+            {
+                events.Add("invoke-open");
+                return true;
+            },
+            () =>
+            {
+                events.Add("confirm-navigation");
+                return Task.FromResult(true);
+            },
+            _ => new[] { dialogHandle },
+            (_, enabled) => events.Add(enabled ? "redraw-on" : "redraw-off"),
+            _ => events.Add("redraw-window")));
+
+        Assert.Equal(
+            new[]
+            {
+                "redraw-off",
+                "set-value",
+                "redraw-on",
+                "redraw-window"
+            },
+            events);
+    }
+
+    [Fact]
     public async Task RunWithoutDialogRedrawRestoresRedrawAfterSuccessfulOperation()
     {
         var dialogHandle = new IntPtr(42);
