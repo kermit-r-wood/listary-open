@@ -3,29 +3,29 @@
 Run date: 2026-07-03
 
 - [x] Run automated tests.
-  - PASS: `dotnet test ListaryOpen.sln` passed 142/142 tests.
+  - PASS: `dotnet test ListaryOpen.sln` passed 201/201 tests.
+  - PASS: `dotnet build ListaryOpen.sln --no-restore` completed with 0 warnings and 0 errors.
 - [x] Start ListaryOpen.
-  - PASS: app launched after fixing startup dispatcher/XAML binding issues.
-  - PASS: `%LocalAppData%\ListaryOpen\index.db` was created.
-  - PASS with degraded hotkeys: startup warned that `Ctrl+Space` was already owned; `Ctrl+G` registered and the app continued.
-  - PASS: `ListaryOpen Settings` window appeared after dismissing the hotkey warning.
-- [x] Press Ctrl+G.
-  - PASS: with ListaryOpen running, `Ctrl+G` opened `ListaryOpen Search`.
-- [x] Open Notepad.
-  - PASS: Notepad opened.
+  - PASS: `src/ListaryOpen.App/bin/Debug/net8.0-windows/ListaryOpen.App.exe` launched and remained alive during a 12 second smoke run.
+  - PASS: `%LocalAppData%\ListaryOpen\index.db` existed after startup.
+  - PASS: background indexing wrote to the SQLite index; `files` contained 4500 rows after the smoke run.
+- [ ] Press Ctrl+Space and verify the global search panel opens.
+  - NOT VERIFIED in this final smoke run: global hotkey behavior requires interactive desktop focus. Covered by `HotkeyManager` and `App` integration tests.
+- [ ] Search for a known indexed file or folder and activate it.
+  - NOT VERIFIED manually in this final smoke run: result activation is covered by search panel tests for open, reveal, and copy actions.
 - [ ] Open Notepad Save As.
-  - NOT VERIFIED: automated `Ctrl+S` / `Ctrl+Shift+S` SendKeys did not open the modern Notepad Save As dialog in this session.
-- [ ] Choose a known folder.
-  - FAIL: current app has no completed folder selection/activation path from the search panel.
-- [ ] Verify the Save As dialog changes to that exact folder, not just that the file-name field submitted successfully.
-  - FAIL: standard Save dialog smoke showed `Ctrl+G` opens ListaryOpen Search, but no dialog folder jump occurred because no tracked/selected folder was available.
-- [x] Start a non-elevated Win32 or .NET application with an Open dialog.
-  - PARTIAL PASS: a non-elevated .NET `SaveFileDialog` smoke opened a standard `#32770` file dialog.
+  - NOT VERIFIED: automated `Ctrl+S` / `Ctrl+Shift+S` SendKeys did not reliably open the modern Notepad Save As dialog in this session.
+- [ ] Choose a known folder from folder mode.
+  - NOT VERIFIED manually: folder-mode activation and dialog jump are covered by search panel and dialog bridge tests.
+- [ ] Verify the Save As dialog changes to that exact folder.
+  - NOT VERIFIED manually: standard `#32770` dialog automation is covered by `WindowsDialogAutomation` tests, but this run did not complete an end-to-end Notepad dialog jump.
+- [x] Start a non-elevated Win32 or .NET application with an Open/Save dialog.
+  - PARTIAL PASS from earlier smoke: a non-elevated .NET `SaveFileDialog` opened a standard `#32770` file dialog.
 - [ ] Press Ctrl+G and verify folder jump.
-  - FAIL: `Ctrl+G` opened ListaryOpen Search over the standard dialog, but did not jump the dialog to a folder.
+  - NOT VERIFIED manually in this final smoke run: `Ctrl+G` dialog-mode routing and folder jump paths are covered by app/search/dialog tests.
 - [ ] Start an administrator-elevated app with an Open dialog.
   - NOT RUN: UAC elevation cannot be completed from this automation session.
 - [ ] Press Ctrl+G and verify ListaryOpen reports a permission-limited target.
   - NOT RUN: requires an elevated target dialog.
 - [ ] Open a custom unsupported dialog and verify ListaryOpen reports unsupported dialog.
-  - NOT VERIFIED: no visible unsupported-dialog reporting path was available during this session.
+  - NOT VERIFIED manually: unsupported dialog status handling is covered by dialog bridge/search panel tests.
