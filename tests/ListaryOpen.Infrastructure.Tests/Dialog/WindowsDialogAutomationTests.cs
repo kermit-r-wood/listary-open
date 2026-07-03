@@ -4,6 +4,66 @@ namespace ListaryOpen.Infrastructure.Tests.Dialog;
 
 public sealed class WindowsDialogAutomationTests
 {
+    [Theory]
+    [InlineData("Address: C:\\Users\\paulx\\Downloads", "C:\\Users\\paulx\\Downloads")]
+    [InlineData("C:\\Users\\paulx\\Downloads", "C:\\Users\\paulx\\Downloads\\")]
+    public void MatchesDialogAddressFolderValueAcceptsCurrentFolderAddress(string addressValue, string targetFolder)
+    {
+        Assert.True(WindowsDialogAutomation.MatchesDialogAddressFolderValue(
+            addressValue,
+            WindowsDialogAutomation.NormalizeFolderPathForTests(targetFolder)));
+    }
+
+    [Fact]
+    public void MatchesDialogAddressFolderValueRejectsDifferentFolder()
+    {
+        Assert.False(WindowsDialogAutomation.MatchesDialogAddressFolderValue(
+            "Address: C:\\Users\\paulx\\Desktop",
+            WindowsDialogAutomation.NormalizeFolderPathForTests("C:\\Users\\paulx\\Downloads")));
+    }
+
+    [Fact]
+    public async Task SubmitFolderNavigationWithKeyboardDoesNotFreezeRedrawBeforeConfirming()
+    {
+        var dialogHandle = new IntPtr(42);
+        var events = new List<string>();
+
+        var result = await WindowsDialogAutomation.SubmitFolderNavigationWithKeyboardAsync(
+            dialogHandle,
+            "C:\\Users\\paulx\\Downloads",
+            () =>
+            {
+                events.Add("focus-file-name");
+                return true;
+            },
+            folderPath =>
+            {
+                events.Add("send-path:" + folderPath);
+                return true;
+            },
+            () =>
+            {
+                events.Add("send-enter");
+                return true;
+            },
+            () =>
+            {
+                events.Add("confirm-address");
+                return Task.FromResult(true);
+            });
+
+        Assert.True(result);
+        Assert.Equal(
+            new[]
+            {
+                "focus-file-name",
+                "send-path:C:\\Users\\paulx\\Downloads",
+                "send-enter",
+                "confirm-address"
+            },
+            events);
+    }
+
     [Fact]
     public async Task SubmitFolderNavigationConfirmsAfterRedrawIsRestored()
     {

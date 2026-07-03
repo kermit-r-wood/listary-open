@@ -14,6 +14,7 @@ public sealed class WindowsDialogAutomation : IDialogAutomation
     private const int AccessDeniedHResult = unchecked((int)0x80070005);
     private static readonly TimeSpan NavigationConfirmationTimeout = TimeSpan.FromSeconds(2);
     private static readonly TimeSpan NavigationConfirmationPollInterval = TimeSpan.FromMilliseconds(100);
+    private static readonly TimeSpan KeyboardFocusDelay = TimeSpan.FromMilliseconds(200);
     private const string FileNameAutomationId = "1148";
     private const string CommitButtonAutomationId = "1";
     private const string StandardDialogClassName = "#32770";
@@ -93,44 +94,55 @@ public sealed class WindowsDialogAutomation : IDialogAutomation
 
         cancellationToken.ThrowIfCancellationRequested();
 
-        if (!TryGetValuePattern(fileNameEdit, out var valuePattern))
+        if (TryGetValuePattern(fileNameEdit, out var valuePattern) &&
+            !IsReadOnly(valuePattern) &&
+            TryFindCommitButton(activeDialog, out var commitButton) &&
+            TryGetInvokePattern(commitButton, out var invokePattern))
         {
-            return false;
+            return await SubmitFolderNavigationAsync(
+                    activeDialogHandle,
+                    () =>
+                    {
+                        cancellationToken.ThrowIfCancellationRequested();
+                        return TrySetValue(valuePattern, folderPath);
+                    },
+                    () =>
+                    {
+                        cancellationToken.ThrowIfCancellationRequested();
+                        return TryInvoke(invokePattern);
+                    },
+                    () => ConfirmFolderNavigationAsync(
+                        valuePattern,
+                        folderPath,
+                        cancellationToken),
+                    EnumerateDialogRedrawHandles,
+                    SetDialogRedrawEnabled,
+                    InvalidateDialogWindow)
+                .ConfigureAwait(false);
         }
 
-        cancellationToken.ThrowIfCancellationRequested();
-
-        if (!TryFindCommitButton(activeDialog, out var commitButton))
-        {
-            return false;
-        }
-
-        cancellationToken.ThrowIfCancellationRequested();
-
-        if (!TryGetInvokePattern(commitButton, out var invokePattern))
-        {
-            return false;
-        }
-
-        return await SubmitFolderNavigationAsync(
+        return await SubmitFolderNavigationWithKeyboardAsync(
                 activeDialogHandle,
+                folderPath,
                 () =>
                 {
                     cancellationToken.ThrowIfCancellationRequested();
-                    return TrySetValue(valuePattern, folderPath);
+                    return TryFocusFileNameEditWindow(activeDialogHandle);
+                },
+                path =>
+                {
+                    cancellationToken.ThrowIfCancellationRequested();
+                    return TrySendKeyboardText(path);
                 },
                 () =>
                 {
                     cancellationToken.ThrowIfCancellationRequested();
-                    return TryInvoke(invokePattern);
+                    return TrySendKeyboardCommit();
                 },
-                () => ConfirmFolderNavigationAsync(
-                    valuePattern,
+                () => ConfirmFolderNavigationByAddressAsync(
+                    activeDialog,
                     folderPath,
-                    cancellationToken),
-                EnumerateDialogRedrawHandles,
-                SetDialogRedrawEnabled,
-                InvalidateDialogWindow)
+                    cancellationToken))
             .ConfigureAwait(false);
     }
 
@@ -155,6 +167,29 @@ public sealed class WindowsDialogAutomation : IDialogAutomation
                 () => Task.FromResult(setFolderValue() && invokeCommit()))
             .ConfigureAwait(false);
         if (!submitted)
+        {
+            return false;
+        }
+
+        return await confirmNavigation().ConfigureAwait(false);
+    }
+
+    internal static async Task<bool> SubmitFolderNavigationWithKeyboardAsync(
+        IntPtr dialogHandle,
+        string folderPath,
+        Func<bool> focusFileNameEdit,
+        Func<string, bool> sendFolderPath,
+        Func<bool> sendCommit,
+        Func<Task<bool>> confirmNavigation)
+    {
+        ArgumentNullException.ThrowIfNull(focusFileNameEdit);
+        ArgumentNullException.ThrowIfNull(sendFolderPath);
+        ArgumentNullException.ThrowIfNull(sendCommit);
+        ArgumentNullException.ThrowIfNull(confirmNavigation);
+
+        if (!focusFileNameEdit() ||
+            !sendFolderPath(folderPath) ||
+            !sendCommit())
         {
             return false;
         }
@@ -293,6 +328,128 @@ public sealed class WindowsDialogAutomation : IDialogAutomation
             NativeMethods.RDW_INVALIDATE | NativeMethods.RDW_ALLCHILDREN | NativeMethods.RDW_UPDATENOW);
     }
 
+    private static bool TryFocusFileNameEditWindow(IntPtr dialogHandle)
+    {
+        if (!TryFindFileNameEditWindowHandle(dialogHandle, out var fileNameEditHandle))
+        {
+            return false;
+        }
+
+        _ = NativeMethods.SetForegroundWindow(dialogHandle);
+        Thread.Sleep(KeyboardFocusDelay);
+        _ = NativeMethods.SetFocus(fileNameEditHandle);
+        Thread.Sleep(KeyboardFocusDelay);
+        return true;
+    }
+
+    private static bool TryFindFileNameEditWindowHandle(IntPtr dialogHandle, out IntPtr fileNameEditHandle)
+    {
+        fileNameEditHandle = IntPtr.Zero;
+        var comboBoxExHandle = NativeMethods.GetDlgItem(dialogHandle, int.Parse(FileNameAutomationId));
+        if (comboBoxExHandle == IntPtr.Zero)
+        {
+            return false;
+        }
+
+        var foundHandle = IntPtr.Zero;
+        NativeMethods.EnumChildWindows(
+            comboBoxExHandle,
+            (childHandle, _) =>
+            {
+                if (string.Equals(GetClassName(childHandle), "Edit", StringComparison.Ordinal))
+                {
+                    foundHandle = childHandle;
+                    return false;
+                }
+
+                return true;
+            },
+            IntPtr.Zero);
+
+        fileNameEditHandle = foundHandle;
+        return fileNameEditHandle != IntPtr.Zero;
+    }
+
+    private static bool TrySendKeyboardText(string text)
+    {
+        var inputs = new List<NativeMethods.Input>();
+        AddVirtualKey(inputs, NativeMethods.VkControl, keyUp: false);
+        AddVirtualKey(inputs, NativeMethods.VkA, keyUp: false);
+        AddVirtualKey(inputs, NativeMethods.VkA, keyUp: true);
+        AddVirtualKey(inputs, NativeMethods.VkControl, keyUp: true);
+
+        foreach (var character in text)
+        {
+            AddUnicodeKey(inputs, character, keyUp: false);
+            AddUnicodeKey(inputs, character, keyUp: true);
+        }
+
+        return TrySendKeyboardInputs(inputs);
+    }
+
+    private static bool TrySendKeyboardCommit()
+    {
+        var inputs = new List<NativeMethods.Input>();
+        AddVirtualKey(inputs, NativeMethods.VkReturn, keyUp: false);
+        AddVirtualKey(inputs, NativeMethods.VkReturn, keyUp: true);
+        return TrySendKeyboardInputs(inputs);
+    }
+
+    private static void AddVirtualKey(List<NativeMethods.Input> inputs, ushort virtualKey, bool keyUp)
+    {
+        inputs.Add(new NativeMethods.Input
+        {
+            Type = NativeMethods.InputKeyboard,
+            Union = new NativeMethods.InputUnion
+            {
+                Keyboard = new NativeMethods.KeyboardInput
+                {
+                    VirtualKey = virtualKey,
+                    Flags = keyUp ? NativeMethods.KeyEventFKeyUp : 0
+                }
+            }
+        });
+    }
+
+    private static void AddUnicodeKey(List<NativeMethods.Input> inputs, char character, bool keyUp)
+    {
+        inputs.Add(new NativeMethods.Input
+        {
+            Type = NativeMethods.InputKeyboard,
+            Union = new NativeMethods.InputUnion
+            {
+                Keyboard = new NativeMethods.KeyboardInput
+                {
+                    ScanCode = character,
+                    Flags = NativeMethods.KeyEventFUnicode | (keyUp ? NativeMethods.KeyEventFKeyUp : 0)
+                }
+            }
+        });
+    }
+
+    private static bool TrySendKeyboardInputs(IReadOnlyList<NativeMethods.Input> inputs)
+    {
+        if (inputs.Count == 0)
+        {
+            return true;
+        }
+
+        try
+        {
+            var inputArray = inputs.ToArray();
+            var sent = NativeMethods.SendInput(
+                (uint)inputArray.Length,
+                inputArray,
+                Marshal.SizeOf<NativeMethods.Input>());
+            return sent == inputArray.Length;
+        }
+        catch (Exception exception) when (exception is Win32Exception or ExternalException)
+        {
+            Trace.TraceError(exception.ToString());
+            return false;
+        }
+    }
+
     private static async Task<bool> ConfirmFolderNavigationAsync(
         ValuePattern fileNameValuePattern,
         string targetFolderPath,
@@ -325,6 +482,67 @@ public sealed class WindowsDialogAutomation : IDialogAutomation
         while (true);
     }
 
+    private static async Task<bool> ConfirmFolderNavigationByAddressAsync(
+        AutomationElement activeDialog,
+        string targetFolderPath,
+        CancellationToken cancellationToken)
+    {
+        var normalizedTargetFolderPath = NormalizeFolderPath(targetFolderPath);
+        var deadline = DateTimeOffset.UtcNow + NavigationConfirmationTimeout;
+
+        do
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+
+            if (TryGetDialogAddressValue(activeDialog, out var addressValue) &&
+                MatchesDialogAddressFolderValue(addressValue, normalizedTargetFolderPath))
+            {
+                return true;
+            }
+
+            if (DateTimeOffset.UtcNow >= deadline)
+            {
+                return false;
+            }
+
+            await Task.Delay(NavigationConfirmationPollInterval, cancellationToken).ConfigureAwait(false);
+        }
+        while (true);
+    }
+
+    private static bool TryGetDialogAddressValue(
+        AutomationElement activeDialog,
+        [NotNullWhen(true)] out string? addressValue)
+    {
+        if (!TryFindAll(activeDialog, TreeScope.Descendants, Condition.TrueCondition, out var elements))
+        {
+            addressValue = null;
+            return false;
+        }
+
+        foreach (AutomationElement element in elements)
+        {
+            try
+            {
+                if (string.Equals(element.Current.AutomationId, "1001", StringComparison.Ordinal))
+                {
+                    var name = element.Current.Name;
+                    if (!string.IsNullOrWhiteSpace(name))
+                    {
+                        addressValue = name;
+                        return true;
+                    }
+                }
+            }
+            catch (Exception exception) when (IsExpectedAutomationException(exception))
+            {
+            }
+        }
+
+        addressValue = null;
+        return false;
+    }
+
     private static string NormalizeFolderPath(string folderPath)
     {
         var fullPath = Path.GetFullPath(folderPath);
@@ -334,6 +552,36 @@ public sealed class WindowsDialogAutomation : IDialogAutomation
         return string.IsNullOrEmpty(trimmedPath) && !string.IsNullOrEmpty(root)
             ? root
             : trimmedPath;
+    }
+
+    internal static string NormalizeFolderPathForTests(string folderPath)
+    {
+        return NormalizeFolderPath(folderPath);
+    }
+
+    internal static bool MatchesDialogAddressFolderValue(string addressValue, string normalizedTargetFolderPath)
+    {
+        var value = addressValue.Trim();
+        const string addressPrefix = "Address:";
+        if (value.StartsWith(addressPrefix, StringComparison.OrdinalIgnoreCase))
+        {
+            value = value[addressPrefix.Length..].Trim();
+        }
+
+        try
+        {
+            return string.Equals(
+                NormalizeFolderPath(value),
+                normalizedTargetFolderPath,
+                StringComparison.OrdinalIgnoreCase);
+        }
+        catch (Exception exception) when (exception is ArgumentException or NotSupportedException or PathTooLongException)
+        {
+            return string.Equals(
+                value.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar),
+                normalizedTargetFolderPath,
+                StringComparison.OrdinalIgnoreCase);
+        }
     }
 
     private static bool MatchesSubmittedFolderValue(string value, string normalizedTargetFolderPath)
@@ -540,7 +788,7 @@ public sealed class WindowsDialogAutomation : IDialogAutomation
         AutomationElement activeDialog,
         [NotNullWhen(true)] out AutomationElement? fileNameEdit)
     {
-        return TryFindFirstValueElement(
+        return TryFindFirstElement(
             activeDialog,
             Condition.TrueCondition,
             IsFileNameElement,
@@ -577,6 +825,33 @@ public sealed class WindowsDialogAutomation : IDialogAutomation
             if (candidatePredicate(element) &&
                 TryGetValuePattern(element, out var valuePattern) &&
                 !IsReadOnly(valuePattern))
+            {
+                result = element;
+                return true;
+            }
+        }
+
+        result = null;
+        return false;
+    }
+
+    private static bool TryFindFirstElement(
+        AutomationElement root,
+        Condition condition,
+        Func<AutomationElement, bool> candidatePredicate,
+        [NotNullWhen(true)] out AutomationElement? result)
+    {
+        ArgumentNullException.ThrowIfNull(candidatePredicate);
+
+        if (!TryFindAll(root, TreeScope.Descendants, condition, out var elements))
+        {
+            result = null;
+            return false;
+        }
+
+        foreach (AutomationElement element in elements)
+        {
+            if (candidatePredicate(element))
             {
                 result = element;
                 return true;
