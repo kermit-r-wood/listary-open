@@ -1,5 +1,7 @@
+using System.Diagnostics;
 using ListaryOpen.Core.Indexing;
 using ListaryOpen.Core.Search;
+using ListaryOpen.Core.Usage;
 using ListaryOpen.Infrastructure.Search;
 using Microsoft.Data.Sqlite;
 
@@ -434,6 +436,33 @@ public sealed class SqliteSearchIndexTests
     }
 
     [Fact]
+    public async Task OpenMigratesExistingDatabaseAndCreatesSearchIndexes()
+    {
+        var dbPath = CreateTempDbPath();
+        var oldRecord = FileRecord.Create("C:\\Docs\\OldInvoice.xlsx", false, 10, DateTimeOffset.UtcNow);
+
+        try
+        {
+            await CreateOldSchemaDatabaseAsync(dbPath, oldRecord);
+
+            await using (var index = await SqliteSearchIndex.OpenAsync(dbPath, CancellationToken.None))
+            {
+            }
+
+            var indexNames = await ReadIndexNamesAsync(dbPath);
+
+            Assert.Contains("ix_files_name", indexNames);
+            Assert.Contains("ix_files_is_directory_name", indexNames);
+            Assert.Contains("ix_files_search_text", indexNames);
+            Assert.Contains("ix_usage_path_key", indexNames);
+        }
+        finally
+        {
+            DeleteIfExists(dbPath);
+        }
+    }
+
+    [Fact]
     public async Task SearchReturnsExactMatchAfterMoreThanFiveThousandEarlierFuzzyCandidates()
     {
         var dbPath = CreateTempDbPath();
@@ -448,6 +477,67 @@ public sealed class SqliteSearchIndexTests
                 var results = await index.SearchAsync(new SearchQuery("invoice", SearchMode.FilesAndFolders), CancellationToken.None);
 
                 Assert.Equal("Invoice.xlsx", results[0].Record.Name);
+            }
+        }
+        finally
+        {
+            DeleteIfExists(dbPath);
+        }
+    }
+
+    [Fact]
+    public async Task SearchAppliesUsageBoostWhenUsageTableHasManyUnrelatedRows()
+    {
+        var dbPath = CreateTempDbPath();
+        var now = DateTimeOffset.UtcNow;
+        var unusedRecord = FileRecord.Create("C:\\Docs\\Invoice Alpha.xlsx", false, 10, now);
+        var usedRecord = FileRecord.Create("C:\\Docs\\Invoice Beta.xlsx", false, 10, now);
+
+        try
+        {
+            await using (var index = await SqliteSearchIndex.OpenAsync(dbPath, CancellationToken.None))
+            {
+                await index.UpsertManyAsync(new[] { unusedRecord, usedRecord }, CancellationToken.None);
+
+                var unrelatedUsageRows = CreateUnrelatedUsageRows(20_000, now.AddDays(-90))
+                    .Append((usedRecord.FullPath, 20, now));
+                await InsertUsageRowsAsync(dbPath, unrelatedUsageRows);
+
+                var results = await index.SearchAsync(new SearchQuery("invoice", SearchMode.FilesAndFolders, limit: 5), CancellationToken.None);
+
+                Assert.Equal(usedRecord.Name, results[0].Record.Name);
+                Assert.Equal("usage", results[0].MatchReason);
+            }
+        }
+        finally
+        {
+            DeleteIfExists(dbPath);
+        }
+    }
+
+    [Fact]
+    public async Task SearchLargeIndexReturnsTargetWithinPerformanceBudget()
+    {
+        var dbPath = CreateTempDbPath();
+        const int fillerCount = 50_000;
+        const string targetName = "ZInvoice 2026.xlsx";
+        var budget = TimeSpan.FromSeconds(3);
+
+        try
+        {
+            await using (var index = await SqliteSearchIndex.OpenAsync(dbPath, CancellationToken.None))
+            {
+                await InsertWeakIv26RowsAsync(index, fillerCount);
+                await index.UpsertAsync(FileRecord.Create($"C:\\Docs\\{targetName}", false, 10, DateTimeOffset.UtcNow), CancellationToken.None);
+
+                var stopwatch = Stopwatch.StartNew();
+                var results = await index.SearchAsync(new SearchQuery("iv26", SearchMode.FilesAndFolders, limit: 10), CancellationToken.None);
+                stopwatch.Stop();
+
+                Assert.Equal(targetName, results[0].Record.Name);
+                Assert.True(
+                    stopwatch.Elapsed < budget,
+                    $"Expected large-index search to complete under {budget.TotalSeconds:N0}s; elapsed {stopwatch.Elapsed}. The budget is intentionally conservative for CI while guarding against unbounded candidate scans.");
             }
         }
         finally
@@ -516,10 +606,15 @@ public sealed class SqliteSearchIndexTests
 
     private static async Task InsertAlphabeticallyEarlierWeakIv26RowsAsync(SqliteSearchIndex index)
     {
+        await InsertWeakIv26RowsAsync(index, EarlierRowCount);
+    }
+
+    private static async Task InsertWeakIv26RowsAsync(SqliteSearchIndex index, int count)
+    {
         var lastWriteTime = DateTimeOffset.UtcNow;
         var records = Enumerable
-            .Range(0, EarlierRowCount)
-            .Select(i => FileRecord.Create($"C:\\Docs\\Aaaaaiaaaavaaaa2aaaa6-fragment-{i:D4}.txt", false, 1, lastWriteTime));
+            .Range(0, count)
+            .Select(i => FileRecord.Create($"C:\\Docs\\Aaaaaiaaaavaaaa2aaaa6-fragment-{i:D5}.txt", false, 1, lastWriteTime));
 
         await index.UpsertManyAsync(records, CancellationToken.None);
     }
@@ -586,6 +681,86 @@ public sealed class SqliteSearchIndexTests
         insertCommand.Parameters.AddWithValue("$last_write_time", record.LastWriteTime.ToString("O"));
 
         await insertCommand.ExecuteNonQueryAsync();
+    }
+
+    private static async Task<IReadOnlySet<string>> ReadIndexNamesAsync(string dbPath)
+    {
+        var connectionString = new SqliteConnectionStringBuilder
+        {
+            DataSource = dbPath,
+            Pooling = false
+        }.ToString();
+
+        await using var connection = new SqliteConnection(connectionString);
+        await connection.OpenAsync();
+
+        using var command = connection.CreateCommand();
+        command.CommandText = """
+            select name
+            from sqlite_master
+            where type = 'index';
+            """;
+
+        var indexNames = new HashSet<string>(StringComparer.Ordinal);
+        var reader = await command.ExecuteReaderAsync();
+        await using (reader.ConfigureAwait(false))
+        {
+            while (await reader.ReadAsync())
+            {
+                indexNames.Add(reader.GetString(0));
+            }
+        }
+
+        return indexNames;
+    }
+
+    private static IEnumerable<(string FullPath, int OpenCount, DateTimeOffset LastUsedAt)> CreateUnrelatedUsageRows(
+        int count,
+        DateTimeOffset lastUsedAt)
+    {
+        for (var i = 0; i < count; i++)
+        {
+            yield return ($"C:\\Unrelated\\Unused-{i:D5}.txt", 1, lastUsedAt);
+        }
+    }
+
+    private static async Task InsertUsageRowsAsync(
+        string dbPath,
+        IEnumerable<(string FullPath, int OpenCount, DateTimeOffset LastUsedAt)> rows)
+    {
+        var connectionString = new SqliteConnectionStringBuilder
+        {
+            DataSource = dbPath,
+            Pooling = false
+        }.ToString();
+
+        await using var connection = new SqliteConnection(connectionString);
+        await connection.OpenAsync();
+        using var transaction = connection.BeginTransaction();
+
+        using var command = connection.CreateCommand();
+        command.Transaction = transaction;
+        command.CommandText = """
+            insert into usage(full_path, path_key, open_count, last_used_at)
+            values ($full_path, $path_key, $open_count, $last_used_at);
+            """;
+        var fullPathParameter = command.Parameters.Add("$full_path", SqliteType.Text);
+        var pathKeyParameter = command.Parameters.Add("$path_key", SqliteType.Text);
+        var openCountParameter = command.Parameters.Add("$open_count", SqliteType.Integer);
+        var lastUsedAtParameter = command.Parameters.Add("$last_used_at", SqliteType.Text);
+
+        foreach (var row in rows)
+        {
+            var usage = new UsageRecord(row.FullPath, row.OpenCount, row.LastUsedAt);
+            fullPathParameter.Value = usage.FullPath;
+            pathKeyParameter.Value = usage.PathKey;
+            openCountParameter.Value = usage.OpenCount;
+            lastUsedAtParameter.Value = usage.LastUsedAt.ToString("O");
+
+            await command.ExecuteNonQueryAsync();
+        }
+
+        await transaction.CommitAsync();
     }
 
     private static async Task AssertSqliteConstraintAsync(string dbPath, string commandText)

@@ -11,6 +11,10 @@ namespace ListaryOpen.Infrastructure.Search;
 public sealed class SqliteSearchIndex : ISearchIndex, IAsyncDisposable
 {
     private const int FallbackCandidateLimit = 200;
+    private const int CandidateLimitMultiplier = 20;
+    private const int MinimumCandidateLimit = 200;
+    private const int MaximumCandidateLimit = 5_000;
+    private const int UsagePathKeyChunkSize = 500;
 
     private readonly SemaphoreSlim _connectionGate = new(1, 1);
     private readonly SqliteConnection _connection;
@@ -132,7 +136,7 @@ public sealed class SqliteSearchIndex : ISearchIndex, IAsyncDisposable
             ThrowIfDisposed();
 
             var candidates = await ReadCandidatesAsync(query, cancellationToken).ConfigureAwait(false);
-            var usage = await ReadUsageAsync(cancellationToken).ConfigureAwait(false);
+            var usage = await ReadUsageAsync(candidates.Select(record => record.PathKey), cancellationToken).ConfigureAwait(false);
 
             return ResultRanker.Rank(query, candidates, usage, Array.Empty<string>());
         }
@@ -197,6 +201,7 @@ public sealed class SqliteSearchIndex : ISearchIndex, IAsyncDisposable
         }
 
         await BackfillSearchTextAsync(connection, cancellationToken).ConfigureAwait(false);
+        await EnsureIndexesAsync(connection, cancellationToken).ConfigureAwait(false);
     }
 
     private static async Task<bool> HasColumnAsync(
@@ -275,6 +280,19 @@ public sealed class SqliteSearchIndex : ISearchIndex, IAsyncDisposable
         }
     }
 
+    private static async Task EnsureIndexesAsync(SqliteConnection connection, CancellationToken cancellationToken)
+    {
+        using var command = connection.CreateCommand();
+        command.CommandText = """
+            create index if not exists ix_files_name on files(name);
+            create index if not exists ix_files_is_directory_name on files(is_directory, name);
+            create index if not exists ix_files_search_text on files(search_text);
+            create index if not exists ix_usage_path_key on usage(path_key);
+            """;
+
+        await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+    }
+
     private async Task ExecuteUpsertAsync(
         FileRecord record,
         SqliteTransaction? transaction,
@@ -330,9 +348,10 @@ public sealed class SqliteSearchIndex : ISearchIndex, IAsyncDisposable
     private async Task<IReadOnlyList<FileRecord>> ReadCandidatesAsync(SearchQuery query, CancellationToken cancellationToken)
     {
         var records = new Dictionary<string, FileRecord>(StringComparer.Ordinal);
+        var candidateLimit = CreateCandidateLimit(query);
 
-        await AddExactCandidatesAsync(query, records, cancellationToken).ConfigureAwait(false);
-        await AddFuzzyCandidatesAsync(query, records, cancellationToken).ConfigureAwait(false);
+        await AddExactCandidatesAsync(query, candidateLimit, records, cancellationToken).ConfigureAwait(false);
+        await AddFuzzyCandidatesAsync(query, candidateLimit, records, cancellationToken).ConfigureAwait(false);
         await AddFallbackCandidatesAsync(records, cancellationToken).ConfigureAwait(false);
 
         return records.Values.ToArray();
@@ -340,6 +359,7 @@ public sealed class SqliteSearchIndex : ISearchIndex, IAsyncDisposable
 
     private async Task AddExactCandidatesAsync(
         SearchQuery query,
+        int candidateLimit,
         IDictionary<string, FileRecord> records,
         CancellationToken cancellationToken)
     {
@@ -361,17 +381,23 @@ public sealed class SqliteSearchIndex : ISearchIndex, IAsyncDisposable
                     when name like $query_prefix escape '\' then 1
                     else 2
                 end,
-                name;
+                length(name),
+                name,
+                length(full_path),
+                full_path
+            limit $limit;
             """;
         command.Parameters.AddWithValue("$contains", containsPattern);
         command.Parameters.AddWithValue("$query", normalizedQuery);
         command.Parameters.AddWithValue("$query_prefix", $"{EscapeLike(normalizedQuery)}%");
+        command.Parameters.AddWithValue("$limit", candidateLimit);
 
         await AddRecordsAsync(command, records, cancellationToken).ConfigureAwait(false);
     }
 
     private async Task AddFuzzyCandidatesAsync(
         SearchQuery query,
+        int candidateLimit,
         IDictionary<string, FileRecord> records,
         CancellationToken cancellationToken)
     {
@@ -387,9 +413,15 @@ public sealed class SqliteSearchIndex : ISearchIndex, IAsyncDisposable
                 last_write_time
             from files
             where search_text like $ordered escape '\'
-            order by name;
+            order by
+                length(name),
+                name,
+                length(full_path),
+                full_path
+            limit $limit;
             """;
         command.Parameters.AddWithValue("$ordered", orderedPattern);
+        command.Parameters.AddWithValue("$limit", candidateLimit);
 
         await AddRecordsAsync(command, records, cancellationToken).ConfigureAwait(false);
     }
@@ -406,7 +438,9 @@ public sealed class SqliteSearchIndex : ISearchIndex, IAsyncDisposable
                 size_bytes,
                 last_write_time
             from files
-            order by name
+            order by
+                name,
+                full_path
             limit $limit;
             """;
         command.Parameters.AddWithValue("$limit", FallbackCandidateLimit);
@@ -434,31 +468,62 @@ public sealed class SqliteSearchIndex : ISearchIndex, IAsyncDisposable
         }
     }
 
-    private async Task<IReadOnlyList<UsageRecord>> ReadUsageAsync(CancellationToken cancellationToken)
+    private async Task<IReadOnlyList<UsageRecord>> ReadUsageAsync(
+        IEnumerable<string> pathKeys,
+        CancellationToken cancellationToken)
     {
-        using var command = _connection.CreateCommand();
-        command.CommandText = """
-            select
-                full_path,
-                open_count,
-                last_used_at
-            from usage;
-            """;
+        var uniquePathKeys = pathKeys
+            .Where(pathKey => !string.IsNullOrEmpty(pathKey))
+            .Distinct(StringComparer.Ordinal)
+            .ToArray();
+
+        if (uniquePathKeys.Length == 0)
+        {
+            return Array.Empty<UsageRecord>();
+        }
 
         var records = new List<UsageRecord>();
-        var reader = await command.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
-        await using (reader.ConfigureAwait(false))
+        for (var offset = 0; offset < uniquePathKeys.Length; offset += UsagePathKeyChunkSize)
         {
-            while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
+            var count = Math.Min(UsagePathKeyChunkSize, uniquePathKeys.Length - offset);
+            var parameterNames = new string[count];
+
+            using var command = _connection.CreateCommand();
+            for (var i = 0; i < count; i++)
             {
-                records.Add(new UsageRecord(
-                    reader.GetString(0),
-                    reader.GetInt32(1),
-                    ParseDateTime(reader.GetString(2))));
+                var parameterName = $"$path_key_{i}";
+                parameterNames[i] = parameterName;
+                command.Parameters.AddWithValue(parameterName, uniquePathKeys[offset + i]);
+            }
+
+            command.CommandText = $"""
+                select
+                    full_path,
+                    open_count,
+                    last_used_at
+                from usage
+                where path_key in ({string.Join(", ", parameterNames)});
+                """;
+
+            var reader = await command.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
+            await using (reader.ConfigureAwait(false))
+            {
+                while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
+                {
+                    records.Add(new UsageRecord(
+                        reader.GetString(0),
+                        reader.GetInt32(1),
+                        ParseDateTime(reader.GetString(2))));
+                }
             }
         }
 
         return records;
+    }
+
+    private static int CreateCandidateLimit(SearchQuery query)
+    {
+        return Math.Clamp(query.Limit * CandidateLimitMultiplier, MinimumCandidateLimit, MaximumCandidateLimit);
     }
 
     private static string CreatePathKey(string fullPath)
