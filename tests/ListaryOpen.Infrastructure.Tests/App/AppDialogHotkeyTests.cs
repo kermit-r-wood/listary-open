@@ -1,3 +1,4 @@
+using ListaryOpen.Infrastructure.Dialog;
 using ListaryOpen.Infrastructure.Windows;
 
 namespace ListaryOpen.Infrastructure.Tests.App;
@@ -97,6 +98,76 @@ public sealed class AppDialogHotkeyTests
         {
             staleFolder.Delete(recursive: true);
             foregroundFolder.Delete(recursive: true);
+        }
+    }
+
+    [Fact]
+    public async Task TryJumpToFirstQuickSwitchFolderAsyncJumpsFirstCandidateDirectly()
+    {
+        var firstFolder = Directory.CreateTempSubdirectory("listary-open-first-");
+        var secondFolder = Directory.CreateTempSubdirectory("listary-open-second-");
+        var jumpedFolders = new List<string>();
+
+        try
+        {
+            var result = await ListaryOpen.App.App.TryJumpToFirstQuickSwitchFolderAsync(
+                new[]
+                {
+                    new QuickSwitchFolderCandidate(firstFolder.FullName, "Explorer", new IntPtr(1), true),
+                    new QuickSwitchFolderCandidate(secondFolder.FullName, "Explorer", new IntPtr(2), false)
+                },
+                (folderPath, _) =>
+                {
+                    jumpedFolders.Add(folderPath);
+                    return Task.FromResult(new DialogJumpResult(DialogJumpStatus.Success, "Dialog folder changed."));
+                },
+                CancellationToken.None);
+
+            Assert.True(result);
+            Assert.Equal(new[] { firstFolder.FullName }, jumpedFolders);
+        }
+        finally
+        {
+            firstFolder.Delete(recursive: true);
+            secondFolder.Delete(recursive: true);
+        }
+    }
+
+    [Fact]
+    public async Task TryJumpToFirstQuickSwitchFolderAsyncFallsBackWhenNoCandidateExists()
+    {
+        var jumped = false;
+
+        var result = await ListaryOpen.App.App.TryJumpToFirstQuickSwitchFolderAsync(
+            Array.Empty<QuickSwitchFolderCandidate>(),
+            (_, _) =>
+            {
+                jumped = true;
+                return Task.FromResult(new DialogJumpResult(DialogJumpStatus.Success, "Dialog folder changed."));
+            },
+            CancellationToken.None);
+
+        Assert.False(result);
+        Assert.False(jumped);
+    }
+
+    [Fact]
+    public async Task TryJumpToFirstQuickSwitchFolderAsyncFallsBackWhenDialogJumpFails()
+    {
+        var folder = Directory.CreateTempSubdirectory("listary-open-failed-jump-");
+
+        try
+        {
+            var result = await ListaryOpen.App.App.TryJumpToFirstQuickSwitchFolderAsync(
+                new[] { new QuickSwitchFolderCandidate(folder.FullName, "Explorer", IntPtr.Zero, false) },
+                (_, _) => Task.FromResult(new DialogJumpResult(DialogJumpStatus.UnsupportedDialog, "No standard dialog.")),
+                CancellationToken.None);
+
+            Assert.False(result);
+        }
+        finally
+        {
+            folder.Delete(recursive: true);
         }
     }
 

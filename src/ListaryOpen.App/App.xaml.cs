@@ -412,7 +412,20 @@ public partial class App : Application
 
     private void HandleDialogHotkey()
     {
+        _ = HandleDialogHotkeyAsync();
+    }
+
+    private async Task HandleDialogHotkeyAsync()
+    {
         var candidates = ObserveQuickSwitchFolderCandidates(_explorerTracker);
+        if (await TryJumpToFirstQuickSwitchFolderAsync(
+                candidates,
+                JumpDialogToFolderAsync,
+                CancellationToken.None))
+        {
+            return;
+        }
+
         _searchPanel?.ActivateQuickSwitchFolderSearch(candidates);
     }
 
@@ -458,6 +471,32 @@ public partial class App : Application
         return !string.IsNullOrWhiteSpace(lastFolder) && Directory.Exists(lastFolder)
             ? lastFolder
             : null;
+    }
+
+    internal static async Task<bool> TryJumpToFirstQuickSwitchFolderAsync(
+        IReadOnlyList<QuickSwitchFolderCandidate> candidates,
+        Func<string, CancellationToken, Task<DialogJumpResult>> dialogFolderActivation,
+        CancellationToken cancellationToken)
+    {
+        ArgumentNullException.ThrowIfNull(candidates);
+        ArgumentNullException.ThrowIfNull(dialogFolderActivation);
+
+        var folderPath = candidates.FirstOrDefault()?.FolderPath;
+        if (string.IsNullOrWhiteSpace(folderPath) || !Directory.Exists(folderPath))
+        {
+            return false;
+        }
+
+        try
+        {
+            var result = await dialogFolderActivation(folderPath, cancellationToken);
+            return result.Status == DialogJumpStatus.Success;
+        }
+        catch (Exception exception) when (exception is not OperationCanceledException)
+        {
+            Trace.TraceError(exception.ToString());
+            return false;
+        }
     }
 
     private Task<DialogJumpResult> JumpDialogToFolderAsync(string folderPath, CancellationToken cancellationToken)
