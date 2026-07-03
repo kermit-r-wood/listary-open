@@ -606,6 +606,63 @@ public sealed class SqliteSearchIndexTests
     }
 
     [Fact]
+    public async Task SearchIncludesCombinedScoreWinnerOutsideSeparateCandidateWindows()
+    {
+        var dbPath = CreateTempDbPath();
+        var query = new SearchQuery("invoice2026", SearchMode.FilesAndFolders, limit: 10);
+        var now = DateTimeOffset.UtcNow;
+        var target = FileRecord.Create("C:\\Docs\\Invoice 2026.xlsx", false, 10, now);
+        var exactNoUsageRecords = Enumerable
+            .Range(0, 250)
+            .Select(i => FileRecord.Create($"C:\\Docs\\Ainvoice2026-{i:D4}.txt", false, 1, now))
+            .ToArray();
+        var recentWeakUsageRecords = Enumerable
+            .Range(0, 250)
+            .Select(i => FileRecord.Create(
+                $"C:\\Docs\\Axxxxixxxxnxxxxvxxxxoxxxxixxxxcxxxxexxxx2xxxx0xxxx2xxxx6-{i:D4}.txt",
+                false,
+                1,
+                now))
+            .ToArray();
+        var usageRecords = recentWeakUsageRecords
+            .Select(record => new UsageRecord(record.FullPath, 10, now))
+            .Append(new UsageRecord(target.FullPath, 10, now.AddDays(-1)))
+            .ToArray();
+
+        var allRelevantRecords = exactNoUsageRecords
+            .Concat(recentWeakUsageRecords)
+            .Append(target)
+            .ToArray();
+        var rankedFromAllRelevantRecords = ResultRanker.Rank(
+            query,
+            allRelevantRecords,
+            usageRecords,
+            Array.Empty<string>());
+
+        Assert.Equal(target.Name, rankedFromAllRelevantRecords[0].Record.Name);
+
+        try
+        {
+            await using (var index = await SqliteSearchIndex.OpenAsync(dbPath, CancellationToken.None))
+            {
+                await index.UpsertManyAsync(allRelevantRecords, CancellationToken.None);
+                await InsertUsageRowsAsync(
+                    dbPath,
+                    usageRecords.Select(record => (record.FullPath, record.OpenCount, record.LastUsedAt)));
+
+                var results = await index.SearchAsync(query, CancellationToken.None);
+
+                Assert.Equal(target.Name, results[0].Record.Name);
+                Assert.Equal("usage", results[0].MatchReason);
+            }
+        }
+        finally
+        {
+            DeleteIfExists(dbPath);
+        }
+    }
+
+    [Fact]
     public async Task SearchLargeIndexReturnsTargetWithinPerformanceBudget()
     {
         var dbPath = CreateTempDbPath();

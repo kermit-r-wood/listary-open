@@ -354,6 +354,7 @@ public sealed class SqliteSearchIndex : ISearchIndex, IAsyncDisposable
         await AddExactCandidatesAsync(query, candidateLimit, records, cancellationToken).ConfigureAwait(false);
         await AddFuzzyCandidatesAsync(query, candidateLimit, records, cancellationToken).ConfigureAwait(false);
         await AddUsageCandidatesAsync(query, candidateLimit, records, cancellationToken).ConfigureAwait(false);
+        await AddCombinedScoreCandidatesAsync(query, candidateLimit, records, cancellationToken).ConfigureAwait(false);
         await AddFallbackCandidatesAsync(query, records, cancellationToken).ConfigureAwait(false);
 
         return records.Values.ToArray();
@@ -465,6 +466,51 @@ public sealed class SqliteSearchIndex : ISearchIndex, IAsyncDisposable
             """;
         command.Parameters.AddWithValue("$contains", containsPattern);
         command.Parameters.AddWithValue("$ordered", orderedPattern);
+        command.Parameters.AddWithValue("$limit", candidateLimit);
+
+        await AddRecordsAsync(command, records, cancellationToken).ConfigureAwait(false);
+    }
+
+    private async Task AddCombinedScoreCandidatesAsync(
+        SearchQuery query,
+        int candidateLimit,
+        IDictionary<string, FileRecord> records,
+        CancellationToken cancellationToken)
+    {
+        var normalizedQuery = NormalizeSearchText(query.NormalizedText);
+        var containsPattern = $"%{EscapeLike(normalizedQuery)}%";
+        var orderedPattern = CreateOrderedLikePattern(normalizedQuery);
+        var directoryFilter = CreateDirectoryFilter(query, "files.");
+
+        using var command = _connection.CreateCommand();
+        command.CommandText = $"""
+            select
+                files.full_path,
+                files.is_directory,
+                files.size_bytes,
+                files.last_write_time
+            from files
+            left join usage on usage.path_key = files.path_key
+            where (
+                files.search_text like $contains escape '\'
+                or files.search_text like $ordered escape '\'
+            ){directoryFilter}
+            order by
+                (
+                    listary_rank_score($query, files.full_path, files.name)
+                    + min(coalesce(usage.open_count, 0) * 5, 50)
+                    + listary_recency_boost(usage.last_used_at, $now)
+                ) desc,
+                files.name collate nocase,
+                files.name,
+                files.full_path collate nocase,
+                files.full_path
+            limit $limit;
+            """;
+        command.Parameters.AddWithValue("$contains", containsPattern);
+        command.Parameters.AddWithValue("$ordered", orderedPattern);
+        command.Parameters.AddWithValue("$query", query.NormalizedText);
+        command.Parameters.AddWithValue("$now", FormatDateTime(DateTimeOffset.UtcNow));
         command.Parameters.AddWithValue("$limit", candidateLimit);
 
         await AddRecordsAsync(command, records, cancellationToken).ConfigureAwait(false);
@@ -587,6 +633,10 @@ public sealed class SqliteSearchIndex : ISearchIndex, IAsyncDisposable
             "listary_rank_score",
             CalculateSqlRankScore,
             isDeterministic: true);
+        connection.CreateFunction<string?, string, double>(
+            "listary_recency_boost",
+            CalculateSqlRecencyBoost,
+            isDeterministic: false);
     }
 
     private static double CalculateSqlRankScore(string query, string fullPath, string name)
@@ -596,6 +646,23 @@ public sealed class SqliteSearchIndex : ISearchIndex, IAsyncDisposable
         var pinyinScore = PinyinMatcher.Score(query, name) * 0.9;
 
         return Math.Max(nameScore, Math.Max(pathScore, pinyinScore));
+    }
+
+    private static double CalculateSqlRecencyBoost(string? lastUsedAt, string now)
+    {
+        if (string.IsNullOrWhiteSpace(lastUsedAt))
+        {
+            return 0;
+        }
+
+        if (!DateTimeOffset.TryParse(lastUsedAt, CultureInfo.InvariantCulture, DateTimeStyles.RoundtripKind, out var parsedLastUsedAt) ||
+            !DateTimeOffset.TryParse(now, CultureInfo.InvariantCulture, DateTimeStyles.RoundtripKind, out var parsedNow))
+        {
+            return 0;
+        }
+
+        var daysSinceUse = (parsedNow - parsedLastUsedAt).TotalDays;
+        return Math.Clamp(20 - daysSinceUse, 0, 20);
     }
 
     private static string CreatePathKey(string fullPath)
