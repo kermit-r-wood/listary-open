@@ -10,7 +10,7 @@ Run date: 2026-07-03
   - PASS: `%LocalAppData%\ListaryOpen\index.db` existed after startup.
   - PASS: background indexing wrote to the SQLite index; `files` contained 4500 rows after the smoke run.
 - [ ] Press Ctrl+Space and verify the global search panel opens.
-  - NOT VERIFIED in this final smoke run: global hotkey behavior requires interactive desktop focus. Covered by `HotkeyManager` and `App` integration tests.
+  - NOT VERIFIED in this final smoke run: global hotkey behavior requires interactive desktop focus. Covered at the service/routing layer by `HotkeyService` and app tests, not by an end-to-end desktop hotkey test.
 - [ ] Search for a known indexed file or folder and activate it.
   - NOT VERIFIED manually in this final smoke run: result activation is covered by search panel tests for open, reveal, and copy actions.
 - [ ] Open Notepad Save As.
@@ -18,7 +18,7 @@ Run date: 2026-07-03
 - [ ] Choose a known folder from folder mode.
   - NOT VERIFIED manually: folder-mode activation and dialog jump are covered by search panel and dialog bridge tests.
 - [ ] Verify the Save As dialog changes to that exact folder.
-  - NOT VERIFIED manually: standard `#32770` dialog automation is covered by `WindowsDialogAutomation` tests, but this run did not complete an end-to-end Notepad dialog jump.
+  - NOT VERIFIED manually: dialog jump status/routing is covered by `DialogBridge` and `SearchPanelViewModel` tests, but this run did not complete an end-to-end standard `#32770` dialog jump.
 - [x] Start a non-elevated Win32 or .NET application with an Open/Save dialog.
   - PARTIAL PASS from earlier smoke: a non-elevated .NET `SaveFileDialog` opened a standard `#32770` file dialog.
 - [ ] Press Ctrl+G and verify folder jump.
