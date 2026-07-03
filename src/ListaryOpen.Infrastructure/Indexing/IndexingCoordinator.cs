@@ -160,7 +160,7 @@ public sealed class IndexingCoordinator
         }
         catch (Exception exception)
         {
-            throw new IndexProviderScanException($"Provider {provider.Name} failed to start scanning {root.Path}.", exception);
+            throw new IndexProviderScanException($"Provider {provider.Name} failed to start scanning {root.Path}: {exception.Message}", exception);
         }
 
         try
@@ -184,7 +184,7 @@ public sealed class IndexingCoordinator
                 }
                 catch (Exception exception)
                 {
-                    throw new IndexProviderScanException($"Provider {provider.Name} failed while scanning {root.Path}.", exception);
+                    throw new IndexProviderScanException($"Provider {provider.Name} failed while scanning {root.Path}: {exception.Message}", exception);
                 }
 
                 batch.Add(record);

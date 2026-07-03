@@ -1,3 +1,5 @@
+using System.IO;
+
 namespace ListaryOpen.Infrastructure.Dialog;
 
 public sealed class DialogBridge
@@ -27,6 +29,11 @@ public sealed class DialogBridge
                 return new DialogJumpResult(DialogJumpStatus.PermissionLimited, probe.Message);
 
             case DialogProbeStatus.StandardDialog:
+                if (!Directory.Exists(folderPath))
+                {
+                    return new DialogJumpResult(DialogJumpStatus.TargetGone, $"The selected folder no longer exists: {folderPath}");
+                }
+
                 var success = await _automation.SetFolderAsync(folderPath, cancellationToken);
                 return success
                     ? new DialogJumpResult(DialogJumpStatus.Success, "Dialog folder changed.")

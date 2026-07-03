@@ -55,7 +55,7 @@ public sealed class ElevatedIndexerClientTests
     }
 
     [Fact]
-    public async Task ScanNtfsAsyncReturnsEmptyRecordsAndTracesWhenHelperCannotStart()
+    public async Task ScanNtfsAsyncThrowsWhenHelperCannotStart()
     {
         var tempDirectory = Path.Combine(Path.GetTempPath(), "listary-open-" + Guid.NewGuid());
         Directory.CreateDirectory(tempDirectory);
@@ -67,11 +67,59 @@ public sealed class ElevatedIndexerClientTests
             var client = new ElevatedIndexerClient(helperPath);
             await using var traceCapture = await TraceCapture.StartAsync();
 
-            var records = await CollectAsync(client.ScanNtfsAsync(new IndexRoot(Path.GetTempPath()), CancellationToken.None));
-            Trace.Flush();
+            var exception = await Assert.ThrowsAnyAsync<InvalidOperationException>(
+                () => CollectAsync(client.ScanNtfsAsync(new IndexRoot(Path.GetTempPath()), CancellationToken.None)));
 
-            Assert.Empty(records);
-            Assert.Contains("Failed to start elevated indexer helper", traceCapture.Messages);
+            Assert.Contains("Failed to start elevated indexer helper", exception.Message);
+        }
+        finally
+        {
+            Directory.Delete(tempDirectory, recursive: true);
+        }
+    }
+
+    [Fact]
+    public async Task ScanNtfsAsyncDoesNotWrapStartFalseFailureTwice()
+    {
+        var tempDirectory = Path.Combine(Path.GetTempPath(), "listary-open-" + Guid.NewGuid());
+        Directory.CreateDirectory(tempDirectory);
+
+        try
+        {
+            var helperPath = Path.Combine(tempDirectory, "ListaryOpen.Indexer.Elevated.exe");
+            File.WriteAllText(helperPath, "placeholder");
+            var client = new ElevatedIndexerClient(helperPath, (_, _) => new StartFalseElevatedIndexerProcess());
+
+            var exception = await Assert.ThrowsAnyAsync<InvalidOperationException>(
+                () => CollectAsync(client.ScanNtfsAsync(new IndexRoot("C:\\Docs"), CancellationToken.None)));
+
+            Assert.Equal($"Failed to start elevated indexer helper '{helperPath}'.", exception.Message);
+        }
+        finally
+        {
+            Directory.Delete(tempDirectory, recursive: true);
+        }
+    }
+
+    [Fact]
+    public async Task ScanNtfsAsyncThrowsWhenHelperExitsNonZero()
+    {
+        var tempDirectory = Path.Combine(Path.GetTempPath(), "listary-open-" + Guid.NewGuid());
+        Directory.CreateDirectory(tempDirectory);
+
+        try
+        {
+            var helperPath = Path.Combine(tempDirectory, "ListaryOpen.Indexer.Elevated.exe");
+            File.WriteAllText(helperPath, "placeholder");
+            var client = new ElevatedIndexerClient(
+                helperPath,
+                (_, _) => new CompletedElevatedIndexerProcess(stdout: string.Empty, stderr: "Access denied.", exitCode: 5));
+
+            var exception = await Assert.ThrowsAnyAsync<InvalidOperationException>(
+                () => CollectAsync(client.ScanNtfsAsync(new IndexRoot("C:\\Docs"), CancellationToken.None)));
+
+            Assert.Contains("exited with code 5", exception.Message);
+            Assert.Contains("Access denied.", exception.Message);
         }
         finally
         {
@@ -246,6 +294,32 @@ public sealed class ElevatedIndexerClientTests
 
         public Task<string> ReadStandardErrorToEndAsync(CancellationToken cancellationToken)
             => Task.FromResult(_stderr);
+
+        public Task WaitForExitAsync(CancellationToken cancellationToken)
+            => Task.CompletedTask;
+
+        public void Kill()
+        {
+        }
+
+        public void Dispose()
+        {
+        }
+    }
+
+    private sealed class StartFalseElevatedIndexerProcess : IElevatedIndexerProcess
+    {
+        public int ExitCode => -1;
+
+        public bool HasExited => true;
+
+        public bool Start() => false;
+
+        public Task<string> ReadStandardOutputToEndAsync(CancellationToken cancellationToken)
+            => Task.FromResult(string.Empty);
+
+        public Task<string> ReadStandardErrorToEndAsync(CancellationToken cancellationToken)
+            => Task.FromResult(string.Empty);
 
         public Task WaitForExitAsync(CancellationToken cancellationToken)
             => Task.CompletedTask;

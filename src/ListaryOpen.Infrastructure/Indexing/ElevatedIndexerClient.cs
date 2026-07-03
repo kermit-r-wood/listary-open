@@ -121,14 +121,16 @@ public sealed class ElevatedIndexerClient : IElevatedIndexerClient
         {
             if (!process.Start())
             {
-                Trace.TraceError("Failed to start elevated indexer helper '{0}'.", helperPath);
-                return Array.Empty<FileRecord>();
+                var message = $"Failed to start elevated indexer helper '{helperPath}'.";
+                Trace.TraceError(message);
+                throw new ElevatedIndexerException(message);
             }
         }
-        catch (Exception exception) when (exception is not OperationCanceledException)
+        catch (Exception exception) when (exception is not OperationCanceledException and not ElevatedIndexerException)
         {
+            var message = $"Failed to start elevated indexer helper '{helperPath}': {exception.Message}";
             Trace.TraceError("Failed to start elevated indexer helper '{0}': {1}", helperPath, exception);
-            return Array.Empty<FileRecord>();
+            throw new ElevatedIndexerException(message, exception);
         }
 
         Task<string>? stdoutTask = null;
@@ -145,12 +147,10 @@ public sealed class ElevatedIndexerClient : IElevatedIndexerClient
 
             if (process.ExitCode != 0)
             {
-                Trace.TraceError(
-                    "Elevated indexer helper '{0}' exited with code {1}. stderr: {2}",
-                    helperPath,
-                    process.ExitCode,
-                    TrimDiagnostic(stderr));
-                return Array.Empty<FileRecord>();
+                var diagnostic = TrimDiagnostic(stderr);
+                var message = $"Elevated indexer helper '{helperPath}' exited with code {process.ExitCode}. stderr: {diagnostic}";
+                Trace.TraceError(message);
+                throw new ElevatedIndexerException(message);
             }
 
             return ParseOutput(stdout);
@@ -164,10 +164,15 @@ public sealed class ElevatedIndexerClient : IElevatedIndexerClient
         {
             throw;
         }
+        catch (ElevatedIndexerException)
+        {
+            throw;
+        }
         catch (Exception exception)
         {
+            var message = $"Elevated indexer helper '{helperPath}' failed while running: {exception.Message}";
             Trace.TraceError("Elevated indexer helper '{0}' failed while running: {1}", helperPath, exception);
-            return Array.Empty<FileRecord>();
+            throw new ElevatedIndexerException(message, exception);
         }
     }
 
@@ -364,6 +369,19 @@ public sealed class ElevatedIndexerClient : IElevatedIndexerClient
 
         [JsonPropertyName("lastWriteTime")]
         public DateTimeOffset? LastWriteTime { get; init; }
+    }
+
+    private sealed class ElevatedIndexerException : InvalidOperationException
+    {
+        public ElevatedIndexerException(string message)
+            : base(message)
+        {
+        }
+
+        public ElevatedIndexerException(string message, Exception innerException)
+            : base(message, innerException)
+        {
+        }
     }
 
     private static void TryKill(IElevatedIndexerProcess process)

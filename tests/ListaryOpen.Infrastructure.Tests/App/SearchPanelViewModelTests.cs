@@ -149,6 +149,7 @@ public sealed class SearchPanelViewModelTests
     [Theory]
     [InlineData(DialogJumpStatus.PermissionLimited, "Permission denied.")]
     [InlineData(DialogJumpStatus.UnsupportedDialog, "No standard file dialog is active.")]
+    [InlineData(DialogJumpStatus.TargetGone, "The selected folder no longer exists.")]
     [InlineData(DialogJumpStatus.Failed, "Dialog folder could not be changed.")]
     public async Task ActivateSelectedAsyncInFolderSearchModeSurfacesDialogJumpFailure(
         DialogJumpStatus status,

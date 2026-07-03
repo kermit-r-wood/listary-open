@@ -21,6 +21,7 @@ public enum DialogJumpStatus
     Success,
     UnsupportedDialog,
     PermissionLimited,
+    TargetGone,
     Failed
 }
 

@@ -111,6 +111,46 @@ public sealed class IndexingCoordinatorTests
     }
 
     [Fact]
+    public async Task IndexRootsAsyncKeepsFinalFailedStatusWhenElevatedHelperFailsAndFallbackSucceeds()
+    {
+        var rootPath = CreateTempDirectory();
+        var dbPath = CreateTempDbPath();
+
+        try
+        {
+            await File.WriteAllTextAsync(Path.Combine(rootPath, "FallbackAfterHelperFailure.txt"), "indexed");
+            var helperPath = Path.Combine(rootPath, "ListaryOpen.Indexer.Elevated.exe");
+            File.WriteAllText(helperPath, "placeholder");
+
+            await using var index = await SqliteSearchIndex.OpenAsync(dbPath, CancellationToken.None);
+            var statuses = new List<IndexingStatus>();
+            var client = new ElevatedIndexerClient(
+                helperPath,
+                (_, _) => new CompletedElevatedIndexerProcess(stdout: string.Empty, stderr: "Access denied.", exitCode: 5));
+            var coordinator = new IndexingCoordinator(
+                index,
+                new VolumeIndexer(new IIndexProvider[] { new NtfsIndexProvider(client) }),
+                new FallbackIndexProvider(),
+                _ => new VolumeInfo(Path.GetPathRoot(rootPath)!, NtfsIndexProvider.ProviderName, true));
+            coordinator.StatusChanged += (_, status) => statuses.Add(status);
+
+            await coordinator.IndexRootsAsync(new[] { new IndexRoot(rootPath) }, CancellationToken.None);
+
+            var results = await index.SearchAsync(new SearchQuery("FallbackAfterHelperFailure", SearchMode.FilesAndFolders), CancellationToken.None);
+
+            Assert.Equal("FallbackAfterHelperFailure.txt", Assert.Single(results).Record.Name);
+            Assert.Contains(statuses, status => status.State == IndexingRunState.Failed && status.Message.Contains("helper", StringComparison.OrdinalIgnoreCase));
+            Assert.Equal(IndexingRunState.Failed, statuses[^1].State);
+            Assert.Contains("errors", statuses[^1].Message, StringComparison.OrdinalIgnoreCase);
+        }
+        finally
+        {
+            DeleteDirectoryIfExists(rootPath);
+            DeleteFileIfExists(dbPath);
+        }
+    }
+
+    [Fact]
     public async Task IndexRootsAsyncReportsFailedStatusForMissingRootAndContinues()
     {
         var existingRootPath = CreateTempDirectory();
@@ -504,6 +544,42 @@ public sealed class IndexingCoordinatorTests
         {
             Interlocked.Increment(ref _postCount);
             ThreadPool.QueueUserWorkItem(_ => d(state));
+        }
+    }
+
+    private sealed class CompletedElevatedIndexerProcess : IElevatedIndexerProcess
+    {
+        private readonly string _stdout;
+        private readonly string _stderr;
+
+        public CompletedElevatedIndexerProcess(string stdout, string stderr, int exitCode)
+        {
+            _stdout = stdout;
+            _stderr = stderr;
+            ExitCode = exitCode;
+        }
+
+        public int ExitCode { get; }
+
+        public bool HasExited => true;
+
+        public bool Start() => true;
+
+        public Task<string> ReadStandardOutputToEndAsync(CancellationToken cancellationToken)
+            => Task.FromResult(_stdout);
+
+        public Task<string> ReadStandardErrorToEndAsync(CancellationToken cancellationToken)
+            => Task.FromResult(_stderr);
+
+        public Task WaitForExitAsync(CancellationToken cancellationToken)
+            => Task.CompletedTask;
+
+        public void Kill()
+        {
+        }
+
+        public void Dispose()
+        {
         }
     }
 }

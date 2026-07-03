@@ -33,13 +33,21 @@ public sealed class DialogBridgeTests
     [Fact]
     public async Task JumpToFolderChangesFolderForStandardDialog()
     {
+        var folder = Directory.CreateTempSubdirectory("listary-open-dialog-");
         var automation = new FakeDialogAutomation(DialogProbeResult.StandardDialog());
         var bridge = new DialogBridge(automation);
 
-        var result = await bridge.JumpToFolderAsync("C:\\Docs", CancellationToken.None);
+        try
+        {
+            var result = await bridge.JumpToFolderAsync(folder.FullName, CancellationToken.None);
 
-        Assert.Equal(DialogJumpStatus.Success, result.Status);
-        Assert.Equal("C:\\Docs", automation.LastFolder);
+            Assert.Equal(DialogJumpStatus.Success, result.Status);
+            Assert.Equal(folder.FullName, automation.LastFolder);
+        }
+        finally
+        {
+            folder.Delete(recursive: true);
+        }
     }
 
     [Fact]
@@ -58,14 +66,37 @@ public sealed class DialogBridgeTests
     [Fact]
     public async Task JumpToFolderReportsFailedWhenSetFolderCannotChangeDialog()
     {
+        var folder = Directory.CreateTempSubdirectory("listary-open-dialog-");
         var automation = new FakeDialogAutomation(DialogProbeResult.StandardDialog(), setFolderResult: false);
         var bridge = new DialogBridge(automation);
 
-        var result = await bridge.JumpToFolderAsync("C:\\Docs", CancellationToken.None);
+        try
+        {
+            var result = await bridge.JumpToFolderAsync(folder.FullName, CancellationToken.None);
 
-        Assert.Equal(DialogJumpStatus.Failed, result.Status);
-        Assert.Equal("Dialog folder could not be changed.", result.Message);
-        Assert.Equal(1, automation.SetFolderCallCount);
+            Assert.Equal(DialogJumpStatus.Failed, result.Status);
+            Assert.Equal("Dialog folder could not be changed.", result.Message);
+            Assert.Equal(1, automation.SetFolderCallCount);
+        }
+        finally
+        {
+            folder.Delete(recursive: true);
+        }
+    }
+
+    [Fact]
+    public async Task JumpToFolderReportsTargetGoneWhenFolderNoLongerExists()
+    {
+        var missingFolder = Path.Combine(Path.GetTempPath(), "listary-open-missing-" + Guid.NewGuid());
+        var automation = new FakeDialogAutomation(DialogProbeResult.StandardDialog());
+        var bridge = new DialogBridge(automation);
+
+        var result = await bridge.JumpToFolderAsync(missingFolder, CancellationToken.None);
+
+        Assert.Equal(DialogJumpStatus.TargetGone, result.Status);
+        Assert.Contains("no longer exists", result.Message);
+        Assert.Equal(1, automation.ProbeCallCount);
+        Assert.Equal(0, automation.SetFolderCallCount);
     }
 
     [Fact]
