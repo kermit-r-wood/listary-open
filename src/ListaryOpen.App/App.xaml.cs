@@ -1,6 +1,7 @@
 using ListaryOpen.App.Tray;
 using ListaryOpen.App.ViewModels;
 using ListaryOpen.Core.Indexing;
+using ListaryOpen.Core.Settings;
 using ListaryOpen.Infrastructure.Dialog;
 using ListaryOpen.Infrastructure.Indexing;
 using ListaryOpen.Infrastructure.Search;
@@ -14,13 +15,19 @@ namespace ListaryOpen.App;
 
 public partial class App : Application
 {
+    private readonly CancellationTokenSource _shutdownCancellation = new();
+    private readonly BackgroundIndexingTaskTracker _indexingTasks = new();
+    private readonly SemaphoreSlim _indexingRunLock = new(1, 1);
+
     private DialogBridge? _dialogBridge;
     private FallbackIndexProvider? _fallbackIndexProvider;
     private ExplorerTracker? _explorerTracker;
     private HotkeyService? _hotkeyService;
+    private IndexingCoordinator? _indexingCoordinator;
     private NtfsIndexProvider? _ntfsIndexProvider;
     private SearchPanel? _searchPanel;
     private SqliteSearchIndex? _searchIndex;
+    private SettingsViewModel? _settingsViewModel;
     private TrayController? _trayController;
     private VolumeIndexer? _volumeIndexer;
     private WindowsDialogAutomation? _dialogAutomation;
@@ -57,6 +64,15 @@ public partial class App : Application
 
     protected override void OnExit(ExitEventArgs e)
     {
+        _shutdownCancellation.Cancel();
+
+        if (_indexingCoordinator is not null)
+        {
+            _indexingCoordinator.StatusChanged -= OnIndexingStatusChanged;
+        }
+
+        WaitForIndexingTasks();
+
         if (_hotkeyService is not null)
         {
             _hotkeyService.HotkeyPressed -= OnHotkeyPressed;
@@ -65,6 +81,7 @@ public partial class App : Application
 
         _trayController?.Dispose();
         DisposeSearchIndex();
+        _shutdownCancellation.Dispose();
 
         base.OnExit(e);
     }
@@ -89,14 +106,17 @@ public partial class App : Application
             _ntfsIndexProvider,
             _fallbackIndexProvider
         });
+        _indexingCoordinator = new IndexingCoordinator(searchIndex, _volumeIndexer, _fallbackIndexProvider);
+        _indexingCoordinator.StatusChanged += OnIndexingStatusChanged;
 
         _dialogAutomation = new WindowsDialogAutomation();
         _dialogBridge = new DialogBridge(_dialogAutomation);
 
-        var settingsWindow = new MainWindow();
+        _settingsViewModel = new SettingsViewModel(AppSettings.Defaults());
+        var settingsWindow = new MainWindow(_settingsViewModel);
         _explorerTracker = new ExplorerTracker();
         _searchPanel = new SearchPanel(new SearchPanelViewModel(searchIndex));
-        _trayController = new TrayController(settingsWindow);
+        _trayController = new TrayController(settingsWindow, RequestReindex);
         _hotkeyService = new HotkeyService();
         _hotkeyService.HotkeyPressed += OnHotkeyPressed;
         var hotkeyStartupDecision = CreateHotkeyStartupDecision(_hotkeyService.RegisterDefaults());
@@ -116,6 +136,7 @@ public partial class App : Application
 
         MainWindow = settingsWindow;
         settingsWindow.Show();
+        StartBackgroundIndexing();
         return true;
     }
 
@@ -170,6 +191,26 @@ public partial class App : Application
             MessageBoxImage.Warning);
     }
 
+    internal static IReadOnlyList<IndexRoot> CreateIndexRoots(IEnumerable<string> rootPaths)
+    {
+        ArgumentNullException.ThrowIfNull(rootPaths);
+
+        var roots = new List<IndexRoot>();
+        foreach (var rootPath in rootPaths)
+        {
+            try
+            {
+                roots.Add(new IndexRoot(rootPath));
+            }
+            catch (Exception exception) when (IsInvalidIndexRootException(exception))
+            {
+                Trace.TraceWarning("Skipping invalid index root '{0}': {1}", rootPath, exception.Message);
+            }
+        }
+
+        return roots;
+    }
+
     private static string JoinHotkeyNames(IEnumerable<HotkeyRegistration> hotkeys)
     {
         return string.Join(", ", hotkeys.Select(hotkey => hotkey.Name));
@@ -188,6 +229,105 @@ public partial class App : Application
         return Path.Combine(appDataDirectory, "index.db");
     }
 
+    private void RequestReindex()
+    {
+        StartBackgroundIndexing();
+    }
+
+    private void StartBackgroundIndexing()
+    {
+        BackgroundIndexingTaskStarter.Start(_indexingTasks, RunInitialIndexAsync, _shutdownCancellation.Token);
+    }
+
+    private async Task RunInitialIndexAsync(CancellationToken cancellationToken)
+    {
+        var lockTaken = false;
+        try
+        {
+            lockTaken = await _indexingRunLock.WaitAsync(0, cancellationToken).ConfigureAwait(false);
+            if (!lockTaken)
+            {
+                Trace.TraceInformation("Indexing is already running; reindex request skipped.");
+                return;
+            }
+
+            var coordinator = _indexingCoordinator;
+            if (coordinator is null)
+            {
+                return;
+            }
+
+            var rootPaths = _settingsViewModel?.Settings.IndexedRoots ?? AppSettings.Defaults().IndexedRoots;
+            var roots = CreateIndexRoots(rootPaths);
+            await coordinator.IndexRootsAsync(roots, cancellationToken).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+        }
+        catch (Exception exception)
+        {
+            Trace.TraceError(exception.ToString());
+        }
+        finally
+        {
+            if (lockTaken)
+            {
+                _indexingRunLock.Release();
+            }
+        }
+    }
+
+    private void OnIndexingStatusChanged(object? sender, IndexingStatus status)
+    {
+        if (IsShuttingDown)
+        {
+            return;
+        }
+
+        _ = UpdateIndexingStatusAsync(status);
+    }
+
+    private async Task UpdateIndexingStatusAsync(IndexingStatus status)
+    {
+        try
+        {
+            if (IsShuttingDown)
+            {
+                return;
+            }
+
+            await InvokeOnDispatcherAsync(
+                    Dispatcher,
+                    () =>
+                    {
+                        if (!IsShuttingDown)
+                        {
+                            _settingsViewModel?.UpdateIndexingStatus(status);
+                        }
+                    })
+                .ConfigureAwait(false);
+        }
+        catch (Exception exception) when (exception is OperationCanceledException or TaskCanceledException)
+        {
+        }
+        catch (Exception exception)
+        {
+            Trace.TraceError(exception.ToString());
+        }
+    }
+
+    private void WaitForIndexingTasks()
+    {
+        try
+        {
+            _indexingTasks.WaitForCompletionAsync().GetAwaiter().GetResult();
+        }
+        catch (Exception exception)
+        {
+            Trace.TraceError(exception.ToString());
+        }
+    }
+
     private void DisposeSearchIndex()
     {
         try
@@ -198,6 +338,13 @@ public partial class App : Application
         {
             Trace.TraceError(exception.ToString());
         }
+    }
+
+    private static bool IsInvalidIndexRootException(Exception exception)
+    {
+        return exception is ArgumentException
+            or NotSupportedException
+            or PathTooLongException;
     }
 
     private void OnHotkeyPressed(object? sender, string name)
@@ -280,3 +427,72 @@ public partial class App : Application
 }
 
 internal sealed record HotkeyStartupDecision(bool ShouldContinue, string? Message, MessageBoxImage Image);
+
+internal static class BackgroundIndexingTaskStarter
+{
+    public static void Start(
+        BackgroundIndexingTaskTracker tracker,
+        Func<CancellationToken, Task> work,
+        CancellationToken cancellationToken)
+    {
+        ArgumentNullException.ThrowIfNull(tracker);
+        ArgumentNullException.ThrowIfNull(work);
+
+        tracker.Track(Task.Run(() => work(cancellationToken)));
+    }
+}
+
+internal sealed class BackgroundIndexingTaskTracker
+{
+    private readonly object _gate = new();
+    private readonly HashSet<Task> _tasks = new();
+
+    public void Track(Task task)
+    {
+        ArgumentNullException.ThrowIfNull(task);
+
+        lock (_gate)
+        {
+            _tasks.Add(task);
+        }
+
+        _ = RemoveWhenCompleteAsync(task);
+    }
+
+    public async Task WaitForCompletionAsync()
+    {
+        while (true)
+        {
+            Task[] tasks;
+            lock (_gate)
+            {
+                tasks = _tasks.ToArray();
+            }
+
+            if (tasks.Length == 0)
+            {
+                return;
+            }
+
+            await Task.WhenAll(tasks).ConfigureAwait(false);
+        }
+    }
+
+    private async Task RemoveWhenCompleteAsync(Task task)
+    {
+        try
+        {
+            await task.ConfigureAwait(false);
+        }
+        catch
+        {
+        }
+        finally
+        {
+            lock (_gate)
+            {
+                _tasks.Remove(task);
+            }
+        }
+    }
+}

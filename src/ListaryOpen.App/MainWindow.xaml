@@ -13,15 +13,21 @@
     <Grid Margin="20">
         <Grid.RowDefinitions>
             <RowDefinition Height="Auto" />
+            <RowDefinition Height="Auto" />
             <RowDefinition Height="*" />
         </Grid.RowDefinitions>
 
         <TextBlock Text="ListaryOpen Settings"
                    FontSize="22"
                    FontWeight="SemiBold"
+                   Margin="0,0,0,6" />
+
+        <TextBlock Grid.Row="1"
+                   Text="{Binding IndexingStatusText}"
+                   TextWrapping="Wrap"
                    Margin="0,0,0,16" />
 
-        <ScrollViewer Grid.Row="1"
+        <ScrollViewer Grid.Row="2"
                       VerticalScrollBarVisibility="Auto">
             <StackPanel>
                 <TextBlock Text="Indexed roots"

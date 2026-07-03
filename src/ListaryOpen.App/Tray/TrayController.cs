@@ -1,4 +1,5 @@
 using Hardcodet.Wpf.TaskbarNotification;
+using System.Diagnostics;
 using System.Windows;
 using System.Windows.Controls;
 
@@ -8,16 +9,21 @@ public sealed class TrayController : IDisposable
 {
     private readonly TaskbarIcon _icon;
     private readonly MenuItem _openSettingsMenuItem;
+    private readonly MenuItem _reindexMenuItem;
     private readonly MenuItem _exitMenuItem;
+    private readonly Action _reindex;
     private readonly Window _settingsWindow;
 
-    public TrayController(Window settingsWindow)
+    public TrayController(Window settingsWindow, Action? reindex = null)
     {
         _settingsWindow = settingsWindow;
+        _reindex = reindex ?? (() => { });
         _openSettingsMenuItem = new MenuItem { Header = "Open Settings" };
+        _reindexMenuItem = new MenuItem { Header = "Reindex" };
         _exitMenuItem = new MenuItem { Header = "Exit" };
 
         _openSettingsMenuItem.Click += OnOpenSettingsClick;
+        _reindexMenuItem.Click += OnReindexClick;
         _exitMenuItem.Click += OnExitClick;
 
         _icon = new TaskbarIcon
@@ -32,6 +38,7 @@ public sealed class TrayController : IDisposable
     {
         _icon.TrayMouseDoubleClick -= OnTrayMouseDoubleClick;
         _openSettingsMenuItem.Click -= OnOpenSettingsClick;
+        _reindexMenuItem.Click -= OnReindexClick;
         _exitMenuItem.Click -= OnExitClick;
         _icon.Dispose();
     }
@@ -40,6 +47,7 @@ public sealed class TrayController : IDisposable
     {
         var contextMenu = new ContextMenu();
         contextMenu.Items.Add(_openSettingsMenuItem);
+        contextMenu.Items.Add(_reindexMenuItem);
         contextMenu.Items.Add(new Separator());
         contextMenu.Items.Add(_exitMenuItem);
 
@@ -59,6 +67,18 @@ public sealed class TrayController : IDisposable
     private static void OnExitClick(object sender, RoutedEventArgs e)
     {
         Application.Current.Shutdown();
+    }
+
+    private void OnReindexClick(object sender, RoutedEventArgs e)
+    {
+        try
+        {
+            _reindex();
+        }
+        catch (Exception exception)
+        {
+            Trace.TraceError(exception.ToString());
+        }
     }
 
     private void ShowSettingsWindow()

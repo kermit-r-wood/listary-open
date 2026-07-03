@@ -10,9 +10,16 @@ namespace ListaryOpen.App;
 public partial class MainWindow : Window
 {
     public MainWindow()
+        : this(new SettingsViewModel())
     {
+    }
+
+    public MainWindow(SettingsViewModel viewModel)
+    {
+        ArgumentNullException.ThrowIfNull(viewModel);
+
         InitializeComponent();
-        DataContext = new SettingsViewModel();
+        DataContext = viewModel;
     }
 
     protected override void OnClosing(CancelEventArgs e)

@@ -258,6 +258,51 @@ public sealed class IndexingCoordinatorTests
         }
     }
 
+    [Fact]
+    public async Task IndexRootsAsyncDoesNotPostContinuationToCallingSynchronizationContext()
+    {
+        var rootPath = CreateTempDirectory();
+        var dbPath = CreateTempDbPath();
+
+        try
+        {
+            await using var index = await SqliteSearchIndex.OpenAsync(dbPath, CancellationToken.None);
+            var provider = new AsynchronousSingleRecordProvider(FileRecord.Create(
+                Path.Combine(rootPath, "ContextFreeIndex.txt"),
+                isDirectory: false,
+                sizeBytes: 1,
+                DateTimeOffset.UtcNow));
+            var coordinator = new IndexingCoordinator(
+                index,
+                new VolumeIndexer(new IIndexProvider[] { provider }),
+                new FallbackIndexProvider(),
+                _ => new VolumeInfo(Path.GetPathRoot(rootPath)!, provider.Name, true),
+                batchSize: 1);
+
+            var previousContext = SynchronizationContext.Current;
+            var context = new RecordingSynchronizationContext();
+            SynchronizationContext.SetSynchronizationContext(context);
+            Task indexingTask;
+            try
+            {
+                indexingTask = coordinator.IndexRootsAsync(new[] { new IndexRoot(rootPath) }, CancellationToken.None);
+            }
+            finally
+            {
+                SynchronizationContext.SetSynchronizationContext(previousContext);
+            }
+
+            await indexingTask.WaitAsync(TimeSpan.FromSeconds(5));
+
+            Assert.Equal(0, context.PostCount);
+        }
+        finally
+        {
+            DeleteDirectoryIfExists(rootPath);
+            DeleteFileIfExists(dbPath);
+        }
+    }
+
     [Theory]
     [InlineData(@"\\server\share", false)]
     [InlineData(@"\\server\share\folder", false)]
@@ -374,6 +419,91 @@ public sealed class IndexingCoordinatorTests
             cancellationToken.ThrowIfCancellationRequested();
             await Task.CompletedTask;
             yield return _record;
+        }
+    }
+
+    private sealed class AsynchronousSingleRecordProvider : IIndexProvider
+    {
+        private readonly FileRecord _record;
+
+        public AsynchronousSingleRecordProvider(FileRecord record)
+        {
+            _record = record;
+        }
+
+        public string Name => "AsyncProvider";
+
+        public bool CanIndex(VolumeInfo volume) => volume.IsReady;
+
+        public IAsyncEnumerable<FileRecord> ScanAsync(IndexRoot root, CancellationToken cancellationToken)
+        {
+            return new AsynchronousSingleRecordEnumerable(_record, cancellationToken);
+        }
+    }
+
+    private sealed class AsynchronousSingleRecordEnumerable : IAsyncEnumerable<FileRecord>
+    {
+        private readonly CancellationToken _cancellationToken;
+        private readonly FileRecord _record;
+
+        public AsynchronousSingleRecordEnumerable(FileRecord record, CancellationToken cancellationToken)
+        {
+            _record = record;
+            _cancellationToken = cancellationToken;
+        }
+
+        public IAsyncEnumerator<FileRecord> GetAsyncEnumerator(CancellationToken cancellationToken = default)
+        {
+            return new AsynchronousSingleRecordEnumerator(
+                _record,
+                CancellationTokenSource.CreateLinkedTokenSource(_cancellationToken, cancellationToken));
+        }
+    }
+
+    private sealed class AsynchronousSingleRecordEnumerator : IAsyncEnumerator<FileRecord>
+    {
+        private readonly CancellationTokenSource _cancellation;
+        private readonly FileRecord _record;
+        private bool _hasReturnedRecord;
+
+        public AsynchronousSingleRecordEnumerator(FileRecord record, CancellationTokenSource cancellation)
+        {
+            _record = record;
+            _cancellation = cancellation;
+        }
+
+        public FileRecord Current { get; private set; } = null!;
+
+        public async ValueTask<bool> MoveNextAsync()
+        {
+            await Task.Delay(1, _cancellation.Token).ConfigureAwait(false);
+            if (_hasReturnedRecord)
+            {
+                return false;
+            }
+
+            _hasReturnedRecord = true;
+            Current = _record;
+            return true;
+        }
+
+        public ValueTask DisposeAsync()
+        {
+            _cancellation.Dispose();
+            return ValueTask.CompletedTask;
+        }
+    }
+
+    private sealed class RecordingSynchronizationContext : SynchronizationContext
+    {
+        private int _postCount;
+
+        public int PostCount => _postCount;
+
+        public override void Post(SendOrPostCallback d, object? state)
+        {
+            Interlocked.Increment(ref _postCount);
+            ThreadPool.QueueUserWorkItem(_ => d(state));
         }
     }
 }

@@ -71,7 +71,7 @@ public sealed class IndexingCoordinator
             try
             {
                 var provider = SelectProvider(root);
-                var result = await IndexRootWithProviderAsync(provider, root, indexedCount, cancellationToken);
+                var result = await IndexRootWithProviderAsync(provider, root, indexedCount, cancellationToken).ConfigureAwait(false);
                 indexedCount += result.IndexedCount;
                 hadFailures |= result.HadFailure;
             }
@@ -116,19 +116,19 @@ public sealed class IndexingCoordinator
     {
         if (!IsNtfsProvider(provider))
         {
-            return new IndexRootResult(await ScanAndUpsertAsync(provider, root, cancellationToken), HadFailure: false);
+            return new IndexRootResult(await ScanAndUpsertAsync(provider, root, cancellationToken).ConfigureAwait(false), HadFailure: false);
         }
 
         try
         {
-            var count = await ScanAndUpsertAsync(provider, root, cancellationToken);
+            var count = await ScanAndUpsertAsync(provider, root, cancellationToken).ConfigureAwait(false);
             if (count > 0)
             {
                 return new IndexRootResult(count, HadFailure: false);
             }
 
             RaiseStatus(IndexingRunState.Indexing, $"NTFS returned no records; using fallback for {root.Path}.", currentIndexedCount);
-            return new IndexRootResult(await ScanAndUpsertAsync(_fallbackProvider, root, cancellationToken), HadFailure: false);
+            return new IndexRootResult(await ScanAndUpsertAsync(_fallbackProvider, root, cancellationToken).ConfigureAwait(false), HadFailure: false);
         }
         catch (OperationCanceledException)
         {
@@ -137,7 +137,7 @@ public sealed class IndexingCoordinator
         catch (IndexProviderScanException exception)
         {
             RaiseStatus(IndexingRunState.Failed, $"NTFS scan failed for {root.Path}; using fallback. {exception.Message}", currentIndexedCount);
-            return new IndexRootResult(await ScanAndUpsertAsync(_fallbackProvider, root, cancellationToken), HadFailure: true);
+            return new IndexRootResult(await ScanAndUpsertAsync(_fallbackProvider, root, cancellationToken).ConfigureAwait(false), HadFailure: true);
         }
     }
 
@@ -171,7 +171,7 @@ public sealed class IndexingCoordinator
 
                 try
                 {
-                    if (!await enumerator.MoveNextAsync())
+                    if (!await enumerator.MoveNextAsync().ConfigureAwait(false))
                     {
                         break;
                     }
@@ -191,16 +191,16 @@ public sealed class IndexingCoordinator
 
                 if (batch.Count == _batchSize)
                 {
-                    indexedCount += await FlushBatchAsync(batch, cancellationToken);
+                    indexedCount += await FlushBatchAsync(batch, cancellationToken).ConfigureAwait(false);
                 }
             }
         }
         finally
         {
-            await enumerator.DisposeAsync();
+            await enumerator.DisposeAsync().ConfigureAwait(false);
         }
 
-        indexedCount += await FlushBatchAsync(batch, cancellationToken);
+        indexedCount += await FlushBatchAsync(batch, cancellationToken).ConfigureAwait(false);
         return indexedCount;
     }
 
@@ -211,7 +211,7 @@ public sealed class IndexingCoordinator
             return 0;
         }
 
-        await _index.UpsertManyAsync(batch, cancellationToken);
+        await _index.UpsertManyAsync(batch, cancellationToken).ConfigureAwait(false);
         var count = batch.Count;
         batch.Clear();
         return count;

@@ -318,6 +318,93 @@ public sealed class SqliteSearchIndexTests
     }
 
     [Fact]
+    public async Task ConcurrentSearchAndWritesOnSingleIndexComplete()
+    {
+        var dbPath = CreateTempDbPath();
+
+        try
+        {
+            await using (var index = await SqliteSearchIndex.OpenAsync(dbPath, CancellationToken.None))
+            {
+                await index.UpsertAsync(FileRecord.Create("C:\\Docs\\SeedInvoice.xlsx", false, 10, DateTimeOffset.UtcNow), CancellationToken.None);
+
+                var tasks = new List<Task>();
+                for (var worker = 0; worker < 8; worker++)
+                {
+                    var workerId = worker;
+                    tasks.Add(Task.Run(async () =>
+                    {
+                        var records = Enumerable
+                            .Range(0, 250)
+                            .Select(i => FileRecord.Create($"C:\\Docs\\Concurrent-{workerId:D2}-{i:D4}.txt", false, 1, DateTimeOffset.UtcNow));
+
+                        await index.UpsertManyAsync(records, CancellationToken.None);
+                    }));
+
+                    tasks.Add(Task.Run(async () =>
+                    {
+                        for (var i = 0; i < 80; i++)
+                        {
+                            await index.SearchAsync(new SearchQuery("invoice", SearchMode.FilesAndFolders), CancellationToken.None);
+                        }
+                    }));
+                }
+
+                var exception = await Record.ExceptionAsync(() => Task.WhenAll(tasks));
+
+                Assert.Null(exception);
+            }
+        }
+        finally
+        {
+            DeleteIfExists(dbPath);
+        }
+    }
+
+    [Fact]
+    public async Task SearchAsyncDoesNotPostContinuationToCallingSynchronizationContextWhileWaitingForGate()
+    {
+        var dbPath = CreateTempDbPath();
+
+        try
+        {
+            await using (var index = await SqliteSearchIndex.OpenAsync(dbPath, CancellationToken.None))
+            {
+                var enteredGate = new ManualResetEventSlim();
+                var releaseGate = new ManualResetEventSlim();
+                var holdGateTask = Task.Run(() => index.UpsertManyAsync(
+                    CreateRecordsThatHoldEnumeration(enteredGate, releaseGate),
+                    CancellationToken.None));
+
+                Assert.True(enteredGate.Wait(TimeSpan.FromSeconds(5)));
+
+                var previousContext = SynchronizationContext.Current;
+                var context = new RecordingSynchronizationContext();
+                SynchronizationContext.SetSynchronizationContext(context);
+                Task<IReadOnlyList<SearchResult>> searchTask;
+                try
+                {
+                    searchTask = index.SearchAsync(new SearchQuery("invoice", SearchMode.FilesAndFolders), CancellationToken.None);
+                }
+                finally
+                {
+                    SynchronizationContext.SetSynchronizationContext(previousContext);
+                }
+
+                releaseGate.Set();
+                await holdGateTask.WaitAsync(TimeSpan.FromSeconds(5));
+                await searchTask.WaitAsync(TimeSpan.FromSeconds(5));
+
+                Assert.Equal(0, context.PostCount);
+            }
+        }
+        finally
+        {
+            DeleteIfExists(dbPath);
+        }
+    }
+
+    [Fact]
     public async Task OpenMigratesOldSchemaDatabaseBeforeSearchAndUpsert()
     {
         var dbPath = CreateTempDbPath();
@@ -406,6 +493,15 @@ public sealed class SqliteSearchIndexTests
             .Select(i => FileRecord.Create($"C:\\Docs\\A{i:D4}.txt", false, 1, lastWriteTime));
 
         await index.UpsertManyAsync(records, CancellationToken.None);
+    }
+
+    private static IEnumerable<FileRecord> CreateRecordsThatHoldEnumeration(
+        ManualResetEventSlim enteredGate,
+        ManualResetEventSlim releaseGate)
+    {
+        yield return FileRecord.Create("C:\\Docs\\HeldGateInvoice.xlsx", false, 1, DateTimeOffset.UtcNow);
+        enteredGate.Set();
+        releaseGate.Wait();
     }
 
     private static async Task InsertAlphabeticallyEarlierFuzzyInvoiceRowsAsync(SqliteSearchIndex index)
@@ -519,6 +615,19 @@ public sealed class SqliteSearchIndexTests
         if (File.Exists(path))
         {
             File.Delete(path);
+        }
+    }
+
+    private sealed class RecordingSynchronizationContext : SynchronizationContext
+    {
+        private int _postCount;
+
+        public int PostCount => _postCount;
+
+        public override void Post(SendOrPostCallback d, object? state)
+        {
+            Interlocked.Increment(ref _postCount);
+            ThreadPool.QueueUserWorkItem(_ => d(state));
         }
     }
 }

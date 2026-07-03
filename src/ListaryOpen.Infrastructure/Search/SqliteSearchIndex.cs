@@ -12,7 +12,9 @@ public sealed class SqliteSearchIndex : ISearchIndex, IAsyncDisposable
 {
     private const int FallbackCandidateLimit = 200;
 
+    private readonly SemaphoreSlim _connectionGate = new(1, 1);
     private readonly SqliteConnection _connection;
+    private bool _disposed;
 
     private SqliteSearchIndex(SqliteConnection connection)
     {
@@ -39,44 +41,63 @@ public sealed class SqliteSearchIndex : ISearchIndex, IAsyncDisposable
         }.ToString();
 
         var connection = new SqliteConnection(connectionString);
-        await connection.OpenAsync(cancellationToken);
+        await connection.OpenAsync(cancellationToken).ConfigureAwait(false);
 
         try
         {
-            await CreateSchemaAsync(connection, cancellationToken);
-            await MigrateSchemaAsync(connection, cancellationToken);
+            await CreateSchemaAsync(connection, cancellationToken).ConfigureAwait(false);
+            await MigrateSchemaAsync(connection, cancellationToken).ConfigureAwait(false);
             return new SqliteSearchIndex(connection);
         }
         catch
         {
-            await connection.DisposeAsync();
+            await connection.DisposeAsync().ConfigureAwait(false);
             throw;
         }
     }
 
     public async Task UpsertAsync(FileRecord record, CancellationToken cancellationToken)
     {
-        await ExecuteUpsertAsync(record, null, cancellationToken);
+        await _connectionGate.WaitAsync(cancellationToken).ConfigureAwait(false);
+        try
+        {
+            ThrowIfDisposed();
+            await ExecuteUpsertAsync(record, null, cancellationToken).ConfigureAwait(false);
+        }
+        finally
+        {
+            _connectionGate.Release();
+        }
     }
 
     public async Task UpsertManyAsync(IEnumerable<FileRecord> records, CancellationToken cancellationToken)
     {
         ArgumentNullException.ThrowIfNull(records);
 
-        using var transaction = _connection.BeginTransaction();
+        await _connectionGate.WaitAsync(cancellationToken).ConfigureAwait(false);
         try
         {
-            foreach (var record in records)
-            {
-                await ExecuteUpsertAsync(record, transaction, cancellationToken);
-            }
+            ThrowIfDisposed();
 
-            await transaction.CommitAsync(cancellationToken);
+            using var transaction = _connection.BeginTransaction();
+            try
+            {
+                foreach (var record in records)
+                {
+                    await ExecuteUpsertAsync(record, transaction, cancellationToken).ConfigureAwait(false);
+                }
+
+                await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
+            }
+            catch
+            {
+                await transaction.RollbackAsync(CancellationToken.None).ConfigureAwait(false);
+                throw;
+            }
         }
-        catch
+        finally
         {
-            await transaction.RollbackAsync(CancellationToken.None);
-            throw;
+            _connectionGate.Release();
         }
     }
 
@@ -84,26 +105,60 @@ public sealed class SqliteSearchIndex : ISearchIndex, IAsyncDisposable
     {
         var pathKey = CreatePathKey(fullPath);
 
-        using var command = _connection.CreateCommand();
-        command.CommandText = "delete from files where path_key = $path_key;";
-        command.Parameters.AddWithValue("$path_key", pathKey);
+        await _connectionGate.WaitAsync(cancellationToken).ConfigureAwait(false);
+        try
+        {
+            ThrowIfDisposed();
 
-        await command.ExecuteNonQueryAsync(cancellationToken);
+            using var command = _connection.CreateCommand();
+            command.CommandText = "delete from files where path_key = $path_key;";
+            command.Parameters.AddWithValue("$path_key", pathKey);
+
+            await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+        }
+        finally
+        {
+            _connectionGate.Release();
+        }
     }
 
     public async Task<IReadOnlyList<SearchResult>> SearchAsync(SearchQuery query, CancellationToken cancellationToken)
     {
         ArgumentNullException.ThrowIfNull(query);
 
-        var candidates = await ReadCandidatesAsync(query, cancellationToken);
-        var usage = await ReadUsageAsync(cancellationToken);
+        await _connectionGate.WaitAsync(cancellationToken).ConfigureAwait(false);
+        try
+        {
+            ThrowIfDisposed();
 
-        return ResultRanker.Rank(query, candidates, usage, Array.Empty<string>());
+            var candidates = await ReadCandidatesAsync(query, cancellationToken).ConfigureAwait(false);
+            var usage = await ReadUsageAsync(cancellationToken).ConfigureAwait(false);
+
+            return ResultRanker.Rank(query, candidates, usage, Array.Empty<string>());
+        }
+        finally
+        {
+            _connectionGate.Release();
+        }
     }
 
-    public ValueTask DisposeAsync()
+    public async ValueTask DisposeAsync()
     {
-        return _connection.DisposeAsync();
+        await _connectionGate.WaitAsync().ConfigureAwait(false);
+        try
+        {
+            if (_disposed)
+            {
+                return;
+            }
+
+            _disposed = true;
+            await _connection.DisposeAsync().ConfigureAwait(false);
+        }
+        finally
+        {
+            _connectionGate.Release();
+        }
     }
 
     private static async Task CreateSchemaAsync(SqliteConnection connection, CancellationToken cancellationToken)
@@ -129,19 +184,19 @@ public sealed class SqliteSearchIndex : ISearchIndex, IAsyncDisposable
             );
             """;
 
-        await command.ExecuteNonQueryAsync(cancellationToken);
+        await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
     }
 
     private static async Task MigrateSchemaAsync(SqliteConnection connection, CancellationToken cancellationToken)
     {
-        if (!await HasColumnAsync(connection, "files", "search_text", cancellationToken))
+        if (!await HasColumnAsync(connection, "files", "search_text", cancellationToken).ConfigureAwait(false))
         {
             using var addColumnCommand = connection.CreateCommand();
             addColumnCommand.CommandText = "alter table files add column search_text text not null default '';";
-            await addColumnCommand.ExecuteNonQueryAsync(cancellationToken);
+            await addColumnCommand.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
         }
 
-        await BackfillSearchTextAsync(connection, cancellationToken);
+        await BackfillSearchTextAsync(connection, cancellationToken).ConfigureAwait(false);
     }
 
     private static async Task<bool> HasColumnAsync(
@@ -159,7 +214,7 @@ public sealed class SqliteSearchIndex : ISearchIndex, IAsyncDisposable
         command.Parameters.AddWithValue("$table_name", tableName);
         command.Parameters.AddWithValue("$column_name", columnName);
 
-        var result = await command.ExecuteScalarAsync(cancellationToken);
+        var result = await command.ExecuteScalarAsync(cancellationToken).ConfigureAwait(false);
         return Convert.ToInt64(result, CultureInfo.InvariantCulture) > 0;
     }
 
@@ -178,10 +233,13 @@ public sealed class SqliteSearchIndex : ISearchIndex, IAsyncDisposable
                 where search_text = '';
                 """;
 
-            await using var reader = await readCommand.ExecuteReaderAsync(cancellationToken);
-            while (await reader.ReadAsync(cancellationToken))
+            var reader = await readCommand.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
+            await using (reader.ConfigureAwait(false))
             {
-                rows.Add((reader.GetString(0), reader.GetString(1), reader.GetString(2)));
+                while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
+                {
+                    rows.Add((reader.GetString(0), reader.GetString(1), reader.GetString(2)));
+                }
             }
         }
 
@@ -205,14 +263,14 @@ public sealed class SqliteSearchIndex : ISearchIndex, IAsyncDisposable
                 updateCommand.Parameters.AddWithValue("$search_text", CreateRecordSearchText(row.FullPath, row.Name));
                 updateCommand.Parameters.AddWithValue("$path_key", row.PathKey);
 
-                await updateCommand.ExecuteNonQueryAsync(cancellationToken);
+                await updateCommand.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
             }
 
-            await transaction.CommitAsync(cancellationToken);
+            await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
         }
         catch
         {
-            await transaction.RollbackAsync(CancellationToken.None);
+            await transaction.RollbackAsync(CancellationToken.None).ConfigureAwait(false);
             throw;
         }
     }
@@ -266,16 +324,16 @@ public sealed class SqliteSearchIndex : ISearchIndex, IAsyncDisposable
         command.Parameters.AddWithValue("$size_bytes", record.SizeBytes);
         command.Parameters.AddWithValue("$last_write_time", FormatDateTime(record.LastWriteTime));
 
-        await command.ExecuteNonQueryAsync(cancellationToken);
+        await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
     }
 
     private async Task<IReadOnlyList<FileRecord>> ReadCandidatesAsync(SearchQuery query, CancellationToken cancellationToken)
     {
         var records = new Dictionary<string, FileRecord>(StringComparer.Ordinal);
 
-        await AddExactCandidatesAsync(query, records, cancellationToken);
-        await AddFuzzyCandidatesAsync(query, records, cancellationToken);
-        await AddFallbackCandidatesAsync(records, cancellationToken);
+        await AddExactCandidatesAsync(query, records, cancellationToken).ConfigureAwait(false);
+        await AddFuzzyCandidatesAsync(query, records, cancellationToken).ConfigureAwait(false);
+        await AddFallbackCandidatesAsync(records, cancellationToken).ConfigureAwait(false);
 
         return records.Values.ToArray();
     }
@@ -309,7 +367,7 @@ public sealed class SqliteSearchIndex : ISearchIndex, IAsyncDisposable
         command.Parameters.AddWithValue("$query", normalizedQuery);
         command.Parameters.AddWithValue("$query_prefix", $"{EscapeLike(normalizedQuery)}%");
 
-        await AddRecordsAsync(command, records, cancellationToken);
+        await AddRecordsAsync(command, records, cancellationToken).ConfigureAwait(false);
     }
 
     private async Task AddFuzzyCandidatesAsync(
@@ -333,7 +391,7 @@ public sealed class SqliteSearchIndex : ISearchIndex, IAsyncDisposable
             """;
         command.Parameters.AddWithValue("$ordered", orderedPattern);
 
-        await AddRecordsAsync(command, records, cancellationToken);
+        await AddRecordsAsync(command, records, cancellationToken).ConfigureAwait(false);
     }
 
     private async Task AddFallbackCandidatesAsync(
@@ -353,7 +411,7 @@ public sealed class SqliteSearchIndex : ISearchIndex, IAsyncDisposable
             """;
         command.Parameters.AddWithValue("$limit", FallbackCandidateLimit);
 
-        await AddRecordsAsync(command, records, cancellationToken);
+        await AddRecordsAsync(command, records, cancellationToken).ConfigureAwait(false);
     }
 
     private static async Task AddRecordsAsync(
@@ -361,15 +419,18 @@ public sealed class SqliteSearchIndex : ISearchIndex, IAsyncDisposable
         IDictionary<string, FileRecord> records,
         CancellationToken cancellationToken)
     {
-        await using var reader = await command.ExecuteReaderAsync(cancellationToken);
-        while (await reader.ReadAsync(cancellationToken))
+        var reader = await command.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
+        await using (reader.ConfigureAwait(false))
         {
-            var record = FileRecord.Create(
-                reader.GetString(0),
-                reader.GetInt64(1) != 0,
-                reader.GetInt64(2),
-                ParseDateTime(reader.GetString(3)));
-            records.TryAdd(record.PathKey, record);
+            while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
+            {
+                var record = FileRecord.Create(
+                    reader.GetString(0),
+                    reader.GetInt64(1) != 0,
+                    reader.GetInt64(2),
+                    ParseDateTime(reader.GetString(3)));
+                records.TryAdd(record.PathKey, record);
+            }
         }
     }
 
@@ -385,13 +446,16 @@ public sealed class SqliteSearchIndex : ISearchIndex, IAsyncDisposable
             """;
 
         var records = new List<UsageRecord>();
-        await using var reader = await command.ExecuteReaderAsync(cancellationToken);
-        while (await reader.ReadAsync(cancellationToken))
+        var reader = await command.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
+        await using (reader.ConfigureAwait(false))
         {
-            records.Add(new UsageRecord(
-                reader.GetString(0),
-                reader.GetInt32(1),
-                ParseDateTime(reader.GetString(2))));
+            while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
+            {
+                records.Add(new UsageRecord(
+                    reader.GetString(0),
+                    reader.GetInt32(1),
+                    ParseDateTime(reader.GetString(2))));
+            }
         }
 
         return records;
@@ -475,5 +539,10 @@ public sealed class SqliteSearchIndex : ISearchIndex, IAsyncDisposable
         }
 
         builder.Append(value);
+    }
+
+    private void ThrowIfDisposed()
+    {
+        ObjectDisposedException.ThrowIf(_disposed, this);
     }
 }
