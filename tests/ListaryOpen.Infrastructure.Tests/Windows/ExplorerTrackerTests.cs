@@ -123,6 +123,65 @@ public sealed class ExplorerTrackerTests
         }
     }
 
+    [Fact]
+    public void GetFolderCandidatesReturnsForegroundExplorerFolderFirstAndDeduplicates()
+    {
+        var first = Directory.CreateTempSubdirectory("listary-open-first-");
+        var second = Directory.CreateTempSubdirectory("listary-open-second-");
+
+        try
+        {
+            var foregroundHandle = new IntPtr(2222);
+            var tracker = new ExplorerTracker(
+                () => foregroundHandle,
+                new RecordingExplorerShellWindowsProvider(new[]
+                {
+                    new ExplorerShellWindow(new IntPtr(1111), first.FullName),
+                    new ExplorerShellWindow(foregroundHandle, second.FullName),
+                    new ExplorerShellWindow(new IntPtr(3333), first.FullName + Path.DirectorySeparatorChar)
+                }));
+
+            var candidates = tracker.GetFolderCandidates();
+
+            Assert.Equal(new[] { second.FullName, first.FullName }, candidates.Select(candidate => candidate.FolderPath));
+            Assert.True(candidates[0].IsForeground);
+            Assert.Equal("Explorer", candidates[0].SourceName);
+            Assert.Equal(foregroundHandle, candidates[0].WindowHandle);
+        }
+        finally
+        {
+            first.Delete(recursive: true);
+            second.Delete(recursive: true);
+        }
+    }
+
+    [Fact]
+    public void GetFolderCandidatesSkipsMissingFolders()
+    {
+        var existing = Directory.CreateTempSubdirectory("listary-open-existing-");
+        var missing = Path.Combine(Path.GetTempPath(), "listary-open-missing-" + Guid.NewGuid());
+
+        try
+        {
+            var tracker = new ExplorerTracker(
+                () => new IntPtr(1234),
+                new RecordingExplorerShellWindowsProvider(new[]
+                {
+                    new ExplorerShellWindow(new IntPtr(1234), missing),
+                    new ExplorerShellWindow(new IntPtr(5678), existing.FullName)
+                }));
+
+            var candidate = Assert.Single(tracker.GetFolderCandidates());
+
+            Assert.Equal(existing.FullName, candidate.FolderPath);
+            Assert.False(candidate.IsForeground);
+        }
+        finally
+        {
+            existing.Delete(recursive: true);
+        }
+    }
+
     private sealed class RecordingExplorerShellWindowsProvider : IExplorerShellWindowsProvider
     {
         private readonly IReadOnlyList<ExplorerShellWindow> _windows;

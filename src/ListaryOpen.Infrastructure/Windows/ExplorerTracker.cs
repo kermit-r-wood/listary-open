@@ -4,7 +4,7 @@ using System.Security;
 
 namespace ListaryOpen.Infrastructure.Windows;
 
-public sealed class ExplorerTracker
+public sealed class ExplorerTracker : IQuickSwitchWindowProvider
 {
     private readonly Func<IntPtr> _foregroundWindowProvider;
     private readonly IExplorerShellWindowsProvider _shellWindowsProvider;
@@ -24,6 +24,44 @@ public sealed class ExplorerTracker
     }
 
     public string? LastFolder => _lastFolder;
+
+    public IReadOnlyList<QuickSwitchFolderCandidate> GetFolderCandidates()
+    {
+        try
+        {
+            var foregroundHandle = _foregroundWindowProvider();
+            var candidates = new List<QuickSwitchFolderCandidate>();
+            var seenFolderPaths = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+            foreach (var window in _shellWindowsProvider.EnumerateWindows())
+            {
+                if (string.IsNullOrWhiteSpace(window.FolderPath))
+                {
+                    continue;
+                }
+
+                var folderPath = Path.TrimEndingDirectorySeparator(Path.GetFullPath(window.FolderPath));
+                if (!Directory.Exists(folderPath) || !seenFolderPaths.Add(folderPath))
+                {
+                    continue;
+                }
+
+                candidates.Add(new QuickSwitchFolderCandidate(
+                    folderPath,
+                    "Explorer",
+                    window.Handle,
+                    window.Handle == foregroundHandle));
+            }
+
+            return candidates
+                .OrderByDescending(candidate => candidate.IsForeground)
+                .ToArray();
+        }
+        catch (Exception exception) when (IsExpectedExplorerObservationException(exception))
+        {
+            return Array.Empty<QuickSwitchFolderCandidate>();
+        }
+    }
 
     public void ObserveForegroundExplorerFolder()
     {
