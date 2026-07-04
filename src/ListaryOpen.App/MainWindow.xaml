@@ -81,7 +81,32 @@
 
                 <CheckBox Content="Quick Save / Open enabled"
                           IsChecked="{Binding Settings.QuickSaveOpenEnabled, Mode=OneWay}"
-                          IsEnabled="False" />
+                          IsEnabled="False"
+                          Margin="0,0,0,16" />
+
+                <Grid>
+                    <Grid.ColumnDefinitions>
+                        <ColumnDefinition Width="*" />
+                        <ColumnDefinition Width="Auto" />
+                    </Grid.ColumnDefinitions>
+
+                    <StackPanel Grid.Column="0"
+                                Margin="0,0,12,0">
+                        <TextBlock Text="NTFS fast indexing"
+                                   FontSize="14"
+                                   FontWeight="SemiBold"
+                                   Margin="0,0,0,6" />
+                        <TextBlock Text="{Binding NtfsFastIndexingStatusText}"
+                                   TextWrapping="Wrap" />
+                    </StackPanel>
+
+                    <Button Grid.Column="1"
+                            MinWidth="80"
+                            Padding="10,4"
+                            VerticalAlignment="Center"
+                            Content="Enable"
+                            Command="{Binding EnableNtfsFastIndexingCommand}" />
+                </Grid>
             </StackPanel>
         </ScrollViewer>
     </Grid>

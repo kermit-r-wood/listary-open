@@ -1,3 +1,4 @@
+using System.ComponentModel;
 using System.Diagnostics;
 using System.Text;
 using ListaryOpen.Core.Indexing;
@@ -62,6 +63,29 @@ public sealed class ElevatedIndexerClientTests
     }
 
     [Fact]
+    public void IsAvailableReturnsTrueWhenExplicitHelperPathExistsAndUacElevationIsEnabled()
+    {
+        var tempDirectory = Path.Combine(Path.GetTempPath(), "listary-open-" + Guid.NewGuid());
+        Directory.CreateDirectory(tempDirectory);
+
+        try
+        {
+            var helperPath = Path.Combine(tempDirectory, "ListaryOpen.Indexer.Elevated.exe");
+            File.WriteAllText(helperPath, "placeholder");
+            var client = new ElevatedIndexerClient(helperPath, () => false);
+
+            client.EnableUacElevation();
+
+            Assert.True(client.IsAvailable);
+            Assert.True(client.UacElevationEnabled);
+        }
+        finally
+        {
+            Directory.Delete(tempDirectory, recursive: true);
+        }
+    }
+
+    [Fact]
     public async Task ScanNtfsAsyncReturnsEmptyRecordsAndWarnsWhenHelperIsMissing()
     {
         var helperPath = Path.Combine(Path.GetTempPath(), "listary-open-" + Guid.NewGuid(), "missing.exe");
@@ -99,6 +123,79 @@ public sealed class ElevatedIndexerClientTests
 
             Assert.Empty(records);
             Assert.False(processCreated);
+        }
+        finally
+        {
+            Directory.Delete(tempDirectory, recursive: true);
+        }
+    }
+
+    [Fact]
+    public async Task ScanNtfsAsyncReadsRecordsFromUacElevatedFileHelperWhenProcessIsNotElevated()
+    {
+        var tempDirectory = Path.Combine(Path.GetTempPath(), "listary-open-" + Guid.NewGuid());
+        Directory.CreateDirectory(tempDirectory);
+
+        try
+        {
+            var helperPath = Path.Combine(tempDirectory, "ListaryOpen.Indexer.Elevated.exe");
+            File.WriteAllText(helperPath, "placeholder");
+            ElevatedFileHelperRequest? createdRequest = null;
+            var client = new ElevatedIndexerClient(
+                helperPath,
+                (_, _) => throw new InvalidOperationException("Redirected helper should not be created."),
+                () => false,
+                () => true,
+                (path, root, outputPath, errorPath) =>
+                {
+                    createdRequest = new ElevatedFileHelperRequest(path, root, outputPath, errorPath);
+                    return new FileWritingElevatedIndexerProcess(
+                        outputPath,
+                        errorPath,
+                        "{\"fullPath\":\"C:\\\\Docs\\\\Elevated.txt\",\"isDirectory\":false,\"sizeBytes\":15,\"lastWriteTime\":\"2026-07-04T00:00:00+00:00\"}",
+                        error: string.Empty,
+                        exitCode: 0);
+                });
+
+            var records = await CollectAsync(client.ScanNtfsAsync(new IndexRoot("C:\\Docs"), CancellationToken.None));
+
+            var record = Assert.Single(records);
+            Assert.Equal("C:\\Docs\\Elevated.txt", record.FullPath);
+            Assert.False(record.IsDirectory);
+            Assert.Equal(15, record.SizeBytes);
+            Assert.Equal(new DateTimeOffset(2026, 7, 4, 0, 0, 0, TimeSpan.Zero), record.LastWriteTime);
+            Assert.NotNull(createdRequest);
+            Assert.Equal(helperPath, createdRequest!.HelperPath);
+            Assert.Equal("C:\\Docs", createdRequest.RootPath);
+            Assert.False(File.Exists(createdRequest.OutputPath));
+            Assert.False(File.Exists(createdRequest.ErrorPath));
+        }
+        finally
+        {
+            Directory.Delete(tempDirectory, recursive: true);
+        }
+    }
+
+    [Fact]
+    public async Task ScanNtfsAsyncReturnsEmptyRecordsWhenUacElevationIsCanceled()
+    {
+        var tempDirectory = Path.Combine(Path.GetTempPath(), "listary-open-" + Guid.NewGuid());
+        Directory.CreateDirectory(tempDirectory);
+
+        try
+        {
+            var helperPath = Path.Combine(tempDirectory, "ListaryOpen.Indexer.Elevated.exe");
+            File.WriteAllText(helperPath, "placeholder");
+            var client = new ElevatedIndexerClient(
+                helperPath,
+                (_, _) => throw new InvalidOperationException("Redirected helper should not be created."),
+                () => false,
+                () => true,
+                (_, _, _, _) => new StartThrowingElevatedIndexerProcess(new Win32Exception(1223, "The operation was canceled by the user.")));
+
+            var records = await CollectAsync(client.ScanNtfsAsync(new IndexRoot("C:\\Docs"), CancellationToken.None));
+
+            Assert.Empty(records);
         }
         finally
         {
@@ -323,6 +420,12 @@ public sealed class ElevatedIndexerClientTests
         return collected;
     }
 
+    private sealed record ElevatedFileHelperRequest(
+        string HelperPath,
+        string RootPath,
+        string OutputPath,
+        string ErrorPath);
+
     private sealed class CompletedElevatedIndexerProcess : IElevatedIndexerProcess
     {
         private readonly string _stdout;
@@ -366,6 +469,89 @@ public sealed class ElevatedIndexerClientTests
         public bool HasExited => true;
 
         public bool Start() => false;
+
+        public Task<string> ReadStandardOutputToEndAsync(CancellationToken cancellationToken)
+            => Task.FromResult(string.Empty);
+
+        public Task<string> ReadStandardErrorToEndAsync(CancellationToken cancellationToken)
+            => Task.FromResult(string.Empty);
+
+        public Task WaitForExitAsync(CancellationToken cancellationToken)
+            => Task.CompletedTask;
+
+        public void Kill()
+        {
+        }
+
+        public void Dispose()
+        {
+        }
+    }
+
+    private sealed class FileWritingElevatedIndexerProcess : IElevatedIndexerProcess
+    {
+        private readonly string _outputPath;
+        private readonly string _errorPath;
+        private readonly string _output;
+        private readonly string _error;
+
+        public FileWritingElevatedIndexerProcess(
+            string outputPath,
+            string errorPath,
+            string output,
+            string error,
+            int exitCode)
+        {
+            _outputPath = outputPath;
+            _errorPath = errorPath;
+            _output = output;
+            _error = error;
+            ExitCode = exitCode;
+        }
+
+        public int ExitCode { get; }
+
+        public bool HasExited => true;
+
+        public bool Start()
+        {
+            File.WriteAllText(_outputPath, _output);
+            File.WriteAllText(_errorPath, _error);
+            return true;
+        }
+
+        public Task<string> ReadStandardOutputToEndAsync(CancellationToken cancellationToken)
+            => Task.FromResult(string.Empty);
+
+        public Task<string> ReadStandardErrorToEndAsync(CancellationToken cancellationToken)
+            => Task.FromResult(string.Empty);
+
+        public Task WaitForExitAsync(CancellationToken cancellationToken)
+            => Task.CompletedTask;
+
+        public void Kill()
+        {
+        }
+
+        public void Dispose()
+        {
+        }
+    }
+
+    private sealed class StartThrowingElevatedIndexerProcess : IElevatedIndexerProcess
+    {
+        private readonly Exception _exception;
+
+        public StartThrowingElevatedIndexerProcess(Exception exception)
+        {
+            _exception = exception;
+        }
+
+        public int ExitCode => -1;
+
+        public bool HasExited => true;
+
+        public bool Start() => throw _exception;
 
         public Task<string> ReadStandardOutputToEndAsync(CancellationToken cancellationToken)
             => Task.FromResult(string.Empty);

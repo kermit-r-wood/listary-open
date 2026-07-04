@@ -1,4 +1,5 @@
 using ListaryOpen.App;
+using ListaryOpen.Infrastructure.Indexing;
 using WpfApp = ListaryOpen.App.App;
 
 namespace ListaryOpen.Infrastructure.Tests.App;
@@ -71,5 +72,28 @@ public sealed class AppIndexRootTests
 
         Assert.NotEqual(callerThreadId, execution.ThreadId);
         Assert.Null(execution.Context);
+    }
+
+    [Fact]
+    public void EnableNtfsFastIndexingEnablesClientAndRequestsReindex()
+    {
+        var helperPath = Path.Combine(Path.GetTempPath(), "listary-open-" + Guid.NewGuid(), "ListaryOpen.Indexer.Elevated.exe");
+        Directory.CreateDirectory(Path.GetDirectoryName(helperPath)!);
+        File.WriteAllText(helperPath, "placeholder");
+        var client = new ElevatedIndexerClient(helperPath, () => false);
+        var reindexRequested = false;
+
+        try
+        {
+            WpfApp.EnableNtfsFastIndexing(client, () => reindexRequested = true);
+
+            Assert.True(client.UacElevationEnabled);
+            Assert.True(client.IsAvailable);
+            Assert.True(reindexRequested);
+        }
+        finally
+        {
+            Directory.Delete(Path.GetDirectoryName(helperPath)!, recursive: true);
+        }
     }
 }

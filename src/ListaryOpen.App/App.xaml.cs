@@ -20,6 +20,7 @@ public partial class App : Application
     private readonly SemaphoreSlim _indexingRunLock = new(1, 1);
 
     private DialogBridge? _dialogBridge;
+    private ElevatedIndexerClient? _elevatedIndexerClient;
     private ExplorerObservationScheduler? _explorerObservationScheduler;
     private FallbackIndexProvider? _fallbackIndexProvider;
     private ExplorerTracker? _explorerTracker;
@@ -116,7 +117,8 @@ public partial class App : Application
     private bool InitializeApplicationServices(SqliteSearchIndex searchIndex)
     {
         _fallbackIndexProvider = new FallbackIndexProvider();
-        _ntfsIndexProvider = new NtfsIndexProvider(new ElevatedIndexerClient());
+        _elevatedIndexerClient = new ElevatedIndexerClient();
+        _ntfsIndexProvider = new NtfsIndexProvider(_elevatedIndexerClient);
         _volumeIndexer = new VolumeIndexer(new IIndexProvider[]
         {
             _ntfsIndexProvider,
@@ -128,7 +130,7 @@ public partial class App : Application
         _dialogAutomation = new WindowsDialogAutomation();
         _dialogBridge = new DialogBridge(_dialogAutomation);
 
-        _settingsViewModel = new SettingsViewModel(AppSettings.Defaults());
+        _settingsViewModel = new SettingsViewModel(AppSettings.Defaults(), EnableNtfsFastIndexing);
         var settingsWindow = new MainWindow(_settingsViewModel);
         _explorerTracker = new ExplorerTracker();
         _explorerObservationScheduler = StartPeriodicExplorerObservation(
@@ -230,6 +232,14 @@ public partial class App : Application
         return roots;
     }
 
+    internal static void EnableNtfsFastIndexing(ElevatedIndexerClient? client, Action requestReindex)
+    {
+        ArgumentNullException.ThrowIfNull(requestReindex);
+
+        client?.EnableUacElevation();
+        requestReindex();
+    }
+
     internal static ExplorerObservationScheduler? StartPeriodicExplorerObservation(
         ExplorerTracker? explorerTracker,
         Func<IExplorerObservationTimer> timerFactory)
@@ -270,6 +280,11 @@ public partial class App : Application
     private void RequestReindex()
     {
         StartBackgroundIndexing();
+    }
+
+    private void EnableNtfsFastIndexing()
+    {
+        EnableNtfsFastIndexing(_elevatedIndexerClient, RequestReindex);
     }
 
     private void StartBackgroundIndexing()

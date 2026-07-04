@@ -54,27 +54,30 @@ public sealed class ElevatedIndexerClient : IElevatedIndexerClient
 
     private readonly Func<string?> _resolveHelperPath;
     private readonly Func<string, string, IElevatedIndexerProcess> _createProcess;
+    private readonly Func<string, string, string, string, IElevatedIndexerProcess> _createElevatedProcess;
     private readonly Func<bool> _isProcessElevated;
+    private readonly Func<bool>? _isUacElevationEnabledOverride;
+    private bool _uacElevationEnabled;
 
     public ElevatedIndexerClient()
-        : this(ResolveDefaultHelperPath, CreateProcess, IsCurrentProcessElevated)
+        : this(ResolveDefaultHelperPath, CreateProcess, CreateElevatedProcess, IsCurrentProcessElevated, null)
     {
     }
 
     public ElevatedIndexerClient(string helperPath)
-        : this(() => helperPath, CreateProcess, IsCurrentProcessElevated)
+        : this(() => helperPath, CreateProcess, CreateElevatedProcess, IsCurrentProcessElevated, null)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(helperPath);
     }
 
     internal ElevatedIndexerClient(string helperPath, Func<bool> isProcessElevated)
-        : this(() => helperPath, CreateProcess, isProcessElevated)
+        : this(() => helperPath, CreateProcess, CreateElevatedProcess, isProcessElevated, null)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(helperPath);
     }
 
     internal ElevatedIndexerClient(string helperPath, Func<string, string, IElevatedIndexerProcess> createProcess)
-        : this(() => helperPath, createProcess, () => true)
+        : this(() => helperPath, createProcess, CreateElevatedProcess, () => true, null)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(helperPath);
     }
@@ -83,7 +86,18 @@ public sealed class ElevatedIndexerClient : IElevatedIndexerClient
         string helperPath,
         Func<string, string, IElevatedIndexerProcess> createProcess,
         Func<bool> isProcessElevated)
-        : this(() => helperPath, createProcess, isProcessElevated)
+        : this(() => helperPath, createProcess, CreateElevatedProcess, isProcessElevated, null)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(helperPath);
+    }
+
+    internal ElevatedIndexerClient(
+        string helperPath,
+        Func<string, string, IElevatedIndexerProcess> createProcess,
+        Func<bool> isProcessElevated,
+        Func<bool> isUacElevationEnabled,
+        Func<string, string, string, string, IElevatedIndexerProcess> createElevatedProcess)
+        : this(() => helperPath, createProcess, createElevatedProcess, isProcessElevated, isUacElevationEnabled)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(helperPath);
     }
@@ -91,19 +105,30 @@ public sealed class ElevatedIndexerClient : IElevatedIndexerClient
     private ElevatedIndexerClient(
         Func<string?> resolveHelperPath,
         Func<string, string, IElevatedIndexerProcess> createProcess,
-        Func<bool> isProcessElevated)
+        Func<string, string, string, string, IElevatedIndexerProcess> createElevatedProcess,
+        Func<bool> isProcessElevated,
+        Func<bool>? isUacElevationEnabled)
     {
         _resolveHelperPath = resolveHelperPath ?? throw new ArgumentNullException(nameof(resolveHelperPath));
         _createProcess = createProcess ?? throw new ArgumentNullException(nameof(createProcess));
+        _createElevatedProcess = createElevatedProcess ?? throw new ArgumentNullException(nameof(createElevatedProcess));
         _isProcessElevated = isProcessElevated ?? throw new ArgumentNullException(nameof(isProcessElevated));
+        _isUacElevationEnabledOverride = isUacElevationEnabled;
     }
+
+    public bool UacElevationEnabled => IsUacElevationEnabled();
 
     public bool IsAvailable
     {
         get
         {
-            return TryResolveAvailableHelperPath(out _);
+            return TryResolveAvailableHelperPath(out _, out _);
         }
+    }
+
+    public void EnableUacElevation()
+    {
+        Volatile.Write(ref _uacElevationEnabled, true);
     }
 
     public async IAsyncEnumerable<FileRecord> ScanNtfsAsync(
@@ -113,14 +138,16 @@ public sealed class ElevatedIndexerClient : IElevatedIndexerClient
         ArgumentNullException.ThrowIfNull(root);
         cancellationToken.ThrowIfCancellationRequested();
 
-        if (!TryResolveAvailableHelperPath(out var helperPath))
+        if (!TryResolveAvailableHelperPath(out var helperPath, out var launchMode))
         {
             Trace.TraceWarning("Elevated indexer helper is not available at '{0}'.", helperPath ?? "<unresolved>");
             await Task.CompletedTask.ConfigureAwait(false);
             yield break;
         }
 
-        var records = await RunHelperAsync(helperPath!, root.Path, cancellationToken).ConfigureAwait(false);
+        var records = launchMode == HelperLaunchMode.UacFile
+            ? await RunElevatedHelperToFileAsync(helperPath!, root.Path, cancellationToken).ConfigureAwait(false)
+            : await RunHelperAsync(helperPath!, root.Path, cancellationToken).ConfigureAwait(false);
         foreach (var record in records)
         {
             cancellationToken.ThrowIfCancellationRequested();
@@ -194,6 +221,80 @@ public sealed class ElevatedIndexerClient : IElevatedIndexerClient
         }
     }
 
+    private async Task<IReadOnlyList<FileRecord>> RunElevatedHelperToFileAsync(
+        string helperPath,
+        string rootPath,
+        CancellationToken cancellationToken)
+    {
+        var outputPath = CreateTempIndexerFilePath(".jsonl");
+        var errorPath = CreateTempIndexerFilePath(".err");
+
+        try
+        {
+            using var process = _createElevatedProcess(helperPath, rootPath, outputPath, errorPath);
+
+            try
+            {
+                if (!process.Start())
+                {
+                    Trace.TraceInformation("Elevated indexer helper launch was canceled or declined.");
+                    return Array.Empty<FileRecord>();
+                }
+            }
+            catch (Exception exception) when (IsUacCanceled(exception))
+            {
+                Trace.TraceInformation("Elevated indexer helper launch was canceled by the user.");
+                return Array.Empty<FileRecord>();
+            }
+            catch (Exception exception) when (exception is not OperationCanceledException)
+            {
+                var message = $"Failed to start elevated indexer helper '{helperPath}': {exception.Message}";
+                Trace.TraceError("Failed to start elevated indexer helper '{0}': {1}", helperPath, exception);
+                throw new ElevatedIndexerException(message, exception);
+            }
+
+            try
+            {
+                await process.WaitForExitAsync(cancellationToken).ConfigureAwait(false);
+
+                if (process.ExitCode != 0)
+                {
+                    var diagnostic = TrimDiagnostic(await ReadFileIfExistsAsync(errorPath, cancellationToken).ConfigureAwait(false));
+                    var message = $"Elevated indexer helper '{helperPath}' exited with code {process.ExitCode}. stderr: {diagnostic}";
+                    Trace.TraceError(message);
+                    throw new ElevatedIndexerException(message);
+                }
+
+                var output = await ReadFileIfExistsAsync(outputPath, cancellationToken).ConfigureAwait(false);
+                return ParseOutput(output);
+            }
+            catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+            {
+                await CleanupCanceledProcessAsync(process, stdoutTask: null, stderrTask: null).ConfigureAwait(false);
+                throw;
+            }
+            catch (InvalidDataException)
+            {
+                throw;
+            }
+            catch (ElevatedIndexerException)
+            {
+                throw;
+            }
+            catch (Exception exception)
+            {
+                var message = $"Elevated indexer helper '{helperPath}' failed while running: {exception.Message}";
+                Trace.TraceError("Elevated indexer helper '{0}' failed while running: {1}", helperPath, exception);
+                throw new ElevatedIndexerException(message, exception);
+            }
+        }
+        finally
+        {
+            TryDeleteFile(outputPath);
+            TryDeleteFile(errorPath);
+        }
+    }
+
     private static IReadOnlyList<FileRecord> ParseOutput(string stdout)
     {
         var records = new List<FileRecord>();
@@ -257,28 +358,48 @@ public sealed class ElevatedIndexerClient : IElevatedIndexerClient
     {
         var process = new Process
         {
-            StartInfo = new ProcessStartInfo
-            {
-                FileName = helperPath,
-                UseShellExecute = false,
-                RedirectStandardOutput = true,
-                RedirectStandardError = true,
-                CreateNoWindow = true
-            }
+            StartInfo = ElevatedIndexerProcessStartInfoFactory.CreateRedirected(helperPath, rootPath)
         };
-
-        process.StartInfo.ArgumentList.Add("scan");
-        process.StartInfo.ArgumentList.Add(rootPath);
 
         return new ElevatedIndexerProcess(process);
     }
 
-    private bool TryResolveAvailableHelperPath(out string? helperPath)
+    private static IElevatedIndexerProcess CreateElevatedProcess(
+        string helperPath,
+        string rootPath,
+        string outputPath,
+        string errorPath)
+    {
+        var process = new Process
+        {
+            StartInfo = ElevatedIndexerProcessStartInfoFactory.CreateUacFile(helperPath, rootPath, outputPath, errorPath)
+        };
+
+        return new ElevatedIndexerProcess(process);
+    }
+
+    private bool TryResolveAvailableHelperPath(out string? helperPath, out HelperLaunchMode launchMode)
     {
         helperPath = _resolveHelperPath();
-        return !string.IsNullOrWhiteSpace(helperPath)
-            && File.Exists(helperPath)
-            && IsProcessElevated();
+        launchMode = HelperLaunchMode.Unavailable;
+        if (string.IsNullOrWhiteSpace(helperPath) || !File.Exists(helperPath))
+        {
+            return false;
+        }
+
+        if (IsProcessElevated())
+        {
+            launchMode = HelperLaunchMode.Redirected;
+            return true;
+        }
+
+        if (IsUacElevationEnabled())
+        {
+            launchMode = HelperLaunchMode.UacFile;
+            return true;
+        }
+
+        return false;
     }
 
     private bool IsProcessElevated()
@@ -292,6 +413,11 @@ public sealed class ElevatedIndexerClient : IElevatedIndexerClient
             Trace.TraceWarning("Unable to determine elevated indexer privilege state: {0}", exception);
             return false;
         }
+    }
+
+    private bool IsUacElevationEnabled()
+    {
+        return _isUacElevationEnabledOverride?.Invoke() ?? Volatile.Read(ref _uacElevationEnabled);
     }
 
     private static bool IsCurrentProcessElevated()
@@ -400,6 +526,48 @@ public sealed class ElevatedIndexerClient : IElevatedIndexerClient
         const int maxLength = 1024;
         var trimmed = value.Trim();
         return trimmed.Length <= maxLength ? trimmed : trimmed[..maxLength];
+    }
+
+    private static string CreateTempIndexerFilePath(string extension)
+    {
+        return Path.Combine(Path.GetTempPath(), "listary-open-indexer-" + Guid.NewGuid() + extension);
+    }
+
+    private static async Task<string> ReadFileIfExistsAsync(string path, CancellationToken cancellationToken)
+    {
+        return File.Exists(path)
+            ? await File.ReadAllTextAsync(path, cancellationToken).ConfigureAwait(false)
+            : string.Empty;
+    }
+
+    private static bool IsUacCanceled(Exception exception)
+    {
+        const int errorCancelled = 1223;
+        return exception is Win32Exception { NativeErrorCode: errorCancelled };
+    }
+
+    private static void TryDeleteFile(string path)
+    {
+        try
+        {
+            if (File.Exists(path))
+            {
+                File.Delete(path);
+            }
+        }
+        catch (IOException)
+        {
+        }
+        catch (UnauthorizedAccessException)
+        {
+        }
+    }
+
+    private enum HelperLaunchMode
+    {
+        Unavailable,
+        Redirected,
+        UacFile
     }
 
     private sealed class ElevatedIndexerRecordDto

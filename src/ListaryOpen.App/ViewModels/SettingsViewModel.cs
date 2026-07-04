@@ -2,12 +2,15 @@ using ListaryOpen.Core.Settings;
 using ListaryOpen.Infrastructure.Indexing;
 using System.ComponentModel;
 using System.Runtime.CompilerServices;
+using System.Windows.Input;
 
 namespace ListaryOpen.App.ViewModels;
 
 public sealed class SettingsViewModel : INotifyPropertyChanged
 {
+    private readonly Action _enableNtfsFastIndexing;
     private string _indexingStatusText = "Indexing: idle";
+    private bool _ntfsFastIndexingEnabled;
 
     public SettingsViewModel()
         : this(AppSettings.Defaults())
@@ -15,11 +18,22 @@ public sealed class SettingsViewModel : INotifyPropertyChanged
     }
 
     public SettingsViewModel(AppSettings settings)
+        : this(settings, null)
+    {
+    }
+
+    public SettingsViewModel(AppSettings settings, Action? enableNtfsFastIndexing)
     {
         Settings = settings;
+        _enableNtfsFastIndexing = enableNtfsFastIndexing ?? (() => { });
+        EnableNtfsFastIndexingCommand = new RelayCommand(
+            EnableNtfsFastIndexing,
+            () => !NtfsFastIndexingEnabled);
     }
 
     public AppSettings Settings { get; }
+
+    public ICommand EnableNtfsFastIndexingCommand { get; }
 
     public string IndexingStatusText
     {
@@ -36,6 +50,30 @@ public sealed class SettingsViewModel : INotifyPropertyChanged
         }
     }
 
+    public bool NtfsFastIndexingEnabled
+    {
+        get => _ntfsFastIndexingEnabled;
+        private set
+        {
+            if (_ntfsFastIndexingEnabled == value)
+            {
+                return;
+            }
+
+            _ntfsFastIndexingEnabled = value;
+            OnPropertyChanged();
+            OnPropertyChanged(nameof(NtfsFastIndexingStatusText));
+            if (EnableNtfsFastIndexingCommand is RelayCommand command)
+            {
+                command.RaiseCanExecuteChanged();
+            }
+        }
+    }
+
+    public string NtfsFastIndexingStatusText => NtfsFastIndexingEnabled
+        ? "NTFS fast indexing: enabled for this session"
+        : "NTFS fast indexing: disabled";
+
     public event PropertyChangedEventHandler? PropertyChanged;
 
     public void UpdateIndexingStatus(IndexingStatus status)
@@ -45,8 +83,48 @@ public sealed class SettingsViewModel : INotifyPropertyChanged
         IndexingStatusText = $"Indexing: {status.Message} ({status.IndexedCount})";
     }
 
+    private void EnableNtfsFastIndexing()
+    {
+        if (NtfsFastIndexingEnabled)
+        {
+            return;
+        }
+
+        _enableNtfsFastIndexing();
+        NtfsFastIndexingEnabled = true;
+    }
+
     private void OnPropertyChanged([CallerMemberName] string? propertyName = null)
     {
         PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(propertyName));
+    }
+}
+
+internal sealed class RelayCommand : ICommand
+{
+    private readonly Action _execute;
+    private readonly Func<bool> _canExecute;
+
+    public RelayCommand(Action execute, Func<bool> canExecute)
+    {
+        _execute = execute ?? throw new ArgumentNullException(nameof(execute));
+        _canExecute = canExecute ?? throw new ArgumentNullException(nameof(canExecute));
+    }
+
+    public event EventHandler? CanExecuteChanged;
+
+    public bool CanExecute(object? parameter) => _canExecute();
+
+    public void Execute(object? parameter)
+    {
+        if (CanExecute(parameter))
+        {
+            _execute();
+        }
+    }
+
+    public void RaiseCanExecuteChanged()
+    {
+        CanExecuteChanged?.Invoke(this, EventArgs.Empty);
     }
 }
