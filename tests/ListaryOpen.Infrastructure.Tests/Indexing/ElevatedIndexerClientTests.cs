@@ -76,6 +76,37 @@ public sealed class ElevatedIndexerClientTests
     }
 
     [Fact]
+    public async Task ScanNtfsAsyncReturnsEmptyRecordsWithoutStartingHelperWhenProcessIsNotElevated()
+    {
+        var tempDirectory = Path.Combine(Path.GetTempPath(), "listary-open-" + Guid.NewGuid());
+        Directory.CreateDirectory(tempDirectory);
+
+        try
+        {
+            var helperPath = Path.Combine(tempDirectory, "ListaryOpen.Indexer.Elevated.exe");
+            File.WriteAllText(helperPath, "placeholder");
+            var processCreated = false;
+            var client = new ElevatedIndexerClient(
+                helperPath,
+                (_, _) =>
+                {
+                    processCreated = true;
+                    throw new InvalidOperationException("Helper process should not be created.");
+                },
+                () => false);
+
+            var records = await CollectAsync(client.ScanNtfsAsync(new IndexRoot(Path.GetTempPath()), CancellationToken.None));
+
+            Assert.Empty(records);
+            Assert.False(processCreated);
+        }
+        finally
+        {
+            Directory.Delete(tempDirectory, recursive: true);
+        }
+    }
+
+    [Fact]
     public async Task ScanNtfsAsyncThrowsWhenHelperCannotStart()
     {
         var tempDirectory = Path.Combine(Path.GetTempPath(), "listary-open-" + Guid.NewGuid());
@@ -85,7 +116,7 @@ public sealed class ElevatedIndexerClientTests
         {
             var helperPath = Path.Combine(tempDirectory, "ListaryOpen.Indexer.Elevated.exe");
             File.WriteAllText(helperPath, "not a portable executable");
-            var client = new ElevatedIndexerClient(helperPath);
+            var client = new ElevatedIndexerClient(helperPath, () => true);
             await using var traceCapture = await TraceCapture.StartAsync();
 
             var exception = await Assert.ThrowsAnyAsync<InvalidOperationException>(

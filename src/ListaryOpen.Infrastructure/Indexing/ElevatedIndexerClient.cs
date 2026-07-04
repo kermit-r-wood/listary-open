@@ -102,10 +102,7 @@ public sealed class ElevatedIndexerClient : IElevatedIndexerClient
     {
         get
         {
-            var helperPath = _resolveHelperPath();
-            return !string.IsNullOrWhiteSpace(helperPath) &&
-                File.Exists(helperPath) &&
-                IsProcessElevated();
+            return TryResolveAvailableHelperPath(out _);
         }
     }
 
@@ -116,8 +113,7 @@ public sealed class ElevatedIndexerClient : IElevatedIndexerClient
         ArgumentNullException.ThrowIfNull(root);
         cancellationToken.ThrowIfCancellationRequested();
 
-        var helperPath = _resolveHelperPath();
-        if (string.IsNullOrWhiteSpace(helperPath) || !File.Exists(helperPath))
+        if (!TryResolveAvailableHelperPath(out var helperPath))
         {
             Trace.TraceWarning("Elevated indexer helper is not available at '{0}'.", helperPath ?? "<unresolved>");
             await Task.CompletedTask.ConfigureAwait(false);
@@ -275,6 +271,14 @@ public sealed class ElevatedIndexerClient : IElevatedIndexerClient
         process.StartInfo.ArgumentList.Add(rootPath);
 
         return new ElevatedIndexerProcess(process);
+    }
+
+    private bool TryResolveAvailableHelperPath(out string? helperPath)
+    {
+        helperPath = _resolveHelperPath();
+        return !string.IsNullOrWhiteSpace(helperPath)
+            && File.Exists(helperPath)
+            && IsProcessElevated();
     }
 
     private bool IsProcessElevated()

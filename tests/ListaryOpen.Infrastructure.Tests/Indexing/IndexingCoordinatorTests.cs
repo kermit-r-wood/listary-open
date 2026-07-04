@@ -151,6 +151,54 @@ public sealed class IndexingCoordinatorTests
     }
 
     [Fact]
+    public async Task IndexRootsAsyncUsesFallbackWithoutFailedStatusWhenElevatedClientIsUnavailable()
+    {
+        var rootPath = CreateTempDirectory();
+        var dbPath = CreateTempDbPath();
+
+        try
+        {
+            await File.WriteAllTextAsync(Path.Combine(rootPath, "FallbackWhenElevatedUnavailable.txt"), "indexed");
+            var helperPath = Path.Combine(rootPath, "ListaryOpen.Indexer.Elevated.exe");
+            File.WriteAllText(helperPath, "placeholder");
+            var helperProcessCreated = false;
+
+            await using var index = await SqliteSearchIndex.OpenAsync(dbPath, CancellationToken.None);
+            var statuses = new List<IndexingStatus>();
+            var client = new ElevatedIndexerClient(
+                helperPath,
+                (_, _) =>
+                {
+                    helperProcessCreated = true;
+                    throw new InvalidOperationException("Helper process should not be created.");
+                },
+                () => false);
+            var fallbackProvider = new FallbackIndexProvider();
+            var coordinator = new IndexingCoordinator(
+                index,
+                new VolumeIndexer(new IIndexProvider[] { new NtfsIndexProvider(client), fallbackProvider }),
+                fallbackProvider,
+                _ => new VolumeInfo(Path.GetPathRoot(rootPath)!, NtfsIndexProvider.ProviderName, true));
+            coordinator.StatusChanged += (_, status) => statuses.Add(status);
+
+            await coordinator.IndexRootsAsync(new[] { new IndexRoot(rootPath) }, CancellationToken.None);
+
+            var results = await index.SearchAsync(new SearchQuery("FallbackWhenElevatedUnavailable", SearchMode.FilesAndFolders), CancellationToken.None);
+
+            Assert.Equal("FallbackWhenElevatedUnavailable.txt", Assert.Single(results).Record.Name);
+            Assert.False(helperProcessCreated);
+            Assert.DoesNotContain(statuses, status => status.State == IndexingRunState.Failed);
+            Assert.DoesNotContain(statuses, status => status.Message.Contains("NTFS scan failed", StringComparison.OrdinalIgnoreCase));
+            Assert.Equal(IndexingRunState.Completed, statuses[^1].State);
+        }
+        finally
+        {
+            DeleteDirectoryIfExists(rootPath);
+            DeleteFileIfExists(dbPath);
+        }
+    }
+
+    [Fact]
     public async Task IndexRootsAsyncReportsFailedStatusForMissingRootAndContinues()
     {
         var existingRootPath = CreateTempDirectory();
