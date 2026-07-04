@@ -90,7 +90,7 @@ internal static partial class NativeMethods
     internal const ushort ImageFileMachineUnknown = 0x0000;
 
     [LibraryImport("kernel32.dll", SetLastError = true)]
-    internal static partial IntPtr OpenProcess(uint desiredAccess, [MarshalAs(UnmanagedType.Bool)] bool inheritHandle, int processId);
+    internal static partial IntPtr OpenProcess(uint desiredAccess, [MarshalAs(UnmanagedType.Bool)] bool inheritHandle, uint processId);
 
     [LibraryImport("kernel32.dll", SetLastError = true)]
     [return: MarshalAs(UnmanagedType.Bool)]

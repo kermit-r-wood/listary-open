@@ -1,5 +1,4 @@
 using ListaryOpen.Infrastructure.Windows;
-using System.Diagnostics;
 using System.Runtime.InteropServices;
 
 namespace ListaryOpen.Infrastructure.Hooks;
@@ -28,8 +27,7 @@ public sealed class HookProcessBitnessDetector
             return false;
         }
 
-        using var process = Process.GetProcessById(checked((int)processId));
-        var handle = NativeMethods.OpenProcess(NativeMethods.ProcessQueryLimitedInformation, false, process.Id);
+        var handle = NativeMethods.OpenProcess(NativeMethods.ProcessQueryLimitedInformation, false, processId);
         if (handle == IntPtr.Zero)
         {
             throw new InvalidOperationException($"OpenProcess failed for process {processId}. Win32 error: {Marshal.GetLastWin32Error()}.");

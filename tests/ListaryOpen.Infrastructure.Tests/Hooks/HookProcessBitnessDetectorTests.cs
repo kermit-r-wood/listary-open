@@ -23,4 +23,20 @@ public sealed class HookProcessBitnessDetectorTests
 
         Assert.Contains("OpenProcess failed", exception.Message);
     }
+
+    [Fact]
+    public void DefaultProbeReportsNativeFailureForLargeUintProcessIdWithoutOverflow()
+    {
+        if (!Environment.Is64BitOperatingSystem)
+        {
+            return;
+        }
+
+        var detector = new HookProcessBitnessDetector();
+
+        var exception = Assert.Throws<InvalidOperationException>(() => detector.GetArchitectureForProcess(uint.MaxValue));
+
+        Assert.Contains("OpenProcess failed", exception.Message);
+        Assert.Contains("4294967295", exception.Message);
+    }
 }
