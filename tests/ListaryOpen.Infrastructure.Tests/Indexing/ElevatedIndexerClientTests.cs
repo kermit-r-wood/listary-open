@@ -20,7 +20,7 @@ public sealed class ElevatedIndexerClientTests
     }
 
     [Fact]
-    public void IsAvailableReturnsTrueWhenExplicitHelperPathExists()
+    public void IsAvailableReturnsTrueWhenExplicitHelperPathExistsAndProcessIsElevated()
     {
         var tempDirectory = Path.Combine(Path.GetTempPath(), "listary-open-" + Guid.NewGuid());
         Directory.CreateDirectory(tempDirectory);
@@ -30,9 +30,30 @@ public sealed class ElevatedIndexerClientTests
             var helperPath = Path.Combine(tempDirectory, "ListaryOpen.Indexer.Elevated.exe");
             File.WriteAllText(helperPath, "placeholder");
 
-            var client = new ElevatedIndexerClient(helperPath);
+            var client = new ElevatedIndexerClient(helperPath, () => true);
 
             Assert.True(client.IsAvailable);
+        }
+        finally
+        {
+            Directory.Delete(tempDirectory, recursive: true);
+        }
+    }
+
+    [Fact]
+    public void IsAvailableReturnsFalseWhenExplicitHelperPathExistsButProcessIsNotElevated()
+    {
+        var tempDirectory = Path.Combine(Path.GetTempPath(), "listary-open-" + Guid.NewGuid());
+        Directory.CreateDirectory(tempDirectory);
+
+        try
+        {
+            var helperPath = Path.Combine(tempDirectory, "ListaryOpen.Indexer.Elevated.exe");
+            File.WriteAllText(helperPath, "placeholder");
+
+            var client = new ElevatedIndexerClient(helperPath, () => false);
+
+            Assert.False(client.IsAvailable);
         }
         finally
         {

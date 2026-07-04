@@ -28,13 +28,25 @@ public sealed class ProviderSelectionTests
     [Fact]
     public void SelectProviderPrefersNtfsForReadyNtfsVolume()
     {
-        var ntfs = new NtfsIndexProvider(new DisabledElevatedIndexerClient());
+        var ntfs = new NtfsIndexProvider(new RecordingElevatedIndexerClient());
         var fallback = new FallbackIndexProvider();
         var indexer = new VolumeIndexer(new IIndexProvider[] { fallback, ntfs });
 
         var selected = indexer.SelectProvider(new VolumeInfo("C:\\", "NTFS", true));
 
         Assert.Equal("NTFS", selected.Name);
+    }
+
+    [Fact]
+    public void SelectProviderFallsBackForReadyNtfsVolumeWhenElevatedClientIsUnavailable()
+    {
+        var ntfs = new NtfsIndexProvider(new DisabledElevatedIndexerClient());
+        var fallback = new FallbackIndexProvider();
+        var indexer = new VolumeIndexer(new IIndexProvider[] { fallback, ntfs });
+
+        var selected = indexer.SelectProvider(new VolumeInfo("C:\\", "NTFS", true));
+
+        Assert.Equal("Fallback", selected.Name);
     }
 
     [Fact]
@@ -55,11 +67,21 @@ public sealed class ProviderSelectionTests
     [InlineData("NtFs")]
     public void NtfsIndexProviderCanIndexMatchesNtfsCaseInsensitively(string fileSystemName)
     {
-        var provider = new NtfsIndexProvider(new DisabledElevatedIndexerClient());
+        var provider = new NtfsIndexProvider(new RecordingElevatedIndexerClient());
 
         var canIndex = provider.CanIndex(new VolumeInfo("C:\\", fileSystemName, true));
 
         Assert.True(canIndex);
+    }
+
+    [Fact]
+    public void NtfsIndexProviderCanIndexReturnsFalseWhenElevatedClientIsUnavailable()
+    {
+        var provider = new NtfsIndexProvider(new DisabledElevatedIndexerClient());
+
+        var canIndex = provider.CanIndex(new VolumeInfo("C:\\", "NTFS", true));
+
+        Assert.False(canIndex);
     }
 
     [Fact]

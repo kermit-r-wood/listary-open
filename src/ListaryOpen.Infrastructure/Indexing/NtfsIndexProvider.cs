@@ -18,7 +18,8 @@ public sealed class NtfsIndexProvider : IIndexProvider
     public bool CanIndex(VolumeInfo volume)
     {
         return volume.IsReady
-            && string.Equals(volume.FileSystemName, ProviderName, StringComparison.OrdinalIgnoreCase);
+            && string.Equals(volume.FileSystemName, ProviderName, StringComparison.OrdinalIgnoreCase)
+            && _client.IsAvailable;
     }
 
     public IAsyncEnumerable<FileRecord> ScanAsync(IndexRoot root, CancellationToken cancellationToken)

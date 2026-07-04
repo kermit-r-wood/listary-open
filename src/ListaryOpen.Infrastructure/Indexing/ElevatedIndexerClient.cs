@@ -2,6 +2,8 @@ using System.ComponentModel;
 using System.Diagnostics;
 using System.IO;
 using System.Runtime.CompilerServices;
+using System.Security;
+using System.Security.Principal;
 using System.Text.Json;
 using System.Text.Json.Serialization;
 using ListaryOpen.Core.Indexing;
@@ -52,30 +54,48 @@ public sealed class ElevatedIndexerClient : IElevatedIndexerClient
 
     private readonly Func<string?> _resolveHelperPath;
     private readonly Func<string, string, IElevatedIndexerProcess> _createProcess;
+    private readonly Func<bool> _isProcessElevated;
 
     public ElevatedIndexerClient()
-        : this(ResolveDefaultHelperPath, CreateProcess)
+        : this(ResolveDefaultHelperPath, CreateProcess, IsCurrentProcessElevated)
     {
     }
 
     public ElevatedIndexerClient(string helperPath)
-        : this(() => helperPath, CreateProcess)
+        : this(() => helperPath, CreateProcess, IsCurrentProcessElevated)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(helperPath);
+    }
+
+    internal ElevatedIndexerClient(string helperPath, Func<bool> isProcessElevated)
+        : this(() => helperPath, CreateProcess, isProcessElevated)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(helperPath);
     }
 
     internal ElevatedIndexerClient(string helperPath, Func<string, string, IElevatedIndexerProcess> createProcess)
-        : this(() => helperPath, createProcess)
+        : this(() => helperPath, createProcess, () => true)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(helperPath);
+    }
+
+    internal ElevatedIndexerClient(
+        string helperPath,
+        Func<string, string, IElevatedIndexerProcess> createProcess,
+        Func<bool> isProcessElevated)
+        : this(() => helperPath, createProcess, isProcessElevated)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(helperPath);
     }
 
     private ElevatedIndexerClient(
         Func<string?> resolveHelperPath,
-        Func<string, string, IElevatedIndexerProcess> createProcess)
+        Func<string, string, IElevatedIndexerProcess> createProcess,
+        Func<bool> isProcessElevated)
     {
         _resolveHelperPath = resolveHelperPath ?? throw new ArgumentNullException(nameof(resolveHelperPath));
         _createProcess = createProcess ?? throw new ArgumentNullException(nameof(createProcess));
+        _isProcessElevated = isProcessElevated ?? throw new ArgumentNullException(nameof(isProcessElevated));
     }
 
     public bool IsAvailable
@@ -83,7 +103,9 @@ public sealed class ElevatedIndexerClient : IElevatedIndexerClient
         get
         {
             var helperPath = _resolveHelperPath();
-            return !string.IsNullOrWhiteSpace(helperPath) && File.Exists(helperPath);
+            return !string.IsNullOrWhiteSpace(helperPath) &&
+                File.Exists(helperPath) &&
+                IsProcessElevated();
         }
     }
 
@@ -253,6 +275,26 @@ public sealed class ElevatedIndexerClient : IElevatedIndexerClient
         process.StartInfo.ArgumentList.Add(rootPath);
 
         return new ElevatedIndexerProcess(process);
+    }
+
+    private bool IsProcessElevated()
+    {
+        try
+        {
+            return _isProcessElevated();
+        }
+        catch (Exception exception) when (exception is SystemException or SecurityException)
+        {
+            Trace.TraceWarning("Unable to determine elevated indexer privilege state: {0}", exception);
+            return false;
+        }
+    }
+
+    private static bool IsCurrentProcessElevated()
+    {
+        using var identity = WindowsIdentity.GetCurrent();
+        var principal = new WindowsPrincipal(identity);
+        return principal.IsInRole(WindowsBuiltInRole.Administrator);
     }
 
     private static async Task CleanupCanceledProcessAsync(
