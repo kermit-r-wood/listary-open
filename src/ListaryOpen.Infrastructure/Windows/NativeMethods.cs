@@ -86,6 +86,20 @@ internal static partial class NativeMethods
         public Rect CaretRectangle;
     }
 
+    internal const uint ProcessQueryLimitedInformation = 0x1000;
+    internal const ushort ImageFileMachineUnknown = 0x0000;
+
+    [LibraryImport("kernel32.dll", SetLastError = true)]
+    internal static partial IntPtr OpenProcess(uint desiredAccess, [MarshalAs(UnmanagedType.Bool)] bool inheritHandle, int processId);
+
+    [LibraryImport("kernel32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    internal static partial bool CloseHandle(IntPtr handle);
+
+    [LibraryImport("kernel32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    internal static partial bool IsWow64Process2(IntPtr process, out ushort processMachine, out ushort nativeMachine);
+
     [DllImport("user32.dll")]
     internal static extern bool EnumChildWindows(IntPtr hWndParent, EnumWindowsProc lpEnumFunc, IntPtr lParam);
 
