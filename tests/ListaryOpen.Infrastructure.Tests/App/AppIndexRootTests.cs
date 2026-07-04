@@ -98,6 +98,27 @@ public sealed class AppIndexRootTests
     }
 
     [Fact]
+    public void IndexingRunCancellationManagerCancelsActiveRunWhenRestarting()
+    {
+        using var shutdown = new CancellationTokenSource();
+        using var manager = new IndexingRunCancellationManager();
+
+        var firstRun = manager.CreateRun(shutdown.Token, cancelActive: false);
+        var secondRun = manager.CreateRun(shutdown.Token, cancelActive: true);
+
+        try
+        {
+            Assert.True(firstRun.IsCancellationRequested);
+            Assert.False(secondRun.IsCancellationRequested);
+        }
+        finally
+        {
+            manager.CompleteRun(firstRun);
+            manager.CompleteRun(secondRun);
+        }
+    }
+
+    [Fact]
     public async Task RunSerializedIndexingAsyncQueuesConcurrentRequests()
     {
         using var gate = new SemaphoreSlim(1, 1);

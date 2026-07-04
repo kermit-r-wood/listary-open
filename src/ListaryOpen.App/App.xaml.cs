@@ -16,6 +16,7 @@ namespace ListaryOpen.App;
 public partial class App : Application
 {
     private readonly CancellationTokenSource _shutdownCancellation = new();
+    private readonly IndexingRunCancellationManager _indexingCancellation = new();
     private readonly BackgroundIndexingTaskTracker _indexingTasks = new();
     private readonly SemaphoreSlim _indexingRunLock = new(1, 1);
 
@@ -79,6 +80,7 @@ public partial class App : Application
 
     protected override void OnExit(ExitEventArgs e)
     {
+        _indexingCancellation.CancelActive();
         _shutdownCancellation.Cancel();
 
         if (_indexingCoordinator is not null)
@@ -97,6 +99,7 @@ public partial class App : Application
         _explorerObservationScheduler?.Dispose();
         _trayController?.Dispose();
         DisposeSearchIndex();
+        _indexingCancellation.Dispose();
         _singleInstanceGuard?.Dispose();
         _shutdownCancellation.Dispose();
 
@@ -284,12 +287,30 @@ public partial class App : Application
 
     private void EnableNtfsFastIndexing()
     {
-        EnableNtfsFastIndexing(_elevatedIndexerClient, RequestReindex);
+        EnableNtfsFastIndexing(
+            _elevatedIndexerClient,
+            () => StartBackgroundIndexing(cancelActive: true));
     }
 
-    private void StartBackgroundIndexing()
+    private void StartBackgroundIndexing(bool cancelActive = false)
     {
-        BackgroundIndexingTaskStarter.Start(_indexingTasks, RunInitialIndexAsync, _shutdownCancellation.Token);
+        var runCancellation = _indexingCancellation.CreateRun(_shutdownCancellation.Token, cancelActive);
+        BackgroundIndexingTaskStarter.Start(
+            _indexingTasks,
+            _ => RunIndexingRunAsync(runCancellation),
+            CancellationToken.None);
+    }
+
+    private async Task RunIndexingRunAsync(CancellationTokenSource runCancellation)
+    {
+        try
+        {
+            await RunInitialIndexAsync(runCancellation.Token).ConfigureAwait(false);
+        }
+        finally
+        {
+            _indexingCancellation.CompleteRun(runCancellation);
+        }
     }
 
     private async Task RunInitialIndexAsync(CancellationToken cancellationToken)
@@ -558,6 +579,55 @@ internal static class BackgroundIndexingTaskStarter
         ArgumentNullException.ThrowIfNull(work);
 
         tracker.Track(Task.Run(() => work(cancellationToken)));
+    }
+}
+
+internal sealed class IndexingRunCancellationManager : IDisposable
+{
+    private readonly object _gate = new();
+    private CancellationTokenSource? _activeRun;
+
+    public CancellationTokenSource CreateRun(CancellationToken shutdownToken, bool cancelActive)
+    {
+        lock (_gate)
+        {
+            if (cancelActive)
+            {
+                _activeRun?.Cancel();
+            }
+
+            var run = CancellationTokenSource.CreateLinkedTokenSource(shutdownToken);
+            _activeRun = run;
+            return run;
+        }
+    }
+
+    public void CompleteRun(CancellationTokenSource run)
+    {
+        ArgumentNullException.ThrowIfNull(run);
+
+        lock (_gate)
+        {
+            if (ReferenceEquals(_activeRun, run))
+            {
+                _activeRun = null;
+            }
+        }
+
+        run.Dispose();
+    }
+
+    public void CancelActive()
+    {
+        lock (_gate)
+        {
+            _activeRun?.Cancel();
+        }
+    }
+
+    public void Dispose()
+    {
+        CancelActive();
     }
 }
 
