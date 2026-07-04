@@ -150,13 +150,11 @@ public sealed class WindowsDialogAutomationTests
     }
 
     [Fact]
-    public async Task SubmitFolderNavigationConfirmsAfterRedrawIsRestored()
+    public async Task SubmitFolderNavigationConfirmsAfterInvokingCommit()
     {
-        var dialogHandle = new IntPtr(42);
         var events = new List<string>();
 
         var result = await WindowsDialogAutomation.SubmitFolderNavigationAsync(
-            dialogHandle,
             () =>
             {
                 events.Add("set-value");
@@ -171,20 +169,14 @@ public sealed class WindowsDialogAutomationTests
             {
                 events.Add("confirm-navigation");
                 return Task.FromResult(true);
-            },
-            _ => new[] { dialogHandle },
-            (_, enabled) => events.Add(enabled ? "redraw-on" : "redraw-off"),
-            _ => events.Add("redraw-window"));
+            });
 
         Assert.True(result);
         Assert.Equal(
             new[]
             {
-                "redraw-off",
                 "set-value",
                 "invoke-open",
-                "redraw-on",
-                "redraw-window",
                 "confirm-navigation"
             },
             events);
@@ -193,11 +185,9 @@ public sealed class WindowsDialogAutomationTests
     [Fact]
     public async Task SubmitFolderNavigationSkipsInvokeAndConfirmWhenSetValueFails()
     {
-        var dialogHandle = new IntPtr(42);
         var events = new List<string>();
 
         var result = await WindowsDialogAutomation.SubmitFolderNavigationAsync(
-            dialogHandle,
             () =>
             {
                 events.Add("set-value");
@@ -212,19 +202,13 @@ public sealed class WindowsDialogAutomationTests
             {
                 events.Add("confirm-navigation");
                 return Task.FromResult(true);
-            },
-            _ => new[] { dialogHandle },
-            (_, enabled) => events.Add(enabled ? "redraw-on" : "redraw-off"),
-            _ => events.Add("redraw-window"));
+            });
 
         Assert.False(result);
         Assert.Equal(
             new[]
             {
-                "redraw-off",
-                "set-value",
-                "redraw-on",
-                "redraw-window"
+                "set-value"
             },
             events);
     }
@@ -232,11 +216,9 @@ public sealed class WindowsDialogAutomationTests
     [Fact]
     public async Task SubmitFolderNavigationSkipsConfirmWhenInvokeFails()
     {
-        var dialogHandle = new IntPtr(42);
         var events = new List<string>();
 
         var result = await WindowsDialogAutomation.SubmitFolderNavigationAsync(
-            dialogHandle,
             () =>
             {
                 events.Add("set-value");
@@ -251,32 +233,24 @@ public sealed class WindowsDialogAutomationTests
             {
                 events.Add("confirm-navigation");
                 return Task.FromResult(true);
-            },
-            _ => new[] { dialogHandle },
-            (_, enabled) => events.Add(enabled ? "redraw-on" : "redraw-off"),
-            _ => events.Add("redraw-window"));
+            });
 
         Assert.False(result);
         Assert.Equal(
             new[]
             {
-                "redraw-off",
                 "set-value",
-                "invoke-open",
-                "redraw-on",
-                "redraw-window"
+                "invoke-open"
             },
             events);
     }
 
     [Fact]
-    public async Task SubmitFolderNavigationRestoresRedrawWhenSetValueThrows()
+    public async Task SubmitFolderNavigationPropagatesSetValueCancellation()
     {
-        var dialogHandle = new IntPtr(42);
         var events = new List<string>();
 
         await Assert.ThrowsAsync<OperationCanceledException>(() => WindowsDialogAutomation.SubmitFolderNavigationAsync(
-            dialogHandle,
             () =>
             {
                 events.Add("set-value");
@@ -291,188 +265,14 @@ public sealed class WindowsDialogAutomationTests
             {
                 events.Add("confirm-navigation");
                 return Task.FromResult(true);
-            },
-            _ => new[] { dialogHandle },
-            (_, enabled) => events.Add(enabled ? "redraw-on" : "redraw-off"),
-            _ => events.Add("redraw-window")));
+            }));
 
         Assert.Equal(
             new[]
             {
-                "redraw-off",
-                "set-value",
-                "redraw-on",
-                "redraw-window"
+                "set-value"
             },
             events);
-    }
-
-    [Fact]
-    public async Task RunWithoutDialogRedrawRestoresRedrawAfterSuccessfulOperation()
-    {
-        var dialogHandle = new IntPtr(42);
-        var redrawStates = new List<bool>();
-        var invalidatedHandles = new List<IntPtr>();
-
-        var result = await WindowsDialogAutomation.RunWithoutDialogRedrawAsync(
-            dialogHandle,
-            (handle, enabled) =>
-            {
-                Assert.Equal(dialogHandle, handle);
-                redrawStates.Add(enabled);
-            },
-            handle => invalidatedHandles.Add(handle),
-            () => Task.FromResult(true));
-
-        Assert.True(result);
-        Assert.Equal(new[] { false, true }, redrawStates);
-        Assert.Equal(new[] { dialogHandle }, invalidatedHandles);
-    }
-
-    [Fact]
-    public async Task RunWithoutDialogRedrawDisablesDialogAndChildWindows()
-    {
-        var dialogHandle = new IntPtr(42);
-        var childEditHandle = new IntPtr(43);
-        var childButtonHandle = new IntPtr(44);
-        var redrawStates = new List<(IntPtr Handle, bool Enabled)>();
-
-        var result = await WindowsDialogAutomation.RunWithoutDialogRedrawAsync(
-            dialogHandle,
-            _ => new[] { dialogHandle, childEditHandle, childButtonHandle },
-            (handle, enabled) => redrawStates.Add((handle, enabled)),
-            _ => { },
-            () => Task.FromResult(true));
-
-        Assert.True(result);
-        Assert.Equal(
-            new[]
-            {
-                (dialogHandle, false),
-                (childEditHandle, false),
-                (childButtonHandle, false),
-                (childButtonHandle, true),
-                (childEditHandle, true),
-                (dialogHandle, true)
-            },
-            redrawStates);
-    }
-
-    [Fact]
-    public async Task RunWithoutDialogRedrawRestoresAllHandlesWhenDisablingAChildThrows()
-    {
-        var dialogHandle = new IntPtr(42);
-        var childEditHandle = new IntPtr(43);
-        var childButtonHandle = new IntPtr(44);
-        var redrawStates = new List<(IntPtr Handle, bool Enabled)>();
-        var operationRan = false;
-        var invalidatedHandles = new List<IntPtr>();
-
-        var result = await WindowsDialogAutomation.RunWithoutDialogRedrawAsync(
-            dialogHandle,
-            _ => new[] { dialogHandle, childEditHandle, childButtonHandle },
-            (handle, enabled) =>
-            {
-                redrawStates.Add((handle, enabled));
-                if (handle == childEditHandle && !enabled)
-                {
-                    throw new InvalidOperationException("disable failed");
-                }
-            },
-            handle => invalidatedHandles.Add(handle),
-            () =>
-            {
-                operationRan = true;
-                return Task.FromResult(true);
-            });
-
-        Assert.True(result);
-        Assert.True(operationRan);
-        Assert.Equal(
-            new[]
-            {
-                (dialogHandle, false),
-                (childEditHandle, false),
-                (childButtonHandle, false),
-                (childButtonHandle, true),
-                (childEditHandle, true),
-                (dialogHandle, true)
-            },
-            redrawStates);
-        Assert.Equal(new[] { dialogHandle }, invalidatedHandles);
-    }
-
-    [Fact]
-    public async Task RunWithoutDialogRedrawRestoresRemainingHandlesWhenRestoreThrows()
-    {
-        var dialogHandle = new IntPtr(42);
-        var childEditHandle = new IntPtr(43);
-        var childButtonHandle = new IntPtr(44);
-        var redrawStates = new List<(IntPtr Handle, bool Enabled)>();
-        var invalidatedHandles = new List<IntPtr>();
-
-        var result = await WindowsDialogAutomation.RunWithoutDialogRedrawAsync(
-            dialogHandle,
-            _ => new[] { dialogHandle, childEditHandle, childButtonHandle },
-            (handle, enabled) =>
-            {
-                redrawStates.Add((handle, enabled));
-                if (handle == childEditHandle && enabled)
-                {
-                    throw new InvalidOperationException("restore failed");
-                }
-            },
-            handle => invalidatedHandles.Add(handle),
-            () => Task.FromResult(true));
-
-        Assert.True(result);
-        Assert.Equal(
-            new[]
-            {
-                (dialogHandle, false),
-                (childEditHandle, false),
-                (childButtonHandle, false),
-                (childButtonHandle, true),
-                (childEditHandle, true),
-                (dialogHandle, true)
-            },
-            redrawStates);
-        Assert.Equal(new[] { dialogHandle }, invalidatedHandles);
-    }
-
-    [Fact]
-    public async Task RunWithoutDialogRedrawRestoresRedrawAfterFailedOperation()
-    {
-        var dialogHandle = new IntPtr(42);
-        var redrawStates = new List<bool>();
-        var invalidatedHandles = new List<IntPtr>();
-
-        var result = await WindowsDialogAutomation.RunWithoutDialogRedrawAsync(
-            dialogHandle,
-            (_, enabled) => redrawStates.Add(enabled),
-            handle => invalidatedHandles.Add(handle),
-            () => Task.FromResult(false));
-
-        Assert.False(result);
-        Assert.Equal(new[] { false, true }, redrawStates);
-        Assert.Equal(new[] { dialogHandle }, invalidatedHandles);
-    }
-
-    [Fact]
-    public async Task RunWithoutDialogRedrawRestoresRedrawWhenOperationThrows()
-    {
-        var dialogHandle = new IntPtr(42);
-        var redrawStates = new List<bool>();
-        var invalidatedHandles = new List<IntPtr>();
-
-        await Assert.ThrowsAsync<InvalidOperationException>(() => WindowsDialogAutomation.RunWithoutDialogRedrawAsync(
-            dialogHandle,
-            (_, enabled) => redrawStates.Add(enabled),
-            handle => invalidatedHandles.Add(handle),
-            () => throw new InvalidOperationException("jump failed")));
-
-        Assert.Equal(new[] { false, true }, redrawStates);
-        Assert.Equal(new[] { dialogHandle }, invalidatedHandles);
     }
 
     [Theory]

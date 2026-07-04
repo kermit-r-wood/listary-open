@@ -94,7 +94,6 @@ public sealed class WindowsDialogAutomation : IDialogAutomation
         {
             fileNameEdit = writableFileNameEdit;
             return await SubmitFolderNavigationAsync(
-                    activeDialogHandle,
                     () =>
                     {
                         cancellationToken.ThrowIfCancellationRequested();
@@ -108,10 +107,7 @@ public sealed class WindowsDialogAutomation : IDialogAutomation
                     () => ConfirmFolderNavigationAsync(
                         valuePattern,
                         folderPath,
-                        cancellationToken),
-                    EnumerateDialogRedrawHandles,
-                    SetDialogRedrawEnabled,
-                    InvalidateDialogWindow)
+                        cancellationToken))
                 .ConfigureAwait(false);
         }
 
@@ -149,26 +145,15 @@ public sealed class WindowsDialogAutomation : IDialogAutomation
     }
 
     internal static async Task<bool> SubmitFolderNavigationAsync(
-        IntPtr dialogHandle,
         Func<bool> setFolderValue,
         Func<bool> invokeCommit,
-        Func<Task<bool>> confirmNavigation,
-        Func<IntPtr, IReadOnlyList<IntPtr>> redrawHandleProvider,
-        Action<IntPtr, bool> setRedrawEnabled,
-        Action<IntPtr> redrawWindow)
+        Func<Task<bool>> confirmNavigation)
     {
         ArgumentNullException.ThrowIfNull(setFolderValue);
         ArgumentNullException.ThrowIfNull(invokeCommit);
         ArgumentNullException.ThrowIfNull(confirmNavigation);
 
-        var submitted = await RunWithoutDialogRedrawAsync(
-                dialogHandle,
-                redrawHandleProvider,
-                setRedrawEnabled,
-                redrawWindow,
-                () => Task.FromResult(setFolderValue() && invokeCommit()))
-            .ConfigureAwait(false);
-        if (!submitted)
+        if (!setFolderValue() || !invokeCommit())
         {
             return false;
         }
@@ -197,137 +182,6 @@ public sealed class WindowsDialogAutomation : IDialogAutomation
         }
 
         return await confirmNavigation().ConfigureAwait(false);
-    }
-
-    internal static async Task<bool> RunWithoutDialogRedrawAsync(
-        IntPtr dialogHandle,
-        Action<IntPtr, bool> setRedrawEnabled,
-        Action<IntPtr> redrawWindow,
-        Func<Task<bool>> operation)
-    {
-        return await RunWithoutDialogRedrawAsync(
-                dialogHandle,
-                handle => new[] { handle },
-                setRedrawEnabled,
-                redrawWindow,
-                operation)
-            .ConfigureAwait(false);
-    }
-
-    internal static async Task<bool> RunWithoutDialogRedrawAsync(
-        IntPtr dialogHandle,
-        Func<IntPtr, IReadOnlyList<IntPtr>> redrawHandleProvider,
-        Action<IntPtr, bool> setRedrawEnabled,
-        Action<IntPtr> redrawWindow,
-        Func<Task<bool>> operation)
-    {
-        ArgumentNullException.ThrowIfNull(redrawHandleProvider);
-        ArgumentNullException.ThrowIfNull(setRedrawEnabled);
-        ArgumentNullException.ThrowIfNull(redrawWindow);
-        ArgumentNullException.ThrowIfNull(operation);
-
-        if (dialogHandle == IntPtr.Zero)
-        {
-            return await operation().ConfigureAwait(false);
-        }
-
-        var redrawHandles = NormalizeRedrawHandles(redrawHandleProvider(dialogHandle), dialogHandle);
-        foreach (var handle in redrawHandles)
-        {
-            TrySetRedrawEnabled(handle, enabled: false, setRedrawEnabled);
-        }
-
-        try
-        {
-            return await operation().ConfigureAwait(false);
-        }
-        finally
-        {
-            for (var index = redrawHandles.Count - 1; index >= 0; index--)
-            {
-                TrySetRedrawEnabled(redrawHandles[index], enabled: true, setRedrawEnabled);
-            }
-
-            redrawWindow(dialogHandle);
-        }
-    }
-
-    private static void TrySetRedrawEnabled(
-        IntPtr handle,
-        bool enabled,
-        Action<IntPtr, bool> setRedrawEnabled)
-    {
-        try
-        {
-            setRedrawEnabled(handle, enabled);
-        }
-        catch (Exception exception)
-        {
-            Trace.TraceError(exception.ToString());
-        }
-    }
-
-    private static IReadOnlyList<IntPtr> NormalizeRedrawHandles(
-        IReadOnlyList<IntPtr>? handles,
-        IntPtr fallbackHandle)
-    {
-        if (handles is null || handles.Count == 0)
-        {
-            return new[] { fallbackHandle };
-        }
-
-        var normalizedHandles = new List<IntPtr>(handles.Count);
-        foreach (var handle in handles)
-        {
-            if (handle != IntPtr.Zero && !normalizedHandles.Contains(handle))
-            {
-                normalizedHandles.Add(handle);
-            }
-        }
-
-        if (normalizedHandles.Count == 0)
-        {
-            normalizedHandles.Add(fallbackHandle);
-        }
-
-        return normalizedHandles;
-    }
-
-    private static IReadOnlyList<IntPtr> EnumerateDialogRedrawHandles(IntPtr dialogHandle)
-    {
-        var handles = new List<IntPtr> { dialogHandle };
-        NativeMethods.EnumChildWindows(
-            dialogHandle,
-            (childHandle, _) =>
-            {
-                if (childHandle != IntPtr.Zero)
-                {
-                    handles.Add(childHandle);
-                }
-
-                return true;
-            },
-            IntPtr.Zero);
-
-        return handles;
-    }
-
-    private static void SetDialogRedrawEnabled(IntPtr dialogHandle, bool enabled)
-    {
-        _ = NativeMethods.SendMessage(
-            dialogHandle,
-            NativeMethods.WM_SETREDRAW,
-            enabled ? new UIntPtr(1) : UIntPtr.Zero,
-            IntPtr.Zero);
-    }
-
-    private static void InvalidateDialogWindow(IntPtr dialogHandle)
-    {
-        _ = NativeMethods.RedrawWindow(
-            dialogHandle,
-            IntPtr.Zero,
-            IntPtr.Zero,
-            NativeMethods.RDW_INVALIDATE | NativeMethods.RDW_ALLCHILDREN | NativeMethods.RDW_UPDATENOW);
     }
 
     private static bool TryFocusFileNameEditWindow(IntPtr dialogHandle, AutomationElement fileNameEdit)

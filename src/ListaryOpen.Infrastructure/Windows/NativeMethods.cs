@@ -10,10 +10,6 @@ internal static partial class NativeMethods
     internal const int InputKeyboard = 1;
     internal const uint KeyEventFKeyUp = 0x0002;
     internal const uint KeyEventFUnicode = 0x0004;
-    internal const uint RDW_INVALIDATE = 0x0001;
-    internal const uint RDW_ALLCHILDREN = 0x0080;
-    internal const uint RDW_UPDATENOW = 0x0100;
-    internal const uint WM_SETREDRAW = 0x000B;
     internal const ushort VkReturn = 0x0D;
     internal const ushort VkA = 0x41;
     internal const ushort VkControl = 0x11;
@@ -123,15 +119,8 @@ internal static partial class NativeMethods
     [return: MarshalAs(UnmanagedType.Bool)]
     internal static partial bool RegisterHotKey(IntPtr hWnd, int id, uint fsModifiers, uint vk);
 
-    [LibraryImport("user32.dll", SetLastError = true)]
-    [return: MarshalAs(UnmanagedType.Bool)]
-    internal static partial bool RedrawWindow(IntPtr hWnd, IntPtr lprcUpdate, IntPtr hrgnUpdate, uint flags);
-
     [DllImport("user32.dll", SetLastError = true)]
     internal static extern uint SendInput(uint nInputs, Input[] pInputs, int cbSize);
-
-    [LibraryImport("user32.dll", EntryPoint = "SendMessageW", SetLastError = true)]
-    internal static partial IntPtr SendMessage(IntPtr hWnd, uint msg, UIntPtr wParam, IntPtr lParam);
 
     [LibraryImport("user32.dll")]
     [return: MarshalAs(UnmanagedType.Bool)]
