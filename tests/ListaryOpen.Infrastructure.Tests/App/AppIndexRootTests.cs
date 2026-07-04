@@ -119,6 +119,30 @@ public sealed class AppIndexRootTests
     }
 
     [Fact]
+    public void IndexingRunCancellationManagerCancelsOutstandingQueuedRunWhenRestarting()
+    {
+        using var shutdown = new CancellationTokenSource();
+        using var manager = new IndexingRunCancellationManager();
+
+        var activeRun = manager.CreateRun(shutdown.Token, cancelActive: false);
+        var queuedRun = manager.CreateRun(shutdown.Token, cancelActive: false);
+        var restartRun = manager.CreateRun(shutdown.Token, cancelActive: true);
+
+        try
+        {
+            Assert.True(activeRun.IsCancellationRequested);
+            Assert.True(queuedRun.IsCancellationRequested);
+            Assert.False(restartRun.IsCancellationRequested);
+        }
+        finally
+        {
+            manager.CompleteRun(activeRun);
+            manager.CompleteRun(queuedRun);
+            manager.CompleteRun(restartRun);
+        }
+    }
+
+    [Fact]
     public async Task RunSerializedIndexingAsyncQueuesConcurrentRequests()
     {
         using var gate = new SemaphoreSlim(1, 1);

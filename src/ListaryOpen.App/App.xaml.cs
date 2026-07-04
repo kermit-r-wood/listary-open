@@ -585,19 +585,22 @@ internal static class BackgroundIndexingTaskStarter
 internal sealed class IndexingRunCancellationManager : IDisposable
 {
     private readonly object _gate = new();
-    private CancellationTokenSource? _activeRun;
+    private readonly HashSet<CancellationTokenSource> _runs = new();
+    private bool _disposed;
 
     public CancellationTokenSource CreateRun(CancellationToken shutdownToken, bool cancelActive)
     {
         lock (_gate)
         {
+            ObjectDisposedException.ThrowIf(_disposed, this);
+
             if (cancelActive)
             {
-                _activeRun?.Cancel();
+                CancelRuns();
             }
 
             var run = CancellationTokenSource.CreateLinkedTokenSource(shutdownToken);
-            _activeRun = run;
+            _runs.Add(run);
             return run;
         }
     }
@@ -608,10 +611,7 @@ internal sealed class IndexingRunCancellationManager : IDisposable
 
         lock (_gate)
         {
-            if (ReferenceEquals(_activeRun, run))
-            {
-                _activeRun = null;
-            }
+            _runs.Remove(run);
         }
 
         run.Dispose();
@@ -621,13 +621,38 @@ internal sealed class IndexingRunCancellationManager : IDisposable
     {
         lock (_gate)
         {
-            _activeRun?.Cancel();
+            CancelRuns();
         }
     }
 
     public void Dispose()
     {
-        CancelActive();
+        CancellationTokenSource[] runs;
+        lock (_gate)
+        {
+            if (_disposed)
+            {
+                return;
+            }
+
+            _disposed = true;
+            CancelRuns();
+            runs = _runs.ToArray();
+            _runs.Clear();
+        }
+
+        foreach (var run in runs)
+        {
+            run.Dispose();
+        }
+    }
+
+    private void CancelRuns()
+    {
+        foreach (var run in _runs)
+        {
+            run.Cancel();
+        }
     }
 }
 
