@@ -294,25 +294,10 @@ public partial class App : Application
 
     private async Task RunInitialIndexAsync(CancellationToken cancellationToken)
     {
-        var lockTaken = false;
         try
         {
-            lockTaken = await _indexingRunLock.WaitAsync(0, cancellationToken).ConfigureAwait(false);
-            if (!lockTaken)
-            {
-                Trace.TraceInformation("Indexing is already running; reindex request skipped.");
-                return;
-            }
-
-            var coordinator = _indexingCoordinator;
-            if (coordinator is null)
-            {
-                return;
-            }
-
-            var rootPaths = _settingsViewModel?.Settings.IndexedRoots ?? AppSettings.Defaults().IndexedRoots;
-            var roots = CreateIndexRoots(rootPaths);
-            await coordinator.IndexRootsAsync(roots, cancellationToken).ConfigureAwait(false);
+            await RunSerializedIndexingAsync(_indexingRunLock, RunSingleIndexAsync, cancellationToken)
+                .ConfigureAwait(false);
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
         {
@@ -321,13 +306,38 @@ public partial class App : Application
         {
             Trace.TraceError(exception.ToString());
         }
+    }
+
+    internal static async Task RunSerializedIndexingAsync(
+        SemaphoreSlim indexingRunLock,
+        Func<CancellationToken, Task> work,
+        CancellationToken cancellationToken)
+    {
+        ArgumentNullException.ThrowIfNull(indexingRunLock);
+        ArgumentNullException.ThrowIfNull(work);
+
+        await indexingRunLock.WaitAsync(cancellationToken).ConfigureAwait(false);
+        try
+        {
+            await work(cancellationToken).ConfigureAwait(false);
+        }
         finally
         {
-            if (lockTaken)
-            {
-                _indexingRunLock.Release();
-            }
+            indexingRunLock.Release();
         }
+    }
+
+    private async Task RunSingleIndexAsync(CancellationToken cancellationToken)
+    {
+        var coordinator = _indexingCoordinator;
+        if (coordinator is null)
+        {
+            return;
+        }
+
+        var rootPaths = _settingsViewModel?.Settings.IndexedRoots ?? AppSettings.Defaults().IndexedRoots;
+        var roots = CreateIndexRoots(rootPaths);
+        await coordinator.IndexRootsAsync(roots, cancellationToken).ConfigureAwait(false);
     }
 
     private void OnIndexingStatusChanged(object? sender, IndexingStatus status)

@@ -36,19 +36,7 @@ internal static class ElevatedIndexerRecordWriter
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(outputPath);
 
-        var outputDirectory = Path.GetDirectoryName(outputPath);
-        if (!string.IsNullOrWhiteSpace(outputDirectory))
-        {
-            Directory.CreateDirectory(outputDirectory);
-        }
-
-        await using var stream = new FileStream(
-            outputPath,
-            FileMode.Create,
-            FileAccess.Write,
-            FileShare.Read,
-            bufferSize: 64 * 1024,
-            useAsync: true);
+        await using var stream = ElevatedIndexerOutputPathValidator.CreateNewFile(outputPath, ".jsonl");
         await using var writer = new StreamWriter(stream);
         await WriteAsync(records, writer, cancellationToken).ConfigureAwait(false);
     }

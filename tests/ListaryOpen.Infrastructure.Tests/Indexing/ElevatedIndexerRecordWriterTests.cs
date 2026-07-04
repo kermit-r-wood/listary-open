@@ -10,7 +10,7 @@ public sealed class ElevatedIndexerRecordWriterTests
     {
         var tempDirectory = Path.Combine(Path.GetTempPath(), "listary-open-" + Guid.NewGuid());
         Directory.CreateDirectory(tempDirectory);
-        var outputPath = Path.Combine(tempDirectory, "records.jsonl");
+        var outputPath = Path.Combine(Path.GetTempPath(), "listary-open-indexer-" + Guid.NewGuid() + ".jsonl");
 
         try
         {
@@ -39,7 +39,37 @@ public sealed class ElevatedIndexerRecordWriterTests
         }
         finally
         {
+            if (File.Exists(outputPath))
+            {
+                File.Delete(outputPath);
+            }
+
             Directory.Delete(tempDirectory, recursive: true);
+        }
+    }
+
+    [Fact]
+    public async Task WriteFileAsyncDoesNotOverwriteExistingFile()
+    {
+        var outputPath = Path.Combine(Path.GetTempPath(), "listary-open-indexer-" + Guid.NewGuid() + ".jsonl");
+        await File.WriteAllTextAsync(outputPath, "existing");
+
+        try
+        {
+            var records = Enumerate(FileRecord.Create(
+                "C:\\Docs\\Report.txt",
+                isDirectory: false,
+                sizeBytes: 42,
+                DateTimeOffset.UtcNow));
+
+            await Assert.ThrowsAnyAsync<Exception>(() =>
+                ElevatedIndexerRecordWriter.WriteFileAsync(records, outputPath, CancellationToken.None));
+
+            Assert.Equal("existing", await File.ReadAllTextAsync(outputPath));
+        }
+        finally
+        {
+            File.Delete(outputPath);
         }
     }
 

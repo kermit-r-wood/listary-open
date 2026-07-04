@@ -101,13 +101,9 @@ static void WriteErrorFile(string errorPath, string message)
 
     try
     {
-        var errorDirectory = Path.GetDirectoryName(errorPath);
-        if (!string.IsNullOrWhiteSpace(errorDirectory))
-        {
-            Directory.CreateDirectory(errorDirectory);
-        }
-
-        File.WriteAllText(errorPath, message);
+        using var stream = ElevatedIndexerOutputPathValidator.CreateNewFile(errorPath, ".err");
+        using var writer = new StreamWriter(stream);
+        writer.Write(message);
     }
     catch
     {

@@ -96,4 +96,35 @@ public sealed class AppIndexRootTests
             Directory.Delete(Path.GetDirectoryName(helperPath)!, recursive: true);
         }
     }
+
+    [Fact]
+    public async Task RunSerializedIndexingAsyncQueuesConcurrentRequests()
+    {
+        using var gate = new SemaphoreSlim(1, 1);
+        var releaseFirstRun = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var firstRunStarted = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var runCount = 0;
+
+        Task Work(CancellationToken cancellationToken)
+        {
+            if (Interlocked.Increment(ref runCount) == 1)
+            {
+                firstRunStarted.SetResult();
+                return releaseFirstRun.Task;
+            }
+
+            return Task.CompletedTask;
+        }
+
+        var firstRun = WpfApp.RunSerializedIndexingAsync(gate, Work, CancellationToken.None);
+        await firstRunStarted.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        var secondRun = WpfApp.RunSerializedIndexingAsync(gate, Work, CancellationToken.None);
+
+        Assert.False(secondRun.IsCompleted);
+
+        releaseFirstRun.SetResult();
+        await Task.WhenAll(firstRun, secondRun).WaitAsync(TimeSpan.FromSeconds(5));
+
+        Assert.Equal(2, runCount);
+    }
 }
