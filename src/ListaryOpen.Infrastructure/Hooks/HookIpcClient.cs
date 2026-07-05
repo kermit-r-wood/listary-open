@@ -56,12 +56,6 @@ public sealed class HookIpcClient : IHookIpcClient, IDisposable
 
             cancellationToken.ThrowIfCancellationRequested();
 
-            var pipePath = $@"\\.\pipe\{_pipeName}";
-            if (!File.Exists(pipePath))
-            {
-                return new HookJumpResult(HookJumpStatus.HostUnavailable, $"Hook host pipe '{_pipeName}' is unavailable.");
-            }
-
             using var pipe = new NamedPipeClientStream(
                 ".",
                 _pipeName,
