@@ -90,7 +90,7 @@ public sealed class SettingsViewModel : INotifyPropertyChanged
                 return "Disabled";
             }
 
-            if (_hookQuickSwitchStatus.X64.HostRunning && _hookQuickSwitchStatus.X86.HostRunning)
+            if (IsHookQuickSwitchReady)
             {
                 return "Ready";
             }
@@ -118,7 +118,7 @@ public sealed class SettingsViewModel : INotifyPropertyChanged
                 return "Enable";
             }
 
-            return HookQuickSwitchBadgeText == "Ready" ? "Enabled" : "Retry";
+            return IsHookQuickSwitchReady ? "Enabled" : "Retry";
         }
     }
 
@@ -175,7 +175,10 @@ public sealed class SettingsViewModel : INotifyPropertyChanged
             _hookQuickSwitchStatus = status;
             OnPropertyChanged(nameof(HookQuickSwitchStatusText));
             OnPropertyChanged(nameof(HookQuickSwitchBadgeText));
-            OnPropertyChanged(nameof(HookQuickSwitchActionText));
+            if (!_hookQuickSwitchEnableInProgress)
+            {
+                OnPropertyChanged(nameof(HookQuickSwitchActionText));
+            }
         }
 
         SetHookQuickSwitchEnableInProgress(false);
@@ -220,6 +223,10 @@ public sealed class SettingsViewModel : INotifyPropertyChanged
         _enableNtfsFastIndexing();
         NtfsFastIndexingEnabled = true;
     }
+
+    private bool IsHookQuickSwitchReady => _hookQuickSwitchStatus.Enabled
+        && _hookQuickSwitchStatus.X64.HostRunning
+        && _hookQuickSwitchStatus.X86.HostRunning;
 
     private void OnPropertyChanged([CallerMemberName] string? propertyName = null)
     {

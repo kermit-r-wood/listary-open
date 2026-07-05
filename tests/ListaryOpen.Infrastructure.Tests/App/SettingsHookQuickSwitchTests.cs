@@ -139,6 +139,47 @@ public sealed class SettingsHookQuickSwitchTests
         Assert.Equal("Retry", viewModel.HookQuickSwitchActionText);
     }
 
+    [Fact]
+    public void HookPresentationShowsFailedWhenNoHostsRun()
+    {
+        var viewModel = new SettingsViewModel(AppSettings.Defaults());
+
+        viewModel.UpdateHookQuickSwitchStatus(new HookQuickSwitchStatus(
+            true,
+            new HookArchitectureStatus(HookArchitecture.X64, true, false, true, "x64 stopped"),
+            new HookArchitectureStatus(HookArchitecture.X86, true, false, true, "x86 stopped")));
+
+        Assert.Equal("Failed", viewModel.HookQuickSwitchBadgeText);
+        Assert.Equal("Retry", viewModel.HookQuickSwitchActionText);
+    }
+
+    [Fact]
+    public void UpdateHookQuickSwitchStatusDoesNotNotifyStaleEnablingActionText()
+    {
+        var viewModel = new SettingsViewModel(
+            AppSettings.Defaults(),
+            enableNtfsFastIndexing: null,
+            enableHookQuickSwitch: () => { });
+        var observedActionTexts = new List<string>();
+
+        viewModel.EnableHookQuickSwitchCommand.Execute(null);
+        viewModel.PropertyChanged += (_, e) =>
+        {
+            if (e.PropertyName == nameof(SettingsViewModel.HookQuickSwitchActionText))
+            {
+                observedActionTexts.Add(viewModel.HookQuickSwitchActionText);
+            }
+        };
+
+        viewModel.UpdateHookQuickSwitchStatus(new HookQuickSwitchStatus(
+            true,
+            new HookArchitectureStatus(HookArchitecture.X64, true, true, true, "x64 running"),
+            new HookArchitectureStatus(HookArchitecture.X86, true, true, true, "x86 running")));
+
+        Assert.DoesNotContain("Enabling", observedActionTexts);
+        Assert.Contains("Enabled", observedActionTexts);
+    }
+
     private static HookQuickSwitchStatus CreatePartialStatus()
     {
         return new HookQuickSwitchStatus(
