@@ -3,6 +3,7 @@
   <ItemGroup>
     <ProjectReference Include="..\ListaryOpen.Core\ListaryOpen.Core.csproj" />
     <ProjectReference Include="..\ListaryOpen.Infrastructure\ListaryOpen.Infrastructure.csproj" />
+    <ProjectReference Include="..\ListaryOpen.Indexer.Elevated\ListaryOpen.Indexer.Elevated.csproj" ReferenceOutputAssembly="false" PrivateAssets="all" />
   </ItemGroup>
 
   <ItemGroup>
@@ -28,6 +29,29 @@
     <NativeHooksX64RuntimeDll>C:\Users\paulx\scoop\apps\mingw-mstorsjo-llvm-msvcrt\22.1.8-20260616\x86_64-w64-mingw32\bin\libunwind.dll</NativeHooksX64RuntimeDll>
     <NativeHooksX86RuntimeDll>C:\Users\paulx\scoop\apps\mingw-mstorsjo-llvm-msvcrt\22.1.8-20260616\i686-w64-mingw32\bin\libunwind.dll</NativeHooksX86RuntimeDll>
   </PropertyGroup>
+
+  <Target Name="CopyElevatedIndexerBundle" AfterTargets="Build">
+    <PropertyGroup>
+      <ElevatedIndexerProjectPath>$(MSBuildProjectDirectory)\..\ListaryOpen.Indexer.Elevated\ListaryOpen.Indexer.Elevated.csproj</ElevatedIndexerProjectPath>
+      <ElevatedIndexerBuildProperties>Configuration=$(Configuration);TargetFramework=$(TargetFramework)</ElevatedIndexerBuildProperties>
+      <ElevatedIndexerBuildProperties Condition="'$(RuntimeIdentifier)' != ''">$(ElevatedIndexerBuildProperties);RuntimeIdentifier=$(RuntimeIdentifier)</ElevatedIndexerBuildProperties>
+    </PropertyGroup>
+    <MSBuild Projects="$(ElevatedIndexerProjectPath)"
+             Targets="GetTargetPath"
+             Properties="$(ElevatedIndexerBuildProperties)">
+      <Output TaskParameter="TargetOutputs" ItemName="ElevatedIndexerTargetPath" />
+    </MSBuild>
+    <ItemGroup>
+      <ElevatedIndexerBundle Include="%(ElevatedIndexerTargetPath.RootDir)%(ElevatedIndexerTargetPath.Directory)**\*" />
+    </ItemGroup>
+    <Error Condition="'@(ElevatedIndexerTargetPath)' == ''"
+           Text="Could not resolve ListaryOpen.Indexer.Elevated target path." />
+    <Error Condition="'@(ElevatedIndexerBundle)' == ''"
+           Text="Could not find ListaryOpen.Indexer.Elevated build output to copy." />
+    <Copy SourceFiles="@(ElevatedIndexerBundle)"
+          DestinationFiles="@(ElevatedIndexerBundle->'$(OutDir)%(RecursiveDir)%(Filename)%(Extension)')"
+          SkipUnchangedFiles="true" />
+  </Target>
 
   <Target Name="BuildNativeHooks" AfterTargets="Build" Condition="'$(BuildNativeHooks)' == 'true'">
     <PropertyGroup>
