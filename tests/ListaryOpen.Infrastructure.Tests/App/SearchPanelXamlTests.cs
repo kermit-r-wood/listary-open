@@ -8,11 +8,18 @@ public sealed class SearchPanelXamlTests
         var xaml = File.ReadAllText(GetRepositoryPath("src", "ListaryOpen.App", "SearchPanel.xaml"));
 
         Assert.Contains("x:Name=\"SearchPanelRoot\"", xaml);
+        Assert.Contains("xmlns:converters=\"clr-namespace:ListaryOpen.App.Converters\"", xaml);
+        Assert.Contains(
+            "<converters:SearchMatchReasonDisplayConverter x:Key=\"SearchMatchReasonDisplayConverter\" />",
+            xaml);
         Assert.Contains("Text=\"{Binding ModeDisplayText}\"", xaml);
         Assert.Contains("Text=\"{Binding QueryPlaceholderText}\"", xaml);
         Assert.Contains("Text=\"{Binding Record.Name}\"", xaml);
         Assert.Contains("Text=\"{Binding Record.ParentPath}\"", xaml);
-        Assert.Contains("Text=\"{Binding MatchReason}\"", xaml);
+        Assert.Contains(
+            "Text=\"{Binding MatchReason, Converter={StaticResource SearchMatchReasonDisplayConverter}}\"",
+            xaml);
+        Assert.DoesNotContain("Text=\"{Binding MatchReason}\"", xaml);
         Assert.Contains("Record.IsDirectory", xaml);
         Assert.Contains("SearchPanelResultListStyle", xaml);
     }
