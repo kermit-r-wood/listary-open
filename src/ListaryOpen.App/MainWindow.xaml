@@ -6,132 +6,162 @@
         mc:Ignorable="d"
         Title="ListaryOpen Settings"
         Icon="{StaticResource ListaryOpenIcon}"
-        Height="360"
-        Width="520"
-        MinHeight="300"
-        MinWidth="420"
+        Height="520"
+        Width="720"
+        MinHeight="420"
+        MinWidth="560"
+        Background="{StaticResource Brush.AppBackground}"
         WindowStartupLocation="CenterScreen">
     <Grid x:Name="SettingsContentRoot"
           Margin="20">
         <Grid.RowDefinitions>
             <RowDefinition Height="Auto" />
-            <RowDefinition Height="Auto" />
             <RowDefinition Height="*" />
         </Grid.RowDefinitions>
 
-        <TextBlock Text="ListaryOpen Settings"
-                   FontSize="22"
-                   FontWeight="SemiBold"
-                   Margin="0,0,0,6" />
-
-        <TextBlock Grid.Row="1"
-                   Text="{Binding IndexingStatusText}"
-                   TextWrapping="Wrap"
+        <TextBlock Style="{StaticResource Text.WindowTitle}"
+                   Text="ListaryOpen Settings"
                    Margin="0,0,0,16" />
 
-        <ScrollViewer Grid.Row="2"
-                      VerticalScrollBarVisibility="Auto">
+        <ScrollViewer Grid.Row="1"
+                      VerticalScrollBarVisibility="Auto"
+                      HorizontalScrollBarVisibility="Disabled">
             <StackPanel>
-                <TextBlock Text="Indexed roots"
-                           FontSize="14"
-                           FontWeight="SemiBold"
-                           Margin="0,0,0,6" />
-                <Border BorderBrush="{DynamicResource {x:Static SystemColors.ControlDarkBrushKey}}"
-                        BorderThickness="1"
-                        Padding="10"
-                        Margin="0,0,0,16">
-                    <ItemsControl ItemsSource="{Binding Settings.IndexedRoots}">
-                        <ItemsControl.ItemTemplate>
-                            <DataTemplate>
-                                <TextBlock Text="{Binding}"
-                                           TextWrapping="Wrap"
-                                           Margin="0,2" />
-                            </DataTemplate>
-                        </ItemsControl.ItemTemplate>
-                    </ItemsControl>
+                <Border x:Name="IndexingSection"
+                        Style="{StaticResource SettingsSectionStyle}">
+                    <StackPanel>
+                        <Grid Margin="0,0,0,12">
+                            <Grid.ColumnDefinitions>
+                                <ColumnDefinition Width="*" />
+                                <ColumnDefinition Width="Auto" />
+                            </Grid.ColumnDefinitions>
+                            <TextBlock Style="{StaticResource Text.SectionTitle}"
+                                       Text="Indexing" />
+                            <TextBlock Grid.Column="1"
+                                       Style="{StaticResource BadgeTextBlockStyle}"
+                                       Text="{Binding IndexingBadgeText}" />
+                        </Grid>
+
+                        <TextBlock Style="{StaticResource SettingsDetailStyle}"
+                                   AutomationProperties.Name="Indexing status"
+                                   Text="{Binding IndexingStatusText}" />
+
+                        <TextBlock Style="{StaticResource SettingsRowTitleStyle}"
+                                   Text="Indexed roots"
+                                   Margin="0,14,0,6" />
+                        <ItemsControl ItemsSource="{Binding Settings.IndexedRoots}">
+                            <ItemsControl.ItemTemplate>
+                                <DataTemplate>
+                                    <TextBlock Style="{StaticResource SettingsPathTextStyle}"
+                                               Text="{Binding}" />
+                                </DataTemplate>
+                            </ItemsControl.ItemTemplate>
+                        </ItemsControl>
+
+                        <Grid Margin="0,14,0,0">
+                            <Grid.ColumnDefinitions>
+                                <ColumnDefinition Width="*" />
+                                <ColumnDefinition Width="Auto" />
+                                <ColumnDefinition Width="Auto" />
+                            </Grid.ColumnDefinitions>
+                            <StackPanel>
+                                <TextBlock Style="{StaticResource SettingsRowTitleStyle}"
+                                           Text="NTFS fast indexing" />
+                                <TextBlock Style="{StaticResource SettingsDetailStyle}"
+                                           Text="{Binding NtfsFastIndexingStatusText}" />
+                            </StackPanel>
+                            <TextBlock Grid.Column="1"
+                                       Style="{StaticResource BadgeTextBlockStyle}"
+                                       Text="{Binding NtfsFastIndexingBadgeText}"
+                                       Margin="12,0,8,0"
+                                       VerticalAlignment="Center" />
+                            <Button Grid.Column="2"
+                                    Style="{StaticResource ActionButtonStyle}"
+                                    Content="{Binding NtfsFastIndexingActionText}"
+                                    Command="{Binding EnableNtfsFastIndexingCommand}"
+                                    VerticalAlignment="Center" />
+                        </Grid>
+                    </StackPanel>
                 </Border>
 
-                <Grid Margin="0,0,0,16">
-                    <Grid.ColumnDefinitions>
-                        <ColumnDefinition Width="*" />
-                        <ColumnDefinition Width="*" />
-                    </Grid.ColumnDefinitions>
-
-                    <StackPanel Grid.Column="0"
-                                Margin="0,0,10,0">
-                        <TextBlock Text="Search hotkey"
-                                   FontSize="14"
-                                   FontWeight="SemiBold"
-                                   Margin="0,0,0,6" />
-                        <TextBlock Text="{Binding Settings.SearchHotkey}"
-                                   FontSize="16"
-                                   TextWrapping="Wrap" />
+                <Border x:Name="HotkeysSection"
+                        Style="{StaticResource SettingsSectionStyle}">
+                    <StackPanel>
+                        <TextBlock Style="{StaticResource Text.SectionTitle}"
+                                   Text="Hotkeys"
+                                   Margin="0,0,0,12" />
+                        <Grid>
+                            <Grid.ColumnDefinitions>
+                                <ColumnDefinition Width="*" />
+                                <ColumnDefinition Width="*" />
+                            </Grid.ColumnDefinitions>
+                            <StackPanel Margin="0,0,12,0">
+                                <TextBlock Style="{StaticResource SettingsRowTitleStyle}"
+                                           Text="Search" />
+                                <TextBlock Style="{StaticResource SettingsDetailStyle}"
+                                           Text="{Binding Settings.SearchHotkey}" />
+                            </StackPanel>
+                            <StackPanel Grid.Column="1">
+                                <TextBlock Style="{StaticResource SettingsRowTitleStyle}"
+                                           Text="Dialog jump" />
+                                <TextBlock Style="{StaticResource SettingsDetailStyle}"
+                                           Text="{Binding Settings.DialogHotkey}" />
+                            </StackPanel>
+                        </Grid>
                     </StackPanel>
+                </Border>
 
-                    <StackPanel Grid.Column="1"
-                                Margin="10,0,0,0">
-                        <TextBlock Text="Dialog hotkey"
-                                   FontSize="14"
-                                   FontWeight="SemiBold"
-                                   Margin="0,0,0,6" />
-                        <TextBlock Text="{Binding Settings.DialogHotkey}"
-                                   FontSize="16"
-                                   TextWrapping="Wrap" />
-                    </StackPanel>
-                </Grid>
+                <Border x:Name="QuickSwitchSection"
+                        Style="{StaticResource SettingsSectionStyle}">
+                    <Grid>
+                        <Grid.ColumnDefinitions>
+                            <ColumnDefinition Width="*" />
+                            <ColumnDefinition Width="Auto" />
+                            <ColumnDefinition Width="Auto" />
+                        </Grid.ColumnDefinitions>
+                        <StackPanel>
+                            <TextBlock Style="{StaticResource Text.SectionTitle}"
+                                       Text="Quick Switch"
+                                       Margin="0,0,0,8" />
+                            <TextBlock Style="{StaticResource SettingsDetailStyle}"
+                                       Text="{Binding HookQuickSwitchStatusText}" />
+                        </StackPanel>
+                        <TextBlock Grid.Column="1"
+                                   Style="{StaticResource BadgeTextBlockStyle}"
+                                   Text="{Binding HookQuickSwitchBadgeText}"
+                                   Margin="12,0,8,0"
+                                   VerticalAlignment="Center" />
+                        <Button Grid.Column="2"
+                                Style="{StaticResource ActionButtonStyle}"
+                                Content="{Binding HookQuickSwitchActionText}"
+                                Command="{Binding EnableHookQuickSwitchCommand}"
+                                VerticalAlignment="Center" />
+                    </Grid>
+                </Border>
 
-                <CheckBox Content="Quick Save / Open enabled"
-                          IsChecked="{Binding Settings.QuickSaveOpenEnabled, Mode=OneWay}"
-                          IsEnabled="False"
-                          Margin="0,0,0,16" />
-
-                <Grid>
-                    <Grid.ColumnDefinitions>
-                        <ColumnDefinition Width="*" />
-                        <ColumnDefinition Width="Auto" />
-                    </Grid.ColumnDefinitions>
-
-                    <StackPanel Grid.Column="0"
-                                Margin="0,0,12,0">
-                        <TextBlock Text="NTFS fast indexing"
-                                   FontSize="14"
-                                   FontWeight="SemiBold"
-                                   Margin="0,0,0,6" />
-                        <TextBlock Text="{Binding NtfsFastIndexingStatusText}"
-                                   TextWrapping="Wrap" />
-                    </StackPanel>
-
-                    <Button Grid.Column="1"
-                            MinWidth="80"
-                            Padding="10,4"
-                            VerticalAlignment="Center"
-                            Content="Enable"
-                            Command="{Binding EnableNtfsFastIndexingCommand}" />
-                </Grid>
-
-                <Grid Margin="0,16,0,0">
-                    <Grid.ColumnDefinitions>
-                        <ColumnDefinition Width="*" />
-                        <ColumnDefinition Width="Auto" />
-                    </Grid.ColumnDefinitions>
-
-                    <StackPanel Grid.Column="0"
-                                Margin="0,0,12,0">
-                        <TextBlock Text="Hook quick switch"
-                                   FontSize="14"
-                                   FontWeight="SemiBold"
-                                   Margin="0,0,0,6" />
-                        <TextBlock Text="{Binding HookQuickSwitchStatusText}"
-                                   TextWrapping="Wrap" />
-                    </StackPanel>
-
-                    <Button Grid.Column="1"
-                            MinWidth="80"
-                            Padding="10,4"
-                            VerticalAlignment="Center"
-                            Content="Enable"
-                            Command="{Binding EnableHookQuickSwitchCommand}" />
-                </Grid>
+                <Border x:Name="GeneralSection"
+                        Style="{StaticResource SettingsSectionStyle}">
+                    <Grid>
+                        <Grid.ColumnDefinitions>
+                            <ColumnDefinition Width="*" />
+                            <ColumnDefinition Width="Auto" />
+                        </Grid.ColumnDefinitions>
+                        <StackPanel>
+                            <TextBlock Style="{StaticResource Text.SectionTitle}"
+                                       Text="General"
+                                       Margin="0,0,0,8" />
+                            <TextBlock Style="{StaticResource SettingsRowTitleStyle}"
+                                       Text="Quick Save / Open" />
+                            <TextBlock Style="{StaticResource SettingsDetailStyle}"
+                                       Text="Current configured state for Quick Save and Open integration." />
+                        </StackPanel>
+                        <TextBlock Grid.Column="1"
+                                   Style="{StaticResource BadgeTextBlockStyle}"
+                                   Text="{Binding QuickSaveOpenBadgeText}"
+                                   Margin="12,0,0,0"
+                                   VerticalAlignment="Center" />
+                    </Grid>
+                </Border>
             </StackPanel>
         </ScrollViewer>
     </Grid>
