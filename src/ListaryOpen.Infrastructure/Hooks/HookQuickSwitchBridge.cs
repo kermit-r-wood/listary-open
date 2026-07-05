@@ -187,6 +187,17 @@ public sealed class HookQuickSwitchBridge : IHookQuickSwitchBridge
             return healthyStatus;
         }
 
+        cancellationToken.ThrowIfCancellationRequested();
+        if (IsDisposed())
+        {
+            return new HookArchitectureStatus(
+                architecture,
+                true,
+                false,
+                snapshot.HookDllExists,
+                $"{architectureName} hook host start was abandoned.");
+        }
+
         if (!snapshot.HostExists || !snapshot.HookDllExists)
         {
             return CreateUnavailableStatus(snapshot);

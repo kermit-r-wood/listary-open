@@ -118,6 +118,37 @@ public sealed class HookQuickSwitchBridgeTests
     }
 
     [Fact]
+    public async Task DisposeDuringHealthProbeSkipsHostStartAndStatusUpdate()
+    {
+        using var hookFiles = HookFileFixture.Create();
+        hookFiles.CreateHostAndDll(HookArchitecture.X64);
+        hookFiles.CreateHostAndDll(HookArchitecture.X86);
+        var healthClient = new BlockingHealthProbeHookClient();
+        var processFactory = new RecordingHookHostProcessFactory(startResult: new Process());
+        var bridge = new HookQuickSwitchBridge(
+            HookQuickSwitchStatus.Disabled(),
+            new Dictionary<HookArchitecture, IHookIpcClient>
+            {
+                [HookArchitecture.X64] = healthClient
+            },
+            hookFiles.Paths,
+            processFactory);
+        var statusChangedCount = 0;
+        bridge.StatusChanged += (_, _) => statusChangedCount++;
+
+        var enableTask = Task.Run(() => bridge.EnableAsync(CancellationToken.None));
+        await healthClient.ProbeEntered.Task.WaitAsync(TimeSpan.FromSeconds(2));
+
+        bridge.Dispose();
+        healthClient.Release(new HookJumpResult(HookJumpStatus.HostUnavailable, "No host."));
+        await enableTask.WaitAsync(TimeSpan.FromSeconds(2));
+        bridge.Dispose();
+
+        Assert.Empty(processFactory.Starts);
+        Assert.Equal(0, statusChangedCount);
+    }
+
+    [Fact]
     public async Task EnableReportsMissingHostAndDllPerArchitecture()
     {
         using var hookFiles = HookFileFixture.Create();
@@ -350,6 +381,27 @@ public sealed class HookQuickSwitchBridgeTests
 
         public Task<HookJumpResult> ProbeHealthAsync(CancellationToken cancellationToken) =>
             Task.FromResult(_healthResult);
+    }
+
+    private sealed class BlockingHealthProbeHookClient : IHookIpcClient, IHookHealthProbeClient
+    {
+        private readonly TaskCompletionSource<HookJumpResult> _result = new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        public TaskCompletionSource ProbeEntered { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        public Task<HookDialogContext?> GetActiveDialogAsync(CancellationToken cancellationToken) =>
+            Task.FromResult<HookDialogContext?>(null);
+
+        public Task<HookJumpResult> JumpDialogToFolderAsync(string dialogId, string folderPath, CancellationToken cancellationToken) =>
+            Task.FromResult(new HookJumpResult(HookJumpStatus.NoActiveDialog, "No dialog."));
+
+        public Task<HookJumpResult> ProbeHealthAsync(CancellationToken cancellationToken)
+        {
+            ProbeEntered.TrySetResult();
+            return _result.Task.WaitAsync(cancellationToken);
+        }
+
+        public void Release(HookJumpResult result) => _result.TrySetResult(result);
     }
 
     private static IReadOnlyDictionary<HookArchitecture, IHookIpcClient> CreateEmptyClients() =>
