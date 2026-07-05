@@ -91,16 +91,13 @@ internal sealed class HookIpcEnvelopeJsonConverter : JsonConverter<HookIpcEnvelo
         }
 
         var messageType = GetRequiredString(root, "messageType");
-        var payloadElement = GetRequiredProperty(root, "payload");
+        var payloadElement = GetRequiredObject(root, "payload");
         object payload = messageType switch
         {
-            "HealthProbe" => payloadElement.Deserialize<HookHealthProbe>(options) ?? new HookHealthProbe(),
-            "JumpDialogToFolder" => payloadElement.Deserialize<HookJumpCommand>(options)
-                ?? throw new InvalidOperationException("Hook jump command payload was empty."),
-            "ActiveDialog" => payloadElement.Deserialize<HookActiveDialogEvent>(options)
-                ?? throw new InvalidOperationException("Hook active dialog payload was empty."),
-            "CommandReply" => payloadElement.Deserialize<HookCommandReply>(options)
-                ?? throw new InvalidOperationException("Hook command reply payload was empty."),
+            "HealthProbe" => new HookHealthProbe(),
+            "JumpDialogToFolder" => ReadJumpCommand(payloadElement),
+            "ActiveDialog" => ReadActiveDialogEvent(payloadElement),
+            "CommandReply" => ReadCommandReply(payloadElement),
             _ => throw new InvalidOperationException($"Unknown hook IPC message type: {messageType}.")
         };
 
@@ -127,10 +124,43 @@ internal sealed class HookIpcEnvelopeJsonConverter : JsonConverter<HookIpcEnvelo
         return property;
     }
 
+    private static JsonElement GetRequiredObject(JsonElement root, string propertyName)
+    {
+        var property = GetRequiredProperty(root, propertyName);
+        if (property.ValueKind != JsonValueKind.Object)
+        {
+            throw InvalidMessage($"{propertyName} must be an object");
+        }
+
+        return property;
+    }
+
     private static int GetRequiredInt32(JsonElement root, string propertyName)
     {
         var property = GetRequiredProperty(root, propertyName);
         if (property.ValueKind != JsonValueKind.Number || !property.TryGetInt32(out var value))
+        {
+            throw InvalidMessage($"{propertyName} was invalid");
+        }
+
+        return value;
+    }
+
+    private static long GetRequiredInt64(JsonElement root, string propertyName)
+    {
+        var property = GetRequiredProperty(root, propertyName);
+        if (property.ValueKind != JsonValueKind.Number || !property.TryGetInt64(out var value))
+        {
+            throw InvalidMessage($"{propertyName} was invalid");
+        }
+
+        return value;
+    }
+
+    private static uint GetRequiredUInt32(JsonElement root, string propertyName)
+    {
+        var property = GetRequiredProperty(root, propertyName);
+        if (property.ValueKind != JsonValueKind.Number || !property.TryGetUInt32(out var value))
         {
             throw InvalidMessage($"{propertyName} was invalid");
         }
@@ -145,6 +175,37 @@ internal sealed class HookIpcEnvelopeJsonConverter : JsonConverter<HookIpcEnvelo
             ? property.GetString() ?? throw InvalidMessage($"{propertyName} was invalid")
             : throw InvalidMessage($"{propertyName} was invalid");
     }
+
+    private static HookJumpCommand ReadJumpCommand(JsonElement payload)
+    {
+        try
+        {
+            return new HookJumpCommand(
+                GetRequiredString(payload, "dialogId"),
+                GetRequiredString(payload, "folderPath"),
+                GetRequiredInt32(payload, "timeoutMs"));
+        }
+        catch (ArgumentException exception)
+        {
+            throw InvalidMessage(exception.Message);
+        }
+    }
+
+    private static HookActiveDialogEvent ReadActiveDialogEvent(JsonElement payload) =>
+        new(
+            GetRequiredString(payload, "dialogId"),
+            GetRequiredInt64(payload, "windowHandle"),
+            GetRequiredUInt32(payload, "processId"),
+            GetRequiredUInt32(payload, "threadId"),
+            GetRequiredString(payload, "architecture"),
+            GetRequiredString(payload, "processName"),
+            GetRequiredString(payload, "className"),
+            GetRequiredString(payload, "title"));
+
+    private static HookCommandReply ReadCommandReply(JsonElement payload) =>
+        new(
+            GetRequiredString(payload, "status"),
+            GetRequiredString(payload, "message"));
 
     private static InvalidOperationException InvalidMessage(string reason) =>
         new($"Invalid hook IPC message: {reason}.");

@@ -128,6 +128,21 @@ public sealed class HookIpcMessagesTests
     }
 
     [Theory]
+    [InlineData("{\"version\":1,\"messageType\":\"JumpDialogToFolder\",\"payload\":{\"dialogId\":\"dialog-1\",\"folderPath\":\"C:\\\\Users\\\\paulx\"}}")]
+    [InlineData("{\"version\":1,\"messageType\":\"JumpDialogToFolder\",\"payload\":{\"folderPath\":\"C:\\\\Users\\\\paulx\",\"timeoutMs\":750}}")]
+    [InlineData("{\"version\":1,\"messageType\":\"ActiveDialog\",\"payload\":{}}")]
+    [InlineData("{\"version\":1,\"messageType\":\"CommandReply\",\"payload\":{}}")]
+    [InlineData("{\"version\":1,\"messageType\":\"JumpDialogToFolder\",\"payload\":null}")]
+    [InlineData("{\"version\":1,\"messageType\":\"ActiveDialog\",\"payload\":null}")]
+    [InlineData("{\"version\":1,\"messageType\":\"CommandReply\",\"payload\":null}")]
+    public void InvalidPayloadIsRejectedAsInvalidMessage(string json)
+    {
+        var exception = Assert.Throws<InvalidOperationException>(() => HookIpcSerializer.Deserialize(json));
+
+        Assert.StartsWith("Invalid hook IPC message:", exception.Message);
+    }
+
+    [Theory]
     [InlineData("", "C:\\Users\\paulx", 750)]
     [InlineData("dialog-1", "", 750)]
     [InlineData("dialog-1", "C:\\Users\\paulx", -1)]
