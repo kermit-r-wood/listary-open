@@ -7,24 +7,30 @@ use std::env;
 use std::io;
 use std::ptr::{null, null_mut};
 use std::thread;
+use std::time::{Duration, Instant};
 use windows_sys::Win32::Foundation::{
     CloseHandle, FreeLibrary, GetLastError, BOOL, ERROR_PIPE_CONNECTED, HANDLE, HMODULE, HWND,
     INVALID_HANDLE_VALUE, LPARAM, LRESULT, TRUE, WPARAM,
 };
-use windows_sys::Win32::Storage::FileSystem::{ReadFile, WriteFile, PIPE_ACCESS_DUPLEX};
+use windows_sys::Win32::Storage::FileSystem::{
+    FlushFileBuffers, ReadFile, WriteFile, PIPE_ACCESS_DUPLEX,
+};
 use windows_sys::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryW};
 use windows_sys::Win32::System::Pipes::{
     ConnectNamedPipe, CreateNamedPipeW, DisconnectNamedPipe, PIPE_READMODE_BYTE, PIPE_TYPE_BYTE,
     PIPE_UNLIMITED_INSTANCES, PIPE_WAIT,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    DispatchMessageW, EnumWindows, GetClassNameW, GetMessageW, GetWindowThreadProcessId,
-    SetWindowsHookExW, TranslateMessage, UnhookWindowsHookEx, HHOOK, MSG, WH_CALLWNDPROC,
+    DispatchMessageW, EnumWindows, GetClassNameW, GetWindowThreadProcessId, PeekMessageW,
+    SetWindowsHookExW, TranslateMessage, UnhookWindowsHookEx, HHOOK, MSG, PM_REMOVE,
+    WH_CALLWNDPROC, WM_QUIT,
 };
 
 const DEFAULT_PIPE_NAME: &str = "listary-open-hook-x64";
 const IPC_VERSION: u32 = 1;
 const BUFFER_SIZE: usize = 64 * 1024;
+const HOOK_RESCAN_INTERVAL: Duration = Duration::from_millis(500);
+const HOOK_LOOP_SLEEP: Duration = Duration::from_millis(50);
 
 fn main() -> io::Result<()> {
     let pipe_name = pipe_name_from_args();
@@ -86,13 +92,10 @@ fn start_hook_thread(dll_path: Option<String>) {
 }
 
 fn run_hook_thread(dll_path: &str) {
-    match HookState::install(dll_path) {
-        Ok(hook_state) => {
-            eprintln!(
-                "Hook host installed {} native dialog hook(s).",
-                hook_state.hook_count()
-            );
-            message_loop(hook_state);
+    match HookState::new(dll_path) {
+        Ok(mut hook_state) => {
+            hook_state.install_new_dialog_hooks();
+            hook_loop(hook_state);
         }
         Err(error) => {
             eprintln!("Hook host native hook setup failed: {error}");
@@ -100,19 +103,27 @@ fn run_hook_thread(dll_path: &str) {
     }
 }
 
-fn message_loop(_hook_state: HookState) {
-    let mut message = unsafe { std::mem::zeroed::<MSG>() };
+fn hook_loop(mut hook_state: HookState) {
+    let mut next_scan = Instant::now() + HOOK_RESCAN_INTERVAL;
     loop {
-        let result = unsafe { GetMessageW(&mut message, null_mut(), 0, 0) };
-        if result <= 0 {
-            if result < 0 {
-                eprintln!(
-                    "Hook host message loop failed: {}",
-                    io::Error::last_os_error()
-                );
-            }
-
+        if !pump_pending_messages() {
             break;
+        }
+
+        if Instant::now() >= next_scan {
+            hook_state.install_new_dialog_hooks();
+            next_scan = Instant::now() + HOOK_RESCAN_INTERVAL;
+        }
+
+        thread::sleep(HOOK_LOOP_SLEEP);
+    }
+}
+
+fn pump_pending_messages() -> bool {
+    let mut message = unsafe { std::mem::zeroed::<MSG>() };
+    while unsafe { PeekMessageW(&mut message, null_mut(), 0, 0, PM_REMOVE) } != 0 {
+        if message.message == WM_QUIT {
+            return false;
         }
 
         unsafe {
@@ -120,15 +131,19 @@ fn message_loop(_hook_state: HookState) {
             DispatchMessageW(&message);
         }
     }
+
+    true
 }
 
 struct HookState {
     module: HMODULE,
+    hook_proc: DialogHookProc,
+    hooked_threads: HashSet<u32>,
     hooks: Vec<HHOOK>,
 }
 
 impl HookState {
-    fn install(dll_path: &str) -> Result<Self, String> {
+    fn new(dll_path: &str) -> Result<Self, String> {
         let module = load_hook_module(dll_path)?;
         let hook_proc = match hook_proc(module) {
             Ok(hook_proc) => hook_proc,
@@ -140,33 +155,33 @@ impl HookState {
             }
         };
 
+        Ok(Self {
+            module,
+            hook_proc,
+            hooked_threads: HashSet::new(),
+            hooks: Vec::new(),
+        })
+    }
+
+    fn install_new_dialog_hooks(&mut self) {
         let threads = match discover_dialog_threads() {
             Ok(threads) => threads,
             Err(error) => {
-                unsafe {
-                    FreeLibrary(module);
-                }
-                return Err(format!("dialog discovery failed: {error}"));
+                eprintln!("Hook host dialog discovery failed: {error}");
+                return;
             }
         };
 
-        if threads.is_empty() {
-            eprintln!("Hook host found no top-level {DIALOG_CLASS} dialog windows to hook.");
-        }
-
-        let mut hooks = Vec::new();
-        for thread_id in threads {
-            match install_thread_hook(module, hook_proc, thread_id) {
-                Ok(hook) => hooks.push(hook),
+        for thread_id in unhooked_threads(&threads, &self.hooked_threads) {
+            match install_thread_hook(self.module, self.hook_proc, thread_id) {
+                Ok(hook) => {
+                    self.hooked_threads.insert(thread_id);
+                    self.hooks.push(hook);
+                    eprintln!("Hook host installed native dialog hook for thread {thread_id}.");
+                }
                 Err(error) => eprintln!("Hook host failed to hook thread {thread_id}: {error}"),
             }
         }
-
-        Ok(Self { module, hooks })
-    }
-
-    fn hook_count(&self) -> usize {
-        self.hooks.len()
     }
 }
 
@@ -248,6 +263,16 @@ fn discover_dialog_threads() -> io::Result<HashSet<u32>> {
     Ok(threads)
 }
 
+fn unhooked_threads(discovered: &HashSet<u32>, hooked_threads: &HashSet<u32>) -> Vec<u32> {
+    let mut thread_ids = discovered
+        .iter()
+        .copied()
+        .filter(|thread_id| !hooked_threads.contains(thread_id))
+        .collect::<Vec<_>>();
+    thread_ids.sort_unstable();
+    thread_ids
+}
+
 unsafe extern "system" fn enum_windows_proc(hwnd: HWND, l_param: LPARAM) -> BOOL {
     if is_dialog_window(hwnd) {
         let mut process_id = 0u32;
@@ -278,7 +303,7 @@ fn serve_connection(pipe: NamedPipeHandle) -> io::Result<()> {
         Err(_) => command_reply("Failed", "Unknown command."),
     };
 
-    let result = write_line(pipe.raw(), &response);
+    let result = write_line(pipe.raw(), &response).and_then(|_| flush_pipe(pipe.raw()));
     unsafe {
         DisconnectNamedPipe(pipe.raw());
     }
@@ -293,6 +318,15 @@ fn connect_pipe(handle: HANDLE) -> io::Result<()> {
         if error != ERROR_PIPE_CONNECTED {
             return Err(io::Error::from_raw_os_error(error as i32));
         }
+    }
+
+    Ok(())
+}
+
+fn flush_pipe(handle: HANDLE) -> io::Result<()> {
+    let flushed = unsafe { FlushFileBuffers(handle) };
+    if flushed == 0 {
+        return Err(io::Error::last_os_error());
     }
 
     Ok(())
@@ -525,5 +559,13 @@ mod tests {
             None,
             arg_value_from(["host.exe", "--pipe", "pipe"], "--dll")
         );
+    }
+
+    #[test]
+    fn unhooked_threads_returns_only_new_dialog_threads() {
+        let discovered = HashSet::from([42, 7, 11, 5]);
+        let hooked = HashSet::from([7, 11, 99]);
+
+        assert_eq!(vec![5, 42], unhooked_threads(&discovered, &hooked));
     }
 }

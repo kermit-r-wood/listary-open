@@ -2,6 +2,9 @@ pub const HOOK_MAGIC: &str = "ListaryOpenHookV1";
 pub const HOOK_DLL_EXPORT: &[u8] = b"ListaryOpenHookProc\0";
 pub const DIALOG_CLASS: &str = "#32770";
 pub const WM_USER_HOOK_BASE: u32 = 0x0400 + 0x4C4F;
+/// Reserved for the written hook plan, but not an external command channel.
+/// `WH_CALLWNDPROC` can observe messages only; commands need explicit validation
+/// and acknowledgement instead of relying on the hook return value.
 pub const WM_LISTARY_OPEN_JUMP: u32 = WM_USER_HOOK_BASE + 1;
 pub const WM_LISTARY_OPEN_REPORT: u32 = WM_USER_HOOK_BASE + 2;
 
