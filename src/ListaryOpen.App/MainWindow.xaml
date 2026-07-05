@@ -11,7 +11,8 @@
         MinHeight="300"
         MinWidth="420"
         WindowStartupLocation="CenterScreen">
-    <Grid Margin="20">
+    <Grid x:Name="SettingsContentRoot"
+          Margin="20">
         <Grid.RowDefinitions>
             <RowDefinition Height="Auto" />
             <RowDefinition Height="Auto" />
