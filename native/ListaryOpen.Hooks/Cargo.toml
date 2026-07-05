@@ -1,0 +1,7 @@
+[workspace]
+resolver = "2"
+members = [
+  "hook_common",
+  "hook_host",
+  "hook_dll"
+]
