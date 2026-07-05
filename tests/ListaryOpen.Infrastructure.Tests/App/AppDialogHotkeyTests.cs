@@ -202,6 +202,62 @@ public sealed class AppDialogHotkeyTests
         }
     }
 
+    [Fact]
+    public void ReportDirectDialogJumpStatusKeepsOrdinarySuccessSilent()
+    {
+        var panelResults = new List<DialogJumpResult>();
+        var trayMessages = new List<string>();
+
+        ListaryOpen.App.App.ReportDirectDialogJumpStatus(
+            new DialogJumpResult(DialogJumpStatus.Success, "Hook changed folder."),
+            panelResults.Add,
+            trayMessages.Add);
+
+        Assert.Empty(panelResults);
+        Assert.Empty(trayMessages);
+    }
+
+    [Fact]
+    public void ReportDirectDialogJumpStatusShowsDegradedSuccessInTrayStatus()
+    {
+        var panelResults = new List<DialogJumpResult>();
+        var trayMessages = new List<string>();
+        var message = "Dialog folder changed via fallback automation after hook Timeout: Hook host timed out.";
+
+        ListaryOpen.App.App.ReportDirectDialogJumpStatus(
+            new DialogJumpResult(DialogJumpStatus.Success, message, isDegradedSuccess: true),
+            panelResults.Add,
+            trayMessages.Add);
+
+        Assert.Empty(panelResults);
+        Assert.Equal(new[] { message }, trayMessages);
+    }
+
+    [Fact]
+    public void ActivateQuickSwitchFolderSearchWithDirectJumpStatusReportsFailureAfterActivation()
+    {
+        var events = new List<string>();
+        var candidates = new[]
+        {
+            new QuickSwitchFolderCandidate("C:\\Projects", "Explorer", IntPtr.Zero, true)
+        };
+
+        ListaryOpen.App.App.ActivateQuickSwitchFolderSearchWithDirectJumpStatus(
+            candidates,
+            new DialogJumpResult(DialogJumpStatus.UnsupportedDialog, "No standard dialog."),
+            activatedCandidates => events.Add("activate:" + activatedCandidates.Count),
+            result => events.Add("report:" + result.Status + ":" + result.Message),
+            message => events.Add("tray:" + message));
+
+        Assert.Equal(
+            new[]
+            {
+                "activate:1",
+                "report:UnsupportedDialog:No standard dialog."
+            },
+            events);
+    }
+
     private sealed class RecordingExplorerShellWindowsProvider : IExplorerShellWindowsProvider
     {
         private readonly IReadOnlyList<ExplorerShellWindow> _windows;

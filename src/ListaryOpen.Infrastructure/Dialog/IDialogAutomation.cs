@@ -25,7 +25,27 @@ public enum DialogJumpStatus
     Failed
 }
 
-public sealed record DialogJumpResult(DialogJumpStatus Status, string Message);
+public sealed record DialogJumpResult
+{
+    public DialogJumpResult(DialogJumpStatus status, string message, bool isDegradedSuccess = false)
+    {
+        Status = status;
+        Message = message;
+        IsDegradedSuccess = isDegradedSuccess;
+    }
+
+    public DialogJumpStatus Status { get; init; }
+
+    public string Message { get; init; }
+
+    public bool IsDegradedSuccess { get; init; }
+
+    public void Deconstruct(out DialogJumpStatus status, out string message)
+    {
+        status = Status;
+        message = Message;
+    }
+}
 
 public interface IDialogAutomation
 {

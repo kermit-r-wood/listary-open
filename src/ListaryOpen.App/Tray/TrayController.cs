@@ -45,6 +45,16 @@ public sealed class TrayController : IDisposable
         _icon.Dispose();
     }
 
+    public void ShowStatus(string message)
+    {
+        if (string.IsNullOrWhiteSpace(message))
+        {
+            return;
+        }
+
+        _icon.ShowBalloonTip("ListaryOpen", message, BalloonIcon.Info);
+    }
+
     private ContextMenu CreateContextMenu()
     {
         var contextMenu = new ContextMenu();

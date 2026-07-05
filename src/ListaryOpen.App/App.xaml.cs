@@ -575,16 +575,30 @@ public partial class App : Application
     private async Task HandleDialogHotkeyAsync()
     {
         var candidates = ObserveQuickSwitchFolderCandidates(_explorerTracker);
+        DialogJumpResult? directJumpResult = null;
         if (await TryJumpToFirstQuickSwitchFolderAsync(
                 candidates,
                 JumpDialogToFolderAsync,
-                result => _searchPanel?.ReportDialogJumpResult(result),
+                result => directJumpResult = result,
                 CancellationToken.None))
         {
+            if (directJumpResult is not null)
+            {
+                ReportDirectDialogJumpStatus(
+                    directJumpResult,
+                    result => _searchPanel?.ReportDialogJumpResult(result),
+                    message => _trayController?.ShowStatus(message));
+            }
+
             return;
         }
 
-        _searchPanel?.ActivateQuickSwitchFolderSearch(candidates);
+        ActivateQuickSwitchFolderSearchWithDirectJumpStatus(
+            candidates,
+            directJumpResult,
+            folderCandidates => _searchPanel?.ActivateQuickSwitchFolderSearch(folderCandidates),
+            result => _searchPanel?.ReportDialogJumpResult(result),
+            message => _trayController?.ShowStatus(message));
     }
 
     internal static IReadOnlyList<QuickSwitchFolderCandidate> ObserveQuickSwitchFolderCandidates(
@@ -671,6 +685,50 @@ public partial class App : Application
             Trace.TraceError(exception.ToString());
             return false;
         }
+    }
+
+    internal static void ActivateQuickSwitchFolderSearchWithDirectJumpStatus(
+        IReadOnlyList<QuickSwitchFolderCandidate> candidates,
+        DialogJumpResult? directJumpResult,
+        Action<IReadOnlyList<QuickSwitchFolderCandidate>> activateFolderSearch,
+        Action<DialogJumpResult> reportPanelStatus,
+        Action<string> showStatus)
+    {
+        ArgumentNullException.ThrowIfNull(candidates);
+        ArgumentNullException.ThrowIfNull(activateFolderSearch);
+        ArgumentNullException.ThrowIfNull(reportPanelStatus);
+        ArgumentNullException.ThrowIfNull(showStatus);
+
+        activateFolderSearch(candidates);
+        if (directJumpResult is not null)
+        {
+            ReportDirectDialogJumpStatus(directJumpResult, reportPanelStatus, showStatus);
+        }
+    }
+
+    internal static void ReportDirectDialogJumpStatus(
+        DialogJumpResult result,
+        Action<DialogJumpResult> reportPanelStatus,
+        Action<string> showStatus)
+    {
+        ArgumentNullException.ThrowIfNull(result);
+        ArgumentNullException.ThrowIfNull(reportPanelStatus);
+        ArgumentNullException.ThrowIfNull(showStatus);
+
+        if (result.Status == DialogJumpStatus.Success)
+        {
+            if (result.IsDegradedSuccess)
+            {
+                showStatus(
+                    string.IsNullOrWhiteSpace(result.Message)
+                        ? "Dialog folder changed."
+                        : result.Message);
+            }
+
+            return;
+        }
+
+        reportPanelStatus(result);
     }
 
     private Task<DialogJumpResult> JumpDialogToFolderAsync(string folderPath, CancellationToken cancellationToken)

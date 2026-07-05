@@ -72,8 +72,12 @@ public sealed class DialogBridge
                 }
 
                 var success = await _automation.SetFolderAsync(folderPath, cancellationToken);
+                var degradedSuccess = !string.IsNullOrWhiteSpace(hookFallbackContext);
                 return success
-                    ? new DialogJumpResult(DialogJumpStatus.Success, CreateSuccessMessage(hookFallbackContext))
+                    ? new DialogJumpResult(
+                        DialogJumpStatus.Success,
+                        CreateSuccessMessage(hookFallbackContext),
+                        isDegradedSuccess: degradedSuccess)
                     : new DialogJumpResult(DialogJumpStatus.Failed, "Dialog folder could not be changed.");
 
             default:
