@@ -702,8 +702,63 @@ public sealed class SearchPanelViewModelTests
 
         await viewModel.ActivateFolderSearchAsync(null);
 
-        Assert.Contains(nameof(SearchPanelViewModel.ModeDisplayText), changedProperties);
-        Assert.Contains(nameof(SearchPanelViewModel.QueryPlaceholderText), changedProperties);
+        Assert.Equal(1, CountChanges(changedProperties, nameof(SearchPanelViewModel.ModeDisplayText)));
+        Assert.Equal(1, CountChanges(changedProperties, nameof(SearchPanelViewModel.QueryPlaceholderText)));
+    }
+
+    [Fact]
+    public async Task ReactivatingSamePresentationModeDoesNotRaisePresentationPropertiesAgain()
+    {
+        var viewModel = new SearchPanelViewModel(new RecordingSearchIndex(Array.Empty<SearchResult>()));
+        var changedProperties = new List<string?>();
+
+        await viewModel.ActivateFolderSearchAsync(null);
+        viewModel.PropertyChanged += (_, e) => changedProperties.Add(e.PropertyName);
+
+        await viewModel.ActivateFolderSearchAsync(null);
+
+        Assert.Equal(0, CountChanges(changedProperties, nameof(SearchPanelViewModel.ModeDisplayText)));
+        Assert.Equal(0, CountChanges(changedProperties, nameof(SearchPanelViewModel.QueryPlaceholderText)));
+    }
+
+    [Fact]
+    public async Task ActivateFilesAndFoldersSearchAsyncReturnsToSearchPresentation()
+    {
+        var viewModel = new SearchPanelViewModel(new RecordingSearchIndex(Array.Empty<SearchResult>()));
+        var changedProperties = new List<string?>();
+
+        await viewModel.ActivateFolderSearchAsync(null);
+        viewModel.PropertyChanged += (_, e) => changedProperties.Add(e.PropertyName);
+
+        await viewModel.ActivateFilesAndFoldersSearchAsync();
+
+        Assert.Equal("Search", viewModel.ModeDisplayText);
+        Assert.Equal("Search files and folders", viewModel.QueryPlaceholderText);
+        Assert.Equal(1, CountChanges(changedProperties, nameof(SearchPanelViewModel.ModeDisplayText)));
+        Assert.Equal(1, CountChanges(changedProperties, nameof(SearchPanelViewModel.QueryPlaceholderText)));
+    }
+
+    [Fact]
+    public async Task PresentationModeNotificationsObserveUpdatedStatus()
+    {
+        var viewModel = new SearchPanelViewModel(new RecordingSearchIndex(Array.Empty<SearchResult>()));
+        var observedStatusText = new List<string>();
+        viewModel.PropertyChanged += (_, e) =>
+        {
+            if (string.Equals(e.PropertyName, nameof(SearchPanelViewModel.ModeDisplayText), StringComparison.Ordinal))
+            {
+                observedStatusText.Add(viewModel.StatusText);
+            }
+        };
+
+        await viewModel.ActivateFolderSearchAsync(null);
+
+        Assert.Equal(new[] { "Select a folder to jump the dialog." }, observedStatusText);
+    }
+
+    private static int CountChanges(IEnumerable<string?> changedProperties, string propertyName)
+    {
+        return changedProperties.Count(property => string.Equals(property, propertyName, StringComparison.Ordinal));
     }
 
     private static QuickSwitchFolderCandidate CreateCandidate(string folderPath)

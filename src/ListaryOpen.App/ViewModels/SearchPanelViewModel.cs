@@ -125,7 +125,10 @@ public sealed class SearchPanelViewModel : INotifyPropertyChanged
         SearchPanelPresentationMode.Search => "Search",
         SearchPanelPresentationMode.DialogJump => "Dialog Jump",
         SearchPanelPresentationMode.QuickSwitch => "Quick Switch",
-        _ => "Search"
+        _ => throw new ArgumentOutOfRangeException(
+            nameof(_presentationMode),
+            _presentationMode,
+            "Unknown search panel presentation mode.")
     };
 
     public string QueryPlaceholderText => _presentationMode switch
@@ -133,7 +136,10 @@ public sealed class SearchPanelViewModel : INotifyPropertyChanged
         SearchPanelPresentationMode.Search => "Search files and folders",
         SearchPanelPresentationMode.DialogJump => "Jump dialog to folder",
         SearchPanelPresentationMode.QuickSwitch => "Quick switch to folder",
-        _ => "Search files and folders"
+        _ => throw new ArgumentOutOfRangeException(
+            nameof(_presentationMode),
+            _presentationMode,
+            "Unknown search panel presentation mode.")
     };
 
     public string QueryText
@@ -154,22 +160,22 @@ public sealed class SearchPanelViewModel : INotifyPropertyChanged
 
     public Task ActivateFilesAndFoldersSearchAsync()
     {
-        SetPresentationMode(SearchPanelPresentationMode.Search);
         _searchMode = SearchMode.FilesAndFolders;
         _pinnedFolderPaths = Array.Empty<string>();
         StatusText = "Search files and folders.";
+        SetPresentationMode(SearchPanelPresentationMode.Search);
         return RefreshAsync();
     }
 
     public Task ActivateFolderSearchAsync(string? trackedFolder)
     {
-        SetPresentationMode(SearchPanelPresentationMode.DialogJump);
         _searchMode = SearchMode.FoldersOnly;
         var normalizedFolder = TryNormalizeExistingFolder(trackedFolder);
         _pinnedFolderPaths = normalizedFolder is null
             ? Array.Empty<string>()
             : new[] { normalizedFolder };
         StatusText = "Select a folder to jump the dialog.";
+        SetPresentationMode(SearchPanelPresentationMode.DialogJump);
         return RefreshAsync();
     }
 
@@ -177,11 +183,11 @@ public sealed class SearchPanelViewModel : INotifyPropertyChanged
     {
         ArgumentNullException.ThrowIfNull(candidates);
 
-        SetPresentationMode(SearchPanelPresentationMode.QuickSwitch);
         _searchMode = SearchMode.FoldersOnly;
         _pinnedFolderPaths = NormalizePinnedFolderPaths(candidates);
         SelectedResult = null;
         StatusText = "Select a folder to jump the dialog.";
+        SetPresentationMode(SearchPanelPresentationMode.QuickSwitch);
         return RefreshAsync();
     }
 
