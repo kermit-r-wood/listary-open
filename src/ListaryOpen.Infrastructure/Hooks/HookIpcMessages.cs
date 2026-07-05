@@ -16,9 +16,34 @@ public sealed record HookIpcEnvelope(int Version, string MessageType, object Pay
 
 public sealed record HookHealthProbe;
 
-public sealed record HookJumpCommand(string DialogId, string FolderPath, TimeSpan Timeout)
+public sealed record HookJumpCommand
 {
-    public int TimeoutMs => checked((int)Timeout.TotalMilliseconds);
+    public HookJumpCommand(string dialogId, string folderPath, TimeSpan timeout)
+        : this(dialogId, folderPath, checked((int)timeout.TotalMilliseconds))
+    {
+    }
+
+    [JsonConstructor]
+    public HookJumpCommand(string dialogId, string folderPath, int timeoutMs)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(dialogId);
+        ArgumentException.ThrowIfNullOrWhiteSpace(folderPath);
+        if (timeoutMs < 0)
+        {
+            throw new ArgumentOutOfRangeException(nameof(timeoutMs), "Hook jump command timeout must be nonnegative.");
+        }
+
+        DialogId = dialogId;
+        FolderPath = folderPath;
+        TimeoutMs = timeoutMs;
+    }
+
+    public string DialogId { get; }
+    public string FolderPath { get; }
+    public int TimeoutMs { get; }
+
+    [JsonIgnore]
+    public TimeSpan Timeout => TimeSpan.FromMilliseconds(TimeoutMs);
 }
 
 public sealed record HookActiveDialogEvent(
@@ -54,15 +79,19 @@ internal sealed class HookIpcEnvelopeJsonConverter : JsonConverter<HookIpcEnvelo
     {
         using var document = JsonDocument.ParseValue(ref reader);
         var root = document.RootElement;
-        var version = root.GetProperty("version").GetInt32();
+        if (root.ValueKind != JsonValueKind.Object)
+        {
+            throw InvalidMessage("root must be an object");
+        }
+
+        var version = GetRequiredInt32(root, "version");
         if (version != HookIpcEnvelope.CurrentVersion)
         {
             throw new InvalidOperationException($"Unsupported hook IPC version: {version}.");
         }
 
-        var messageType = root.GetProperty("messageType").GetString()
-            ?? throw new InvalidOperationException("Hook IPC messageType was missing.");
-        var payloadElement = root.GetProperty("payload");
+        var messageType = GetRequiredString(root, "messageType");
+        var payloadElement = GetRequiredProperty(root, "payload");
         object payload = messageType switch
         {
             "HealthProbe" => payloadElement.Deserialize<HookHealthProbe>(options) ?? new HookHealthProbe(),
@@ -87,4 +116,36 @@ internal sealed class HookIpcEnvelopeJsonConverter : JsonConverter<HookIpcEnvelo
         JsonSerializer.Serialize(writer, value.Payload, value.Payload.GetType(), options);
         writer.WriteEndObject();
     }
+
+    private static JsonElement GetRequiredProperty(JsonElement root, string propertyName)
+    {
+        if (!root.TryGetProperty(propertyName, out var property))
+        {
+            throw InvalidMessage($"{propertyName} was missing");
+        }
+
+        return property;
+    }
+
+    private static int GetRequiredInt32(JsonElement root, string propertyName)
+    {
+        var property = GetRequiredProperty(root, propertyName);
+        if (property.ValueKind != JsonValueKind.Number || !property.TryGetInt32(out var value))
+        {
+            throw InvalidMessage($"{propertyName} was invalid");
+        }
+
+        return value;
+    }
+
+    private static string GetRequiredString(JsonElement root, string propertyName)
+    {
+        var property = GetRequiredProperty(root, propertyName);
+        return property.ValueKind == JsonValueKind.String
+            ? property.GetString() ?? throw InvalidMessage($"{propertyName} was invalid")
+            : throw InvalidMessage($"{propertyName} was invalid");
+    }
+
+    private static InvalidOperationException InvalidMessage(string reason) =>
+        new($"Invalid hook IPC message: {reason}.");
 }
