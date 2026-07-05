@@ -2,6 +2,7 @@ use serde::{Deserialize, Serialize};
 use std::env;
 use std::io;
 use std::ptr::{null, null_mut};
+use std::thread;
 use windows_sys::Win32::Foundation::{
     CloseHandle, GetLastError, ERROR_PIPE_CONNECTED, HANDLE, INVALID_HANDLE_VALUE,
 };
@@ -23,9 +24,13 @@ fn main() -> io::Result<()> {
 
     loop {
         let pipe = NamedPipeHandle::create(&pipe_path)?;
-        if let Err(error) = serve_connection(&pipe) {
-            eprintln!("Hook host connection failed: {error}");
-        }
+        connect_pipe(pipe.raw())?;
+
+        thread::spawn(move || {
+            if let Err(error) = serve_connection(pipe) {
+                eprintln!("Hook host connection failed: {error}");
+            }
+        });
     }
 }
 
@@ -42,21 +47,18 @@ fn pipe_name_from_args() -> String {
     DEFAULT_PIPE_NAME.to_string()
 }
 
-fn serve_connection(pipe: &NamedPipeHandle) -> io::Result<()> {
-    connect_pipe(pipe.raw())?;
-
+fn serve_connection(pipe: NamedPipeHandle) -> io::Result<()> {
     let response = match read_line(pipe.raw()) {
         Ok(request) => response_for_request(&request),
         Err(_) => command_reply("Failed", "Unknown command."),
     };
 
-    write_line(pipe.raw(), &response)?;
-
+    let result = write_line(pipe.raw(), &response);
     unsafe {
         DisconnectNamedPipe(pipe.raw());
     }
 
-    Ok(())
+    result
 }
 
 fn connect_pipe(handle: HANDLE) -> io::Result<()> {
@@ -74,6 +76,7 @@ fn connect_pipe(handle: HANDLE) -> io::Result<()> {
 fn read_line(handle: HANDLE) -> io::Result<String> {
     let mut request = Vec::new();
     let mut buffer = [0u8; 4096];
+    let mut saw_newline = false;
 
     while request.len() < BUFFER_SIZE {
         let remaining = BUFFER_SIZE - request.len();
@@ -90,20 +93,39 @@ fn read_line(handle: HANDLE) -> io::Result<String> {
         };
 
         if read == 0 {
-            return Err(io::Error::last_os_error());
+            let error = io::Error::last_os_error();
+            if error.kind() == io::ErrorKind::BrokenPipe {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "hook IPC request ended before newline",
+                ));
+            }
+
+            return Err(error);
         }
 
         if bytes_read == 0 {
-            break;
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "hook IPC request ended before newline",
+            ));
         }
 
         let chunk = &buffer[..bytes_read as usize];
         if let Some(newline) = chunk.iter().position(|byte| *byte == b'\n') {
             request.extend_from_slice(&chunk[..newline]);
+            saw_newline = true;
             break;
         }
 
         request.extend_from_slice(chunk);
+    }
+
+    if !saw_newline {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "hook IPC request exceeded maximum line length",
+        ));
     }
 
     if request.ends_with(b"\r") {
@@ -181,6 +203,10 @@ fn to_wide_null(value: &str) -> Vec<u16> {
 }
 
 struct NamedPipeHandle(HANDLE);
+
+// SAFETY: NamedPipeHandle owns one pipe HANDLE and ownership is moved to exactly
+// one worker thread, which disconnects/closes it before drop.
+unsafe impl Send for NamedPipeHandle {}
 
 impl NamedPipeHandle {
     fn create(pipe_path: &str) -> io::Result<Self> {

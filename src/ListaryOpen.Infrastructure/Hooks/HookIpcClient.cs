@@ -42,6 +42,7 @@ public sealed class HookIpcClient : IHookIpcClient, IDisposable
     public async Task<HookJumpResult> JumpDialogToFolderAsync(string dialogId, string folderPath, CancellationToken cancellationToken)
     {
         cancellationToken.ThrowIfCancellationRequested();
+        var connectionEstablished = false;
 
         using var timeoutCancellation = new CancellationTokenSource();
         timeoutCancellation.CancelAfter(_connectTimeout);
@@ -63,15 +64,13 @@ public sealed class HookIpcClient : IHookIpcClient, IDisposable
                 PipeOptions.Asynchronous);
 
             await pipe.ConnectAsync(linkedCancellation.Token).ConfigureAwait(false);
+            connectionEstablished = true;
 
-            using var writer = new StreamWriter(pipe, PipeEncoding, bufferSize: 1024, leaveOpen: true)
-            {
-                AutoFlush = true
-            };
             using var reader = new StreamReader(pipe, Encoding.UTF8, detectEncodingFromByteOrderMarks: false, bufferSize: 1024, leaveOpen: true);
 
-            await writer.WriteLineAsync(request).ConfigureAwait(false);
-            await writer.FlushAsync(linkedCancellation.Token).ConfigureAwait(false);
+            var requestLine = PipeEncoding.GetBytes(request + "\n");
+            await pipe.WriteAsync(requestLine.AsMemory(0, requestLine.Length), linkedCancellation.Token).ConfigureAwait(false);
+            await pipe.FlushAsync(linkedCancellation.Token).ConfigureAwait(false);
 
             var response = await reader.ReadLineAsync(linkedCancellation.Token).ConfigureAwait(false);
             if (string.IsNullOrWhiteSpace(response))
@@ -93,6 +92,10 @@ public sealed class HookIpcClient : IHookIpcClient, IDisposable
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
         {
             throw;
+        }
+        catch (OperationCanceledException) when (timeoutCancellation.IsCancellationRequested && !connectionEstablished)
+        {
+            return new HookJumpResult(HookJumpStatus.HostUnavailable, "Hook host pipe was unavailable before the connect timeout.");
         }
         catch (OperationCanceledException) when (timeoutCancellation.IsCancellationRequested)
         {

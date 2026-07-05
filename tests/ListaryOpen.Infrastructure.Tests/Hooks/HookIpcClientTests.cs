@@ -10,13 +10,13 @@ public sealed class HookIpcClientTests
     private static readonly UTF8Encoding PipeEncoding = new(encoderShouldEmitUTF8Identifier: false);
 
     [Fact]
-    public async Task MissingPipeReturnsHostUnavailableOrTimeout()
+    public async Task MissingPipeReturnsHostUnavailable()
     {
         var client = new HookIpcClient("listary-open-missing-" + Guid.NewGuid(), TimeSpan.FromMilliseconds(50));
 
         var result = await client.JumpDialogToFolderAsync("dlg", "C:\\Users\\paulx", CancellationToken.None);
 
-        Assert.Contains(result.Status, new[] { HookJumpStatus.HostUnavailable, HookJumpStatus.Timeout });
+        Assert.Equal(HookJumpStatus.HostUnavailable, result.Status);
     }
 
     [Fact]
@@ -34,26 +34,34 @@ public sealed class HookIpcClientTests
     public async Task CommandReplyRoundTripsOverNamedPipe()
     {
         var pipeName = "listary-open-test-" + Guid.NewGuid();
+        using var serverCancellation = new CancellationTokenSource(TimeSpan.FromSeconds(5));
         var serverTask = ServeOnceAsync(
             pipeName,
             HookIpcSerializer.Serialize(new HookIpcEnvelope(
                 HookIpcEnvelope.CurrentVersion,
                 "CommandReply",
                 new HookCommandReply("NoActiveDialog", "No active hook dialog."))),
-            CancellationToken.None);
+            serverCancellation.Token);
         var client = new HookIpcClient(pipeName, TimeSpan.FromSeconds(2));
 
-        var result = await client.JumpDialogToFolderAsync("dlg", "C:\\Users\\paulx", CancellationToken.None);
-        var exchange = await serverTask.WaitAsync(TimeSpan.FromSeconds(1));
+        try
+        {
+            var result = await client.JumpDialogToFolderAsync("dlg", "C:\\Users\\paulx", CancellationToken.None);
+            var exchange = await serverTask.WaitAsync(TimeSpan.FromSeconds(1));
 
-        var request = HookIpcSerializer.Deserialize(exchange.Request);
-        var payload = Assert.IsType<HookJumpCommand>(request.Payload);
-        Assert.Equal("JumpDialogToFolder", request.MessageType);
-        Assert.Equal("dlg", payload.DialogId);
-        Assert.Equal("C:\\Users\\paulx", payload.FolderPath);
-        Assert.Equal(750, payload.TimeoutMs);
-        Assert.Equal(HookJumpStatus.NoActiveDialog, result.Status);
-        Assert.Equal("No active hook dialog.", result.Message);
+            var request = HookIpcSerializer.Deserialize(exchange.Request);
+            var payload = Assert.IsType<HookJumpCommand>(request.Payload);
+            Assert.Equal("JumpDialogToFolder", request.MessageType);
+            Assert.Equal("dlg", payload.DialogId);
+            Assert.Equal("C:\\Users\\paulx", payload.FolderPath);
+            Assert.Equal(750, payload.TimeoutMs);
+            Assert.Equal(HookJumpStatus.NoActiveDialog, result.Status);
+            Assert.Equal("No active hook dialog.", result.Message);
+        }
+        finally
+        {
+            await StopServerAsync(serverCancellation, serverTask);
+        }
     }
 
     [Fact]
@@ -74,29 +82,59 @@ public sealed class HookIpcClientTests
                 new HookCommandReply("NoActiveDialog", "No active hook dialog."))),
             serverCancellation.Token);
 
-        var result = await clientTask.WaitAsync(TimeSpan.FromSeconds(3));
-        if (result.Status != HookJumpStatus.NoActiveDialog)
+        try
         {
-            await serverCancellation.CancelAsync();
-            await IgnoreCanceledAsync(serverTask);
-        }
+            var result = await clientTask.WaitAsync(TimeSpan.FromSeconds(3));
 
-        Assert.Equal(HookJumpStatus.NoActiveDialog, result.Status);
-        _ = await serverTask.WaitAsync(TimeSpan.FromSeconds(1));
+            Assert.Equal(HookJumpStatus.NoActiveDialog, result.Status);
+            _ = await serverTask.WaitAsync(TimeSpan.FromSeconds(1));
+        }
+        finally
+        {
+            await StopServerAsync(serverCancellation, serverTask);
+        }
+    }
+
+    [Fact]
+    public async Task ConnectedHostWithoutReplyReturnsTimeout()
+    {
+        var pipeName = "listary-open-no-reply-" + Guid.NewGuid();
+        using var serverCancellation = new CancellationTokenSource(TimeSpan.FromSeconds(5));
+        var serverTask = ServeWithoutReplyOnceAsync(pipeName, serverCancellation.Token);
+        var client = new HookIpcClient(pipeName, TimeSpan.FromMilliseconds(100));
+
+        try
+        {
+            var result = await client.JumpDialogToFolderAsync("dlg", "C:\\Users\\paulx", CancellationToken.None);
+
+            Assert.Equal(HookJumpStatus.Timeout, result.Status);
+        }
+        finally
+        {
+            await StopServerAsync(serverCancellation, serverTask);
+        }
     }
 
     [Fact]
     public async Task InvalidJsonReplyReturnsFailed()
     {
         var pipeName = "listary-open-invalid-json-" + Guid.NewGuid();
-        var serverTask = ServeOnceAsync(pipeName, "{not valid json", CancellationToken.None);
+        using var serverCancellation = new CancellationTokenSource(TimeSpan.FromSeconds(5));
+        var serverTask = ServeOnceAsync(pipeName, "{not valid json", serverCancellation.Token);
         var client = new HookIpcClient(pipeName, TimeSpan.FromSeconds(2));
 
-        var result = await client.JumpDialogToFolderAsync("dlg", "C:\\Users\\paulx", CancellationToken.None);
-        _ = await serverTask.WaitAsync(TimeSpan.FromSeconds(1));
+        try
+        {
+            var result = await client.JumpDialogToFolderAsync("dlg", "C:\\Users\\paulx", CancellationToken.None);
+            _ = await serverTask.WaitAsync(TimeSpan.FromSeconds(1));
 
-        Assert.Equal(HookJumpStatus.Failed, result.Status);
-        Assert.Contains("invalid JSON", result.Message, StringComparison.OrdinalIgnoreCase);
+            Assert.Equal(HookJumpStatus.Failed, result.Status);
+            Assert.Contains("invalid JSON", result.Message, StringComparison.OrdinalIgnoreCase);
+        }
+        finally
+        {
+            await StopServerAsync(serverCancellation, serverTask);
+        }
     }
 
     private static async Task<ServerExchange> ServeOnceAsync(
@@ -117,6 +155,22 @@ public sealed class HookIpcClientTests
         await WriteLineAsync(server, response, cancellationToken);
 
         return new ServerExchange(request ?? string.Empty);
+    }
+
+    private static async Task ServeWithoutReplyOnceAsync(
+        string pipeName,
+        CancellationToken cancellationToken)
+    {
+        using var server = new NamedPipeServerStream(
+            pipeName,
+            PipeDirection.InOut,
+            maxNumberOfServerInstances: 1,
+            PipeTransmissionMode.Byte,
+            PipeOptions.Asynchronous);
+
+        await server.WaitForConnectionAsync(cancellationToken);
+        _ = await ReadLineAsync(server, cancellationToken);
+        await Task.Delay(Timeout.InfiniteTimeSpan, cancellationToken);
     }
 
     private static async Task<string?> ReadLineAsync(Stream stream, CancellationToken cancellationToken)
@@ -156,13 +210,22 @@ public sealed class HookIpcClientTests
         await stream.FlushAsync(cancellationToken);
     }
 
-    private static async Task IgnoreCanceledAsync(Task task)
+    private static async Task StopServerAsync(CancellationTokenSource cancellation, Task? task)
     {
+        await cancellation.CancelAsync();
+        if (task is null)
+        {
+            return;
+        }
+
         try
         {
             await task;
         }
         catch (OperationCanceledException)
+        {
+        }
+        catch (IOException) when (cancellation.IsCancellationRequested)
         {
         }
     }
