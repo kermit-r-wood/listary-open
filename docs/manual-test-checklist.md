@@ -1,6 +1,7 @@
 # Manual Windows Acceptance Checklist
 
 Run date: 2026-07-04
+UI modernization verification date: 2026-07-06
 
 - [x] Run automated tests.
   - PASS: `dotnet test ListaryOpen.sln -c Release --no-restore` passed in the latest verification run.
