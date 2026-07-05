@@ -107,6 +107,30 @@
                             Content="Enable"
                             Command="{Binding EnableNtfsFastIndexingCommand}" />
                 </Grid>
+
+                <Grid Margin="0,16,0,0">
+                    <Grid.ColumnDefinitions>
+                        <ColumnDefinition Width="*" />
+                        <ColumnDefinition Width="Auto" />
+                    </Grid.ColumnDefinitions>
+
+                    <StackPanel Grid.Column="0"
+                                Margin="0,0,12,0">
+                        <TextBlock Text="Hook quick switch"
+                                   FontSize="14"
+                                   FontWeight="SemiBold"
+                                   Margin="0,0,0,6" />
+                        <TextBlock Text="{Binding HookQuickSwitchStatusText}"
+                                   TextWrapping="Wrap" />
+                    </StackPanel>
+
+                    <Button Grid.Column="1"
+                            MinWidth="80"
+                            Padding="10,4"
+                            VerticalAlignment="Center"
+                            Content="Enable"
+                            Command="{Binding EnableHookQuickSwitchCommand}" />
+                </Grid>
             </StackPanel>
         </ScrollViewer>
     </Grid>

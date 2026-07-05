@@ -3,6 +3,7 @@ using ListaryOpen.App.ViewModels;
 using ListaryOpen.Core.Indexing;
 using ListaryOpen.Core.Settings;
 using ListaryOpen.Infrastructure.Dialog;
+using ListaryOpen.Infrastructure.Hooks;
 using ListaryOpen.Infrastructure.Indexing;
 using ListaryOpen.Infrastructure.Search;
 using ListaryOpen.Infrastructure.Windows;
@@ -24,6 +25,7 @@ public partial class App : Application
     private ElevatedIndexerClient? _elevatedIndexerClient;
     private ExplorerObservationScheduler? _explorerObservationScheduler;
     private FallbackIndexProvider? _fallbackIndexProvider;
+    private IHookQuickSwitchBridge? _hookQuickSwitchBridge;
     private ExplorerTracker? _explorerTracker;
     private HotkeyService? _hotkeyService;
     private IndexingCoordinator? _indexingCoordinator;
@@ -96,6 +98,12 @@ public partial class App : Application
             _hotkeyService.Dispose();
         }
 
+        if (_hookQuickSwitchBridge is not null)
+        {
+            _hookQuickSwitchBridge.StatusChanged -= OnHookQuickSwitchStatusChanged;
+            _hookQuickSwitchBridge.Dispose();
+        }
+
         _explorerObservationScheduler?.Dispose();
         _trayController?.Dispose();
         DisposeSearchIndex();
@@ -131,9 +139,15 @@ public partial class App : Application
         _indexingCoordinator.StatusChanged += OnIndexingStatusChanged;
 
         _dialogAutomation = new WindowsDialogAutomation();
-        _dialogBridge = new DialogBridge(_dialogAutomation);
+        _hookQuickSwitchBridge = HookQuickSwitchBridgeFactory.CreateDefault();
+        _hookQuickSwitchBridge.StatusChanged += OnHookQuickSwitchStatusChanged;
+        _dialogBridge = new DialogBridge(_dialogAutomation, _hookQuickSwitchBridge);
 
-        _settingsViewModel = new SettingsViewModel(AppSettings.Defaults(), EnableNtfsFastIndexing);
+        _settingsViewModel = new SettingsViewModel(
+            AppSettings.Defaults(),
+            EnableNtfsFastIndexing,
+            EnableHookQuickSwitch);
+        _settingsViewModel.UpdateHookQuickSwitchStatus(_hookQuickSwitchBridge.Status);
         var settingsWindow = new MainWindow(_settingsViewModel);
         _explorerTracker = new ExplorerTracker();
         _explorerObservationScheduler = StartPeriodicExplorerObservation(
@@ -292,6 +306,32 @@ public partial class App : Application
             () => StartBackgroundIndexing(cancelActive: true));
     }
 
+    private void EnableHookQuickSwitch()
+    {
+        var bridge = _hookQuickSwitchBridge;
+        if (bridge is null)
+        {
+            return;
+        }
+
+        _ = EnableHookQuickSwitchAsync(bridge);
+    }
+
+    private async Task EnableHookQuickSwitchAsync(IHookQuickSwitchBridge bridge)
+    {
+        try
+        {
+            await bridge.EnableAsync(_shutdownCancellation.Token).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException) when (_shutdownCancellation.IsCancellationRequested)
+        {
+        }
+        catch (Exception exception)
+        {
+            Trace.TraceError(exception.ToString());
+        }
+    }
+
     private void StartBackgroundIndexing(bool cancelActive = false)
     {
         var runCancellation = _indexingCancellation.CreateRun(_shutdownCancellation.Token, cancelActive);
@@ -369,6 +409,16 @@ public partial class App : Application
         }
 
         _ = UpdateIndexingStatusAsync(status);
+    }
+
+    private void OnHookQuickSwitchStatusChanged(object? sender, HookQuickSwitchStatus status)
+    {
+        if (IsShuttingDown)
+        {
+            return;
+        }
+
+        _ = InvokeOnDispatcherAsync(Dispatcher, () => _settingsViewModel?.UpdateHookQuickSwitchStatus(status));
     }
 
     private async Task UpdateIndexingStatusAsync(IndexingStatus status)
