@@ -11,6 +11,7 @@ public sealed class SettingsViewModel : INotifyPropertyChanged
 {
     private readonly Action _enableHookQuickSwitch;
     private readonly Action _enableNtfsFastIndexing;
+    private bool _hookQuickSwitchEnableInProgress;
     private HookQuickSwitchStatus _hookQuickSwitchStatus = HookQuickSwitchStatus.Disabled();
     private string _indexingStatusText = "Indexing: idle";
     private bool _ntfsFastIndexingEnabled;
@@ -40,7 +41,7 @@ public sealed class SettingsViewModel : INotifyPropertyChanged
             () => !NtfsFastIndexingEnabled);
         EnableHookQuickSwitchCommand = new RelayCommand(
             EnableHookQuickSwitch,
-            () => true);
+            () => !_hookQuickSwitchEnableInProgress);
     }
 
     public AppSettings Settings { get; }
@@ -103,18 +104,41 @@ public sealed class SettingsViewModel : INotifyPropertyChanged
     {
         ArgumentNullException.ThrowIfNull(status);
 
-        if (Equals(_hookQuickSwitchStatus, status))
+        if (!Equals(_hookQuickSwitchStatus, status))
         {
-            return;
+            _hookQuickSwitchStatus = status;
+            OnPropertyChanged(nameof(HookQuickSwitchStatusText));
         }
 
-        _hookQuickSwitchStatus = status;
-        OnPropertyChanged(nameof(HookQuickSwitchStatusText));
+        SetHookQuickSwitchEnableInProgress(false);
     }
 
     private void EnableHookQuickSwitch()
     {
-        _enableHookQuickSwitch();
+        SetHookQuickSwitchEnableInProgress(true);
+        try
+        {
+            _enableHookQuickSwitch();
+        }
+        catch
+        {
+            SetHookQuickSwitchEnableInProgress(false);
+            throw;
+        }
+    }
+
+    private void SetHookQuickSwitchEnableInProgress(bool value)
+    {
+        if (_hookQuickSwitchEnableInProgress == value)
+        {
+            return;
+        }
+
+        _hookQuickSwitchEnableInProgress = value;
+        if (EnableHookQuickSwitchCommand is RelayCommand command)
+        {
+            command.RaiseCanExecuteChanged();
+        }
     }
 
     private void EnableNtfsFastIndexing()

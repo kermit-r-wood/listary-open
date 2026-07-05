@@ -418,7 +418,36 @@ public partial class App : Application
             return;
         }
 
-        _ = InvokeOnDispatcherAsync(Dispatcher, () => _settingsViewModel?.UpdateHookQuickSwitchStatus(status));
+        _ = UpdateHookQuickSwitchStatusAsync(status);
+    }
+
+    private async Task UpdateHookQuickSwitchStatusAsync(HookQuickSwitchStatus status)
+    {
+        try
+        {
+            if (IsShuttingDown)
+            {
+                return;
+            }
+
+            await InvokeOnDispatcherAsync(
+                    Dispatcher,
+                    () =>
+                    {
+                        if (!IsShuttingDown)
+                        {
+                            _settingsViewModel?.UpdateHookQuickSwitchStatus(status);
+                        }
+                    })
+                .ConfigureAwait(false);
+        }
+        catch (Exception exception) when (exception is OperationCanceledException or TaskCanceledException)
+        {
+        }
+        catch (Exception exception)
+        {
+            Trace.TraceError(exception.ToString());
+        }
     }
 
     private async Task UpdateIndexingStatusAsync(IndexingStatus status)
