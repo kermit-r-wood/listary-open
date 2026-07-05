@@ -8,7 +8,29 @@ Run date: 2026-07-04
   - PASS: SQLite performance regressions are covered by large-index, bounded-candidate, usage-window, combined-ranking-window, folder-only, and fuzzy-prefilter tests.
   - PASS: Quick Switch multi-Explorer candidate ordering, remembered-folder fallback, app routing helper, and folder-mode pinning are covered by unit tests.
   - PASS: Browser upload file picker dialog resolution for Firefox/Chrome process cases is covered by `WindowsDialogAutomationTests`.
+  - PASS: `dotnet test tests\ListaryOpen.Infrastructure.Tests\ListaryOpen.Infrastructure.Tests.csproj --no-restore --nologo --filter "FullyQualifiedName~ListaryOpen.Infrastructure.Tests.App" -p:UseAppHost=false -p:BaseOutputPath=.test-ui-app-final\` passed with 111 tests.
+  - PASS: `dotnet test ListaryOpen.sln --no-restore --nologo -p:UseAppHost=false -p:BaseOutputPath=.test-ui-solution-final\` passed with 60 Core tests and 411 Infrastructure tests.
+  - PASS: `dotnet build src\ListaryOpen.App\ListaryOpen.App.csproj --no-restore --nologo -p:UseAppHost=false -p:BaseOutputPath=.test-ui-app-build\` completed with 0 warnings and 0 errors.
+- [ ] Verify modernized search panel UI.
+  - Press Ctrl+Space and confirm the panel opens as a compact command palette.
+  - Confirm the top mode label reads Search for normal file/folder search.
+  - Type a known query and confirm result rows show name, parent path, file/folder badge, and match reason.
+  - Confirm long names and parent paths trim without overlapping badges.
+  - Press Enter, Esc, Ctrl+Enter, and Ctrl+C and confirm existing behavior is unchanged.
+  - NOT VERIFIED: requires interactive desktop focus and visual inspection; automated coverage is provided by `SearchPanelXamlTests`, `SearchPanelViewModelTests`, and `SearchPanelKeyboardTests`.
+- [ ] Verify dialog/quick-switch search panel mode UI.
+  - Press Ctrl+G over a supported dialog and confirm the panel shows Dialog Jump or Quick Switch mode.
+  - Confirm folder-only results remain readable and keyboard focus stays in the query box.
+  - Confirm long dialog jump status messages stay within the status area.
+  - NOT VERIFIED: requires an interactive supported dialog and visual inspection; automated coverage is provided by `SearchPanelViewModelTests` and `AppDialogHotkeyTests`.
+- [ ] Verify modernized settings UI.
+  - Open settings from the tray and confirm Indexing, Hotkeys, Quick Switch, and General sections are visible.
+  - Confirm indexed roots, NTFS fast indexing, hook quick switch, and Quick Save/Open states use readable badges.
+  - Resize the settings window to its minimum size and confirm text remains readable without overlap.
+  - Check 100%, 125%, and 150% DPI if available on the test machine.
+  - NOT VERIFIED: requires interactive desktop, tray access, resize checks, and manual DPI validation; automated coverage is provided by `SettingsXamlTests`, `SettingsViewModelTests`, and `SettingsHookQuickSwitchTests`.
 - [x] Start ListaryOpen.
+  - PASS: `dotnet src\ListaryOpen.App\.test-ui-app-build\Debug\net8.0-windows\ListaryOpen.App.dll` launched from the final build output and remained alive during a 12 second non-interactive smoke run.
   - PASS: `src/ListaryOpen.App/bin/Debug/net8.0-windows/ListaryOpen.App.exe` launched and remained alive during a 12 second smoke run.
   - PASS: `src/ListaryOpen.App/bin/Debug/net8.0-windows/data/index.db` existed after startup.
   - PASS: indexer temp files are created under `src/ListaryOpen.App/bin/Debug/net8.0-windows/data/tmp`.
