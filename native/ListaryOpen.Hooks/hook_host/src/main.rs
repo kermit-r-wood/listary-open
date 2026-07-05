@@ -12,7 +12,7 @@ use std::ffi::c_void;
 use std::io;
 use std::ptr::{null, null_mut};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::mpsc;
+use std::sync::{mpsc, Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 use windows_sys::Win32::Foundation::{
@@ -46,7 +46,7 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     WM_NCCREATE, WM_QUIT, WNDCLASSW,
 };
 
-const DEFAULT_PIPE_NAME: &str = "listary-open-hook-x64";
+const DEFAULT_PIPE_NAME: &str = pipe_name_for_pointer_width(usize::BITS);
 const IPC_VERSION: u32 = 1;
 const BUFFER_SIZE: usize = 64 * 1024;
 const HOOK_RESCAN_INTERVAL: Duration = Duration::from_millis(500);
@@ -83,6 +83,13 @@ fn main() -> io::Result<()> {
 
 fn pipe_name_from_args() -> String {
     arg_value("--pipe").unwrap_or_else(|| DEFAULT_PIPE_NAME.to_string())
+}
+
+const fn pipe_name_for_pointer_width(pointer_width: u32) -> &'static str {
+    match pointer_width {
+        32 => "listary-open-hook-x86",
+        _ => "listary-open-hook-x64",
+    }
 }
 
 fn arg_value(name: &str) -> Option<String> {
@@ -222,6 +229,7 @@ impl HookState {
             match install_thread_hook(self.module, self.hook_proc, thread_id) {
                 Ok(hook) => {
                     self.hooked_threads.insert(thread_id);
+                    mark_hook_thread_confirmed(thread_id);
                     self.hooks.push(hook);
                     eprintln!("Hook host installed native dialog hook for thread {thread_id}.");
                 }
@@ -254,6 +262,10 @@ impl Drop for HookState {
                     io::Error::last_os_error()
                 );
             }
+        }
+
+        for thread_id in self.hooked_threads.drain() {
+            clear_confirmed_hook_thread(thread_id);
         }
 
         if !self.module.is_null() {
@@ -330,6 +342,32 @@ fn unhooked_threads(discovered: &HashSet<u32>, hooked_threads: &HashSet<u32>) ->
         .collect::<Vec<_>>();
     thread_ids.sort_unstable();
     thread_ids
+}
+
+fn confirmed_hook_threads() -> &'static Mutex<HashSet<u32>> {
+    static CONFIRMED_HOOK_THREADS: OnceLock<Mutex<HashSet<u32>>> = OnceLock::new();
+    CONFIRMED_HOOK_THREADS.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+fn mark_hook_thread_confirmed(thread_id: u32) {
+    let mut threads = confirmed_hook_threads()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    threads.insert(thread_id);
+}
+
+fn clear_confirmed_hook_thread(thread_id: u32) {
+    let mut threads = confirmed_hook_threads()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    threads.remove(&thread_id);
+}
+
+fn is_hook_thread_confirmed(thread_id: u32) -> bool {
+    confirmed_hook_threads()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .contains(&thread_id)
 }
 
 unsafe extern "system" fn enum_windows_proc(hwnd: HWND, l_param: LPARAM) -> BOOL {
@@ -447,6 +485,19 @@ fn should_hook_observed_dialog(
 ) -> bool {
     dialog_architecture.eq_ignore_ascii_case(host_architecture)
         && is_supported_dialog_shape(class_name, title, has_address_control)
+}
+
+fn should_report_active_dialog<C>(
+    host_architecture: &str,
+    dialog_architecture: &str,
+    thread_id: u32,
+    is_thread_hook_confirmed: C,
+) -> bool
+where
+    C: Fn(u32) -> bool,
+{
+    dialog_architecture.eq_ignore_ascii_case(host_architecture)
+        && is_thread_hook_confirmed(thread_id)
 }
 
 fn observed_dialog(hwnd: HWND) -> Option<ObservedDialog> {
@@ -644,7 +695,12 @@ fn response_for_request(request: &str) -> String {
 fn active_dialog_response() -> Option<String> {
     let hwnd = resolve_active_dialog_window()?;
     let dialog = observed_dialog(hwnd)?;
-    if dialog.architecture != host_architecture() {
+    if !should_report_active_dialog(
+        host_architecture(),
+        dialog.architecture,
+        dialog.thread_id,
+        is_hook_thread_confirmed,
+    ) {
         return None;
     }
 
@@ -707,6 +763,15 @@ fn jump_dialog_to_folder(payload: JumpCommandPayload) -> String {
         );
     }
 
+    if let Err(failure) = jump_target_ready(
+        hwnd,
+        thread_id,
+        resolve_active_dialog_window(),
+        is_hook_thread_confirmed,
+    ) {
+        return command_reply(failure.status, failure.message);
+    }
+
     let command_id = next_command_id();
     let ack_receiver = match AckReceiver::new(command_id) {
         Ok(receiver) => receiver,
@@ -763,6 +828,15 @@ fn jump_dialog_to_folder(payload: JumpCommandPayload) -> String {
             "UnsupportedDialog",
             "Dialog address edit control disappeared after jump command was acknowledged.",
         );
+    }
+
+    if let Err(failure) = jump_target_ready(
+        hwnd,
+        thread_id,
+        resolve_active_dialog_window(),
+        is_hook_thread_confirmed,
+    ) {
+        return command_reply(failure.status, failure.message);
     }
 
     command_reply(status, message)
@@ -846,6 +920,47 @@ fn next_command_id() -> u64 {
 
 fn remaining_timeout(started: Instant, timeout_ms: u32) -> Duration {
     Duration::from_millis(timeout_ms as u64).saturating_sub(started.elapsed())
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct CommandFailure {
+    status: &'static str,
+    message: &'static str,
+}
+
+fn jump_target_ready<C>(
+    target_hwnd: HWND,
+    target_thread_id: u32,
+    active_hwnd: Option<HWND>,
+    is_thread_hook_confirmed: C,
+) -> Result<(), CommandFailure>
+where
+    C: Fn(u32) -> bool,
+{
+    match active_hwnd {
+        Some(active_hwnd) if active_hwnd == target_hwnd => {}
+        Some(_) => {
+            return Err(CommandFailure {
+                status: "TargetGone",
+                message: "Dialog window is no longer the active foreground dialog.",
+            });
+        }
+        None => {
+            return Err(CommandFailure {
+                status: "NoActiveDialog",
+                message: "No active hook dialog.",
+            });
+        }
+    }
+
+    if !is_thread_hook_confirmed(target_thread_id) {
+        return Err(CommandFailure {
+            status: "NoActiveDialog",
+            message: "Target dialog hook has not been installed yet.",
+        });
+    }
+
+    Ok(())
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1534,6 +1649,58 @@ mod tests {
         let hooked = HashSet::from([7, 11, 99]);
 
         assert_eq!(vec![5, 42], unhooked_threads(&discovered, &hooked));
+    }
+
+    #[test]
+    fn pipe_name_for_pointer_width_selects_matching_hook_host_pipe() {
+        assert_eq!("listary-open-hook-x64", pipe_name_for_pointer_width(64));
+        assert_eq!("listary-open-hook-x86", pipe_name_for_pointer_width(32));
+    }
+
+    #[test]
+    fn active_dialog_reporting_requires_matching_architecture_and_confirmed_hook() {
+        assert!(should_report_active_dialog(
+            "x64",
+            "x64",
+            42,
+            |thread_id| thread_id == 42
+        ));
+        assert!(!should_report_active_dialog(
+            "x64",
+            "x86",
+            42,
+            |thread_id| thread_id == 42
+        ));
+        assert!(!should_report_active_dialog("x64", "x64", 42, |_| false));
+    }
+
+    #[test]
+    fn jump_target_ready_requires_active_target_and_confirmed_hook() {
+        let target = 0x1234usize as HWND;
+        let other = 0x5678usize as HWND;
+
+        assert_eq!(
+            Ok(()),
+            jump_target_ready(target, 42, Some(target), |thread_id| thread_id == 42)
+        );
+
+        let inactive = jump_target_ready(target, 42, Some(other), |_| true).unwrap_err();
+        assert_eq!("TargetGone", inactive.status);
+        assert_eq!(
+            "Dialog window is no longer the active foreground dialog.",
+            inactive.message
+        );
+
+        let missing_active = jump_target_ready(target, 42, None, |_| true).unwrap_err();
+        assert_eq!("NoActiveDialog", missing_active.status);
+        assert_eq!("No active hook dialog.", missing_active.message);
+
+        let unhooked = jump_target_ready(target, 42, Some(target), |_| false).unwrap_err();
+        assert_eq!("NoActiveDialog", unhooked.status);
+        assert_eq!(
+            "Target dialog hook has not been installed yet.",
+            unhooked.message
+        );
     }
 
     #[test]
