@@ -215,6 +215,42 @@ function Test-PathUnderRoot {
     }
 }
 
+function Get-ProcessStartTimeOrNull {
+    param(
+        [Parameter(Mandatory = $true)]
+        [System.Diagnostics.Process]$Process
+    )
+
+    try {
+        return $Process.StartTime
+    }
+    catch {
+        return $null
+    }
+}
+
+function Test-SameProcessInstance {
+    param(
+        [Parameter(Mandatory = $true)]
+        [System.Diagnostics.Process]$OriginalProcess,
+        [Parameter(Mandatory = $true)]
+        [System.Diagnostics.Process]$LiveProcess,
+        [AllowNull()]
+        [object]$OriginalStartTime
+    )
+
+    if (-not [string]::Equals($OriginalProcess.ProcessName, $LiveProcess.ProcessName, [System.StringComparison]::OrdinalIgnoreCase)) {
+        return $false
+    }
+
+    if ($null -eq $OriginalStartTime) {
+        return $true
+    }
+
+    $liveStartTime = Get-ProcessStartTimeOrNull -Process $LiveProcess
+    return $null -ne $liveStartTime -and $liveStartTime -eq $OriginalStartTime
+}
+
 function Test-HookModule {
     param(
         [Parameter(Mandatory = $true)]
@@ -227,6 +263,7 @@ function Test-HookModule {
 
     $processName = $Process.ProcessName
     $processId = $Process.Id
+    $processStartTime = Get-ProcessStartTimeOrNull -Process $Process
     $hookLoaded = $false
     $hookModulePath = $null
     $status = "HookMissing"
@@ -247,7 +284,35 @@ function Test-HookModule {
             }
         }
 
-        $modules = $Process.Modules
+        $liveProcess = Get-Process -Id $processId -ErrorAction Stop
+        $liveProcess.Refresh()
+        if (-not (Test-SameProcessInstance -OriginalProcess $Process -LiveProcess $liveProcess -OriginalStartTime $processStartTime)) {
+            $status = "ProcessIdentityChanged"
+            $hookModulePath = "process changed before module verification"
+
+            return [pscustomobject]@{
+                ProcessName = $processName
+                Id = $processId
+                HookLoaded = $hookLoaded
+                HookModulePath = $hookModulePath
+                Status = $status
+            }
+        }
+
+        if ($liveProcess.HasExited) {
+            $status = "ProcessExited"
+            $hookModulePath = "process exited before module verification"
+
+            return [pscustomobject]@{
+                ProcessName = $processName
+                Id = $processId
+                HookLoaded = $hookLoaded
+                HookModulePath = $hookModulePath
+                Status = $status
+            }
+        }
+
+        $modules = $liveProcess.Modules
         if ($null -eq $modules) {
             $status = "ModuleEnumerationFailed"
             $hookModulePath = "module enumeration failed: modules unavailable"
@@ -340,6 +405,11 @@ if ($missingRequiredTargets) {
 $verificationFailures = $results | Where-Object { $_.Status -eq "ProcessExited" -or $_.Status -eq "ModuleEnumerationFailed" }
 if ($verificationFailures) {
     throw "Hook module could not be verified for one or more target processes."
+}
+
+$identityFailures = $results | Where-Object { $_.Status -eq "ProcessIdentityChanged" }
+if ($identityFailures) {
+    throw "Target process identity changed before module verification."
 }
 
 $hookPathMismatch = $results | Where-Object { $_.Status -eq "HookPathMismatch" }

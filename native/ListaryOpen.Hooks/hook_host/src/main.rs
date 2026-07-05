@@ -16,8 +16,16 @@ use std::sync::{mpsc, Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 use windows_sys::Win32::Foundation::{
-    CloseHandle, FreeLibrary, GetLastError, BOOL, ERROR_CLASS_ALREADY_EXISTS, ERROR_PIPE_CONNECTED,
-    HANDLE, HMODULE, HWND, INVALID_HANDLE_VALUE, LPARAM, LRESULT, TRUE, WPARAM,
+    CloseHandle, FreeLibrary, GetLastError, LocalFree, BOOL, ERROR_CLASS_ALREADY_EXISTS,
+    ERROR_PIPE_CONNECTED, HANDLE, HMODULE, HWND, INVALID_HANDLE_VALUE, LPARAM, LRESULT, TRUE,
+    WPARAM,
+};
+use windows_sys::Win32::Security::Authorization::{
+    ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW,
+};
+use windows_sys::Win32::Security::{
+    GetTokenInformation, TokenUser, PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES, TOKEN_QUERY,
+    TOKEN_USER,
 };
 use windows_sys::Win32::Storage::FileSystem::{
     FlushFileBuffers, ReadFile, WriteFile, PIPE_ACCESS_DUPLEX,
@@ -33,7 +41,8 @@ use windows_sys::Win32::System::SystemInformation::{
     IMAGE_FILE_MACHINE_UNKNOWN,
 };
 use windows_sys::Win32::System::Threading::{
-    IsWow64Process2, OpenProcess, QueryFullProcessImageNameW, PROCESS_QUERY_LIMITED_INFORMATION,
+    GetCurrentProcess, IsWow64Process2, OpenProcess, OpenProcessToken, QueryFullProcessImageNameW,
+    PROCESS_QUERY_LIMITED_INFORMATION,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     ChangeWindowMessageFilterEx, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW,
@@ -1591,6 +1600,7 @@ unsafe impl Send for NamedPipeHandle {}
 impl NamedPipeHandle {
     fn create(pipe_path: &str) -> io::Result<Self> {
         let pipe_path = to_wide_null(pipe_path);
+        let (mut security_attributes, _security_descriptor) = pipe_security_attributes()?;
         let handle = unsafe {
             CreateNamedPipeW(
                 pipe_path.as_ptr(),
@@ -1600,7 +1610,7 @@ impl NamedPipeHandle {
                 BUFFER_SIZE as u32,
                 BUFFER_SIZE as u32,
                 0,
-                null(),
+                &mut security_attributes,
             )
         };
 
@@ -1614,6 +1624,133 @@ impl NamedPipeHandle {
     fn raw(&self) -> HANDLE {
         self.0
     }
+}
+
+struct OwnedSecurityDescriptor(PSECURITY_DESCRIPTOR);
+
+impl Drop for OwnedSecurityDescriptor {
+    fn drop(&mut self) {
+        if !self.0.is_null() {
+            unsafe {
+                LocalFree(self.0);
+            }
+        }
+    }
+}
+
+struct OwnedHandle(HANDLE);
+
+impl Drop for OwnedHandle {
+    fn drop(&mut self) {
+        if !self.0.is_null() {
+            unsafe {
+                CloseHandle(self.0);
+            }
+        }
+    }
+}
+
+struct OwnedLocalString(windows_sys::core::PWSTR);
+
+impl Drop for OwnedLocalString {
+    fn drop(&mut self) {
+        if !self.0.is_null() {
+            unsafe {
+                LocalFree(self.0.cast());
+            }
+        }
+    }
+}
+
+fn pipe_security_descriptor_sddl_for_user(user_sid: &str) -> String {
+    format!("D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GRGW;;;{user_sid})")
+}
+
+fn current_user_sid_string() -> io::Result<String> {
+    let mut token = null_mut();
+    let opened = unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) };
+    if opened == 0 {
+        return Err(io::Error::last_os_error());
+    }
+
+    let token = OwnedHandle(token);
+    let mut token_length = 0u32;
+    unsafe {
+        GetTokenInformation(token.0, TokenUser, null_mut(), 0, &mut token_length);
+    }
+    if token_length == 0 {
+        return Err(io::Error::last_os_error());
+    }
+
+    let mut token_buffer = vec![0u8; token_length as usize];
+    let loaded = unsafe {
+        GetTokenInformation(
+            token.0,
+            TokenUser,
+            token_buffer.as_mut_ptr().cast(),
+            token_length,
+            &mut token_length,
+        )
+    };
+    if loaded == 0 {
+        return Err(io::Error::last_os_error());
+    }
+
+    let token_user = unsafe { &*(token_buffer.as_ptr().cast::<TOKEN_USER>()) };
+    sid_to_string(token_user.User.Sid)
+}
+
+fn sid_to_string(sid: windows_sys::Win32::Security::PSID) -> io::Result<String> {
+    let mut sid_string = null_mut();
+    let converted = unsafe { ConvertSidToStringSidW(sid, &mut sid_string) };
+    if converted == 0 {
+        return Err(io::Error::last_os_error());
+    }
+
+    let sid_string = OwnedLocalString(sid_string);
+    Ok(wide_null_ptr_to_string(sid_string.0))
+}
+
+fn wide_null_ptr_to_string(value: *const u16) -> String {
+    if value.is_null() {
+        return String::new();
+    }
+
+    let mut len = 0usize;
+    unsafe {
+        while *value.add(len) != 0 {
+            len += 1;
+        }
+
+        String::from_utf16_lossy(std::slice::from_raw_parts(value, len))
+    }
+}
+
+fn pipe_security_attributes() -> io::Result<(SECURITY_ATTRIBUTES, OwnedSecurityDescriptor)> {
+    let user_sid = current_user_sid_string()?;
+    let sddl = pipe_security_descriptor_sddl_for_user(&user_sid);
+    let sddl = to_wide_null(&sddl);
+    let mut security_descriptor: PSECURITY_DESCRIPTOR = null_mut();
+    let converted = unsafe {
+        ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            sddl.as_ptr(),
+            1,
+            &mut security_descriptor,
+            null_mut(),
+        )
+    };
+    if converted == 0 {
+        return Err(io::Error::last_os_error());
+    }
+
+    let owned_security_descriptor = OwnedSecurityDescriptor(security_descriptor);
+    let security_attributes = SECURITY_ATTRIBUTES {
+        nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
+        lpSecurityDescriptor: owned_security_descriptor.0,
+        bInheritHandle: 0,
+    };
+
+    Ok((security_attributes, owned_security_descriptor))
 }
 
 impl Drop for NamedPipeHandle {
@@ -1794,6 +1931,14 @@ mod tests {
         assert_eq!(HashSet::from([kept]), hooked);
         assert_eq!(std::collections::HashMap::from([(kept, 700usize)]), hooks);
         assert_eq!(vec![removed], cleared);
+    }
+
+    #[test]
+    fn pipe_security_descriptor_allows_interactive_users() {
+        let sddl = pipe_security_descriptor_sddl_for_user("S-1-5-21-1-2-3-1001");
+
+        assert!(sddl.contains("(A;;GRGW;;;S-1-5-21-1-2-3-1001)"));
+        assert!(!sddl.contains(";;;IU)"));
     }
 
     #[test]

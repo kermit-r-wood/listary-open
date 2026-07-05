@@ -63,6 +63,24 @@ public sealed class VerifyHookModulesScriptTests
         Assert.Contains("Test-TargetProcessName -ProcessName $process.ProcessName -TargetNames $TargetNames", script, StringComparison.Ordinal);
     }
 
+    [Fact]
+    public void HookModuleVerificationRefreshesProcessByIdAfterDialogPing()
+    {
+        var script = ReadScript();
+
+        Assert.Contains("Get-Process -Id $processId -ErrorAction Stop", script, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void HookModuleVerificationRejectsPidReuseBeforeModuleEnumeration()
+    {
+        var script = ReadScript();
+
+        Assert.Contains("ProcessIdentityChanged", script, StringComparison.Ordinal);
+        Assert.Contains("Test-SameProcessInstance", script, StringComparison.Ordinal);
+        Assert.Contains("[object]$OriginalStartTime", script, StringComparison.Ordinal);
+    }
+
     private static string ReadScript()
     {
         return File.ReadAllText(Path.Combine(FindRepositoryRoot(), "tools", "verify-hook-modules.ps1"));
