@@ -53,6 +53,8 @@ const HOOK_RESCAN_INTERVAL: Duration = Duration::from_millis(500);
 const HOOK_LOOP_SLEEP: Duration = Duration::from_millis(50);
 const ADDRESS_BAR_EDIT_CONTROL_ID: i32 = 41477;
 const ACK_WINDOW_CLASS: &str = "ListaryOpenHookAckWindow";
+const ACK_STARTUP_ACCEPT_TIMEOUT: Duration = Duration::from_secs(2);
+const ACK_STARTUP_SHUTDOWN_GRACE: Duration = Duration::from_millis(100);
 const WM_LISTARY_ACK_CLOSE: u32 = WM_APP + 0x4C4F;
 
 static NEXT_COMMAND_ID: AtomicU64 = AtomicU64::new(1);
@@ -765,26 +767,35 @@ struct AckReceiver {
     thread: Option<thread::JoinHandle<()>>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum AckStartupControl {
+    Accept,
+    Cancel,
+}
+
 impl AckReceiver {
     fn new(command_id: u64) -> io::Result<Self> {
         let (ready_sender, ready_receiver) = mpsc::channel();
         let (ack_sender, ack_receiver) = mpsc::channel();
-        let thread = thread::spawn(move || ack_window_thread(command_id, ack_sender, ready_sender));
+        let (startup_control_sender, startup_control_receiver) = mpsc::channel();
+        let (finished_sender, finished_receiver) = mpsc::channel();
+        let thread = thread::spawn(move || {
+            ack_window_thread(
+                command_id,
+                ack_sender,
+                ready_sender,
+                startup_control_receiver,
+            );
+            let _ = finished_sender.send(());
+        });
 
-        let hwnd = match ready_receiver.recv_timeout(Duration::from_secs(2)) {
-            Ok(Ok(hwnd)) => hwnd as HWND,
-            Ok(Err(error)) => {
-                let _ = thread.join();
-                return Err(io::Error::new(io::ErrorKind::Other, error));
-            }
-            Err(error) => {
-                let _ = thread.join();
-                return Err(io::Error::new(
-                    io::ErrorKind::TimedOut,
-                    format!("ack window startup timed out: {error}"),
-                ));
-            }
-        };
+        let hwnd = wait_for_ack_window_startup(
+            &ready_receiver,
+            Duration::from_secs(2),
+            &startup_control_sender,
+            &finished_receiver,
+            ACK_STARTUP_SHUTDOWN_GRACE,
+        )? as HWND;
 
         Ok(Self {
             hwnd,
@@ -820,6 +831,51 @@ impl Drop for AckReceiver {
     }
 }
 
+fn wait_for_ack_window_startup(
+    ready_receiver: &mpsc::Receiver<Result<usize, String>>,
+    startup_timeout: Duration,
+    startup_control_sender: &mpsc::Sender<AckStartupControl>,
+    finished_receiver: &mpsc::Receiver<()>,
+    shutdown_grace: Duration,
+) -> io::Result<usize> {
+    match ready_receiver.recv_timeout(startup_timeout) {
+        Ok(Ok(hwnd)) => {
+            if startup_control_sender
+                .send(AckStartupControl::Accept)
+                .is_err()
+            {
+                let _ = finished_receiver.recv_timeout(shutdown_grace);
+                return Err(io::Error::new(
+                    io::ErrorKind::Other,
+                    "ack window exited before startup could be accepted",
+                ));
+            }
+            Ok(hwnd)
+        }
+        Ok(Err(error)) => {
+            let _ = startup_control_sender.send(AckStartupControl::Cancel);
+            let _ = finished_receiver.recv_timeout(shutdown_grace);
+            Err(io::Error::new(io::ErrorKind::Other, error))
+        }
+        Err(mpsc::RecvTimeoutError::Timeout) => {
+            let _ = startup_control_sender.send(AckStartupControl::Cancel);
+            let _ = finished_receiver.recv_timeout(shutdown_grace);
+            Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "ack window startup timed out",
+            ))
+        }
+        Err(mpsc::RecvTimeoutError::Disconnected) => {
+            let _ = startup_control_sender.send(AckStartupControl::Cancel);
+            let _ = finished_receiver.recv_timeout(shutdown_grace);
+            Err(io::Error::new(
+                io::ErrorKind::Other,
+                "ack window startup ended before reporting readiness",
+            ))
+        }
+    }
+}
+
 struct AckWindowState {
     command_id: u64,
     sender: mpsc::Sender<JumpAckStatus>,
@@ -829,11 +885,20 @@ fn ack_window_thread(
     command_id: u64,
     ack_sender: mpsc::Sender<JumpAckStatus>,
     ready_sender: mpsc::Sender<Result<usize, String>>,
+    startup_control_receiver: mpsc::Receiver<AckStartupControl>,
 ) {
+    if startup_cancelled(&startup_control_receiver) {
+        return;
+    }
+
     let class_name = to_wide_null(ACK_WINDOW_CLASS);
     let instance = unsafe { GetModuleHandleW(null()) };
     if let Err(error) = register_ack_window_class(&class_name, instance) {
         let _ = ready_sender.send(Err(error));
+        return;
+    }
+
+    if startup_cancelled(&startup_control_receiver) {
         return;
     }
 
@@ -870,14 +935,54 @@ fn ack_window_thread(
         return;
     }
 
+    if startup_cancelled(&startup_control_receiver) {
+        unsafe {
+            DestroyWindow(hwnd);
+        }
+        return;
+    }
+
     allow_ack_copydata_message(hwnd);
-    let _ = ready_sender.send(Ok(hwnd as usize));
+    if ready_sender.send(Ok(hwnd as usize)).is_err() {
+        unsafe {
+            DestroyWindow(hwnd);
+        }
+        return;
+    }
+
+    if !wait_for_startup_acceptance(&startup_control_receiver, ACK_STARTUP_ACCEPT_TIMEOUT) {
+        unsafe {
+            DestroyWindow(hwnd);
+        }
+        return;
+    }
+
     let mut message = unsafe { std::mem::zeroed::<MSG>() };
     while unsafe { GetMessageW(&mut message, null_mut(), 0, 0) } > 0 {
         unsafe {
             TranslateMessage(&message);
             DispatchMessageW(&message);
         }
+    }
+}
+
+fn startup_cancelled(receiver: &mpsc::Receiver<AckStartupControl>) -> bool {
+    match receiver.try_recv() {
+        Ok(AckStartupControl::Cancel) | Err(mpsc::TryRecvError::Disconnected) => true,
+        Ok(AckStartupControl::Accept) => false,
+        Err(mpsc::TryRecvError::Empty) => false,
+    }
+}
+
+fn wait_for_startup_acceptance(
+    receiver: &mpsc::Receiver<AckStartupControl>,
+    timeout: Duration,
+) -> bool {
+    match receiver.recv_timeout(timeout) {
+        Ok(AckStartupControl::Accept) => true,
+        Ok(AckStartupControl::Cancel)
+        | Err(mpsc::RecvTimeoutError::Timeout)
+        | Err(mpsc::RecvTimeoutError::Disconnected) => false,
     }
 }
 
@@ -1388,6 +1493,53 @@ mod tests {
         );
         assert_eq!(None, process_name_from_image_path(""));
         assert_eq!(None, process_name_from_image_path(r"C:\Windows\System32\"));
+    }
+
+    #[test]
+    fn ack_startup_timeout_signals_cancel_and_does_not_wait_for_thread_finish() {
+        let (_ready_sender, ready_receiver) = mpsc::channel::<Result<usize, String>>();
+        let (control_sender, control_receiver) = mpsc::channel::<AckStartupControl>();
+        let (_finished_sender, finished_receiver) = mpsc::channel::<()>();
+
+        let started = Instant::now();
+        let result = wait_for_ack_window_startup(
+            &ready_receiver,
+            Duration::from_millis(1),
+            &control_sender,
+            &finished_receiver,
+            Duration::from_millis(1),
+        );
+
+        let error = result.expect_err("startup wait should time out");
+        assert_eq!(io::ErrorKind::TimedOut, error.kind());
+        assert!(started.elapsed() < Duration::from_millis(100));
+        assert_eq!(
+            AckStartupControl::Cancel,
+            control_receiver.try_recv().unwrap()
+        );
+    }
+
+    #[test]
+    fn ack_startup_ready_sends_acceptance_before_returning_window() {
+        let (ready_sender, ready_receiver) = mpsc::channel::<Result<usize, String>>();
+        let (control_sender, control_receiver) = mpsc::channel::<AckStartupControl>();
+        let (_finished_sender, finished_receiver) = mpsc::channel::<()>();
+        ready_sender.send(Ok(1234)).unwrap();
+
+        let hwnd = wait_for_ack_window_startup(
+            &ready_receiver,
+            Duration::from_millis(1),
+            &control_sender,
+            &finished_receiver,
+            Duration::from_millis(1),
+        )
+        .unwrap();
+
+        assert_eq!(1234, hwnd);
+        assert_eq!(
+            AckStartupControl::Accept,
+            control_receiver.try_recv().unwrap()
+        );
     }
 
     fn ack_payload_bytes(command_id: u64, status: u32) -> Vec<u8> {
