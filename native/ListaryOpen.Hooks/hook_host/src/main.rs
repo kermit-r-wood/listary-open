@@ -172,7 +172,7 @@ fn pump_pending_messages() -> bool {
 struct HookState {
     module: HMODULE,
     hook_proc: DialogHookProc,
-    hooked_threads: HashSet<u32>,
+    hooked_threads: HashSet<HookThreadKey>,
     logged_mobaxterm_threads: HashSet<u32>,
     hooks: Vec<HHOOK>,
 }
@@ -223,17 +223,28 @@ impl HookState {
                     has_address_control(dialog.window_handle),
                 )
             })
-            .map(|dialog| dialog.thread_id)
+            .map(|dialog| HookThreadKey::new(dialog.process_id, dialog.thread_id))
             .collect::<HashSet<_>>();
-        for thread_id in unhooked_threads(&threads, &self.hooked_threads) {
-            match install_thread_hook(self.module, self.hook_proc, thread_id) {
+        prune_missing_hook_threads(
+            &threads,
+            &mut self.hooked_threads,
+            clear_confirmed_hook_thread,
+        );
+        for thread in unhooked_threads(&threads, &self.hooked_threads) {
+            match install_thread_hook(self.module, self.hook_proc, thread.thread_id) {
                 Ok(hook) => {
-                    self.hooked_threads.insert(thread_id);
-                    mark_hook_thread_confirmed(thread_id);
+                    self.hooked_threads.insert(thread);
+                    mark_hook_thread_confirmed(thread);
                     self.hooks.push(hook);
-                    eprintln!("Hook host installed native dialog hook for thread {thread_id}.");
+                    eprintln!(
+                        "Hook host installed native dialog hook for thread {}.",
+                        thread.thread_id
+                    );
                 }
-                Err(error) => eprintln!("Hook host failed to hook thread {thread_id}: {error}"),
+                Err(error) => eprintln!(
+                    "Hook host failed to hook thread {}: {error}",
+                    thread.thread_id
+                ),
             }
         }
     }
@@ -264,8 +275,8 @@ impl Drop for HookState {
             }
         }
 
-        for thread_id in self.hooked_threads.drain() {
-            clear_confirmed_hook_thread(thread_id);
+        for thread in self.hooked_threads.drain() {
+            clear_confirmed_hook_thread(thread);
         }
 
         if !self.module.is_null() {
@@ -277,6 +288,21 @@ impl Drop for HookState {
 }
 
 type DialogHookProc = unsafe extern "system" fn(i32, WPARAM, LPARAM) -> LRESULT;
+
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+struct HookThreadKey {
+    process_id: u32,
+    thread_id: u32,
+}
+
+impl HookThreadKey {
+    fn new(process_id: u32, thread_id: u32) -> Self {
+        Self {
+            process_id,
+            thread_id,
+        }
+    }
+}
 
 fn load_hook_module(dll_path: &str) -> Result<HMODULE, String> {
     let wide_path = to_wide_null(dll_path);
@@ -334,40 +360,67 @@ fn discover_observed_dialogs() -> io::Result<Vec<ObservedDialog>> {
     Ok(dialogs)
 }
 
-fn unhooked_threads(discovered: &HashSet<u32>, hooked_threads: &HashSet<u32>) -> Vec<u32> {
-    let mut thread_ids = discovered
+fn unhooked_threads<T>(discovered: &HashSet<T>, hooked_threads: &HashSet<T>) -> Vec<T>
+where
+    T: Copy + Eq + std::hash::Hash + Ord,
+{
+    let mut threads = discovered
         .iter()
         .copied()
-        .filter(|thread_id| !hooked_threads.contains(thread_id))
+        .filter(|thread| !hooked_threads.contains(thread))
         .collect::<Vec<_>>();
-    thread_ids.sort_unstable();
-    thread_ids
+    threads.sort_unstable();
+    threads
 }
 
-fn confirmed_hook_threads() -> &'static Mutex<HashSet<u32>> {
-    static CONFIRMED_HOOK_THREADS: OnceLock<Mutex<HashSet<u32>>> = OnceLock::new();
+fn prune_missing_hook_threads<T, C>(
+    discovered: &HashSet<T>,
+    hooked_threads: &mut HashSet<T>,
+    mut clear_confirmed: C,
+) -> Vec<T>
+where
+    T: Copy + Eq + std::hash::Hash + Ord,
+    C: FnMut(T),
+{
+    let mut missing = hooked_threads
+        .iter()
+        .copied()
+        .filter(|thread| !discovered.contains(thread))
+        .collect::<Vec<_>>();
+    missing.sort_unstable();
+
+    for thread in &missing {
+        hooked_threads.remove(thread);
+        clear_confirmed(*thread);
+    }
+
+    missing
+}
+
+fn confirmed_hook_threads() -> &'static Mutex<HashSet<HookThreadKey>> {
+    static CONFIRMED_HOOK_THREADS: OnceLock<Mutex<HashSet<HookThreadKey>>> = OnceLock::new();
     CONFIRMED_HOOK_THREADS.get_or_init(|| Mutex::new(HashSet::new()))
 }
 
-fn mark_hook_thread_confirmed(thread_id: u32) {
+fn mark_hook_thread_confirmed(thread: HookThreadKey) {
     let mut threads = confirmed_hook_threads()
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    threads.insert(thread_id);
+    threads.insert(thread);
 }
 
-fn clear_confirmed_hook_thread(thread_id: u32) {
+fn clear_confirmed_hook_thread(thread: HookThreadKey) {
     let mut threads = confirmed_hook_threads()
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    threads.remove(&thread_id);
+    threads.remove(&thread);
 }
 
-fn is_hook_thread_confirmed(thread_id: u32) -> bool {
+fn is_hook_thread_confirmed(thread: HookThreadKey) -> bool {
     confirmed_hook_threads()
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .contains(&thread_id)
+        .contains(&thread)
 }
 
 unsafe extern "system" fn enum_windows_proc(hwnd: HWND, l_param: LPARAM) -> BOOL {
@@ -490,14 +543,15 @@ fn should_hook_observed_dialog(
 fn should_report_active_dialog<C>(
     host_architecture: &str,
     dialog_architecture: &str,
+    process_id: u32,
     thread_id: u32,
     is_thread_hook_confirmed: C,
 ) -> bool
 where
-    C: Fn(u32) -> bool,
+    C: Fn(HookThreadKey) -> bool,
 {
     dialog_architecture.eq_ignore_ascii_case(host_architecture)
-        && is_thread_hook_confirmed(thread_id)
+        && is_thread_hook_confirmed(HookThreadKey::new(process_id, thread_id))
 }
 
 fn observed_dialog(hwnd: HWND) -> Option<ObservedDialog> {
@@ -698,6 +752,7 @@ fn active_dialog_response() -> Option<String> {
     if !should_report_active_dialog(
         host_architecture(),
         dialog.architecture,
+        dialog.process_id,
         dialog.thread_id,
         is_hook_thread_confirmed,
     ) {
@@ -765,6 +820,7 @@ fn jump_dialog_to_folder(payload: JumpCommandPayload) -> String {
 
     if let Err(failure) = jump_target_ready(
         hwnd,
+        expected_process_id,
         thread_id,
         resolve_active_dialog_window(),
         is_hook_thread_confirmed,
@@ -832,6 +888,7 @@ fn jump_dialog_to_folder(payload: JumpCommandPayload) -> String {
 
     if let Err(failure) = jump_target_ready(
         hwnd,
+        expected_process_id,
         thread_id,
         resolve_active_dialog_window(),
         is_hook_thread_confirmed,
@@ -930,12 +987,13 @@ struct CommandFailure {
 
 fn jump_target_ready<C>(
     target_hwnd: HWND,
+    target_process_id: u32,
     target_thread_id: u32,
     active_hwnd: Option<HWND>,
     is_thread_hook_confirmed: C,
 ) -> Result<(), CommandFailure>
 where
-    C: Fn(u32) -> bool,
+    C: Fn(HookThreadKey) -> bool,
 {
     match active_hwnd {
         Some(active_hwnd) if active_hwnd == target_hwnd => {}
@@ -953,7 +1011,7 @@ where
         }
     }
 
-    if !is_thread_hook_confirmed(target_thread_id) {
+    if !is_thread_hook_confirmed(HookThreadKey::new(target_process_id, target_thread_id)) {
         return Err(CommandFailure {
             status: "NoActiveDialog",
             message: "Target dialog hook has not been installed yet.",
@@ -1652,6 +1710,56 @@ mod tests {
     }
 
     #[test]
+    fn prune_missing_hook_threads_clears_confirmed_state_for_disappeared_threads() {
+        let discovered = HashSet::from([7, 11]);
+        let mut hooked = HashSet::from([42, 7]);
+        let mut confirmed = HashSet::from([42, 7]);
+
+        assert_eq!(
+            vec![42],
+            prune_missing_hook_threads(&discovered, &mut hooked, |thread_id| {
+                confirmed.remove(&thread_id);
+            })
+        );
+
+        assert_eq!(HashSet::from([7]), hooked);
+        assert_eq!(HashSet::from([7]), confirmed);
+    }
+
+    #[test]
+    fn reused_thread_id_is_not_confirmed_until_hook_is_reinstalled() {
+        let previous = HookThreadKey::new(100, 42);
+        let reused = HookThreadKey::new(200, 42);
+        let mut hooked = HashSet::from([previous]);
+        let mut confirmed = HashSet::from([previous]);
+
+        prune_missing_hook_threads(&HashSet::new(), &mut hooked, |thread| {
+            confirmed.remove(&thread);
+        });
+
+        let later_discovered = HashSet::from([reused]);
+        assert_eq!(vec![reused], unhooked_threads(&later_discovered, &hooked));
+        assert!(!should_report_active_dialog(
+            "x64",
+            "x64",
+            200,
+            42,
+            |thread| { confirmed.contains(&thread) }
+        ));
+
+        hooked.insert(reused);
+        confirmed.insert(reused);
+
+        assert!(should_report_active_dialog(
+            "x64",
+            "x64",
+            200,
+            42,
+            |thread| { confirmed.contains(&thread) }
+        ));
+    }
+
+    #[test]
     fn pipe_name_for_pointer_width_selects_matching_hook_host_pipe() {
         assert_eq!("listary-open-hook-x64", pipe_name_for_pointer_width(64));
         assert_eq!("listary-open-hook-x86", pipe_name_for_pointer_width(32));
@@ -1662,16 +1770,20 @@ mod tests {
         assert!(should_report_active_dialog(
             "x64",
             "x64",
+            100,
             42,
-            |thread_id| thread_id == 42
+            |thread| thread == HookThreadKey::new(100, 42)
         ));
         assert!(!should_report_active_dialog(
             "x64",
             "x86",
+            100,
             42,
-            |thread_id| thread_id == 42
+            |thread| thread == HookThreadKey::new(100, 42)
         ));
-        assert!(!should_report_active_dialog("x64", "x64", 42, |_| false));
+        assert!(!should_report_active_dialog("x64", "x64", 100, 42, |_| {
+            false
+        }));
     }
 
     #[test]
@@ -1681,21 +1793,23 @@ mod tests {
 
         assert_eq!(
             Ok(()),
-            jump_target_ready(target, 42, Some(target), |thread_id| thread_id == 42)
+            jump_target_ready(target, 100, 42, Some(target), |thread| {
+                thread == HookThreadKey::new(100, 42)
+            })
         );
 
-        let inactive = jump_target_ready(target, 42, Some(other), |_| true).unwrap_err();
+        let inactive = jump_target_ready(target, 100, 42, Some(other), |_| true).unwrap_err();
         assert_eq!("TargetGone", inactive.status);
         assert_eq!(
             "Dialog window is no longer the active foreground dialog.",
             inactive.message
         );
 
-        let missing_active = jump_target_ready(target, 42, None, |_| true).unwrap_err();
+        let missing_active = jump_target_ready(target, 100, 42, None, |_| true).unwrap_err();
         assert_eq!("NoActiveDialog", missing_active.status);
         assert_eq!("No active hook dialog.", missing_active.message);
 
-        let unhooked = jump_target_ready(target, 42, Some(target), |_| false).unwrap_err();
+        let unhooked = jump_target_ready(target, 100, 42, Some(target), |_| false).unwrap_err();
         assert_eq!("NoActiveDialog", unhooked.status);
         assert_eq!(
             "Target dialog hook has not been installed yet.",
