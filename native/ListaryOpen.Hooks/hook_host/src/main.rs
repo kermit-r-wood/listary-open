@@ -6,7 +6,7 @@ use listary_open_hook_common::{
     JUMP_COPYDATA_MAGIC,
 };
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::env;
 use std::ffi::c_void;
 use std::io;
@@ -174,7 +174,7 @@ struct HookState {
     hook_proc: DialogHookProc,
     hooked_threads: HashSet<HookThreadKey>,
     logged_mobaxterm_threads: HashSet<u32>,
-    hooks: Vec<HHOOK>,
+    hooks: HashMap<HookThreadKey, HHOOK>,
 }
 
 impl HookState {
@@ -195,7 +195,7 @@ impl HookState {
             hook_proc,
             hooked_threads: HashSet::new(),
             logged_mobaxterm_threads: HashSet::new(),
-            hooks: Vec::new(),
+            hooks: HashMap::new(),
         })
     }
 
@@ -225,17 +225,22 @@ impl HookState {
             })
             .map(|dialog| HookThreadKey::new(dialog.process_id, dialog.thread_id))
             .collect::<HashSet<_>>();
-        prune_missing_hook_threads(
+        let pruned_hooks = prune_missing_hook_threads(
             &threads,
             &mut self.hooked_threads,
+            &mut self.hooks,
             clear_confirmed_hook_thread,
         );
+        for hook in pruned_hooks {
+            unhook_thread_hook(hook);
+        }
+
         for thread in unhooked_threads(&threads, &self.hooked_threads) {
             match install_thread_hook(self.module, self.hook_proc, thread.thread_id) {
                 Ok(hook) => {
                     self.hooked_threads.insert(thread);
                     mark_hook_thread_confirmed(thread);
-                    self.hooks.push(hook);
+                    self.hooks.insert(thread, hook);
                     eprintln!(
                         "Hook host installed native dialog hook for thread {}.",
                         thread.thread_id
@@ -265,14 +270,8 @@ impl HookState {
 
 impl Drop for HookState {
     fn drop(&mut self) {
-        for hook in self.hooks.drain(..) {
-            let unhooked = unsafe { UnhookWindowsHookEx(hook) };
-            if unhooked == 0 {
-                eprintln!(
-                    "Hook host failed to unhook native dialog hook: {}",
-                    io::Error::last_os_error()
-                );
-            }
+        for (_, hook) in self.hooks.drain() {
+            unhook_thread_hook(hook);
         }
 
         for thread in self.hooked_threads.drain() {
@@ -288,6 +287,16 @@ impl Drop for HookState {
 }
 
 type DialogHookProc = unsafe extern "system" fn(i32, WPARAM, LPARAM) -> LRESULT;
+
+fn unhook_thread_hook(hook: HHOOK) {
+    let unhooked = unsafe { UnhookWindowsHookEx(hook) };
+    if unhooked == 0 {
+        eprintln!(
+            "Hook host failed to unhook native dialog hook: {}",
+            io::Error::last_os_error()
+        );
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 struct HookThreadKey {
@@ -373,11 +382,12 @@ where
     threads
 }
 
-fn prune_missing_hook_threads<T, C>(
+fn prune_missing_hook_threads<T, H, C>(
     discovered: &HashSet<T>,
     hooked_threads: &mut HashSet<T>,
+    hooks: &mut HashMap<T, H>,
     mut clear_confirmed: C,
-) -> Vec<T>
+) -> Vec<H>
 where
     T: Copy + Eq + std::hash::Hash + Ord,
     C: FnMut(T),
@@ -389,12 +399,16 @@ where
         .collect::<Vec<_>>();
     missing.sort_unstable();
 
+    let mut removed_hooks = Vec::new();
     for thread in &missing {
         hooked_threads.remove(thread);
+        if let Some(hook) = hooks.remove(thread) {
+            removed_hooks.push(hook);
+        }
         clear_confirmed(*thread);
     }
 
-    missing
+    removed_hooks
 }
 
 fn confirmed_hook_threads() -> &'static Mutex<HashSet<HookThreadKey>> {
@@ -1714,10 +1728,11 @@ mod tests {
         let discovered = HashSet::from([7, 11]);
         let mut hooked = HashSet::from([42, 7]);
         let mut confirmed = HashSet::from([42, 7]);
+        let mut hooks: std::collections::HashMap<i32, usize> = std::collections::HashMap::new();
 
         assert_eq!(
-            vec![42],
-            prune_missing_hook_threads(&discovered, &mut hooked, |thread_id| {
+            Vec::<usize>::new(),
+            prune_missing_hook_threads(&discovered, &mut hooked, &mut hooks, |thread_id| {
                 confirmed.remove(&thread_id);
             })
         );
@@ -1732,8 +1747,10 @@ mod tests {
         let reused = HookThreadKey::new(200, 42);
         let mut hooked = HashSet::from([previous]);
         let mut confirmed = HashSet::from([previous]);
+        let mut hooks: std::collections::HashMap<HookThreadKey, usize> =
+            std::collections::HashMap::new();
 
-        prune_missing_hook_threads(&HashSet::new(), &mut hooked, |thread| {
+        prune_missing_hook_threads(&HashSet::new(), &mut hooked, &mut hooks, |thread| {
             confirmed.remove(&thread);
         });
 
@@ -1757,6 +1774,26 @@ mod tests {
             42,
             |thread| { confirmed.contains(&thread) }
         ));
+    }
+
+    #[test]
+    fn prune_missing_hook_threads_removes_hook_handles_for_unhooking() {
+        let kept = HookThreadKey::new(100, 7);
+        let removed = HookThreadKey::new(200, 42);
+        let discovered = HashSet::from([kept]);
+        let mut hooked = HashSet::from([kept, removed]);
+        let mut hooks = std::collections::HashMap::from([(kept, 700usize), (removed, 4200usize)]);
+        let mut cleared = Vec::new();
+
+        let removed_hooks =
+            prune_missing_hook_threads(&discovered, &mut hooked, &mut hooks, |thread| {
+                cleared.push(thread)
+            });
+
+        assert_eq!(vec![4200], removed_hooks);
+        assert_eq!(HashSet::from([kept]), hooked);
+        assert_eq!(std::collections::HashMap::from([(kept, 700usize)]), hooks);
+        assert_eq!(vec![removed], cleared);
     }
 
     #[test]
