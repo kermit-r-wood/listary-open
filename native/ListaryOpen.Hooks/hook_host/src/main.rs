@@ -1,24 +1,29 @@
 #![windows_subsystem = "windows"]
 
 use listary_open_hook_common::{
-    JumpCommandHeader, DIALOG_CLASS, HOOK_DLL_EXPORT, JUMP_COPYDATA_MAGIC,
+    JumpAckHeader, JumpCommandHeader, DIALOG_CLASS, HOOK_DLL_EXPORT, JUMP_ACK_COPYDATA_MAGIC,
+    JUMP_ACK_STATUS_FAILED, JUMP_ACK_STATUS_SUCCESS, JUMP_ACK_STATUS_UNSUPPORTED_DIALOG,
+    JUMP_COPYDATA_MAGIC,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::env;
+use std::ffi::c_void;
 use std::io;
 use std::ptr::{null, null_mut};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
 use windows_sys::Win32::Foundation::{
-    CloseHandle, FreeLibrary, GetLastError, BOOL, ERROR_PIPE_CONNECTED, HANDLE, HMODULE, HWND,
-    INVALID_HANDLE_VALUE, LPARAM, LRESULT, TRUE, WPARAM,
+    CloseHandle, FreeLibrary, GetLastError, BOOL, ERROR_CLASS_ALREADY_EXISTS, ERROR_PIPE_CONNECTED,
+    HANDLE, HMODULE, HWND, INVALID_HANDLE_VALUE, LPARAM, LRESULT, TRUE, WPARAM,
 };
 use windows_sys::Win32::Storage::FileSystem::{
     FlushFileBuffers, ReadFile, WriteFile, PIPE_ACCESS_DUPLEX,
 };
 use windows_sys::Win32::System::DataExchange::COPYDATASTRUCT;
-use windows_sys::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryW};
+use windows_sys::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress, LoadLibraryW};
 use windows_sys::Win32::System::Pipes::{
     ConnectNamedPipe, CreateNamedPipeW, DisconnectNamedPipe, PIPE_READMODE_BYTE, PIPE_TYPE_BYTE,
     PIPE_UNLIMITED_INSTANCES, PIPE_WAIT,
@@ -28,13 +33,17 @@ use windows_sys::Win32::System::SystemInformation::{
     IMAGE_FILE_MACHINE_UNKNOWN,
 };
 use windows_sys::Win32::System::Threading::{
-    IsWow64Process2, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+    IsWow64Process2, OpenProcess, QueryFullProcessImageNameW, PROCESS_QUERY_LIMITED_INFORMATION,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    DispatchMessageW, EnumWindows, GetAncestor, GetClassNameW, GetDlgItem, GetForegroundWindow,
-    GetWindowTextLengthW, GetWindowTextW, GetWindowThreadProcessId, IsWindow, IsWindowVisible,
-    PeekMessageW, SendMessageTimeoutW, SetWindowsHookExW, TranslateMessage, UnhookWindowsHookEx,
-    GA_ROOT, HHOOK, MSG, PM_REMOVE, SMTO_ABORTIFHUNG, WH_CALLWNDPROC, WM_COPYDATA, WM_QUIT,
+    ChangeWindowMessageFilterEx, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW,
+    EnumWindows, GetAncestor, GetClassNameW, GetDlgItem, GetForegroundWindow, GetMessageW,
+    GetWindowLongPtrW, GetWindowTextLengthW, GetWindowTextW, GetWindowThreadProcessId, IsWindow,
+    PeekMessageW, PostMessageW, PostQuitMessage, RegisterClassW, SendMessageTimeoutW,
+    SetWindowLongPtrW, SetWindowsHookExW, TranslateMessage, UnhookWindowsHookEx,
+    CHANGEFILTERSTRUCT, CREATESTRUCTW, GA_ROOT, GWLP_USERDATA, HHOOK, HWND_MESSAGE, MSG,
+    MSGFLT_ALLOW, PM_REMOVE, SMTO_ABORTIFHUNG, WH_CALLWNDPROC, WM_APP, WM_COPYDATA, WM_DESTROY,
+    WM_NCCREATE, WM_QUIT, WNDCLASSW,
 };
 
 const DEFAULT_PIPE_NAME: &str = "listary-open-hook-x64";
@@ -43,6 +52,10 @@ const BUFFER_SIZE: usize = 64 * 1024;
 const HOOK_RESCAN_INTERVAL: Duration = Duration::from_millis(500);
 const HOOK_LOOP_SLEEP: Duration = Duration::from_millis(50);
 const ADDRESS_BAR_EDIT_CONTROL_ID: i32 = 41477;
+const ACK_WINDOW_CLASS: &str = "ListaryOpenHookAckWindow";
+const WM_LISTARY_ACK_CLOSE: u32 = WM_APP + 0x4C4F;
+
+static NEXT_COMMAND_ID: AtomicU64 = AtomicU64::new(1);
 
 fn main() -> io::Result<()> {
     let pipe_name = pipe_name_from_args();
@@ -486,7 +499,7 @@ fn active_dialog_response() -> Option<String> {
         process_id,
         thread_id,
         architecture,
-        process_name: format!("pid-{process_id}"),
+        process_name: process_name(process_id),
         class_name: class_name(hwnd).unwrap_or_else(|| DIALOG_CLASS.to_string()),
         title: window_text(hwnd),
     };
@@ -540,7 +553,19 @@ fn jump_dialog_to_folder(payload: JumpCommandPayload) -> String {
         );
     }
 
-    let mut payload_bytes = build_jump_copydata_payload(&payload.folder_path);
+    let command_id = next_command_id();
+    let ack_receiver = match AckReceiver::new(command_id) {
+        Ok(receiver) => receiver,
+        Err(error) => {
+            return command_reply(
+                "Failed",
+                &format!("Could not create hook acknowledgement receiver: {error}"),
+            );
+        }
+    };
+
+    let mut payload_bytes =
+        build_jump_copydata_payload(ack_receiver.hwnd(), command_id, &payload.folder_path);
     let Ok(cb_data) = u32::try_from(payload_bytes.len()) else {
         return command_reply("Failed", "Jump command payload is too large.");
     };
@@ -552,6 +577,7 @@ fn jump_dialog_to_folder(payload: JumpCommandPayload) -> String {
     };
     let mut send_result = 0usize;
     let timeout_ms = payload.timeout_ms as u32;
+    let send_started = Instant::now();
     let sent = unsafe {
         SendMessageTimeoutW(
             hwnd,
@@ -572,71 +598,52 @@ fn jump_dialog_to_folder(payload: JumpCommandPayload) -> String {
         };
     }
 
-    if !is_live_window(hwnd) {
-        return command_reply("TargetGone", "Dialog closed after jump command was sent.");
+    let ack = ack_receiver.wait(remaining_timeout(send_started, timeout_ms));
+    let (status, message) = jump_status_for_ack(ack, is_live_window(hwnd));
+    if status != "Success" {
+        return command_reply(status, message);
     }
 
     if unsafe { GetDlgItem(hwnd, ADDRESS_BAR_EDIT_CONTROL_ID) }.is_null() {
         return command_reply(
             "UnsupportedDialog",
-            "Dialog address edit control disappeared after jump command was sent.",
+            "Dialog address edit control disappeared after jump command was acknowledged.",
         );
     }
 
-    command_reply(
-        "Success",
-        "Jump command sent to hook dialog; dialog remains open.",
-    )
+    command_reply(status, message)
 }
 
 fn resolve_active_dialog_window() -> Option<HWND> {
     let foreground = unsafe { GetForegroundWindow() };
-    if !foreground.is_null() {
-        if let Some(hwnd) = resolve_dialog_from_window(foreground) {
-            return Some(hwnd);
-        }
-    }
-
-    first_top_level_dialog()
+    resolve_active_dialog_candidate(foreground, is_dialog_window, |hwnd| unsafe {
+        GetAncestor(hwnd, GA_ROOT)
+    })
 }
 
-fn resolve_dialog_from_window(hwnd: HWND) -> Option<HWND> {
-    if is_dialog_window(hwnd) {
-        return Some(hwnd);
+fn resolve_active_dialog_candidate<I, R>(
+    foreground: HWND,
+    is_dialog: I,
+    root_window: R,
+) -> Option<HWND>
+where
+    I: Fn(HWND) -> bool,
+    R: Fn(HWND) -> HWND,
+{
+    if foreground.is_null() {
+        return None;
     }
 
-    let root = unsafe { GetAncestor(hwnd, GA_ROOT) };
-    if !root.is_null() && is_dialog_window(root) {
+    if is_dialog(foreground) {
+        return Some(foreground);
+    }
+
+    let root = root_window(foreground);
+    if !root.is_null() && is_dialog(root) {
         return Some(root);
     }
 
     None
-}
-
-fn first_top_level_dialog() -> Option<HWND> {
-    let mut found: HWND = null_mut();
-    unsafe {
-        EnumWindows(
-            Some(enum_first_dialog_proc),
-            (&mut found as *mut HWND) as LPARAM,
-        );
-    }
-
-    if found.is_null() {
-        None
-    } else {
-        Some(found)
-    }
-}
-
-unsafe extern "system" fn enum_first_dialog_proc(hwnd: HWND, l_param: LPARAM) -> BOOL {
-    if is_dialog_window(hwnd) && unsafe { IsWindowVisible(hwnd) } != 0 {
-        let found = unsafe { &mut *(l_param as *mut HWND) };
-        *found = hwnd;
-        return 0;
-    }
-
-    TRUE
 }
 
 fn dialog_id_for_window(process_id: u32, hwnd: HWND) -> String {
@@ -654,7 +661,7 @@ fn parse_dialog_id(dialog_id: &str) -> Option<(u32, HWND)> {
     Some((process_id, hwnd))
 }
 
-fn build_jump_copydata_payload(folder_path: &str) -> Vec<u8> {
+fn build_jump_copydata_payload(ack_hwnd: HWND, command_id: u64, folder_path: &str) -> Vec<u8> {
     let utf16 = folder_path
         .encode_utf16()
         .chain(Some(0))
@@ -662,6 +669,9 @@ fn build_jump_copydata_payload(folder_path: &str) -> Vec<u8> {
     let mut payload =
         Vec::with_capacity(std::mem::size_of::<JumpCommandHeader>() + utf16.len() * 2);
     payload.extend_from_slice(&JUMP_COPYDATA_MAGIC.to_ne_bytes());
+    payload.extend_from_slice(&(ack_hwnd as usize).to_ne_bytes());
+    payload.resize(align_up(payload.len(), std::mem::align_of::<u64>()), 0);
+    payload.extend_from_slice(&command_id.to_ne_bytes());
     payload.extend_from_slice(&(utf16.len() as u32).to_ne_bytes());
     payload.resize(std::mem::size_of::<JumpCommandHeader>(), 0);
     for unit in utf16 {
@@ -669,6 +679,319 @@ fn build_jump_copydata_payload(folder_path: &str) -> Vec<u8> {
     }
 
     payload
+}
+
+fn next_command_id() -> u64 {
+    loop {
+        let command_id = NEXT_COMMAND_ID.fetch_add(1, Ordering::Relaxed);
+        if command_id != 0 {
+            return command_id;
+        }
+    }
+}
+
+fn remaining_timeout(started: Instant, timeout_ms: u32) -> Duration {
+    Duration::from_millis(timeout_ms as u64).saturating_sub(started.elapsed())
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum JumpAckStatus {
+    Success,
+    UnsupportedDialog,
+    Failed,
+}
+
+fn jump_status_for_ack(
+    ack: Option<JumpAckStatus>,
+    target_alive: bool,
+) -> (&'static str, &'static str) {
+    match ack {
+        Some(JumpAckStatus::Success) => ("Success", "Hook acknowledged folder jump."),
+        Some(JumpAckStatus::UnsupportedDialog) => (
+            "UnsupportedDialog",
+            "Hook could not navigate this dialog shape.",
+        ),
+        Some(JumpAckStatus::Failed) => ("Failed", "Hook failed while navigating the dialog."),
+        None if target_alive => ("Timeout", "Hook did not acknowledge jump command."),
+        None => (
+            "TargetGone",
+            "Dialog closed before hook acknowledged jump command.",
+        ),
+    }
+}
+
+fn decode_jump_ack_payload(dw_data: usize, bytes: &[u8]) -> Option<(u64, JumpAckStatus)> {
+    if dw_data != JUMP_ACK_COPYDATA_MAGIC {
+        return None;
+    }
+
+    let header_size = std::mem::size_of::<JumpAckHeader>();
+    let usize_size = std::mem::size_of::<usize>();
+    let command_offset = align_up(usize_size, std::mem::align_of::<u64>());
+    let status_offset = command_offset.checked_add(std::mem::size_of::<u64>())?;
+    if bytes.len() != header_size || bytes.len() < status_offset + std::mem::size_of::<u32>() {
+        return None;
+    }
+
+    let magic = usize::from_ne_bytes(bytes[..usize_size].try_into().ok()?);
+    if magic != JUMP_ACK_COPYDATA_MAGIC {
+        return None;
+    }
+
+    let command_id = u64::from_ne_bytes(bytes[command_offset..command_offset + 8].try_into().ok()?);
+    let status_code = u32::from_ne_bytes(
+        bytes[status_offset..status_offset + std::mem::size_of::<u32>()]
+            .try_into()
+            .ok()?,
+    );
+    let status = match status_code {
+        JUMP_ACK_STATUS_SUCCESS => JumpAckStatus::Success,
+        JUMP_ACK_STATUS_UNSUPPORTED_DIALOG => JumpAckStatus::UnsupportedDialog,
+        JUMP_ACK_STATUS_FAILED => JumpAckStatus::Failed,
+        _ => return None,
+    };
+
+    Some((command_id, status))
+}
+
+fn align_up(value: usize, alignment: usize) -> usize {
+    debug_assert!(alignment.is_power_of_two());
+    (value + alignment - 1) & !(alignment - 1)
+}
+
+struct AckReceiver {
+    hwnd: HWND,
+    receiver: mpsc::Receiver<JumpAckStatus>,
+    thread: Option<thread::JoinHandle<()>>,
+}
+
+impl AckReceiver {
+    fn new(command_id: u64) -> io::Result<Self> {
+        let (ready_sender, ready_receiver) = mpsc::channel();
+        let (ack_sender, ack_receiver) = mpsc::channel();
+        let thread = thread::spawn(move || ack_window_thread(command_id, ack_sender, ready_sender));
+
+        let hwnd = match ready_receiver.recv_timeout(Duration::from_secs(2)) {
+            Ok(Ok(hwnd)) => hwnd as HWND,
+            Ok(Err(error)) => {
+                let _ = thread.join();
+                return Err(io::Error::new(io::ErrorKind::Other, error));
+            }
+            Err(error) => {
+                let _ = thread.join();
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    format!("ack window startup timed out: {error}"),
+                ));
+            }
+        };
+
+        Ok(Self {
+            hwnd,
+            receiver: ack_receiver,
+            thread: Some(thread),
+        })
+    }
+
+    fn hwnd(&self) -> HWND {
+        self.hwnd
+    }
+
+    fn wait(&self, timeout: Duration) -> Option<JumpAckStatus> {
+        if timeout.is_zero() {
+            return self.receiver.try_recv().ok();
+        }
+
+        self.receiver.recv_timeout(timeout).ok()
+    }
+}
+
+impl Drop for AckReceiver {
+    fn drop(&mut self) {
+        if !self.hwnd.is_null() {
+            unsafe {
+                PostMessageW(self.hwnd, WM_LISTARY_ACK_CLOSE, 0, 0);
+            }
+        }
+
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+struct AckWindowState {
+    command_id: u64,
+    sender: mpsc::Sender<JumpAckStatus>,
+}
+
+fn ack_window_thread(
+    command_id: u64,
+    ack_sender: mpsc::Sender<JumpAckStatus>,
+    ready_sender: mpsc::Sender<Result<usize, String>>,
+) {
+    let class_name = to_wide_null(ACK_WINDOW_CLASS);
+    let instance = unsafe { GetModuleHandleW(null()) };
+    if let Err(error) = register_ack_window_class(&class_name, instance) {
+        let _ = ready_sender.send(Err(error));
+        return;
+    }
+
+    let state = Box::new(AckWindowState {
+        command_id,
+        sender: ack_sender,
+    });
+    let state_ptr = Box::into_raw(state);
+    let hwnd = unsafe {
+        CreateWindowExW(
+            0,
+            class_name.as_ptr(),
+            class_name.as_ptr(),
+            0,
+            0,
+            0,
+            0,
+            0,
+            HWND_MESSAGE,
+            null_mut(),
+            instance,
+            state_ptr.cast::<c_void>(),
+        )
+    };
+
+    if hwnd.is_null() {
+        unsafe {
+            drop(Box::from_raw(state_ptr));
+        }
+        let _ = ready_sender.send(Err(format!(
+            "CreateWindowExW failed for ack receiver: {}",
+            io::Error::last_os_error()
+        )));
+        return;
+    }
+
+    allow_ack_copydata_message(hwnd);
+    let _ = ready_sender.send(Ok(hwnd as usize));
+    let mut message = unsafe { std::mem::zeroed::<MSG>() };
+    while unsafe { GetMessageW(&mut message, null_mut(), 0, 0) } > 0 {
+        unsafe {
+            TranslateMessage(&message);
+            DispatchMessageW(&message);
+        }
+    }
+}
+
+fn register_ack_window_class(class_name: &[u16], instance: HMODULE) -> Result<(), String> {
+    let window_class = WNDCLASSW {
+        style: 0,
+        lpfnWndProc: Some(ack_window_proc),
+        cbClsExtra: 0,
+        cbWndExtra: 0,
+        hInstance: instance,
+        hIcon: null_mut(),
+        hCursor: null_mut(),
+        hbrBackground: null_mut(),
+        lpszMenuName: null(),
+        lpszClassName: class_name.as_ptr(),
+    };
+
+    let registered = unsafe { RegisterClassW(&window_class) };
+    if registered != 0 {
+        return Ok(());
+    }
+
+    let error = unsafe { GetLastError() };
+    if error == ERROR_CLASS_ALREADY_EXISTS {
+        Ok(())
+    } else {
+        Err(format!(
+            "RegisterClassW failed for ack receiver: {}",
+            io::Error::from_raw_os_error(error as i32)
+        ))
+    }
+}
+
+fn allow_ack_copydata_message(hwnd: HWND) {
+    let mut filter = CHANGEFILTERSTRUCT {
+        cbSize: std::mem::size_of::<CHANGEFILTERSTRUCT>() as u32,
+        ExtStatus: 0,
+    };
+    unsafe {
+        ChangeWindowMessageFilterEx(hwnd, WM_COPYDATA, MSGFLT_ALLOW, &mut filter);
+    }
+}
+
+unsafe extern "system" fn ack_window_proc(
+    hwnd: HWND,
+    message: u32,
+    w_param: WPARAM,
+    l_param: LPARAM,
+) -> LRESULT {
+    match message {
+        WM_NCCREATE => {
+            let create = l_param as *const CREATESTRUCTW;
+            if create.is_null() {
+                return 0;
+            }
+
+            let state_ptr = unsafe { (*create).lpCreateParams as *mut AckWindowState };
+            if state_ptr.is_null() {
+                return 0;
+            }
+
+            unsafe {
+                SetWindowLongPtrW(hwnd, GWLP_USERDATA, (state_ptr as isize) as _);
+            }
+            TRUE as LRESULT
+        }
+        WM_COPYDATA => {
+            let state_ptr =
+                unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut AckWindowState };
+            if state_ptr.is_null() || l_param == 0 {
+                return 0;
+            }
+
+            let copy_data = unsafe { &*(l_param as *const COPYDATASTRUCT) };
+            if copy_data.lpData.is_null() || copy_data.cbData == 0 {
+                return 0;
+            }
+
+            let bytes = unsafe {
+                std::slice::from_raw_parts(copy_data.lpData.cast::<u8>(), copy_data.cbData as usize)
+            };
+            if let Some((command_id, status)) = decode_jump_ack_payload(copy_data.dwData, bytes) {
+                let state = unsafe { &*state_ptr };
+                if command_id == state.command_id {
+                    let _ = state.sender.send(status);
+                    return TRUE as LRESULT;
+                }
+            }
+
+            0
+        }
+        WM_LISTARY_ACK_CLOSE => {
+            unsafe {
+                DestroyWindow(hwnd);
+            }
+            0
+        }
+        WM_DESTROY => {
+            let state_ptr =
+                unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut AckWindowState };
+            if !state_ptr.is_null() {
+                unsafe {
+                    SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
+                    drop(Box::from_raw(state_ptr));
+                }
+            }
+
+            unsafe {
+                PostQuitMessage(0);
+            }
+            0
+        }
+        _ => unsafe { DefWindowProcW(hwnd, message, w_param, l_param) },
+    }
 }
 
 fn process_architecture(process_id: u32) -> Option<&'static str> {
@@ -712,6 +1035,46 @@ fn host_architecture() -> &'static str {
     #[cfg(target_pointer_width = "32")]
     {
         "x86"
+    }
+}
+
+fn process_name(process_id: u32) -> String {
+    query_process_image_path(process_id)
+        .and_then(|path| process_name_from_image_path(&path))
+        .unwrap_or_else(|| format!("pid-{process_id}"))
+}
+
+fn query_process_image_path(process_id: u32) -> Option<String> {
+    let process = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, process_id) };
+    if process.is_null() {
+        return None;
+    }
+
+    let mut buffer = vec![0u16; 32768];
+    let mut size = buffer.len() as u32;
+    let queried = unsafe { QueryFullProcessImageNameW(process, 0, buffer.as_mut_ptr(), &mut size) };
+    unsafe {
+        CloseHandle(process);
+    }
+
+    if queried == 0 || size == 0 {
+        return None;
+    }
+
+    Some(String::from_utf16_lossy(&buffer[..size as usize]))
+}
+
+fn process_name_from_image_path(path: &str) -> Option<String> {
+    let trimmed = path.trim();
+    if trimmed.is_empty() || trimmed.ends_with(['\\', '/']) {
+        return None;
+    }
+
+    let name = trimmed.rsplit(['\\', '/']).next()?;
+    if name.is_empty() {
+        None
+    } else {
+        Some(name.to_string())
     }
 }
 
@@ -904,17 +1267,26 @@ mod tests {
     }
 
     #[test]
-    fn build_jump_copydata_payload_encodes_header_and_null_terminated_utf16() {
-        let payload = build_jump_copydata_payload("C:\\Temp");
+    fn build_jump_copydata_payload_encodes_ack_command_header_and_null_terminated_utf16() {
+        let payload =
+            build_jump_copydata_payload(0x1234usize as HWND, 0xABCD_EF01_2345_6789, "C:\\Temp");
         let header_size = std::mem::size_of::<listary_open_hook_common::JumpCommandHeader>();
         assert!(payload.len() > header_size);
 
-        let magic = usize::from_ne_bytes(
-            payload[..std::mem::size_of::<usize>()]
+        let usize_size = std::mem::size_of::<usize>();
+        let magic = usize::from_ne_bytes(payload[..usize_size].try_into().expect("payload magic"));
+        let ack_hwnd = usize::from_ne_bytes(
+            payload[usize_size..usize_size * 2]
                 .try_into()
-                .expect("payload contains usize magic"),
+                .expect("ack hwnd"),
         );
-        let len_offset = std::mem::size_of::<usize>();
+        let command_offset = align_up(usize_size * 2, std::mem::align_of::<u64>());
+        let command_id = u64::from_ne_bytes(
+            payload[command_offset..command_offset + std::mem::size_of::<u64>()]
+                .try_into()
+                .expect("command id"),
+        );
+        let len_offset = command_offset + std::mem::size_of::<u64>();
         let utf16_code_units = u32::from_ne_bytes(
             payload[len_offset..len_offset + std::mem::size_of::<u32>()]
                 .try_into()
@@ -926,10 +1298,107 @@ mod tests {
             .collect::<Vec<_>>();
 
         assert_eq!(listary_open_hook_common::JUMP_COPYDATA_MAGIC, magic);
+        assert_eq!(0x1234, ack_hwnd);
+        assert_eq!(0xABCD_EF01_2345_6789, command_id);
         assert_eq!(8, utf16_code_units);
         assert_eq!(
             "C:\\Temp".encode_utf16().chain(Some(0)).collect::<Vec<_>>(),
             encoded_path
         );
+    }
+
+    #[test]
+    fn jump_status_for_ack_requires_explicit_ack() {
+        assert_eq!(
+            ("Timeout", "Hook did not acknowledge jump command."),
+            jump_status_for_ack(None, true)
+        );
+        assert_eq!(
+            (
+                "TargetGone",
+                "Dialog closed before hook acknowledged jump command."
+            ),
+            jump_status_for_ack(None, false)
+        );
+        assert_eq!(
+            ("Success", "Hook acknowledged folder jump."),
+            jump_status_for_ack(Some(JumpAckStatus::Success), true)
+        );
+        assert_eq!(
+            (
+                "UnsupportedDialog",
+                "Hook could not navigate this dialog shape."
+            ),
+            jump_status_for_ack(Some(JumpAckStatus::UnsupportedDialog), true)
+        );
+        assert_eq!(
+            ("Failed", "Hook failed while navigating the dialog."),
+            jump_status_for_ack(Some(JumpAckStatus::Failed), true)
+        );
+    }
+
+    #[test]
+    fn decode_jump_ack_payload_accepts_magic_command_and_status() {
+        let payload = ack_payload_bytes(0xABCD_EF01_2345_6789, JUMP_ACK_STATUS_SUCCESS);
+
+        assert_eq!(
+            Some((0xABCD_EF01_2345_6789, JumpAckStatus::Success)),
+            decode_jump_ack_payload(JUMP_ACK_COPYDATA_MAGIC, &payload)
+        );
+        assert_eq!(None, decode_jump_ack_payload(0, &payload));
+    }
+
+    #[test]
+    fn resolve_active_dialog_candidate_does_not_fallback_to_background_dialog() {
+        let dialog = 100usize as HWND;
+        let child = 101usize as HWND;
+        let unrelated = 200usize as HWND;
+        let background_dialog = 300usize as HWND;
+
+        let is_dialog = |hwnd: HWND| hwnd == dialog || hwnd == background_dialog;
+        let root = |hwnd: HWND| if hwnd == child { dialog } else { hwnd };
+
+        assert_eq!(
+            Some(dialog),
+            resolve_active_dialog_candidate(dialog, is_dialog, root)
+        );
+        assert_eq!(
+            Some(dialog),
+            resolve_active_dialog_candidate(child, is_dialog, root)
+        );
+        assert_eq!(
+            None,
+            resolve_active_dialog_candidate(unrelated, is_dialog, root)
+        );
+        assert_eq!(
+            None,
+            resolve_active_dialog_candidate(null_mut(), is_dialog, root)
+        );
+    }
+
+    #[test]
+    fn process_name_from_image_path_returns_base_name() {
+        assert_eq!(
+            Some("notepad.exe".to_string()),
+            process_name_from_image_path(r"C:\Windows\System32\notepad.exe")
+        );
+        assert_eq!(
+            Some("app.exe".to_string()),
+            process_name_from_image_path(r"\\server\share\folder\app.exe")
+        );
+        assert_eq!(None, process_name_from_image_path(""));
+        assert_eq!(None, process_name_from_image_path(r"C:\Windows\System32\"));
+    }
+
+    fn ack_payload_bytes(command_id: u64, status: u32) -> Vec<u8> {
+        let usize_size = std::mem::size_of::<usize>();
+        let command_offset = align_up(usize_size, std::mem::align_of::<u64>());
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&JUMP_ACK_COPYDATA_MAGIC.to_ne_bytes());
+        payload.resize(command_offset, 0);
+        payload.extend_from_slice(&command_id.to_ne_bytes());
+        payload.extend_from_slice(&status.to_ne_bytes());
+        payload.resize(std::mem::size_of::<JumpAckHeader>(), 0);
+        payload
     }
 }

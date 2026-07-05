@@ -1,4 +1,8 @@
-use listary_open_hook_common::{JumpCommandHeader, DIALOG_CLASS, JUMP_COPYDATA_MAGIC};
+use listary_open_hook_common::{
+    JumpAckHeader, JumpCommandHeader, DIALOG_CLASS, JUMP_ACK_COPYDATA_MAGIC,
+    JUMP_ACK_STATUS_FAILED, JUMP_ACK_STATUS_SUCCESS, JUMP_ACK_STATUS_UNSUPPORTED_DIALOG,
+    JUMP_COPYDATA_MAGIC,
+};
 use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
 use windows_sys::Win32::System::DataExchange::COPYDATASTRUCT;
 use windows_sys::Win32::UI::WindowsAndMessaging::{
@@ -52,14 +56,29 @@ fn handle_dialog_message(hwnd: HWND, message: u32, _w_param: WPARAM, l_param: LP
     let bytes = unsafe {
         std::slice::from_raw_parts(copy_data.lpData.cast::<u8>(), copy_data.cbData as usize)
     };
-    let Some(folder_path) = decode_jump_copydata_payload(copy_data.dwData, bytes) else {
+    let Some(command) = decode_jump_copydata_payload(copy_data.dwData, bytes) else {
         return;
     };
 
-    navigate_dialog_to_folder(hwnd, &folder_path);
+    let status = navigate_dialog_to_folder(hwnd, &command.folder_path);
+    send_jump_ack(command.ack_hwnd, command.command_id, status);
 }
 
-fn decode_jump_copydata_payload(dw_data: usize, bytes: &[u8]) -> Option<String> {
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct JumpCommand {
+    ack_hwnd: HWND,
+    command_id: u64,
+    folder_path: String,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum JumpAckStatus {
+    Success,
+    UnsupportedDialog,
+    Failed,
+}
+
+fn decode_jump_copydata_payload(dw_data: usize, bytes: &[u8]) -> Option<JumpCommand> {
     if dw_data != JUMP_COPYDATA_MAGIC {
         return None;
     }
@@ -67,7 +86,9 @@ fn decode_jump_copydata_payload(dw_data: usize, bytes: &[u8]) -> Option<String> 
     let header_size = std::mem::size_of::<JumpCommandHeader>();
     let usize_size = std::mem::size_of::<usize>();
     let u32_size = std::mem::size_of::<u32>();
-    if bytes.len() < header_size || bytes.len() < usize_size + u32_size {
+    let command_offset = align_up(usize_size * 2, std::mem::align_of::<u64>());
+    let utf16_len_offset = command_offset.checked_add(std::mem::size_of::<u64>())?;
+    if bytes.len() < header_size || bytes.len() < utf16_len_offset + u32_size {
         return None;
     }
 
@@ -76,8 +97,21 @@ fn decode_jump_copydata_payload(dw_data: usize, bytes: &[u8]) -> Option<String> 
         return None;
     }
 
-    let utf16_code_units =
-        u32::from_ne_bytes(bytes[usize_size..usize_size + u32_size].try_into().ok()?) as usize;
+    let ack_hwnd = usize::from_ne_bytes(bytes[usize_size..usize_size * 2].try_into().ok()?);
+    if ack_hwnd == 0 {
+        return None;
+    }
+
+    let command_id = u64::from_ne_bytes(bytes[command_offset..command_offset + 8].try_into().ok()?);
+    if command_id == 0 {
+        return None;
+    }
+
+    let utf16_code_units = u32::from_ne_bytes(
+        bytes[utf16_len_offset..utf16_len_offset + u32_size]
+            .try_into()
+            .ok()?,
+    ) as usize;
     if utf16_code_units == 0 {
         return None;
     }
@@ -96,20 +130,24 @@ fn decode_jump_copydata_payload(dw_data: usize, bytes: &[u8]) -> Option<String> 
         return None;
     }
 
-    String::from_utf16(&utf16[..utf16.len() - 1]).ok()
+    Some(JumpCommand {
+        ack_hwnd: ack_hwnd as HWND,
+        command_id,
+        folder_path: String::from_utf16(&utf16[..utf16.len() - 1]).ok()?,
+    })
 }
 
-fn navigate_dialog_to_folder(hwnd: HWND, folder_path: &str) -> bool {
+fn navigate_dialog_to_folder(hwnd: HWND, folder_path: &str) -> JumpAckStatus {
     let address_edit = unsafe { GetDlgItem(hwnd, ADDRESS_BAR_EDIT_CONTROL_ID) };
     if address_edit.is_null() {
-        return false;
+        return JumpAckStatus::UnsupportedDialog;
     }
 
     let wide_path = to_wide_null(folder_path);
     let set_text =
         unsafe { SendMessageW(address_edit, WM_SETTEXT, 0, wide_path.as_ptr() as LPARAM) };
     if set_text == 0 {
-        return false;
+        return JumpAckStatus::Failed;
     }
 
     unsafe {
@@ -117,7 +155,61 @@ fn navigate_dialog_to_folder(hwnd: HWND, folder_path: &str) -> bool {
         SendMessageW(address_edit, WM_KEYUP, VK_RETURN_KEY, 0);
     }
 
-    true
+    JumpAckStatus::Success
+}
+
+fn send_jump_ack(ack_hwnd: HWND, command_id: u64, status: JumpAckStatus) {
+    if ack_hwnd.is_null() || command_id == 0 {
+        return;
+    }
+
+    let mut payload = build_jump_ack_payload(command_id, status);
+    let Ok(cb_data) = u32::try_from(payload.len()) else {
+        return;
+    };
+
+    let mut copy_data = COPYDATASTRUCT {
+        dwData: JUMP_ACK_COPYDATA_MAGIC,
+        cbData: cb_data,
+        lpData: payload.as_mut_ptr().cast(),
+    };
+
+    unsafe {
+        SendMessageW(
+            ack_hwnd,
+            WM_COPYDATA,
+            0,
+            (&mut copy_data as *mut COPYDATASTRUCT) as LPARAM,
+        );
+    }
+}
+
+fn build_jump_ack_payload(command_id: u64, status: JumpAckStatus) -> Vec<u8> {
+    let usize_size = std::mem::size_of::<usize>();
+    let command_offset = align_up(usize_size, std::mem::align_of::<u64>());
+    let status_offset = command_offset + std::mem::size_of::<u64>();
+    let mut payload = Vec::with_capacity(std::mem::size_of::<JumpAckHeader>());
+    payload.extend_from_slice(&JUMP_ACK_COPYDATA_MAGIC.to_ne_bytes());
+    payload.resize(command_offset, 0);
+    payload.extend_from_slice(&command_id.to_ne_bytes());
+    payload.extend_from_slice(&jump_ack_status_code(status).to_ne_bytes());
+    payload.resize(status_offset + std::mem::size_of::<u32>(), 0);
+    payload.resize(std::mem::size_of::<JumpAckHeader>(), 0);
+
+    payload
+}
+
+fn jump_ack_status_code(status: JumpAckStatus) -> u32 {
+    match status {
+        JumpAckStatus::Success => JUMP_ACK_STATUS_SUCCESS,
+        JumpAckStatus::UnsupportedDialog => JUMP_ACK_STATUS_UNSUPPORTED_DIALOG,
+        JumpAckStatus::Failed => JUMP_ACK_STATUS_FAILED,
+    }
+}
+
+fn align_up(value: usize, alignment: usize) -> usize {
+    debug_assert!(alignment.is_power_of_two());
+    (value + alignment - 1) & !(alignment - 1)
 }
 
 fn to_wide_null(value: &str) -> Vec<u16> {
@@ -129,22 +221,29 @@ mod tests {
     use super::*;
 
     #[test]
-    fn decode_jump_payload_accepts_valid_magic_header_and_terminated_path() {
+    fn decode_jump_payload_accepts_valid_magic_header_ack_command_and_terminated_path() {
         let payload = payload_bytes(
             listary_open_hook_common::JUMP_COPYDATA_MAGIC,
+            0x1234,
+            0xABCD_EF01_2345_6789,
             "C:\\Temp".encode_utf16().chain(Some(0)).collect::<Vec<_>>(),
         );
 
-        assert_eq!(
-            Some("C:\\Temp".to_string()),
+        let command =
             decode_jump_copydata_payload(listary_open_hook_common::JUMP_COPYDATA_MAGIC, &payload)
-        );
+                .expect("valid jump payload should decode");
+
+        assert_eq!(0x1234, command.ack_hwnd as usize);
+        assert_eq!(0xABCD_EF01_2345_6789, command.command_id);
+        assert_eq!("C:\\Temp", command.folder_path);
     }
 
     #[test]
     fn decode_jump_payload_rejects_mismatched_dwdata_magic() {
         let payload = payload_bytes(
             listary_open_hook_common::JUMP_COPYDATA_MAGIC,
+            0x1234,
+            42,
             "C:\\Temp".encode_utf16().chain(Some(0)).collect::<Vec<_>>(),
         );
 
@@ -153,7 +252,12 @@ mod tests {
 
     #[test]
     fn decode_jump_payload_rejects_mismatched_header_magic() {
-        let payload = payload_bytes(0, "C:\\Temp".encode_utf16().chain(Some(0)).collect());
+        let payload = payload_bytes(
+            0,
+            0x1234,
+            42,
+            "C:\\Temp".encode_utf16().chain(Some(0)).collect(),
+        );
 
         assert_eq!(
             None,
@@ -165,6 +269,8 @@ mod tests {
     fn decode_jump_payload_rejects_missing_null_terminator() {
         let payload = payload_bytes(
             listary_open_hook_common::JUMP_COPYDATA_MAGIC,
+            0x1234,
+            42,
             "C:\\Temp".encode_utf16().collect(),
         );
 
@@ -174,9 +280,44 @@ mod tests {
         );
     }
 
-    fn payload_bytes(header_magic: usize, utf16_units: Vec<u16>) -> Vec<u8> {
+    #[test]
+    fn encode_jump_ack_payload_includes_magic_command_and_status() {
+        let payload =
+            build_jump_ack_payload(0xABCD_EF01_2345_6789, JumpAckStatus::UnsupportedDialog);
+        let usize_size = std::mem::size_of::<usize>();
+        let magic = usize::from_ne_bytes(payload[..usize_size].try_into().expect("ack magic"));
+        let command_offset = align_up(usize_size, std::mem::align_of::<u64>());
+        let command_id = u64::from_ne_bytes(
+            payload[command_offset..command_offset + std::mem::size_of::<u64>()]
+                .try_into()
+                .expect("ack command id"),
+        );
+        let status_offset = command_offset + std::mem::size_of::<u64>();
+        let status = u32::from_ne_bytes(
+            payload[status_offset..status_offset + std::mem::size_of::<u32>()]
+                .try_into()
+                .expect("ack status"),
+        );
+
+        assert_eq!(listary_open_hook_common::JUMP_ACK_COPYDATA_MAGIC, magic);
+        assert_eq!(0xABCD_EF01_2345_6789, command_id);
+        assert_eq!(
+            listary_open_hook_common::JUMP_ACK_STATUS_UNSUPPORTED_DIALOG,
+            status
+        );
+    }
+
+    fn payload_bytes(
+        header_magic: usize,
+        ack_hwnd: usize,
+        command_id: u64,
+        utf16_units: Vec<u16>,
+    ) -> Vec<u8> {
         let mut payload = Vec::new();
         payload.extend_from_slice(&header_magic.to_ne_bytes());
+        payload.extend_from_slice(&ack_hwnd.to_ne_bytes());
+        payload.resize(align_up(payload.len(), std::mem::align_of::<u64>()), 0);
+        payload.extend_from_slice(&command_id.to_ne_bytes());
         payload.extend_from_slice(&(utf16_units.len() as u32).to_ne_bytes());
         payload.resize(
             std::mem::size_of::<listary_open_hook_common::JumpCommandHeader>(),
