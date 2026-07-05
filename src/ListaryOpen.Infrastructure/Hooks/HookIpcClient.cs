@@ -12,7 +12,12 @@ public interface IHookIpcClient
     Task<HookJumpResult> JumpDialogToFolderAsync(string dialogId, string folderPath, CancellationToken cancellationToken);
 }
 
-public sealed class HookIpcClient : IHookIpcClient, IDisposable
+public interface IHookHealthProbeClient
+{
+    Task<HookJumpResult> ProbeHealthAsync(CancellationToken cancellationToken);
+}
+
+public sealed class HookIpcClient : IHookIpcClient, IHookHealthProbeClient, IDisposable
 {
     private static readonly UTF8Encoding PipeEncoding = new(encoderShouldEmitUTF8Identifier: false);
 
@@ -39,9 +44,19 @@ public sealed class HookIpcClient : IHookIpcClient, IDisposable
 
     public Task<HookDialogContext?> GetActiveDialogAsync(CancellationToken cancellationToken) => Task.FromResult(_activeDialog);
 
-    public async Task<HookJumpResult> JumpDialogToFolderAsync(string dialogId, string folderPath, CancellationToken cancellationToken)
+    public Task<HookJumpResult> ProbeHealthAsync(CancellationToken cancellationToken) =>
+        SendCommandAsync(HookIpcEnvelope.Command(new HookHealthProbe()), cancellationToken);
+
+    public Task<HookJumpResult> JumpDialogToFolderAsync(string dialogId, string folderPath, CancellationToken cancellationToken)
     {
         cancellationToken.ThrowIfCancellationRequested();
+        var envelope = HookIpcEnvelope.Command(new HookJumpCommand(dialogId, folderPath, TimeSpan.FromMilliseconds(750)));
+
+        return SendCommandAsync(envelope, cancellationToken);
+    }
+
+    private async Task<HookJumpResult> SendCommandAsync(HookIpcEnvelope envelope, CancellationToken cancellationToken)
+    {
         var connectionEstablished = false;
 
         using var timeoutCancellation = new CancellationTokenSource();
@@ -52,8 +67,7 @@ public sealed class HookIpcClient : IHookIpcClient, IDisposable
 
         try
         {
-            var request = HookIpcSerializer.Serialize(
-                HookIpcEnvelope.Command(new HookJumpCommand(dialogId, folderPath, TimeSpan.FromMilliseconds(750))));
+            var request = HookIpcSerializer.Serialize(envelope);
 
             cancellationToken.ThrowIfCancellationRequested();
 

@@ -65,6 +65,37 @@ public sealed class HookIpcClientTests
     }
 
     [Fact]
+    public async Task HealthProbeRoundTripsOverNamedPipe()
+    {
+        var pipeName = "listary-open-health-" + Guid.NewGuid();
+        using var serverCancellation = new CancellationTokenSource(TimeSpan.FromSeconds(5));
+        var serverTask = ServeOnceAsync(
+            pipeName,
+            HookIpcSerializer.Serialize(new HookIpcEnvelope(
+                HookIpcEnvelope.CurrentVersion,
+                "CommandReply",
+                new HookCommandReply("Success", "Hook host healthy."))),
+            serverCancellation.Token);
+        IHookHealthProbeClient client = new HookIpcClient(pipeName, TimeSpan.FromSeconds(2));
+
+        try
+        {
+            var result = await client.ProbeHealthAsync(CancellationToken.None);
+            var exchange = await serverTask.WaitAsync(TimeSpan.FromSeconds(1));
+
+            var request = HookIpcSerializer.Deserialize(exchange.Request);
+            Assert.Equal("HealthProbe", request.MessageType);
+            Assert.IsType<HookHealthProbe>(request.Payload);
+            Assert.Equal(HookJumpStatus.Success, result.Status);
+            Assert.Equal("Hook host healthy.", result.Message);
+        }
+        finally
+        {
+            await StopServerAsync(serverCancellation, serverTask);
+        }
+    }
+
+    [Fact]
     public async Task ConnectWaitsForServerCreatedWithinTimeout()
     {
         var pipeName = "listary-open-delayed-" + Guid.NewGuid();

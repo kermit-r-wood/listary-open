@@ -40,6 +40,17 @@ public sealed class ElevatedIndexerProjectTests
     }
 
     [Fact]
+    public void AppBuildOutputDirectoryUsesCurrentTestRunOutput()
+    {
+        Assert.True(
+            string.Equals(
+                Path.GetFullPath(AppContext.BaseDirectory).TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar),
+                Path.GetFullPath(FindAppBuildOutputDirectory()).TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar),
+                StringComparison.OrdinalIgnoreCase),
+            "Elevated indexer output tests must inspect the current test run output directory.");
+    }
+
+    [Fact]
     public void AppBuildOutputElevatedIndexerStartsFromCopiedBundle()
     {
         var helperPath = Path.Combine(FindAppBuildOutputDirectory(), "ListaryOpen.Indexer.Elevated.exe");
@@ -102,12 +113,33 @@ public sealed class ElevatedIndexerProjectTests
         var target = document.Descendants("Target").Single(element => (string?)element.Attribute("Name") == "BuildNativeHooks");
         var targetXml = target.ToString(SaveOptions.DisableFormatting);
 
+        Assert.DoesNotContain(@"C:\Users\paulx", projectXml, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains("$(SCOOP)", projectXml, StringComparison.Ordinal);
+        Assert.Contains(@"$(USERPROFILE)\scoop", projectXml, StringComparison.Ordinal);
+        Assert.Contains(@"mingw-mstorsjo-llvm-msvcrt\current", projectXml, StringComparison.Ordinal);
+        Assert.Contains(
+            document.Descendants("NativeHooksRoot"),
+            element => ((string?)element.Attribute("Condition"))?.Contains("'$(NativeHooksRoot)' == ''", StringComparison.Ordinal) == true);
+        Assert.Contains(
+            document.Descendants("NativeHooksX64Target"),
+            element => ((string?)element.Attribute("Condition"))?.Contains("'$(NativeHooksX64Target)' == ''", StringComparison.Ordinal) == true);
+        Assert.Contains(
+            document.Descendants("NativeHooksX86Target"),
+            element => ((string?)element.Attribute("Condition"))?.Contains("'$(NativeHooksX86Target)' == ''", StringComparison.Ordinal) == true);
+        Assert.Contains(
+            document.Descendants("NativeHooksX64RuntimeDll"),
+            element => ((string?)element.Attribute("Condition"))?.Contains("'$(NativeHooksX64RuntimeDll)' == ''", StringComparison.Ordinal) == true);
+        Assert.Contains(
+            document.Descendants("NativeHooksX86RuntimeDll"),
+            element => ((string?)element.Attribute("Condition"))?.Contains("'$(NativeHooksX86RuntimeDll)' == ''", StringComparison.Ordinal) == true);
         Assert.Contains("<BuildNativeHooks", projectXml, StringComparison.Ordinal);
-        Assert.Contains("x86_64-pc-windows-gnullvm", targetXml, StringComparison.Ordinal);
-        Assert.Contains("i686-pc-windows-gnullvm", targetXml, StringComparison.Ordinal);
+        Assert.Contains("x86_64-pc-windows-gnullvm", projectXml, StringComparison.Ordinal);
+        Assert.Contains("i686-pc-windows-gnullvm", projectXml, StringComparison.Ordinal);
         Assert.Contains("cargo build --locked", targetXml, StringComparison.Ordinal);
         Assert.Contains("-p listary_open_hook_host", targetXml, StringComparison.Ordinal);
         Assert.Contains("-p listary_open_hook", targetXml, StringComparison.Ordinal);
+        Assert.Contains("--target $(NativeHooksX64Target)", targetXml, StringComparison.Ordinal);
+        Assert.Contains("--target $(NativeHooksX86Target)", targetXml, StringComparison.Ordinal);
         Assert.Contains(@"hooks\x64\ListaryOpen.HookHost.exe", targetXml, StringComparison.Ordinal);
         Assert.Contains(@"hooks\x64\ListaryOpen.Hook.dll", targetXml, StringComparison.Ordinal);
         Assert.Contains(@"hooks\x86\ListaryOpen.HookHost.exe", targetXml, StringComparison.Ordinal);
@@ -134,34 +166,6 @@ public sealed class ElevatedIndexerProjectTests
 
     private static string FindAppBuildOutputDirectory()
     {
-        var repositoryRoot = FindRepositoryRoot();
-        var outputDirectory = new DirectoryInfo(Path.TrimEndingDirectorySeparator(AppContext.BaseDirectory));
-        var targetFramework = outputDirectory.Name;
-        string? runtimeIdentifier = null;
-        var configurationDirectory = outputDirectory.Parent;
-
-        if (!targetFramework.StartsWith("net", StringComparison.OrdinalIgnoreCase))
-        {
-            runtimeIdentifier = targetFramework;
-            outputDirectory = configurationDirectory ?? throw new DirectoryNotFoundException("Could not find target framework output directory.");
-            targetFramework = outputDirectory.Name;
-            configurationDirectory = outputDirectory.Parent;
-        }
-
-        var configuration = configurationDirectory?.Name;
-        if (string.IsNullOrWhiteSpace(configuration))
-        {
-            throw new DirectoryNotFoundException("Could not infer build configuration from test output directory.");
-        }
-
-        var path = Path.Combine(
-            repositoryRoot,
-            "src",
-            "ListaryOpen.App",
-            "bin",
-            configuration,
-            targetFramework);
-
-        return runtimeIdentifier is null ? path : Path.Combine(path, runtimeIdentifier);
+        return AppContext.BaseDirectory;
     }
 }

@@ -11,6 +11,7 @@ public sealed class HookQuickSwitchBridge : IHookQuickSwitchBridge
     private readonly IReadOnlyDictionary<HookArchitecture, IHookIpcClient> _clients;
     private readonly HookHostPaths? _hostPaths;
     private readonly HookHostProcessFactory _processFactory;
+    private readonly SemaphoreSlim _enableGate = new(1, 1);
     private readonly object _hostProcessGate = new();
     private readonly Dictionary<HookArchitecture, Process> _hostProcesses = new();
 
@@ -47,20 +48,27 @@ public sealed class HookQuickSwitchBridge : IHookQuickSwitchBridge
 
     public event EventHandler<HookQuickSwitchStatus>? StatusChanged;
 
-    public Task EnableAsync(CancellationToken cancellationToken)
+    public async Task EnableAsync(CancellationToken cancellationToken)
     {
         cancellationToken.ThrowIfCancellationRequested();
 
-        if (_hostPaths is not null)
+        await _enableGate.WaitAsync(cancellationToken).ConfigureAwait(false);
+        try
         {
-            Status = new HookQuickSwitchStatus(
-                true,
-                EnableArchitecture(HookArchitecture.X64, cancellationToken),
-                EnableArchitecture(HookArchitecture.X86, cancellationToken));
-        }
+            if (_hostPaths is not null)
+            {
+                Status = new HookQuickSwitchStatus(
+                    true,
+                    await EnableArchitectureAsync(HookArchitecture.X64, cancellationToken).ConfigureAwait(false),
+                    await EnableArchitectureAsync(HookArchitecture.X86, cancellationToken).ConfigureAwait(false));
+            }
 
-        StatusChanged?.Invoke(this, Status);
-        return Task.CompletedTask;
+            StatusChanged?.Invoke(this, Status);
+        }
+        finally
+        {
+            _enableGate.Release();
+        }
     }
 
     public async Task<HookDialogContext?> GetActiveDialogAsync(CancellationToken cancellationToken)
@@ -117,9 +125,11 @@ public sealed class HookQuickSwitchBridge : IHookQuickSwitchBridge
         {
             TerminateAndDispose(process);
         }
+
+        _enableGate.Dispose();
     }
 
-    private HookArchitectureStatus EnableArchitecture(
+    private async Task<HookArchitectureStatus> EnableArchitectureAsync(
         HookArchitecture architecture,
         CancellationToken cancellationToken)
     {
@@ -137,6 +147,16 @@ public sealed class HookQuickSwitchBridge : IHookQuickSwitchBridge
                 true,
                 snapshot.HookDllExists,
                 $"{architectureName} hook host is already running.");
+        }
+
+        var healthyStatus = await TryCreateHealthyExistingHostStatusAsync(
+                architecture,
+                snapshot,
+                cancellationToken)
+            .ConfigureAwait(false);
+        if (healthyStatus is not null)
+        {
+            return healthyStatus;
         }
 
         if (!snapshot.HostExists || !snapshot.HookDllExists)
@@ -182,6 +202,45 @@ public sealed class HookQuickSwitchBridge : IHookQuickSwitchBridge
                 false,
                 true,
                 $"{architectureName} hook host failed to start: {exception.Message}");
+        }
+    }
+
+    private async Task<HookArchitectureStatus?> TryCreateHealthyExistingHostStatusAsync(
+        HookArchitecture architecture,
+        HookArchitecturePathSnapshot snapshot,
+        CancellationToken cancellationToken)
+    {
+        if (!_clients.TryGetValue(architecture, out var client)
+            || client is not IHookHealthProbeClient healthProbeClient)
+        {
+            return null;
+        }
+
+        try
+        {
+            var result = await healthProbeClient.ProbeHealthAsync(cancellationToken).ConfigureAwait(false);
+            if (result.Status != HookJumpStatus.Success)
+            {
+                return null;
+            }
+
+            var architectureName = architecture.ToFolderName();
+            return new HookArchitectureStatus(
+                architecture,
+                true,
+                true,
+                snapshot.HookDllExists,
+                string.IsNullOrWhiteSpace(result.Message)
+                    ? $"{architectureName} hook host is healthy."
+                    : $"{architectureName} hook host is healthy: {result.Message}");
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            throw;
+        }
+        catch (Exception)
+        {
+            return null;
         }
     }
 

@@ -37,6 +37,58 @@ public sealed class HookQuickSwitchBridgeTests
     }
 
     [Fact]
+    public async Task EnableUsesHealthyExistingHostWithoutStartingDuplicateProcess()
+    {
+        using var hookFiles = HookFileFixture.Create();
+        hookFiles.CreateHostAndDll(HookArchitecture.X64);
+        hookFiles.CreateHostAndDll(HookArchitecture.X86);
+        var processFactory = new RecordingHookHostProcessFactory(startResult: new Process());
+        var bridge = new HookQuickSwitchBridge(
+            HookQuickSwitchStatus.Disabled(),
+            new Dictionary<HookArchitecture, IHookIpcClient>
+            {
+                [HookArchitecture.X64] = new HealthProbeHookClient(HookJumpResult.Success("Hook host healthy.")),
+                [HookArchitecture.X86] = new HealthProbeHookClient(new HookJumpResult(HookJumpStatus.HostUnavailable, "No host."))
+            },
+            hookFiles.Paths,
+            processFactory);
+
+        await bridge.EnableAsync(CancellationToken.None);
+
+        Assert.True(bridge.Status.X64.HostRunning);
+        Assert.Contains("healthy", bridge.Status.X64.Message, StringComparison.OrdinalIgnoreCase);
+        var start = Assert.Single(processFactory.Starts);
+        Assert.Equal("listary-open-hook-x86", start.StartInfo.ArgumentList[1]);
+    }
+
+    [Fact]
+    public async Task ConcurrentEnableStartsAtMostOneHostPerArchitecture()
+    {
+        using var hookFiles = HookFileFixture.Create();
+        hookFiles.CreateHostAndDll(HookArchitecture.X64);
+        hookFiles.CreateHostAndDll(HookArchitecture.X86);
+        var processFactory = new BlockingHookHostProcessFactory();
+        var bridge = new HookQuickSwitchBridge(
+            HookQuickSwitchStatus.Disabled(),
+            CreateEmptyClients(),
+            hookFiles.Paths,
+            processFactory);
+
+        var firstEnable = Task.Run(() => bridge.EnableAsync(CancellationToken.None));
+        await processFactory.FirstStartEntered.Task.WaitAsync(TimeSpan.FromSeconds(2));
+        var secondEnable = Task.Run(() => bridge.EnableAsync(CancellationToken.None));
+        await Task.Delay(100);
+
+        processFactory.Release();
+        await Task.WhenAll(firstEnable, secondEnable).WaitAsync(TimeSpan.FromSeconds(2));
+
+        Assert.Equal(2, processFactory.Starts.Count);
+        Assert.Equal(
+            new[] { "listary-open-hook-x64", "listary-open-hook-x86" },
+            processFactory.Starts.Select(start => start.StartInfo.ArgumentList[1]));
+    }
+
+    [Fact]
     public async Task EnableReportsMissingHostAndDllPerArchitecture()
     {
         using var hookFiles = HookFileFixture.Create();
@@ -252,6 +304,25 @@ public sealed class HookQuickSwitchBridgeTests
         }
     }
 
+    private sealed class HealthProbeHookClient : IHookIpcClient, IHookHealthProbeClient
+    {
+        private readonly HookJumpResult _healthResult;
+
+        public HealthProbeHookClient(HookJumpResult healthResult)
+        {
+            _healthResult = healthResult;
+        }
+
+        public Task<HookDialogContext?> GetActiveDialogAsync(CancellationToken cancellationToken) =>
+            Task.FromResult<HookDialogContext?>(null);
+
+        public Task<HookJumpResult> JumpDialogToFolderAsync(string dialogId, string folderPath, CancellationToken cancellationToken) =>
+            Task.FromResult(new HookJumpResult(HookJumpStatus.NoActiveDialog, "No dialog."));
+
+        public Task<HookJumpResult> ProbeHealthAsync(CancellationToken cancellationToken) =>
+            Task.FromResult(_healthResult);
+    }
+
     private static IReadOnlyDictionary<HookArchitecture, IHookIpcClient> CreateEmptyClients() =>
         new Dictionary<HookArchitecture, IHookIpcClient>();
 
@@ -302,6 +373,33 @@ public sealed class HookQuickSwitchBridgeTests
     }
 
     private sealed record RecordedStart(ProcessStartInfo StartInfo);
+
+    private sealed class BlockingHookHostProcessFactory : HookHostProcessFactory
+    {
+        private readonly TaskCompletionSource _release = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        private readonly object _gate = new();
+
+        public TaskCompletionSource FirstStartEntered { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        public List<RecordedStart> Starts { get; } = new();
+
+        public override Process? Start(ProcessStartInfo startInfo)
+        {
+            lock (_gate)
+            {
+                Starts.Add(new RecordedStart(startInfo));
+                if (Starts.Count == 1)
+                {
+                    FirstStartEntered.TrySetResult();
+                }
+            }
+
+            _release.Task.GetAwaiter().GetResult();
+            return new Process();
+        }
+
+        public void Release() => _release.TrySetResult();
+    }
 
     private sealed class HookFileFixture : IDisposable
     {
