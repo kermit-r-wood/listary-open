@@ -23,8 +23,8 @@ pub unsafe extern "system" fn ListaryOpenHookProc(
         let cwp = l_param as *const CWPSTRUCT;
         if !cwp.is_null() {
             let cwp = unsafe { &*cwp };
-            if is_supported_dialog(cwp.hwnd) && cwp.message == WM_COPYDATA {
-                handle_dialog_message(cwp.hwnd, cwp.message, cwp.wParam, cwp.lParam);
+            if cwp.message == WM_COPYDATA {
+                handle_dialog_message(cwp.hwnd, cwp.message, cwp.lParam);
             }
         }
     }
@@ -33,11 +33,30 @@ pub unsafe extern "system" fn ListaryOpenHookProc(
 }
 
 fn is_supported_dialog(hwnd: HWND) -> bool {
-    let Some(class_name) = class_name(hwnd) else {
+    is_supported_dialog_from_probe(
+        class_name(hwnd),
+        || window_text(hwnd),
+        || has_address_control(hwnd),
+    )
+}
+
+fn is_supported_dialog_from_probe<T, A>(
+    class_name: Option<String>,
+    title: T,
+    has_address_control: A,
+) -> bool
+where
+    T: FnOnce() -> String,
+    A: FnOnce() -> bool,
+{
+    let Some(class_name) = class_name else {
         return false;
     };
+    if class_name != DIALOG_CLASS {
+        return false;
+    }
 
-    is_supported_dialog_shape(&class_name, &window_text(hwnd), has_address_control(hwnd))
+    is_supported_dialog_shape(&class_name, &title(), has_address_control())
 }
 
 fn is_supported_dialog_shape(class_name: &str, title: &str, has_address_control: bool) -> bool {
@@ -85,25 +104,58 @@ fn window_text(hwnd: HWND) -> String {
     String::from_utf16_lossy(&buffer[..copied as usize])
 }
 
-fn handle_dialog_message(hwnd: HWND, message: u32, _w_param: WPARAM, l_param: LPARAM) {
-    if message != WM_COPYDATA || l_param == 0 {
+fn handle_dialog_message(hwnd: HWND, message: u32, l_param: LPARAM) {
+    let Some((command, status)) = dispatch_hook_copydata_message(
+        message,
+        || decode_jump_copydata_message(l_param),
+        || is_supported_dialog(hwnd),
+        |command| navigate_dialog_to_folder(hwnd, &command.folder_path),
+    ) else {
         return;
-    }
+    };
 
+    send_jump_ack(command.ack_hwnd, command.command_id, status);
+}
+
+fn decode_jump_copydata_message(l_param: LPARAM) -> Option<JumpCommand> {
+    if l_param == 0 {
+        return None;
+    }
     let copy_data = unsafe { &*(l_param as *const COPYDATASTRUCT) };
     if copy_data.lpData.is_null() || copy_data.cbData == 0 {
-        return;
+        return None;
     }
 
     let bytes = unsafe {
         std::slice::from_raw_parts(copy_data.lpData.cast::<u8>(), copy_data.cbData as usize)
     };
-    let Some(command) = decode_jump_copydata_payload(copy_data.dwData, bytes) else {
-        return;
+
+    decode_jump_copydata_payload(copy_data.dwData, bytes)
+}
+
+fn dispatch_hook_copydata_message<D, S, N>(
+    message: u32,
+    decode_command: D,
+    is_supported_dialog: S,
+    navigate_dialog: N,
+) -> Option<(JumpCommand, JumpAckStatus)>
+where
+    D: FnOnce() -> Option<JumpCommand>,
+    S: FnOnce() -> bool,
+    N: FnOnce(&JumpCommand) -> JumpAckStatus,
+{
+    if message != WM_COPYDATA {
+        return None;
+    }
+
+    let command = decode_command()?;
+    let status = if is_supported_dialog() {
+        navigate_dialog(&command)
+    } else {
+        JumpAckStatus::UnsupportedDialog
     };
 
-    let status = navigate_dialog_to_folder(hwnd, &command.folder_path);
-    send_jump_ack(command.ack_hwnd, command.command_id, status);
+    Some((command, status))
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -345,6 +397,64 @@ mod tests {
     }
 
     #[test]
+    fn hook_copydata_dispatch_skips_non_copydata_without_decoding_or_shape_probe() {
+        let mut decoded = false;
+        let mut shape_probed = false;
+        let mut navigated = false;
+
+        let result = dispatch_hook_copydata_message(
+            WM_KEYDOWN,
+            || {
+                decoded = true;
+                Some(test_jump_command())
+            },
+            || {
+                shape_probed = true;
+                true
+            },
+            |_| {
+                navigated = true;
+                JumpAckStatus::Success
+            },
+        );
+
+        assert_eq!(None, result);
+        assert!(!decoded);
+        assert!(!shape_probed);
+        assert!(!navigated);
+    }
+
+    #[test]
+    fn hook_copydata_dispatch_returns_unsupported_for_decoded_command_with_unsupported_shape() {
+        let command = test_jump_command();
+        let mut navigated = false;
+
+        let result = dispatch_hook_copydata_message(
+            WM_COPYDATA,
+            || Some(command.clone()),
+            || false,
+            |_| {
+                navigated = true;
+                JumpAckStatus::Success
+            },
+        );
+
+        assert_eq!(Some((command, JumpAckStatus::UnsupportedDialog)), result);
+        assert!(!navigated);
+    }
+
+    #[test]
+    fn supported_dialog_probe_returns_before_title_or_address_for_non_dialog_class() {
+        let result = is_supported_dialog_from_probe(
+            Some("MozillaWindowClass".to_string()),
+            || panic!("title should not be read for non-dialog class"),
+            || panic!("address control should not be read for non-dialog class"),
+        );
+
+        assert!(!result);
+    }
+
+    #[test]
     fn encode_jump_ack_payload_includes_magic_command_and_status() {
         let payload =
             build_jump_ack_payload(0xABCD_EF01_2345_6789, JumpAckStatus::UnsupportedDialog);
@@ -392,5 +502,13 @@ mod tests {
         }
 
         payload
+    }
+
+    fn test_jump_command() -> JumpCommand {
+        JumpCommand {
+            ack_hwnd: 0x1234usize as HWND,
+            command_id: 42,
+            folder_path: "C:\\Users\\paulx".to_string(),
+        }
     }
 }
