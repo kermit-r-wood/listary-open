@@ -7,6 +7,7 @@ using System.Windows.Media;
 using ListaryOpen.App.ViewModels;
 using ListaryOpen.Core.Indexing;
 using ListaryOpen.Core.Search;
+using ListaryOpen.Infrastructure.Dialog;
 using ListaryOpen.Infrastructure.Windows;
 
 namespace ListaryOpen.App;
@@ -47,6 +48,11 @@ public partial class SearchPanel : Window
     {
         _ = ViewModel.ActivateQuickSwitchFolderSearchAsync(candidates);
         ShowAndFocusQuery();
+    }
+
+    public void ReportDialogJumpResult(DialogJumpResult result)
+    {
+        ViewModel.ReportDialogJumpResult(result);
     }
 
     private SearchPanelViewModel ViewModel => (SearchPanelViewModel)DataContext;

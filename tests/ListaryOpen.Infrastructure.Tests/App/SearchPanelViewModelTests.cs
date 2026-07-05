@@ -147,6 +147,17 @@ public sealed class SearchPanelViewModelTests
         Assert.Equal("Dialog folder changed.", viewModel.StatusText);
     }
 
+    [Fact]
+    public void ReportDialogJumpResultSurfacesFallbackSuccessMessage()
+    {
+        var viewModel = new SearchPanelViewModel(new RecordingSearchIndex(Array.Empty<SearchResult>()));
+        var message = "Dialog folder changed via fallback automation after hook Failed: Hook could not jump.";
+
+        viewModel.ReportDialogJumpResult(new DialogJumpResult(DialogJumpStatus.Success, message));
+
+        Assert.Equal(message, viewModel.StatusText);
+    }
+
     [Theory]
     [InlineData(DialogJumpStatus.PermissionLimited, "Permission denied.")]
     [InlineData(DialogJumpStatus.UnsupportedDialog, "No standard file dialog is active.")]

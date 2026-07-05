@@ -578,6 +578,7 @@ public partial class App : Application
         if (await TryJumpToFirstQuickSwitchFolderAsync(
                 candidates,
                 JumpDialogToFolderAsync,
+                result => _searchPanel?.ReportDialogJumpResult(result),
                 CancellationToken.None))
         {
             return;
@@ -635,8 +636,23 @@ public partial class App : Application
         Func<string, CancellationToken, Task<DialogJumpResult>> dialogFolderActivation,
         CancellationToken cancellationToken)
     {
+        return await TryJumpToFirstQuickSwitchFolderAsync(
+                candidates,
+                dialogFolderActivation,
+                _ => { },
+                cancellationToken)
+            .ConfigureAwait(false);
+    }
+
+    internal static async Task<bool> TryJumpToFirstQuickSwitchFolderAsync(
+        IReadOnlyList<QuickSwitchFolderCandidate> candidates,
+        Func<string, CancellationToken, Task<DialogJumpResult>> dialogFolderActivation,
+        Action<DialogJumpResult> reportDialogJumpResult,
+        CancellationToken cancellationToken)
+    {
         ArgumentNullException.ThrowIfNull(candidates);
         ArgumentNullException.ThrowIfNull(dialogFolderActivation);
+        ArgumentNullException.ThrowIfNull(reportDialogJumpResult);
 
         var folderPath = candidates.FirstOrDefault()?.FolderPath;
         if (string.IsNullOrWhiteSpace(folderPath) || !Directory.Exists(folderPath))
@@ -647,6 +663,7 @@ public partial class App : Application
         try
         {
             var result = await dialogFolderActivation(folderPath, cancellationToken);
+            reportDialogJumpResult(result);
             return result.Status == DialogJumpStatus.Success;
         }
         catch (Exception exception) when (exception is not OperationCanceledException)

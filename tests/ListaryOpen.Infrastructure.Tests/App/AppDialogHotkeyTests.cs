@@ -134,6 +134,32 @@ public sealed class AppDialogHotkeyTests
     }
 
     [Fact]
+    public async Task TryJumpToFirstQuickSwitchFolderAsyncReportsSuccessfulDialogJumpResult()
+    {
+        var folder = Directory.CreateTempSubdirectory("listary-open-reported-jump-");
+        var reportedResults = new List<DialogJumpResult>();
+        var fallbackMessage = "Dialog folder changed via fallback automation after hook Failed: Hook could not jump.";
+
+        try
+        {
+            var result = await ListaryOpen.App.App.TryJumpToFirstQuickSwitchFolderAsync(
+                new[] { new QuickSwitchFolderCandidate(folder.FullName, "Explorer", IntPtr.Zero, true) },
+                (_, _) => Task.FromResult(new DialogJumpResult(DialogJumpStatus.Success, fallbackMessage)),
+                reportedResults.Add,
+                CancellationToken.None);
+
+            Assert.True(result);
+            var reported = Assert.Single(reportedResults);
+            Assert.Equal(DialogJumpStatus.Success, reported.Status);
+            Assert.Equal(fallbackMessage, reported.Message);
+        }
+        finally
+        {
+            folder.Delete(recursive: true);
+        }
+    }
+
+    [Fact]
     public async Task TryJumpToFirstQuickSwitchFolderAsyncFallsBackWhenNoCandidateExists()
     {
         var jumped = false;
@@ -155,15 +181,20 @@ public sealed class AppDialogHotkeyTests
     public async Task TryJumpToFirstQuickSwitchFolderAsyncFallsBackWhenDialogJumpFails()
     {
         var folder = Directory.CreateTempSubdirectory("listary-open-failed-jump-");
+        var reportedResults = new List<DialogJumpResult>();
 
         try
         {
             var result = await ListaryOpen.App.App.TryJumpToFirstQuickSwitchFolderAsync(
                 new[] { new QuickSwitchFolderCandidate(folder.FullName, "Explorer", IntPtr.Zero, false) },
                 (_, _) => Task.FromResult(new DialogJumpResult(DialogJumpStatus.UnsupportedDialog, "No standard dialog.")),
+                reportedResults.Add,
                 CancellationToken.None);
 
             Assert.False(result);
+            var reported = Assert.Single(reportedResults);
+            Assert.Equal(DialogJumpStatus.UnsupportedDialog, reported.Status);
+            Assert.Equal("No standard dialog.", reported.Message);
         }
         finally
         {

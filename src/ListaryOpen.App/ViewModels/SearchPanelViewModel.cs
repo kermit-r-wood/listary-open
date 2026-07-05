@@ -241,6 +241,13 @@ public sealed class SearchPanelViewModel : INotifyPropertyChanged
         StatusText = $"Unexpected interaction error: {exception.Message}";
     }
 
+    internal void ReportDialogJumpResult(DialogJumpResult result)
+    {
+        StatusText = result.Status == DialogJumpStatus.Success
+            ? (string.IsNullOrWhiteSpace(result.Message) ? "Dialog folder changed." : result.Message)
+            : FormatDialogJumpFailure(result);
+    }
+
     private async Task RefreshAsync()
     {
         var version = Interlocked.Increment(ref _refreshVersion);
@@ -479,9 +486,7 @@ public sealed class SearchPanelViewModel : INotifyPropertyChanged
         try
         {
             var result = await _dialogFolderActivation(folderPath, CancellationToken.None);
-            StatusText = result.Status == DialogJumpStatus.Success
-                ? (string.IsNullOrWhiteSpace(result.Message) ? "Dialog folder changed." : result.Message)
-                : FormatDialogJumpFailure(result);
+            ReportDialogJumpResult(result);
         }
         catch (Exception exception)
         {
