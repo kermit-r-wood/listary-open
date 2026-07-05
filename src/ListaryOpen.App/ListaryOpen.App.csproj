@@ -21,6 +21,71 @@
     <Nullable>enable</Nullable>
     <ImplicitUsings>enable</ImplicitUsings>
     <UseWPF>true</UseWPF>
+    <BuildNativeHooks Condition="'$(BuildNativeHooks)' == ''">false</BuildNativeHooks>
+    <NativeHooksRoot>$(MSBuildProjectDirectory)\..\..\native\ListaryOpen.Hooks</NativeHooksRoot>
+    <NativeHooksX64Target>x86_64-pc-windows-gnullvm</NativeHooksX64Target>
+    <NativeHooksX86Target>i686-pc-windows-gnullvm</NativeHooksX86Target>
+    <NativeHooksX64RuntimeDll>C:\Users\paulx\scoop\apps\mingw-mstorsjo-llvm-msvcrt\22.1.8-20260616\x86_64-w64-mingw32\bin\libunwind.dll</NativeHooksX64RuntimeDll>
+    <NativeHooksX86RuntimeDll>C:\Users\paulx\scoop\apps\mingw-mstorsjo-llvm-msvcrt\22.1.8-20260616\i686-w64-mingw32\bin\libunwind.dll</NativeHooksX86RuntimeDll>
   </PropertyGroup>
+
+  <Target Name="BuildNativeHooks" AfterTargets="Build" Condition="'$(BuildNativeHooks)' == 'true'">
+    <PropertyGroup>
+      <NativeHooksX64Target Condition="'$(NativeHooksX64Target)' == ''">x86_64-pc-windows-gnullvm</NativeHooksX64Target>
+      <NativeHooksX86Target Condition="'$(NativeHooksX86Target)' == ''">i686-pc-windows-gnullvm</NativeHooksX86Target>
+      <NativeHooksX64RuntimeDll Condition="'$(NativeHooksX64RuntimeDll)' == ''">C:\Users\paulx\scoop\apps\mingw-mstorsjo-llvm-msvcrt\22.1.8-20260616\x86_64-w64-mingw32\bin\libunwind.dll</NativeHooksX64RuntimeDll>
+      <NativeHooksX86RuntimeDll Condition="'$(NativeHooksX86RuntimeDll)' == ''">C:\Users\paulx\scoop\apps\mingw-mstorsjo-llvm-msvcrt\22.1.8-20260616\i686-w64-mingw32\bin\libunwind.dll</NativeHooksX86RuntimeDll>
+      <NativeHooksX64OutputDir>$(OutDir)hooks\x64\</NativeHooksX64OutputDir>
+      <NativeHooksX86OutputDir>$(OutDir)hooks\x86\</NativeHooksX86OutputDir>
+      <NativeHooksX64HostSource>$(NativeHooksRoot)\target\$(NativeHooksX64Target)\debug\listary_open_hook_host.exe</NativeHooksX64HostSource>
+      <NativeHooksX64DllSource>$(NativeHooksRoot)\target\$(NativeHooksX64Target)\debug\listary_open_hook.dll</NativeHooksX64DllSource>
+      <NativeHooksX86HostSource>$(NativeHooksRoot)\target\$(NativeHooksX86Target)\debug\listary_open_hook_host.exe</NativeHooksX86HostSource>
+      <NativeHooksX86DllSource>$(NativeHooksRoot)\target\$(NativeHooksX86Target)\debug\listary_open_hook.dll</NativeHooksX86DllSource>
+      <NativeHooksX64HostDestination>$(OutDir)hooks\x64\ListaryOpen.HookHost.exe</NativeHooksX64HostDestination>
+      <NativeHooksX64DllDestination>$(OutDir)hooks\x64\ListaryOpen.Hook.dll</NativeHooksX64DllDestination>
+      <NativeHooksX64RuntimeDestination>$(OutDir)hooks\x64\libunwind.dll</NativeHooksX64RuntimeDestination>
+      <NativeHooksX86HostDestination>$(OutDir)hooks\x86\ListaryOpen.HookHost.exe</NativeHooksX86HostDestination>
+      <NativeHooksX86DllDestination>$(OutDir)hooks\x86\ListaryOpen.Hook.dll</NativeHooksX86DllDestination>
+      <NativeHooksX86RuntimeDestination>$(OutDir)hooks\x86\libunwind.dll</NativeHooksX86RuntimeDestination>
+    </PropertyGroup>
+
+    <Exec WorkingDirectory="$(NativeHooksRoot)"
+          Command="cargo build --locked -p listary_open_hook_host -p listary_open_hook --target $(NativeHooksX64Target)" />
+    <Exec WorkingDirectory="$(NativeHooksRoot)"
+          Command="cargo build --locked -p listary_open_hook_host -p listary_open_hook --target $(NativeHooksX86Target)" />
+
+    <Error Condition="!Exists('$(NativeHooksX64HostSource)')"
+           Text="Expected native x64 hook host output was not found: $(NativeHooksX64HostSource)" />
+    <Error Condition="!Exists('$(NativeHooksX64DllSource)')"
+           Text="Expected native x64 hook DLL output was not found: $(NativeHooksX64DllSource)" />
+    <Error Condition="!Exists('$(NativeHooksX64RuntimeDll)')"
+           Text="Expected native x64 libunwind.dll was not found: $(NativeHooksX64RuntimeDll)" />
+    <Error Condition="!Exists('$(NativeHooksX86HostSource)')"
+           Text="Expected native x86 hook host output was not found: $(NativeHooksX86HostSource)" />
+    <Error Condition="!Exists('$(NativeHooksX86DllSource)')"
+           Text="Expected native x86 hook DLL output was not found: $(NativeHooksX86DllSource)" />
+    <Error Condition="!Exists('$(NativeHooksX86RuntimeDll)')"
+           Text="Expected native x86 libunwind.dll was not found: $(NativeHooksX86RuntimeDll)" />
+
+    <MakeDir Directories="$(NativeHooksX64OutputDir);$(NativeHooksX86OutputDir)" />
+    <Copy SourceFiles="$(NativeHooksX64HostSource)"
+          DestinationFiles="$(NativeHooksX64HostDestination)"
+          SkipUnchangedFiles="true" />
+    <Copy SourceFiles="$(NativeHooksX64DllSource)"
+          DestinationFiles="$(NativeHooksX64DllDestination)"
+          SkipUnchangedFiles="true" />
+    <Copy SourceFiles="$(NativeHooksX64RuntimeDll)"
+          DestinationFiles="$(NativeHooksX64RuntimeDestination)"
+          SkipUnchangedFiles="true" />
+    <Copy SourceFiles="$(NativeHooksX86HostSource)"
+          DestinationFiles="$(NativeHooksX86HostDestination)"
+          SkipUnchangedFiles="true" />
+    <Copy SourceFiles="$(NativeHooksX86DllSource)"
+          DestinationFiles="$(NativeHooksX86DllDestination)"
+          SkipUnchangedFiles="true" />
+    <Copy SourceFiles="$(NativeHooksX86RuntimeDll)"
+          DestinationFiles="$(NativeHooksX86RuntimeDestination)"
+          SkipUnchangedFiles="true" />
+  </Target>
 
 </Project>
