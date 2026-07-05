@@ -8,8 +8,17 @@ public sealed class HookQuickSwitchBridge : IHookQuickSwitchBridge
         HookQuickSwitchStatus initialStatus,
         IReadOnlyDictionary<HookArchitecture, IHookIpcClient> clients)
     {
+        ArgumentNullException.ThrowIfNull(clients);
+        foreach (var client in clients)
+        {
+            if (client.Value is null)
+            {
+                throw new ArgumentException("Hook IPC clients cannot contain null values.", nameof(clients));
+            }
+        }
+
         Status = initialStatus;
-        _clients = clients;
+        _clients = clients.ToDictionary(client => client.Key, client => client.Value);
     }
 
     public HookQuickSwitchStatus Status { get; private set; }

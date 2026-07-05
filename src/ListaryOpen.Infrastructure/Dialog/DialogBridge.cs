@@ -24,20 +24,31 @@ public sealed class DialogBridge
 
         if (_hookBridge is not null && Directory.Exists(folderPath))
         {
-            var hookResult = await _hookBridge.JumpActiveDialogToFolderAsync(folderPath, cancellationToken).ConfigureAwait(false);
-            if (hookResult.Status == HookJumpStatus.Success)
+            try
             {
-                return new DialogJumpResult(DialogJumpStatus.Success, hookResult.Message);
-            }
+                var hookResult = await _hookBridge.JumpActiveDialogToFolderAsync(folderPath, cancellationToken).ConfigureAwait(false);
+                if (hookResult.Status == HookJumpStatus.Success)
+                {
+                    return new DialogJumpResult(DialogJumpStatus.Success, hookResult.Message);
+                }
 
-            if (hookResult.Status is HookJumpStatus.AccessDenied)
-            {
-                return new DialogJumpResult(DialogJumpStatus.PermissionLimited, hookResult.Message);
-            }
+                if (hookResult.Status is HookJumpStatus.AccessDenied)
+                {
+                    return new DialogJumpResult(DialogJumpStatus.PermissionLimited, hookResult.Message);
+                }
 
-            if (hookResult.Status is HookJumpStatus.TargetGone)
+                if (hookResult.Status is HookJumpStatus.TargetGone)
+                {
+                    return new DialogJumpResult(DialogJumpStatus.TargetGone, hookResult.Message);
+                }
+            }
+            catch (OperationCanceledException)
             {
-                return new DialogJumpResult(DialogJumpStatus.TargetGone, hookResult.Message);
+                throw;
+            }
+            catch (Exception)
+            {
+                // Hook quick switch is optional; existing automation remains the fallback boundary.
             }
         }
 

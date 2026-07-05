@@ -49,6 +49,59 @@ public sealed class HookQuickSwitchBridgeTests
         Assert.Equal(HookJumpStatus.NoActiveDialog, result.Status);
     }
 
+    [Fact]
+    public async Task JumpUsesSnapshotOfClientDictionary()
+    {
+        var dialog = new HookDialogContext(
+            "dlg-2",
+            new IntPtr(101),
+            201,
+            301,
+            HookArchitecture.X86,
+            "MobaXterm",
+            "#32770",
+            "Choose which file(s) to upload...",
+            DateTimeOffset.UtcNow);
+        var originalClient = new RecordingHookClient(dialog, HookJumpResult.Success("Jumped."));
+        var clients = new Dictionary<HookArchitecture, IHookIpcClient>
+        {
+            [HookArchitecture.X64] = new RecordingHookClient(null, new HookJumpResult(HookJumpStatus.NoActiveDialog, "No dialog.")),
+            [HookArchitecture.X86] = originalClient
+        };
+        var bridge = new HookQuickSwitchBridge(HookQuickSwitchStatus.Disabled(), clients);
+
+        clients[HookArchitecture.X86] = new RecordingHookClient(null, new HookJumpResult(HookJumpStatus.NoActiveDialog, "No dialog."));
+        clients.Remove(HookArchitecture.X64);
+
+        var result = await bridge.JumpActiveDialogToFolderAsync("C:\\Users\\paulx", CancellationToken.None);
+
+        Assert.Equal(HookJumpStatus.Success, result.Status);
+        Assert.Equal("dlg-2", originalClient.LastDialogId);
+    }
+
+    [Fact]
+    public void ConstructorRejectsNullClients()
+    {
+        var exception = Assert.Throws<ArgumentNullException>(
+            () => new HookQuickSwitchBridge(HookQuickSwitchStatus.Disabled(), null!));
+
+        Assert.Equal("clients", exception.ParamName);
+    }
+
+    [Fact]
+    public void ConstructorRejectsNullClient()
+    {
+        var exception = Assert.Throws<ArgumentException>(
+            () => new HookQuickSwitchBridge(
+                HookQuickSwitchStatus.Disabled(),
+                new Dictionary<HookArchitecture, IHookIpcClient>
+                {
+                    [HookArchitecture.X64] = null!
+                }));
+
+        Assert.Equal("clients", exception.ParamName);
+    }
+
     private sealed class RecordingHookClient : IHookIpcClient
     {
         private readonly HookDialogContext? _activeDialog;
