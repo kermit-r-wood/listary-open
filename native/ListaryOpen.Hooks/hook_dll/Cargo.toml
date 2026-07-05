@@ -10,5 +10,6 @@ crate-type = ["cdylib"]
 listary_open_hook_common = { path = "../hook_common" }
 windows-sys = { version = "0.59", features = [
   "Win32_Foundation",
+  "Win32_System_DataExchange",
   "Win32_UI_WindowsAndMessaging"
 ] }

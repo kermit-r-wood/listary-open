@@ -23,7 +23,6 @@ public sealed class HookIpcClient : IHookIpcClient, IHookHealthProbeClient, IDis
 
     private readonly string _pipeName;
     private readonly TimeSpan _connectTimeout;
-    private HookDialogContext? _activeDialog;
 
     public HookIpcClient(string pipeName, TimeSpan connectTimeout)
     {
@@ -39,10 +38,36 @@ public sealed class HookIpcClient : IHookIpcClient, IHookHealthProbeClient, IDis
 
         _pipeName = pipeName;
         _connectTimeout = connectTimeout;
-        _activeDialog = null;
     }
 
-    public Task<HookDialogContext?> GetActiveDialogAsync(CancellationToken cancellationToken) => Task.FromResult(_activeDialog);
+    public async Task<HookDialogContext?> GetActiveDialogAsync(CancellationToken cancellationToken)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+
+        var exchange = await SendRequestAsync(
+                HookIpcEnvelope.Command(new HookActiveDialogQuery()),
+                cancellationToken)
+            .ConfigureAwait(false);
+        if (exchange.Envelope is null)
+        {
+            return null;
+        }
+
+        if (string.Equals(exchange.Envelope.MessageType, "ActiveDialog", StringComparison.Ordinal)
+            && exchange.Envelope.Payload is HookActiveDialogEvent activeDialog)
+        {
+            return CreateDialogContext(activeDialog);
+        }
+
+        if (string.Equals(exchange.Envelope.MessageType, "CommandReply", StringComparison.Ordinal)
+            && exchange.Envelope.Payload is HookCommandReply reply
+            && string.Equals(reply.Status, HookJumpStatus.NoActiveDialog.ToString(), StringComparison.OrdinalIgnoreCase))
+        {
+            return null;
+        }
+
+        return null;
+    }
 
     public Task<HookJumpResult> ProbeHealthAsync(CancellationToken cancellationToken) =>
         SendCommandAsync(HookIpcEnvelope.Command(new HookHealthProbe()), cancellationToken);
@@ -56,6 +81,29 @@ public sealed class HookIpcClient : IHookIpcClient, IHookHealthProbeClient, IDis
     }
 
     private async Task<HookJumpResult> SendCommandAsync(HookIpcEnvelope envelope, CancellationToken cancellationToken)
+    {
+        var exchange = await SendRequestAsync(envelope, cancellationToken).ConfigureAwait(false);
+        if (exchange.Failure is not null)
+        {
+            return exchange.Failure;
+        }
+
+        var replyEnvelope = exchange.Envelope;
+        if (replyEnvelope is null
+            || replyEnvelope.Payload is not HookCommandReply reply
+            || !string.Equals(replyEnvelope.MessageType, "CommandReply", StringComparison.Ordinal))
+        {
+            return new HookJumpResult(
+                HookJumpStatus.Failed,
+                $"Hook host returned unexpected message type '{replyEnvelope?.MessageType ?? "<none>"}'.");
+        }
+
+        return Enum.TryParse<HookJumpStatus>(reply.Status, ignoreCase: true, out var status)
+            ? new HookJumpResult(status, reply.Message)
+            : new HookJumpResult(HookJumpStatus.Failed, $"Hook host returned unknown status '{reply.Status}'.");
+    }
+
+    private async Task<HookIpcExchange> SendRequestAsync(HookIpcEnvelope envelope, CancellationToken cancellationToken)
     {
         var connectionEstablished = false;
 
@@ -89,19 +137,12 @@ public sealed class HookIpcClient : IHookIpcClient, IHookHealthProbeClient, IDis
             var response = await reader.ReadLineAsync(linkedCancellation.Token).ConfigureAwait(false);
             if (string.IsNullOrWhiteSpace(response))
             {
-                return new HookJumpResult(HookJumpStatus.Failed, "Hook host returned an empty response.");
+                return HookIpcExchange.FromFailure(
+                    new HookJumpResult(HookJumpStatus.Failed, "Hook host returned an empty response."));
             }
 
             var replyEnvelope = HookIpcSerializer.Deserialize(response);
-            if (replyEnvelope.Payload is not HookCommandReply reply
-                || !string.Equals(replyEnvelope.MessageType, "CommandReply", StringComparison.Ordinal))
-            {
-                return new HookJumpResult(HookJumpStatus.Failed, $"Hook host returned unexpected message type '{replyEnvelope.MessageType}'.");
-            }
-
-            return Enum.TryParse<HookJumpStatus>(reply.Status, ignoreCase: true, out var status)
-                ? new HookJumpResult(status, reply.Message)
-                : new HookJumpResult(HookJumpStatus.Failed, $"Hook host returned unknown status '{reply.Status}'.");
+            return HookIpcExchange.FromEnvelope(replyEnvelope);
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
         {
@@ -109,31 +150,85 @@ public sealed class HookIpcClient : IHookIpcClient, IHookHealthProbeClient, IDis
         }
         catch (OperationCanceledException) when (timeoutCancellation.IsCancellationRequested && !connectionEstablished)
         {
-            return new HookJumpResult(HookJumpStatus.HostUnavailable, "Hook host pipe was unavailable before the connect timeout.");
+            return HookIpcExchange.FromFailure(
+                new HookJumpResult(HookJumpStatus.HostUnavailable, "Hook host pipe was unavailable before the connect timeout."));
         }
         catch (OperationCanceledException) when (timeoutCancellation.IsCancellationRequested)
         {
-            return new HookJumpResult(HookJumpStatus.Timeout, "Hook host did not respond before timeout.");
+            return HookIpcExchange.FromFailure(
+                new HookJumpResult(HookJumpStatus.Timeout, "Hook host did not respond before timeout."));
         }
         catch (IOException exception)
         {
-            return new HookJumpResult(HookJumpStatus.HostUnavailable, exception.Message);
+            return HookIpcExchange.FromFailure(new HookJumpResult(HookJumpStatus.HostUnavailable, exception.Message));
         }
         catch (TimeoutException exception)
         {
-            return new HookJumpResult(HookJumpStatus.HostUnavailable, exception.Message);
+            return HookIpcExchange.FromFailure(new HookJumpResult(HookJumpStatus.HostUnavailable, exception.Message));
         }
         catch (JsonException exception)
         {
-            return new HookJumpResult(HookJumpStatus.Failed, $"Hook host returned invalid JSON: {exception.Message}");
+            return HookIpcExchange.FromFailure(
+                new HookJumpResult(HookJumpStatus.Failed, $"Hook host returned invalid JSON: {exception.Message}"));
         }
         catch (InvalidOperationException exception)
         {
-            return new HookJumpResult(HookJumpStatus.Failed, $"Hook host returned an invalid response: {exception.Message}");
+            return HookIpcExchange.FromFailure(
+                new HookJumpResult(HookJumpStatus.Failed, $"Hook host returned an invalid response: {exception.Message}"));
         }
+    }
+
+    private static HookDialogContext? CreateDialogContext(HookActiveDialogEvent activeDialog)
+    {
+        if (!TryParseArchitecture(activeDialog.Architecture, out var architecture))
+        {
+            return null;
+        }
+
+        try
+        {
+            return new HookDialogContext(
+                activeDialog.DialogId,
+                new IntPtr(activeDialog.WindowHandle),
+                activeDialog.ProcessId,
+                activeDialog.ThreadId,
+                architecture,
+                activeDialog.ProcessName,
+                activeDialog.ClassName,
+                activeDialog.Title,
+                DateTimeOffset.UtcNow);
+        }
+        catch (OverflowException)
+        {
+            return null;
+        }
+    }
+
+    private static bool TryParseArchitecture(string value, out HookArchitecture architecture)
+    {
+        if (string.Equals(value, "x64", StringComparison.OrdinalIgnoreCase))
+        {
+            architecture = HookArchitecture.X64;
+            return true;
+        }
+
+        if (string.Equals(value, "x86", StringComparison.OrdinalIgnoreCase))
+        {
+            architecture = HookArchitecture.X86;
+            return true;
+        }
+
+        return Enum.TryParse(value, ignoreCase: true, out architecture);
     }
 
     public void Dispose()
     {
+    }
+
+    private sealed record HookIpcExchange(HookIpcEnvelope? Envelope, HookJumpResult? Failure)
+    {
+        public static HookIpcExchange FromEnvelope(HookIpcEnvelope envelope) => new(envelope, null);
+
+        public static HookIpcExchange FromFailure(HookJumpResult result) => new(null, result);
     }
 }

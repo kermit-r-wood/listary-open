@@ -96,6 +96,83 @@ public sealed class HookIpcClientTests
     }
 
     [Fact]
+    public async Task GetActiveDialogRoundTripsOverNamedPipe()
+    {
+        var pipeName = "listary-open-active-dialog-" + Guid.NewGuid();
+        using var serverCancellation = new CancellationTokenSource(TimeSpan.FromSeconds(5));
+        var serverTask = ServeOnceAsync(
+            pipeName,
+            HookIpcSerializer.Serialize(new HookIpcEnvelope(
+                HookIpcEnvelope.CurrentVersion,
+                "ActiveDialog",
+                new HookActiveDialogEvent(
+                    "42:123456",
+                    123456,
+                    42,
+                    84,
+                    "x86",
+                    "notepad.exe",
+                    "#32770",
+                    "Open"))),
+            serverCancellation.Token);
+        var client = new HookIpcClient(pipeName, TimeSpan.FromSeconds(2));
+
+        try
+        {
+            var before = DateTimeOffset.UtcNow;
+            var dialog = await client.GetActiveDialogAsync(CancellationToken.None);
+            var exchange = await serverTask.WaitAsync(TimeSpan.FromSeconds(1));
+
+            var request = HookIpcSerializer.Deserialize(exchange.Request);
+            Assert.Equal("GetActiveDialog", request.MessageType);
+            Assert.IsType<HookActiveDialogQuery>(request.Payload);
+            Assert.NotNull(dialog);
+            Assert.Equal("42:123456", dialog.DialogId);
+            Assert.Equal(new IntPtr(123456), dialog.WindowHandle);
+            Assert.Equal(42u, dialog.ProcessId);
+            Assert.Equal(84u, dialog.ThreadId);
+            Assert.Equal(HookArchitecture.X86, dialog.Architecture);
+            Assert.Equal("notepad.exe", dialog.ProcessName);
+            Assert.Equal("#32770", dialog.ClassName);
+            Assert.Equal("Open", dialog.Title);
+            Assert.True(dialog.ObservedAt >= before);
+        }
+        finally
+        {
+            await StopServerAsync(serverCancellation, serverTask);
+        }
+    }
+
+    [Fact]
+    public async Task GetActiveDialogReturnsNullForNoActiveDialogReply()
+    {
+        var pipeName = "listary-open-no-active-dialog-" + Guid.NewGuid();
+        using var serverCancellation = new CancellationTokenSource(TimeSpan.FromSeconds(5));
+        var serverTask = ServeOnceAsync(
+            pipeName,
+            HookIpcSerializer.Serialize(new HookIpcEnvelope(
+                HookIpcEnvelope.CurrentVersion,
+                "CommandReply",
+                new HookCommandReply("NoActiveDialog", "No active hook dialog."))),
+            serverCancellation.Token);
+        var client = new HookIpcClient(pipeName, TimeSpan.FromSeconds(2));
+
+        try
+        {
+            var dialog = await client.GetActiveDialogAsync(CancellationToken.None);
+            var exchange = await serverTask.WaitAsync(TimeSpan.FromSeconds(1));
+
+            var request = HookIpcSerializer.Deserialize(exchange.Request);
+            Assert.Equal("GetActiveDialog", request.MessageType);
+            Assert.Null(dialog);
+        }
+        finally
+        {
+            await StopServerAsync(serverCancellation, serverTask);
+        }
+    }
+
+    [Fact]
     public async Task ConnectWaitsForServerCreatedWithinTimeout()
     {
         var pipeName = "listary-open-delayed-" + Guid.NewGuid();

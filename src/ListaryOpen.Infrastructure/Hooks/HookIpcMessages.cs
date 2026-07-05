@@ -12,9 +12,14 @@ public sealed record HookIpcEnvelope(int Version, string MessageType, object Pay
 
     public static HookIpcEnvelope Command(HookHealthProbe probe) =>
         new(CurrentVersion, "HealthProbe", probe);
+
+    public static HookIpcEnvelope Command(HookActiveDialogQuery query) =>
+        new(CurrentVersion, "GetActiveDialog", query);
 }
 
 public sealed record HookHealthProbe;
+
+public sealed record HookActiveDialogQuery;
 
 public sealed record HookJumpCommand
 {
@@ -95,6 +100,7 @@ internal sealed class HookIpcEnvelopeJsonConverter : JsonConverter<HookIpcEnvelo
         object payload = messageType switch
         {
             "HealthProbe" => new HookHealthProbe(),
+            "GetActiveDialog" => new HookActiveDialogQuery(),
             "JumpDialogToFolder" => ReadJumpCommand(payloadElement),
             "ActiveDialog" => ReadActiveDialogEvent(payloadElement),
             "CommandReply" => ReadCommandReply(payloadElement),

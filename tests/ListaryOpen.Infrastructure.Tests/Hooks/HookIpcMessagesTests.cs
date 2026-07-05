@@ -65,6 +65,19 @@ public sealed class HookIpcMessagesTests
     }
 
     [Fact]
+    public void GetActiveDialogCommandRoundTrips()
+    {
+        var command = HookIpcEnvelope.Command(new HookActiveDialogQuery());
+
+        var json = HookIpcSerializer.Serialize(command);
+        var roundTrip = HookIpcSerializer.Deserialize(json);
+
+        Assert.Equal(1, roundTrip.Version);
+        Assert.Equal("GetActiveDialog", roundTrip.MessageType);
+        Assert.IsType<HookActiveDialogQuery>(roundTrip.Payload);
+    }
+
+    [Fact]
     public void ActiveDialogDeserializesFields()
     {
         var json = """
