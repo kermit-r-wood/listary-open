@@ -1,0 +1,31 @@
+namespace ListaryOpen.Infrastructure.Tests.App;
+
+public sealed class SearchPanelXamlTests
+{
+    [Fact]
+    public void SearchPanelBindsModePlaceholderAndRicherResultFields()
+    {
+        var xaml = File.ReadAllText(GetRepositoryPath("src", "ListaryOpen.App", "SearchPanel.xaml"));
+
+        Assert.Contains("x:Name=\"SearchPanelRoot\"", xaml);
+        Assert.Contains("Text=\"{Binding ModeDisplayText}\"", xaml);
+        Assert.Contains("Text=\"{Binding QueryPlaceholderText}\"", xaml);
+        Assert.Contains("Text=\"{Binding Record.Name}\"", xaml);
+        Assert.Contains("Text=\"{Binding Record.ParentPath}\"", xaml);
+        Assert.Contains("Text=\"{Binding MatchReason}\"", xaml);
+        Assert.Contains("Record.IsDirectory", xaml);
+        Assert.Contains("SearchPanelResultListStyle", xaml);
+    }
+
+    private static string GetRepositoryPath(params string[] segments)
+    {
+        return Path.GetFullPath(Path.Combine(
+            AppContext.BaseDirectory,
+            "..",
+            "..",
+            "..",
+            "..",
+            "..",
+            Path.Combine(segments)));
+    }
+}

@@ -3,35 +3,150 @@
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
         Title="ListaryOpen Search"
         Icon="{StaticResource ListaryOpenIcon}"
-        Width="720"
-        Height="420"
+        Width="760"
+        Height="460"
+        MinWidth="620"
+        MinHeight="360"
         WindowStartupLocation="CenterScreen"
-        Topmost="True">
-    <Grid Margin="16">
+        Topmost="True"
+        Background="{StaticResource Brush.AppBackground}">
+    <Grid x:Name="SearchPanelRoot" Margin="16">
         <Grid.RowDefinitions>
+            <RowDefinition Height="Auto" />
             <RowDefinition Height="Auto" />
             <RowDefinition Height="*" />
             <RowDefinition Height="Auto" />
         </Grid.RowDefinitions>
-        <TextBox x:Name="QueryBox"
-                 FontSize="22"
-                 Margin="0,0,0,12"
-                 Text="{Binding QueryText, UpdateSourceTrigger=PropertyChanged}" />
+
+        <Grid Margin="2,0,2,10">
+            <Grid.ColumnDefinitions>
+                <ColumnDefinition Width="Auto" />
+                <ColumnDefinition Width="*" />
+            </Grid.ColumnDefinitions>
+
+            <TextBlock Style="{StaticResource SearchPanelModeTextStyle}"
+                       Text="{Binding ModeDisplayText}"
+                       VerticalAlignment="Center" />
+            <TextBlock Grid.Column="1"
+                       Margin="12,0,0,0"
+                       HorizontalAlignment="Right"
+                       VerticalAlignment="Center"
+                       TextAlignment="Right"
+                       Style="{StaticResource SearchStatusTextStyle}"
+                       Text="{Binding StatusText}" />
+        </Grid>
+
+        <Grid Grid.Row="1" Margin="0,0,0,12">
+            <TextBox x:Name="QueryBox"
+                     AutomationProperties.Name="Search query"
+                     Style="{StaticResource SearchQueryBoxStyle}"
+                     Text="{Binding QueryText, UpdateSourceTrigger=PropertyChanged}" />
+            <TextBlock Margin="17,0"
+                       VerticalAlignment="Center"
+                       IsHitTestVisible="False"
+                       FontFamily="{StaticResource Font.Primary}"
+                       FontSize="{StaticResource FontSize.SearchQuery}"
+                       Foreground="{StaticResource Brush.TextMuted}"
+                       Text="{Binding QueryPlaceholderText}">
+                <TextBlock.Style>
+                    <Style TargetType="TextBlock">
+                        <Setter Property="Visibility" Value="Collapsed" />
+                        <Style.Triggers>
+                            <DataTrigger Binding="{Binding Text, ElementName=QueryBox}" Value="">
+                                <Setter Property="Visibility" Value="Visible" />
+                            </DataTrigger>
+                        </Style.Triggers>
+                    </Style>
+                </TextBlock.Style>
+            </TextBlock>
+        </Grid>
+
         <ListBox x:Name="ResultsList"
-                 Grid.Row="1"
+                 Grid.Row="2"
+                 AutomationProperties.Name="Search results"
                  ItemsSource="{Binding Results}"
                  MouseDoubleClick="ResultsList_MouseDoubleClick"
-                 SelectedItem="{Binding SelectedResult, Mode=TwoWay}">
+                 SelectedItem="{Binding SelectedResult, Mode=TwoWay}"
+                 Style="{StaticResource SearchPanelResultListStyle}"
+                 ItemContainerStyle="{StaticResource SearchResultItemContainerStyle}">
             <ListBox.ItemTemplate>
                 <DataTemplate>
-                    <TextBlock Text="{Binding Record.FullPath}" />
+                    <Grid Margin="10,8">
+                        <Grid.ColumnDefinitions>
+                            <ColumnDefinition Width="32" />
+                            <ColumnDefinition Width="*" />
+                            <ColumnDefinition Width="Auto" />
+                            <ColumnDefinition Width="Auto" />
+                        </Grid.ColumnDefinitions>
+
+                        <Border Width="28"
+                                Height="28"
+                                HorizontalAlignment="Center"
+                                VerticalAlignment="Center"
+                                Background="{StaticResource Brush.SurfaceMuted}"
+                                CornerRadius="6">
+                            <TextBlock HorizontalAlignment="Center"
+                                       VerticalAlignment="Center"
+                                       FontFamily="Segoe MDL2 Assets"
+                                       FontSize="15">
+                                <TextBlock.Style>
+                                    <Style TargetType="TextBlock">
+                                        <Setter Property="Text" Value="&#xE7C3;" />
+                                        <Setter Property="Foreground" Value="{StaticResource Brush.TextMuted}" />
+                                        <Style.Triggers>
+                                            <DataTrigger Binding="{Binding Record.IsDirectory}" Value="True">
+                                                <Setter Property="Text" Value="&#xE8B7;" />
+                                                <Setter Property="Foreground" Value="{StaticResource Brush.Accent}" />
+                                            </DataTrigger>
+                                        </Style.Triggers>
+                                    </Style>
+                                </TextBlock.Style>
+                            </TextBlock>
+                        </Border>
+
+                        <StackPanel Grid.Column="1"
+                                    Margin="10,0,12,0"
+                                    VerticalAlignment="Center">
+                            <TextBlock Style="{StaticResource SearchResultTitleStyle}"
+                                       Text="{Binding Record.Name}" />
+                            <TextBlock Margin="0,3,0,0"
+                                       Style="{StaticResource SearchResultPathStyle}"
+                                       Text="{Binding Record.ParentPath}" />
+                        </StackPanel>
+
+                        <TextBlock Grid.Column="2"
+                                   VerticalAlignment="Center">
+                            <TextBlock.Style>
+                                <Style TargetType="TextBlock" BasedOn="{StaticResource BadgeTextBlockStyle}">
+                                    <Setter Property="MinWidth" Value="56" />
+                                    <Setter Property="Text" Value="File" />
+                                    <Style.Triggers>
+                                        <DataTrigger Binding="{Binding Record.IsDirectory}" Value="True">
+                                            <Setter Property="Text" Value="Folder" />
+                                            <Setter Property="Foreground" Value="{StaticResource Brush.Accent}" />
+                                            <Setter Property="Background" Value="{StaticResource Brush.AccentSoft}" />
+                                        </DataTrigger>
+                                    </Style.Triggers>
+                                </Style>
+                            </TextBlock.Style>
+                        </TextBlock>
+
+                        <TextBlock Grid.Column="3"
+                                   Margin="8,0,0,0"
+                                   VerticalAlignment="Center"
+                                   Style="{StaticResource BadgeTextBlockStyle}"
+                                   Text="{Binding MatchReason}" />
+                    </Grid>
                 </DataTemplate>
             </ListBox.ItemTemplate>
         </ListBox>
-        <TextBlock Grid.Row="2"
-                   Margin="0,8,0,0"
+
+        <TextBlock x:Name="SearchStatusText"
+                   Grid.Row="3"
+                   Margin="2,8,2,0"
                    MinHeight="18"
-                   Foreground="{DynamicResource {x:Static SystemColors.GrayTextBrushKey}}"
+                   AutomationProperties.Name="Search status"
+                   Style="{StaticResource SearchStatusTextStyle}"
                    Text="{Binding StatusText}" />
     </Grid>
 </Window>
