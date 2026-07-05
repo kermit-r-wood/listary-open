@@ -655,6 +655,57 @@ public sealed class SearchPanelViewModelTests
         Assert.Empty(index.ObservedQueries);
     }
 
+    [Fact]
+    public void ConstructorStartsWithSearchPresentation()
+    {
+        var viewModel = new SearchPanelViewModel(new RecordingSearchIndex(Array.Empty<SearchResult>()));
+
+        Assert.Equal("Search", viewModel.ModeDisplayText);
+        Assert.Equal("Search files and folders", viewModel.QueryPlaceholderText);
+    }
+
+    [Fact]
+    public async Task ActivateFolderSearchAsyncUsesDialogJumpPresentation()
+    {
+        var viewModel = new SearchPanelViewModel(new RecordingSearchIndex(Array.Empty<SearchResult>()));
+
+        await viewModel.ActivateFolderSearchAsync(null);
+
+        Assert.Equal("Dialog Jump", viewModel.ModeDisplayText);
+        Assert.Equal("Jump dialog to folder", viewModel.QueryPlaceholderText);
+    }
+
+    [Fact]
+    public async Task ActivateQuickSwitchFolderSearchAsyncUsesQuickSwitchPresentation()
+    {
+        var viewModel = new SearchPanelViewModel(
+            new RecordingSearchIndex(Array.Empty<SearchResult>()),
+            NormalizeTestFolder,
+            _ => true,
+            _ => DateTimeOffset.UtcNow);
+
+        await viewModel.ActivateQuickSwitchFolderSearchAsync(new[]
+        {
+            CreateCandidate("C:\\Projects")
+        });
+
+        Assert.Equal("Quick Switch", viewModel.ModeDisplayText);
+        Assert.Equal("Quick switch to folder", viewModel.QueryPlaceholderText);
+    }
+
+    [Fact]
+    public async Task PresentationModeChangesRaisePropertyChanged()
+    {
+        var viewModel = new SearchPanelViewModel(new RecordingSearchIndex(Array.Empty<SearchResult>()));
+        var changedProperties = new List<string?>();
+        viewModel.PropertyChanged += (_, e) => changedProperties.Add(e.PropertyName);
+
+        await viewModel.ActivateFolderSearchAsync(null);
+
+        Assert.Contains(nameof(SearchPanelViewModel.ModeDisplayText), changedProperties);
+        Assert.Contains(nameof(SearchPanelViewModel.QueryPlaceholderText), changedProperties);
+    }
+
     private static QuickSwitchFolderCandidate CreateCandidate(string folderPath)
     {
         return new QuickSwitchFolderCandidate(folderPath, "Explorer", IntPtr.Zero, false);

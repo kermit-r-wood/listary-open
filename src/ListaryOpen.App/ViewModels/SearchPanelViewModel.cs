@@ -28,6 +28,7 @@ public sealed class SearchPanelViewModel : INotifyPropertyChanged
     private string _queryText = string.Empty;
     private string _statusText = string.Empty;
     private SearchMode _searchMode = SearchMode.FilesAndFolders;
+    private SearchPanelPresentationMode _presentationMode = SearchPanelPresentationMode.Search;
     private SearchResult? _selectedResult;
     private IReadOnlyList<string> _pinnedFolderPaths = Array.Empty<string>();
 
@@ -119,6 +120,22 @@ public sealed class SearchPanelViewModel : INotifyPropertyChanged
         }
     }
 
+    public string ModeDisplayText => _presentationMode switch
+    {
+        SearchPanelPresentationMode.Search => "Search",
+        SearchPanelPresentationMode.DialogJump => "Dialog Jump",
+        SearchPanelPresentationMode.QuickSwitch => "Quick Switch",
+        _ => "Search"
+    };
+
+    public string QueryPlaceholderText => _presentationMode switch
+    {
+        SearchPanelPresentationMode.Search => "Search files and folders",
+        SearchPanelPresentationMode.DialogJump => "Jump dialog to folder",
+        SearchPanelPresentationMode.QuickSwitch => "Quick switch to folder",
+        _ => "Search files and folders"
+    };
+
     public string QueryText
     {
         get => _queryText;
@@ -137,6 +154,7 @@ public sealed class SearchPanelViewModel : INotifyPropertyChanged
 
     public Task ActivateFilesAndFoldersSearchAsync()
     {
+        SetPresentationMode(SearchPanelPresentationMode.Search);
         _searchMode = SearchMode.FilesAndFolders;
         _pinnedFolderPaths = Array.Empty<string>();
         StatusText = "Search files and folders.";
@@ -145,6 +163,7 @@ public sealed class SearchPanelViewModel : INotifyPropertyChanged
 
     public Task ActivateFolderSearchAsync(string? trackedFolder)
     {
+        SetPresentationMode(SearchPanelPresentationMode.DialogJump);
         _searchMode = SearchMode.FoldersOnly;
         var normalizedFolder = TryNormalizeExistingFolder(trackedFolder);
         _pinnedFolderPaths = normalizedFolder is null
@@ -158,6 +177,7 @@ public sealed class SearchPanelViewModel : INotifyPropertyChanged
     {
         ArgumentNullException.ThrowIfNull(candidates);
 
+        SetPresentationMode(SearchPanelPresentationMode.QuickSwitch);
         _searchMode = SearchMode.FoldersOnly;
         _pinnedFolderPaths = NormalizePinnedFolderPaths(candidates);
         SelectedResult = null;
@@ -569,8 +589,27 @@ public sealed class SearchPanelViewModel : INotifyPropertyChanged
             or System.ComponentModel.Win32Exception or System.Runtime.InteropServices.ExternalException;
     }
 
+    private void SetPresentationMode(SearchPanelPresentationMode presentationMode)
+    {
+        if (_presentationMode == presentationMode)
+        {
+            return;
+        }
+
+        _presentationMode = presentationMode;
+        OnPropertyChanged(nameof(ModeDisplayText));
+        OnPropertyChanged(nameof(QueryPlaceholderText));
+    }
+
     private void OnPropertyChanged([CallerMemberName] string? name = null)
     {
         PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(name));
     }
+}
+
+internal enum SearchPanelPresentationMode
+{
+    Search,
+    DialogJump,
+    QuickSwitch
 }
