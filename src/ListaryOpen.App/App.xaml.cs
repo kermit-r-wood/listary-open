@@ -11,7 +11,6 @@ using ListaryOpen.Infrastructure.Windows;
 using System.Diagnostics;
 using System.IO;
 using System.Windows;
-using System.Windows.Media.Imaging;
 using System.Windows.Threading;
 
 namespace ListaryOpen.App;
@@ -44,13 +43,6 @@ public partial class App : Application
     internal static bool IsShuttingDown =>
         Current?.Dispatcher.HasShutdownStarted == true ||
         Current?.Dispatcher.HasShutdownFinished == true;
-
-    public App()
-    {
-        InitializeComponent();
-        Resources["ListaryOpenIcon"] = new BitmapImage(
-            new Uri("pack://application:,,,/ListaryOpen.App;component/Assets/ListaryOpen.ico", UriKind.Absolute));
-    }
 
     protected override async void OnStartup(StartupEventArgs e)
     {

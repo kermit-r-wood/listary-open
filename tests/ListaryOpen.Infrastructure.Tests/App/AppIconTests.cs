@@ -18,7 +18,7 @@ public sealed class AppIconTests
         var appXaml = File.ReadAllText(GetRepositoryPath("src", "ListaryOpen.App", "App.xaml"));
 
         Assert.Contains("ListaryOpenIcon", appXaml);
-        Assert.Contains("pack://application:,,,/Assets/ListaryOpen.ico", appXaml);
+        Assert.Contains("pack://application:,,,/ListaryOpen.App;component/Assets/ListaryOpen.ico", appXaml);
     }
 
     [Theory]

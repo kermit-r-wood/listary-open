@@ -17,9 +17,14 @@ public sealed class WpfSmokeTests
         var completed = false;
         var thread = new Thread(() =>
         {
+            WpfApp? application = null;
+            MainWindow? mainWindow = null;
+            SearchPanel? searchPanel = null;
+
             try
             {
-                var application = new WpfApp();
+                application = new WpfApp();
+                application.InitializeComponent();
 
                 Assert.NotNull(application.FindResource("Brush.AppBackground"));
                 Assert.NotNull(application.FindResource("Brush.Surface"));
@@ -27,16 +32,12 @@ public sealed class WpfSmokeTests
                 Assert.NotNull(application.FindResource("SearchPanelResultListStyle"));
                 Assert.NotNull(application.FindResource("SettingsSectionStyle"));
 
-                var mainWindow = new MainWindow(new SettingsViewModel(AppSettings.Defaults()));
+                mainWindow = new MainWindow(new SettingsViewModel(AppSettings.Defaults()));
                 Assert.NotNull(mainWindow.FindName("SettingsContentRoot"));
 
-                var searchPanel = new SearchPanel();
+                searchPanel = new SearchPanel();
                 Assert.NotNull(searchPanel.FindName("QueryBox"));
                 Assert.NotNull(searchPanel.FindName("ResultsList"));
-
-                mainWindow.Hide();
-                searchPanel.Hide();
-                application.Shutdown();
             }
             catch (Exception caught)
             {
@@ -44,15 +45,20 @@ public sealed class WpfSmokeTests
             }
             finally
             {
+                searchPanel?.Hide();
+                mainWindow?.Hide();
+                application?.Shutdown();
                 completed = true;
             }
         });
 
         thread.SetApartmentState(ApartmentState.STA);
+        thread.IsBackground = true;
         thread.Start();
-        thread.Join(TimeSpan.FromSeconds(10));
+        var finishedInTime = thread.Join(TimeSpan.FromSeconds(10));
 
-        Assert.True(completed);
+        Assert.True(finishedInTime, "WPF smoke test STA thread did not finish within 10 seconds.");
+        Assert.True(completed, "WPF smoke test STA thread did not complete.");
         if (exception is not null)
         {
             ExceptionDispatchInfo.Capture(exception).Throw();

@@ -13,7 +13,7 @@
             </ResourceDictionary.MergedDictionaries>
 
             <BitmapImage x:Key="ListaryOpenIcon"
-                         UriSource="pack://application:,,,/Assets/ListaryOpen.ico" />
+                         UriSource="pack://application:,,,/ListaryOpen.App;component/Assets/ListaryOpen.ico" />
         </ResourceDictionary>
     </Application.Resources>
 </Application>
