@@ -1,4 +1,5 @@
 using System.Diagnostics;
+using System.Globalization;
 using ListaryOpen.Core.Indexing;
 using ListaryOpen.Core.Search;
 using ListaryOpen.Core.Usage;
@@ -249,6 +250,72 @@ public sealed class SqliteSearchIndexTests
     }
 
     [Fact]
+    public async Task OpenClearsFilesWhenIndexContentVersionIsMissingAndPreservesUsage()
+    {
+        var dbPath = CreateTempDbPath();
+        var oldRecord = FileRecord.Create("C:\\Docs\\OldExcludedNodeModule.js", false, 10, DateTimeOffset.UtcNow);
+
+        try
+        {
+            await CreateCurrentSchemaDatabaseWithoutMetadataAsync(dbPath, oldRecord);
+            await InsertUsageRowsAsync(dbPath, new[] { (oldRecord.FullPath, 7, DateTimeOffset.UtcNow) });
+
+            await using (var index = await SqliteSearchIndex.OpenAsync(dbPath, CancellationToken.None))
+            {
+                var oldResults = await index.SearchAsync(new SearchQuery("OldExcludedNodeModule", SearchMode.FilesAndFolders), CancellationToken.None);
+
+                Assert.Empty(oldResults);
+            }
+
+            Assert.Equal(0, await CountRowsAsync(dbPath, "files"));
+            Assert.Equal(1, await CountRowsAsync(dbPath, "usage"));
+        }
+        finally
+        {
+            DeleteIfExists(dbPath);
+        }
+    }
+
+    [Fact]
+    public async Task ImportUsageFromAsyncCopiesLegacyUsageWithoutImportingLegacyFiles()
+    {
+        var dbPath = CreateTempDbPath();
+        var legacyDbPath = CreateTempDbPath();
+        var importedRecord = FileRecord.Create("C:\\Docs\\ImportedUsageTarget.txt", false, 10, DateTimeOffset.UtcNow);
+        var legacyOnlyRecord = FileRecord.Create("C:\\Docs\\LegacyOnlyFile.txt", false, 10, DateTimeOffset.UtcNow);
+        var now = DateTimeOffset.UtcNow;
+
+        try
+        {
+            await CreateCurrentSchemaDatabaseWithoutMetadataAsync(legacyDbPath, legacyOnlyRecord);
+            await InsertUsageRowsAsync(legacyDbPath, new[] { (importedRecord.FullPath, 9, now) });
+
+            await using (var index = await SqliteSearchIndex.OpenAsync(dbPath, CancellationToken.None))
+            {
+                await index.ImportUsageFromAsync(legacyDbPath, CancellationToken.None);
+                await index.UpsertManyAsync(new[]
+                {
+                    FileRecord.Create("C:\\Docs\\ImportedUsageTarget.txt", false, 10, now),
+                    FileRecord.Create("C:\\Docs\\ImportedUsageOther.txt", false, 10, now)
+                }, CancellationToken.None);
+
+                var results = await index.SearchAsync(new SearchQuery("ImportedUsage", SearchMode.FilesAndFolders, limit: 2), CancellationToken.None);
+
+                Assert.Equal("ImportedUsageTarget.txt", results[0].Record.Name);
+                Assert.Equal("usage", results[0].MatchReason);
+            }
+
+            Assert.Equal(1, await CountRowsAsync(dbPath, "usage"));
+            Assert.Equal(0, await CountMatchingFilesAsync(dbPath, legacyOnlyRecord.PathKey));
+        }
+        finally
+        {
+            DeleteIfExists(dbPath);
+            DeleteIfExists(legacyDbPath);
+        }
+    }
+
+    [Fact]
     public async Task SearchRoundTripsLastWriteTimeOffset()
     {
         var dbPath = CreateTempDbPath();
@@ -433,7 +500,7 @@ public sealed class SqliteSearchIndexTests
     }
 
     [Fact]
-    public async Task OpenMigratesOldSchemaDatabaseBeforeSearchAndUpsert()
+    public async Task OpenMigratesOldSchemaDatabaseClearsStaleFilesAndStillAllowsUpsert()
     {
         var dbPath = CreateTempDbPath();
         var oldRecord = FileRecord.Create("C:\\Docs\\OldInvoice.xlsx", false, 10, DateTimeOffset.UtcNow);
@@ -446,7 +513,7 @@ public sealed class SqliteSearchIndexTests
             {
                 var oldResults = await index.SearchAsync(new SearchQuery("oldinvoice", SearchMode.FilesAndFolders), CancellationToken.None);
 
-                Assert.Equal("OldInvoice.xlsx", Assert.Single(oldResults).Record.Name);
+                Assert.Empty(oldResults);
 
                 await index.UpsertAsync(FileRecord.Create("C:\\Docs\\NewInvoice.xlsx", false, 10, DateTimeOffset.UtcNow), CancellationToken.None);
 
@@ -918,6 +985,74 @@ public sealed class SqliteSearchIndexTests
         await insertCommand.ExecuteNonQueryAsync();
     }
 
+    private static async Task CreateCurrentSchemaDatabaseWithoutMetadataAsync(string dbPath, FileRecord record)
+    {
+        var connectionString = new SqliteConnectionStringBuilder
+        {
+            DataSource = dbPath,
+            Pooling = false
+        }.ToString();
+
+        await using var connection = new SqliteConnection(connectionString);
+        await connection.OpenAsync();
+
+        using var createCommand = connection.CreateCommand();
+        createCommand.CommandText = """
+            create table files(
+                full_path text not null,
+                path_key text not null primary key,
+                name text not null,
+                parent_path text not null,
+                search_text text not null,
+                is_directory integer not null check(is_directory in (0, 1)),
+                size_bytes integer not null check(size_bytes >= 0),
+                last_write_time text not null
+            );
+
+            create table usage(
+                full_path text not null,
+                path_key text not null primary key,
+                open_count integer not null check(open_count >= 0),
+                last_used_at text not null
+            );
+            """;
+        await createCommand.ExecuteNonQueryAsync();
+
+        using var insertCommand = connection.CreateCommand();
+        insertCommand.CommandText = """
+            insert into files(
+                full_path,
+                path_key,
+                name,
+                parent_path,
+                search_text,
+                is_directory,
+                size_bytes,
+                last_write_time
+            )
+            values (
+                $full_path,
+                $path_key,
+                $name,
+                $parent_path,
+                $search_text,
+                $is_directory,
+                $size_bytes,
+                $last_write_time
+            );
+            """;
+        insertCommand.Parameters.AddWithValue("$full_path", record.FullPath);
+        insertCommand.Parameters.AddWithValue("$path_key", record.PathKey);
+        insertCommand.Parameters.AddWithValue("$name", record.Name);
+        insertCommand.Parameters.AddWithValue("$parent_path", record.ParentPath);
+        insertCommand.Parameters.AddWithValue("$search_text", record.Name);
+        insertCommand.Parameters.AddWithValue("$is_directory", record.IsDirectory ? 1 : 0);
+        insertCommand.Parameters.AddWithValue("$size_bytes", record.SizeBytes);
+        insertCommand.Parameters.AddWithValue("$last_write_time", record.LastWriteTime.ToString("O"));
+
+        await insertCommand.ExecuteNonQueryAsync();
+    }
+
     private static async Task<IReadOnlySet<string>> ReadIndexNamesAsync(string dbPath)
     {
         var connectionString = new SqliteConnectionStringBuilder
@@ -947,6 +1082,43 @@ public sealed class SqliteSearchIndexTests
         }
 
         return indexNames;
+    }
+
+    private static async Task<long> CountRowsAsync(string dbPath, string tableName)
+    {
+        var connectionString = new SqliteConnectionStringBuilder
+        {
+            DataSource = dbPath,
+            Pooling = false
+        }.ToString();
+
+        await using var connection = new SqliteConnection(connectionString);
+        await connection.OpenAsync();
+
+        using var command = connection.CreateCommand();
+        command.CommandText = $"select count(*) from {tableName};";
+
+        var result = await command.ExecuteScalarAsync();
+        return Convert.ToInt64(result, CultureInfo.InvariantCulture);
+    }
+
+    private static async Task<long> CountMatchingFilesAsync(string dbPath, string pathKey)
+    {
+        var connectionString = new SqliteConnectionStringBuilder
+        {
+            DataSource = dbPath,
+            Pooling = false
+        }.ToString();
+
+        await using var connection = new SqliteConnection(connectionString);
+        await connection.OpenAsync();
+
+        using var command = connection.CreateCommand();
+        command.CommandText = "select count(*) from files where path_key = $path_key;";
+        command.Parameters.AddWithValue("$path_key", pathKey);
+
+        var result = await command.ExecuteScalarAsync();
+        return Convert.ToInt64(result, CultureInfo.InvariantCulture);
     }
 
     private static IEnumerable<(string FullPath, int OpenCount, DateTimeOffset LastUsedAt)> CreateUnrelatedUsageRows(

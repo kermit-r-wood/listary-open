@@ -74,6 +74,33 @@ public sealed class AppDialogHotkeyTests
     }
 
     [Fact]
+    public void ObserveQuickSwitchFolderCandidatesKeepsCompositeFallbackCandidate()
+    {
+        var rememberedFolder = Directory.CreateTempSubdirectory("listary-open-composite-remembered-");
+
+        try
+        {
+            var composite = new CompositeQuickSwitchWindowProvider(
+                new IQuickSwitchWindowProvider[]
+                {
+                    new EmptyQuickSwitchWindowProvider()
+                },
+                new[]
+                {
+                    new QuickSwitchFolderCandidate(rememberedFolder.FullName, "Explorer", IntPtr.Zero, false)
+                });
+
+            var candidate = Assert.Single(ListaryOpen.App.App.ObserveQuickSwitchFolderCandidates(composite));
+
+            Assert.Equal(rememberedFolder.FullName, candidate.FolderPath);
+        }
+        finally
+        {
+            rememberedFolder.Delete(recursive: true);
+        }
+    }
+
+    [Fact]
     public void ObserveAndGetExistingTrackedFolderRefreshesExplorerTrackerBeforeReadingLastFolder()
     {
         var staleFolder = Directory.CreateTempSubdirectory("listary-open-stale-");
@@ -285,6 +312,14 @@ public sealed class AppDialogHotkeyTests
         public IEnumerable<ExplorerShellWindow> EnumerateWindows()
         {
             return _windows;
+        }
+    }
+
+    private sealed class EmptyQuickSwitchWindowProvider : IQuickSwitchWindowProvider
+    {
+        public IReadOnlyList<QuickSwitchFolderCandidate> GetFolderCandidates()
+        {
+            return Array.Empty<QuickSwitchFolderCandidate>();
         }
     }
 }

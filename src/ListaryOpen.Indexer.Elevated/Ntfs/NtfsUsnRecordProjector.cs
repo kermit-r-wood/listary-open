@@ -1,4 +1,5 @@
 using ListaryOpen.Core.Indexing;
+using ListaryOpen.Infrastructure.Indexing;
 
 namespace ListaryOpen.Indexer.Elevated.Ntfs;
 
@@ -15,7 +16,9 @@ internal static class NtfsUsnRecordProjector
         string requestedRoot,
         IEnumerable<NtfsUsnEntry> entries,
         INtfsFileMetadataReader metadataReader,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        ulong? volumeRootFileReferenceNumber = null,
+        IndexExclusionRules? exclusionRules = null)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(volumeRoot);
         ArgumentException.ThrowIfNullOrWhiteSpace(requestedRoot);
@@ -23,15 +26,56 @@ internal static class NtfsUsnRecordProjector
         ArgumentNullException.ThrowIfNull(metadataReader);
 
         var orderedEntries = entries.ToList();
-        var entriesByReferenceNumber = orderedEntries
+        var directoriesByReferenceNumber = orderedEntries
+            .Where(entry => entry.IsDirectory)
             .GroupBy(entry => entry.FileReferenceNumber)
             .ToDictionary(group => group.Key, group => group.Last());
+
+        foreach (var record in CreateFileRecordsFromDirectoryMap(
+                     volumeRoot,
+                     requestedRoot,
+                     directoriesByReferenceNumber,
+                     orderedEntries,
+                     metadataReader,
+                     cancellationToken,
+                     volumeRootFileReferenceNumber,
+                     exclusionRules))
+        {
+            yield return record;
+        }
+    }
+
+    public static IEnumerable<FileRecord> CreateFileRecordsFromDirectoryMap(
+        string volumeRoot,
+        string requestedRoot,
+        IReadOnlyDictionary<ulong, NtfsUsnEntry> directoriesByReferenceNumber,
+        IEnumerable<NtfsUsnEntry> entries,
+        INtfsFileMetadataReader metadataReader,
+        CancellationToken cancellationToken,
+        ulong? volumeRootFileReferenceNumber = null,
+        IndexExclusionRules? exclusionRules = null)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(volumeRoot);
+        ArgumentException.ThrowIfNullOrWhiteSpace(requestedRoot);
+        ArgumentNullException.ThrowIfNull(directoriesByReferenceNumber);
+        ArgumentNullException.ThrowIfNull(entries);
+        ArgumentNullException.ThrowIfNull(metadataReader);
+
+        var rules = exclusionRules ?? IndexExclusionRules.Default;
         var resolvedPaths = new Dictionary<ulong, string>();
 
-        foreach (var entry in orderedEntries)
+        foreach (var entry in entries)
         {
             cancellationToken.ThrowIfCancellationRequested();
-            if (!TryResolvePath(entry, volumeRoot, entriesByReferenceNumber, resolvedPaths, new HashSet<ulong>(), out var fullPath)
+            if (!TryResolvePath(
+                    entry,
+                    volumeRoot,
+                    directoriesByReferenceNumber,
+                    resolvedPaths,
+                    new HashSet<ulong>(),
+                    volumeRootFileReferenceNumber,
+                    out var fullPath)
+                || IsExcludedByRules(fullPath, entry.IsDirectory, rules)
                 || !IsRequestedRootOrDescendant(fullPath, requestedRoot)
                 || !metadataReader.TryRead(fullPath, entry.IsDirectory, cancellationToken, out var metadata))
             {
@@ -42,14 +86,54 @@ internal static class NtfsUsnRecordProjector
         }
     }
 
+    private static bool IsExcludedByRules(string fullPath, bool isDirectory, IndexExclusionRules exclusionRules)
+    {
+        var normalizedPath = NormalizePath(fullPath);
+        var root = Path.GetPathRoot(normalizedPath);
+        var relativePath = string.IsNullOrWhiteSpace(root)
+            ? normalizedPath
+            : Path.GetRelativePath(root, normalizedPath);
+        if (relativePath == ".")
+        {
+            return false;
+        }
+
+        var segments = relativePath.Split(
+            new[] { Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar },
+            StringSplitOptions.RemoveEmptyEntries);
+        var segmentCount = isDirectory ? segments.Length : Math.Max(0, segments.Length - 1);
+        for (var index = 0; index < segmentCount; index++)
+        {
+            if (exclusionRules.ShouldExcludeDirectoryName(segments[index]))
+            {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
     private static bool TryResolvePath(
         NtfsUsnEntry entry,
         string volumeRoot,
         IReadOnlyDictionary<ulong, NtfsUsnEntry> entries,
         IDictionary<ulong, string> resolvedPaths,
         ISet<ulong> resolving,
+        ulong? volumeRootFileReferenceNumber,
         out string fullPath)
     {
+        if (!entry.IsDirectory)
+        {
+            return TryResolveFilePath(
+                entry,
+                volumeRoot,
+                entries,
+                resolvedPaths,
+                resolving,
+                volumeRootFileReferenceNumber,
+                out fullPath);
+        }
+
         if (resolvedPaths.TryGetValue(entry.FileReferenceNumber, out fullPath!))
         {
             return true;
@@ -63,17 +147,31 @@ internal static class NtfsUsnRecordProjector
 
         try
         {
-            if (IsRootEntry(entry))
+            if (IsRootEntry(entry, volumeRootFileReferenceNumber))
             {
                 fullPath = volumeRoot;
                 resolvedPaths[entry.FileReferenceNumber] = fullPath;
                 return true;
             }
 
+            if (IsDirectChildOfVolumeRoot(entry, volumeRootFileReferenceNumber)
+                && IsUsableChildName(entry.Name))
+            {
+                fullPath = Path.Combine(volumeRoot, entry.Name);
+                resolvedPaths[entry.FileReferenceNumber] = fullPath;
+                return true;
+            }
+
             if (!entries.TryGetValue(entry.ParentFileReferenceNumber, out var parent)
-                || !TryResolvePath(parent, volumeRoot, entries, resolvedPaths, resolving, out var parentPath)
-                || string.IsNullOrWhiteSpace(entry.Name)
-                || entry.Name == ".")
+                || !TryResolvePath(
+                    parent,
+                    volumeRoot,
+                    entries,
+                    resolvedPaths,
+                    resolving,
+                    volumeRootFileReferenceNumber,
+                    out var parentPath)
+                || !IsUsableChildName(entry.Name))
             {
                 fullPath = string.Empty;
                 return false;
@@ -89,10 +187,68 @@ internal static class NtfsUsnRecordProjector
         }
     }
 
-    private static bool IsRootEntry(NtfsUsnEntry entry)
+    private static bool TryResolveFilePath(
+        NtfsUsnEntry entry,
+        string volumeRoot,
+        IReadOnlyDictionary<ulong, NtfsUsnEntry> entries,
+        IDictionary<ulong, string> resolvedPaths,
+        ISet<ulong> resolving,
+        ulong? volumeRootFileReferenceNumber,
+        out string fullPath)
+    {
+        if (!IsUsableChildName(entry.Name))
+        {
+            fullPath = string.Empty;
+            return false;
+        }
+
+        if (IsDirectChildOfVolumeRoot(entry, volumeRootFileReferenceNumber))
+        {
+            fullPath = Path.Combine(volumeRoot, entry.Name);
+            return true;
+        }
+
+        if (!entries.TryGetValue(entry.ParentFileReferenceNumber, out var parent)
+            || !TryResolvePath(
+                parent,
+                volumeRoot,
+                entries,
+                resolvedPaths,
+                resolving,
+                volumeRootFileReferenceNumber,
+                out var parentPath))
+        {
+            fullPath = string.Empty;
+            return false;
+        }
+
+        fullPath = Path.Combine(parentPath, entry.Name);
+        return true;
+    }
+
+    private static bool IsRootEntry(NtfsUsnEntry entry, ulong? volumeRootFileReferenceNumber)
     {
         return entry.FileReferenceNumber == entry.ParentFileReferenceNumber
+            || IsSameFileReference(entry.FileReferenceNumber, volumeRootFileReferenceNumber)
             || entry.Name == ".";
+    }
+
+    private static bool IsDirectChildOfVolumeRoot(NtfsUsnEntry entry, ulong? volumeRootFileReferenceNumber)
+    {
+        return IsSameFileReference(entry.ParentFileReferenceNumber, volumeRootFileReferenceNumber);
+    }
+
+    private static bool IsSameFileReference(ulong referenceNumber, ulong? expectedReferenceNumber)
+    {
+        const ulong mftSegmentReferenceNumberMask = 0x0000_FFFF_FFFF_FFFF;
+        return expectedReferenceNumber is { } expected
+            && (referenceNumber == expected
+                || (referenceNumber & mftSegmentReferenceNumberMask) == (expected & mftSegmentReferenceNumberMask));
+    }
+
+    private static bool IsUsableChildName(string name)
+    {
+        return !string.IsNullOrWhiteSpace(name) && name != ".";
     }
 
     private static bool IsRequestedRootOrDescendant(string fullPath, string requestedRoot)

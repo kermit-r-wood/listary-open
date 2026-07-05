@@ -90,6 +90,13 @@ public partial class SearchPanel : Window
             return;
         }
 
+        if (GetPreviewKeyAction(e.Key) == SearchPanelPreviewKeyAction.HidePanel)
+        {
+            e.Handled = true;
+            Close();
+            return;
+        }
+
         var isControlPressed = Keyboard.Modifiers.HasFlag(ModifierKeys.Control);
         if (e.Key == Key.Enter && isControlPressed)
         {
@@ -129,6 +136,13 @@ public partial class SearchPanel : Window
     internal static bool ShouldCopySelectedResultPath(bool focusIsQueryBox, bool focusIsTextInput)
     {
         return !focusIsQueryBox && !focusIsTextInput;
+    }
+
+    internal static SearchPanelPreviewKeyAction GetPreviewKeyAction(Key key)
+    {
+        return key == Key.Escape
+            ? SearchPanelPreviewKeyAction.HidePanel
+            : SearchPanelPreviewKeyAction.None;
     }
 
     internal static async Task RunInteractionAsync(
@@ -183,4 +197,10 @@ public partial class SearchPanel : Window
             return Task.FromResult<IReadOnlyList<SearchResult>>(Array.Empty<SearchResult>());
         }
     }
+}
+
+internal enum SearchPanelPreviewKeyAction
+{
+    None,
+    HidePanel
 }

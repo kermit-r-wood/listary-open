@@ -7,6 +7,7 @@ using System.Security.Principal;
 using System.Text.Json;
 using System.Text.Json.Serialization;
 using ListaryOpen.Core.Indexing;
+using ListaryOpen.Infrastructure.AppData;
 
 namespace ListaryOpen.Infrastructure.Indexing;
 
@@ -24,8 +25,6 @@ internal interface IElevatedIndexerProcess : IDisposable
     bool HasExited { get; }
 
     bool Start();
-
-    Task<string> ReadStandardOutputToEndAsync(CancellationToken cancellationToken);
 
     Task<string> ReadStandardErrorToEndAsync(CancellationToken cancellationToken);
 
@@ -51,69 +50,116 @@ public sealed class DisabledElevatedIndexerClient : IElevatedIndexerClient
 public sealed class ElevatedIndexerClient : IElevatedIndexerClient
 {
     private const string HelperExecutableName = "ListaryOpen.Indexer.Elevated.exe";
+    private const string HelperAssemblyName = "ListaryOpen.Indexer.Elevated.dll";
+    private const string HelperDepsName = "ListaryOpen.Indexer.Elevated.deps.json";
+    private const string HelperRuntimeConfigName = "ListaryOpen.Indexer.Elevated.runtimeconfig.json";
 
     private readonly Func<string?> _resolveHelperPath;
-    private readonly Func<string, string, IElevatedIndexerProcess> _createProcess;
+    private readonly Func<string, string, string, string, IElevatedIndexerProcess> _createFileProcess;
     private readonly Func<string, string, string, string, IElevatedIndexerProcess> _createElevatedProcess;
     private readonly Func<bool> _isProcessElevated;
     private readonly Func<bool>? _isUacElevationEnabledOverride;
+    private readonly string _indexerTempDirectory;
     private bool _uacElevationEnabled;
 
     public ElevatedIndexerClient()
-        : this(ResolveDefaultHelperPath, CreateProcess, CreateElevatedProcess, IsCurrentProcessElevated, null)
+        : this(
+            ResolveDefaultHelperPath,
+            CreateFileProcess,
+            CreateElevatedProcess,
+            IsCurrentProcessElevated,
+            null,
+            AppDataPaths.CreateDefault().IndexerTempDirectory)
     {
     }
 
     public ElevatedIndexerClient(string helperPath)
-        : this(() => helperPath, CreateProcess, CreateElevatedProcess, IsCurrentProcessElevated, null)
+        : this(
+            () => helperPath,
+            CreateFileProcess,
+            CreateElevatedProcess,
+            IsCurrentProcessElevated,
+            null,
+            AppDataPaths.CreateDefault().IndexerTempDirectory)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(helperPath);
     }
 
     internal ElevatedIndexerClient(string helperPath, Func<bool> isProcessElevated)
-        : this(() => helperPath, CreateProcess, CreateElevatedProcess, isProcessElevated, null)
-    {
-        ArgumentException.ThrowIfNullOrWhiteSpace(helperPath);
-    }
-
-    internal ElevatedIndexerClient(string helperPath, Func<string, string, IElevatedIndexerProcess> createProcess)
-        : this(() => helperPath, createProcess, CreateElevatedProcess, () => true, null)
+        : this(
+            () => helperPath,
+            CreateFileProcess,
+            CreateElevatedProcess,
+            isProcessElevated,
+            null,
+            AppDataPaths.CreateDefault().IndexerTempDirectory)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(helperPath);
     }
 
     internal ElevatedIndexerClient(
         string helperPath,
-        Func<string, string, IElevatedIndexerProcess> createProcess,
+        Func<string, string, string, string, IElevatedIndexerProcess> createFileProcess)
+        : this(
+            () => helperPath,
+            createFileProcess,
+            CreateElevatedProcess,
+            () => true,
+            null,
+            AppDataPaths.CreateDefault().IndexerTempDirectory)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(helperPath);
+    }
+
+    internal ElevatedIndexerClient(
+        string helperPath,
+        Func<string, string, string, string, IElevatedIndexerProcess> createFileProcess,
         Func<bool> isProcessElevated)
-        : this(() => helperPath, createProcess, CreateElevatedProcess, isProcessElevated, null)
+        : this(
+            () => helperPath,
+            createFileProcess,
+            CreateElevatedProcess,
+            isProcessElevated,
+            null,
+            AppDataPaths.CreateDefault().IndexerTempDirectory)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(helperPath);
     }
 
     internal ElevatedIndexerClient(
         string helperPath,
-        Func<string, string, IElevatedIndexerProcess> createProcess,
+        Func<string, string, string, string, IElevatedIndexerProcess> createFileProcess,
         Func<bool> isProcessElevated,
         Func<bool> isUacElevationEnabled,
-        Func<string, string, string, string, IElevatedIndexerProcess> createElevatedProcess)
-        : this(() => helperPath, createProcess, createElevatedProcess, isProcessElevated, isUacElevationEnabled)
+        Func<string, string, string, string, IElevatedIndexerProcess> createElevatedProcess,
+        string? indexerTempDirectory = null)
+        : this(
+            () => helperPath,
+            createFileProcess,
+            createElevatedProcess,
+            isProcessElevated,
+            isUacElevationEnabled,
+            indexerTempDirectory ?? AppDataPaths.CreateDefault().IndexerTempDirectory)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(helperPath);
     }
 
     private ElevatedIndexerClient(
         Func<string?> resolveHelperPath,
-        Func<string, string, IElevatedIndexerProcess> createProcess,
+        Func<string, string, string, string, IElevatedIndexerProcess> createFileProcess,
         Func<string, string, string, string, IElevatedIndexerProcess> createElevatedProcess,
         Func<bool> isProcessElevated,
-        Func<bool>? isUacElevationEnabled)
+        Func<bool>? isUacElevationEnabled,
+        string indexerTempDirectory)
     {
+        ArgumentException.ThrowIfNullOrWhiteSpace(indexerTempDirectory);
+
         _resolveHelperPath = resolveHelperPath ?? throw new ArgumentNullException(nameof(resolveHelperPath));
-        _createProcess = createProcess ?? throw new ArgumentNullException(nameof(createProcess));
+        _createFileProcess = createFileProcess ?? throw new ArgumentNullException(nameof(createFileProcess));
         _createElevatedProcess = createElevatedProcess ?? throw new ArgumentNullException(nameof(createElevatedProcess));
         _isProcessElevated = isProcessElevated ?? throw new ArgumentNullException(nameof(isProcessElevated));
         _isUacElevationEnabledOverride = isUacElevationEnabled;
+        _indexerTempDirectory = Path.GetFullPath(indexerTempDirectory);
     }
 
     public bool UacElevationEnabled => IsUacElevationEnabled();
@@ -145,64 +191,104 @@ public sealed class ElevatedIndexerClient : IElevatedIndexerClient
             yield break;
         }
 
-        var records = launchMode == HelperLaunchMode.UacFile
-            ? await RunElevatedHelperToFileAsync(helperPath!, root.Path, cancellationToken).ConfigureAwait(false)
-            : await RunHelperAsync(helperPath!, root.Path, cancellationToken).ConfigureAwait(false);
-        foreach (var record in records)
+        await foreach (var record in RunHelperToFileAsync(helperPath!, root.Path, launchMode, cancellationToken)
+                           .ConfigureAwait(false))
         {
             cancellationToken.ThrowIfCancellationRequested();
             yield return record;
         }
     }
 
-    private async Task<IReadOnlyList<FileRecord>> RunHelperAsync(
+    private async IAsyncEnumerable<FileRecord> RunHelperToFileAsync(
         string helperPath,
         string rootPath,
+        HelperLaunchMode launchMode,
+        [EnumeratorCancellation]
         CancellationToken cancellationToken)
     {
-        using var process = _createProcess(helperPath, rootPath);
+        var outputPath = CreateTempIndexerFilePath(".jsonl");
+        var errorPath = CreateTempIndexerFilePath(".err");
+
+        try
+        {
+            await WriteHelperOutputFileAsync(
+                    helperPath,
+                    rootPath,
+                    outputPath,
+                    errorPath,
+                    launchMode,
+                    cancellationToken).ConfigureAwait(false);
+
+            await foreach (var record in ParseOutputFileIfExistsAsync(outputPath, cancellationToken).ConfigureAwait(false))
+            {
+                yield return record;
+            }
+        }
+        finally
+        {
+            TryDeleteFile(outputPath);
+            TryDeleteFile(errorPath);
+        }
+    }
+
+    private async Task WriteHelperOutputFileAsync(
+        string helperPath,
+        string rootPath,
+        string outputPath,
+        string errorPath,
+        HelperLaunchMode launchMode,
+        CancellationToken cancellationToken)
+    {
+        using var process = launchMode == HelperLaunchMode.UacFile
+            ? _createElevatedProcess(helperPath, rootPath, outputPath, errorPath)
+            : _createFileProcess(helperPath, rootPath, outputPath, errorPath);
 
         try
         {
             if (!process.Start())
             {
+                if (launchMode == HelperLaunchMode.UacFile)
+                {
+                    Trace.TraceInformation("Elevated indexer helper launch was canceled or declined.");
+                    throw new ElevatedIndexerLaunchCanceledException("Elevated indexer helper launch was canceled or declined.");
+                }
+
                 var message = $"Failed to start elevated indexer helper '{helperPath}'.";
                 Trace.TraceError(message);
                 throw new ElevatedIndexerException(message);
             }
         }
-        catch (Exception exception) when (exception is not OperationCanceledException and not ElevatedIndexerException)
+        catch (Exception exception) when (launchMode == HelperLaunchMode.UacFile && IsUacCanceled(exception))
+        {
+            Trace.TraceInformation("Elevated indexer helper launch was canceled by the user.");
+            throw new ElevatedIndexerLaunchCanceledException("Elevated indexer helper launch was canceled by the user.", exception);
+        }
+        catch (Exception exception) when (exception is not OperationCanceledException
+                                         and not ElevatedIndexerException
+                                         and not ElevatedIndexerLaunchCanceledException)
         {
             var message = $"Failed to start elevated indexer helper '{helperPath}': {exception.Message}";
             Trace.TraceError("Failed to start elevated indexer helper '{0}': {1}", helperPath, exception);
             throw new ElevatedIndexerException(message, exception);
         }
 
-        Task<string>? stdoutTask = null;
-        Task<string>? stderrTask = null;
-
         try
         {
-            stdoutTask = process.ReadStandardOutputToEndAsync(cancellationToken);
-            stderrTask = process.ReadStandardErrorToEndAsync(cancellationToken);
-
             await process.WaitForExitAsync(cancellationToken).ConfigureAwait(false);
-            var stdout = await stdoutTask.ConfigureAwait(false);
-            var stderr = await stderrTask.ConfigureAwait(false);
 
             if (process.ExitCode != 0)
             {
-                var diagnostic = TrimDiagnostic(stderr);
+                var diagnostic = TrimDiagnostic(await ReadFileIfExistsAsync(errorPath, cancellationToken).ConfigureAwait(false));
                 var message = $"Elevated indexer helper '{helperPath}' exited with code {process.ExitCode}. stderr: {diagnostic}";
                 Trace.TraceError(message);
                 throw new ElevatedIndexerException(message);
             }
 
-            return ParseOutput(stdout);
+            return;
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
         {
-            await CleanupCanceledProcessAsync(process, stdoutTask, stderrTask).ConfigureAwait(false);
+            await CleanupCanceledProcessAsync(process, stdoutTask: null, stderrTask: null).ConfigureAwait(false);
             throw;
         }
         catch (InvalidDataException)
@@ -221,87 +307,20 @@ public sealed class ElevatedIndexerClient : IElevatedIndexerClient
         }
     }
 
-    private async Task<IReadOnlyList<FileRecord>> RunElevatedHelperToFileAsync(
-        string helperPath,
-        string rootPath,
+    private static async IAsyncEnumerable<FileRecord> ParseOutputFileIfExistsAsync(
+        string path,
+        [EnumeratorCancellation]
         CancellationToken cancellationToken)
     {
-        var outputPath = CreateTempIndexerFilePath(".jsonl");
-        var errorPath = CreateTempIndexerFilePath(".err");
-
-        try
+        if (!File.Exists(path))
         {
-            using var process = _createElevatedProcess(helperPath, rootPath, outputPath, errorPath);
-
-            try
-            {
-                if (!process.Start())
-                {
-                    Trace.TraceInformation("Elevated indexer helper launch was canceled or declined.");
-                    return Array.Empty<FileRecord>();
-                }
-            }
-            catch (Exception exception) when (IsUacCanceled(exception))
-            {
-                Trace.TraceInformation("Elevated indexer helper launch was canceled by the user.");
-                return Array.Empty<FileRecord>();
-            }
-            catch (Exception exception) when (exception is not OperationCanceledException)
-            {
-                var message = $"Failed to start elevated indexer helper '{helperPath}': {exception.Message}";
-                Trace.TraceError("Failed to start elevated indexer helper '{0}': {1}", helperPath, exception);
-                throw new ElevatedIndexerException(message, exception);
-            }
-
-            try
-            {
-                await process.WaitForExitAsync(cancellationToken).ConfigureAwait(false);
-
-                if (process.ExitCode != 0)
-                {
-                    var diagnostic = TrimDiagnostic(await ReadFileIfExistsAsync(errorPath, cancellationToken).ConfigureAwait(false));
-                    var message = $"Elevated indexer helper '{helperPath}' exited with code {process.ExitCode}. stderr: {diagnostic}";
-                    Trace.TraceError(message);
-                    throw new ElevatedIndexerException(message);
-                }
-
-                var output = await ReadFileIfExistsAsync(outputPath, cancellationToken).ConfigureAwait(false);
-                return ParseOutput(output);
-            }
-            catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
-            {
-                await CleanupCanceledProcessAsync(process, stdoutTask: null, stderrTask: null).ConfigureAwait(false);
-                throw;
-            }
-            catch (InvalidDataException)
-            {
-                throw;
-            }
-            catch (ElevatedIndexerException)
-            {
-                throw;
-            }
-            catch (Exception exception)
-            {
-                var message = $"Elevated indexer helper '{helperPath}' failed while running: {exception.Message}";
-                Trace.TraceError("Elevated indexer helper '{0}' failed while running: {1}", helperPath, exception);
-                throw new ElevatedIndexerException(message, exception);
-            }
+            yield break;
         }
-        finally
-        {
-            TryDeleteFile(outputPath);
-            TryDeleteFile(errorPath);
-        }
-    }
 
-    private static IReadOnlyList<FileRecord> ParseOutput(string stdout)
-    {
-        var records = new List<FileRecord>();
-        using var reader = new StringReader(stdout);
+        using var stream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read, bufferSize: 64 * 1024, useAsync: true);
+        using var reader = new StreamReader(stream);
         var lineNumber = 0;
-
-        while (reader.ReadLine() is { } line)
+        while (await reader.ReadLineAsync(cancellationToken).ConfigureAwait(false) is { } line)
         {
             lineNumber++;
             if (string.IsNullOrWhiteSpace(line))
@@ -309,10 +328,8 @@ public sealed class ElevatedIndexerClient : IElevatedIndexerClient
                 continue;
             }
 
-            records.Add(ParseRecord(line, lineNumber));
+            yield return ParseRecord(line, lineNumber);
         }
-
-        return records;
     }
 
     private static FileRecord ParseRecord(string line, int lineNumber)
@@ -354,11 +371,19 @@ public sealed class ElevatedIndexerClient : IElevatedIndexerClient
         }
     }
 
-    private static IElevatedIndexerProcess CreateProcess(string helperPath, string rootPath)
+    private static IElevatedIndexerProcess CreateFileProcess(
+        string helperPath,
+        string rootPath,
+        string outputPath,
+        string errorPath)
     {
         var process = new Process
         {
-            StartInfo = ElevatedIndexerProcessStartInfoFactory.CreateRedirected(helperPath, rootPath)
+            StartInfo = ElevatedIndexerProcessStartInfoFactory.CreateRedirectedFile(
+                helperPath,
+                rootPath,
+                outputPath,
+                errorPath)
         };
 
         return new ElevatedIndexerProcess(process);
@@ -372,7 +397,11 @@ public sealed class ElevatedIndexerClient : IElevatedIndexerClient
     {
         var process = new Process
         {
-            StartInfo = ElevatedIndexerProcessStartInfoFactory.CreateUacFile(helperPath, rootPath, outputPath, errorPath)
+            StartInfo = ElevatedIndexerProcessStartInfoFactory.CreateUacFile(
+                helperPath,
+                rootPath,
+                outputPath,
+                errorPath)
         };
 
         return new ElevatedIndexerProcess(process);
@@ -382,7 +411,7 @@ public sealed class ElevatedIndexerClient : IElevatedIndexerClient
     {
         helperPath = _resolveHelperPath();
         launchMode = HelperLaunchMode.Unavailable;
-        if (string.IsNullOrWhiteSpace(helperPath) || !File.Exists(helperPath))
+        if (string.IsNullOrWhiteSpace(helperPath) || !IsUsableHelperBundle(helperPath))
         {
             return false;
         }
@@ -477,23 +506,44 @@ public sealed class ElevatedIndexerClient : IElevatedIndexerClient
 
     private static string ResolveDefaultHelperPath()
     {
-        var baseDirectory = AppContext.BaseDirectory;
+        return ResolveDefaultHelperPath(AppContext.BaseDirectory);
+    }
+
+    internal static string ResolveDefaultHelperPath(string baseDirectory)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(baseDirectory);
+
         var besideApp = Path.Combine(baseDirectory, HelperExecutableName);
-        if (File.Exists(besideApp))
+        if (IsUsableHelperBundle(besideApp))
         {
             return besideApp;
         }
 
         var buildOutput = ResolveRepositoryBuildOutput(baseDirectory);
-        return buildOutput is not null && File.Exists(buildOutput) ? buildOutput : besideApp;
+        return buildOutput is not null && IsUsableHelperBundle(buildOutput) ? buildOutput : besideApp;
+    }
+
+    private static bool IsUsableHelperBundle(string helperPath)
+    {
+        if (!File.Exists(helperPath))
+        {
+            return false;
+        }
+
+        var directory = Path.GetDirectoryName(helperPath);
+        return !string.IsNullOrWhiteSpace(directory) &&
+            File.Exists(Path.Combine(directory, HelperAssemblyName)) &&
+            File.Exists(Path.Combine(directory, HelperDepsName)) &&
+            File.Exists(Path.Combine(directory, HelperRuntimeConfigName));
     }
 
     private static string? ResolveRepositoryBuildOutput(string baseDirectory)
     {
-        var trimmedBaseDirectory = Path.TrimEndingDirectorySeparator(baseDirectory);
-        var targetFramework = new DirectoryInfo(trimmedBaseDirectory).Name;
-        var configuration = Directory.GetParent(trimmedBaseDirectory)?.Name;
-        if (string.IsNullOrWhiteSpace(targetFramework) || string.IsNullOrWhiteSpace(configuration))
+        if (!TryInferBuildOutputLayout(
+                baseDirectory,
+                out var configuration,
+                out var targetFramework,
+                out var runtimeIdentifier))
         {
             return null;
         }
@@ -507,8 +557,13 @@ public sealed class ElevatedIndexerClient : IElevatedIndexerClient
                 "ListaryOpen.Indexer.Elevated",
                 "bin",
                 configuration,
-                targetFramework,
-                HelperExecutableName);
+                targetFramework);
+            if (!string.IsNullOrWhiteSpace(runtimeIdentifier))
+            {
+                candidate = Path.Combine(candidate, runtimeIdentifier);
+            }
+
+            candidate = Path.Combine(candidate, HelperExecutableName);
 
             if (File.Exists(candidate))
             {
@@ -521,6 +576,30 @@ public sealed class ElevatedIndexerClient : IElevatedIndexerClient
         return null;
     }
 
+    private static bool TryInferBuildOutputLayout(
+        string baseDirectory,
+        out string configuration,
+        out string targetFramework,
+        out string? runtimeIdentifier)
+    {
+        var outputDirectory = new DirectoryInfo(Path.TrimEndingDirectorySeparator(baseDirectory));
+        targetFramework = outputDirectory.Name;
+        runtimeIdentifier = null;
+        var configurationDirectory = outputDirectory.Parent;
+
+        if (!targetFramework.StartsWith("net", StringComparison.OrdinalIgnoreCase))
+        {
+            runtimeIdentifier = targetFramework;
+            outputDirectory = configurationDirectory ?? new DirectoryInfo(baseDirectory);
+            targetFramework = outputDirectory.Name;
+            configurationDirectory = outputDirectory.Parent;
+        }
+
+        configuration = configurationDirectory?.Name ?? string.Empty;
+        return !string.IsNullOrWhiteSpace(configuration) &&
+            !string.IsNullOrWhiteSpace(targetFramework);
+    }
+
     private static string TrimDiagnostic(string value)
     {
         const int maxLength = 1024;
@@ -528,9 +607,10 @@ public sealed class ElevatedIndexerClient : IElevatedIndexerClient
         return trimmed.Length <= maxLength ? trimmed : trimmed[..maxLength];
     }
 
-    private static string CreateTempIndexerFilePath(string extension)
+    private string CreateTempIndexerFilePath(string extension)
     {
-        return Path.Combine(Path.GetTempPath(), "listary-open-indexer-" + Guid.NewGuid() + extension);
+        Directory.CreateDirectory(_indexerTempDirectory);
+        return Path.Combine(_indexerTempDirectory, "listary-open-indexer-" + Guid.NewGuid() + extension);
     }
 
     private static async Task<string> ReadFileIfExistsAsync(string path, CancellationToken cancellationToken)
@@ -636,9 +716,6 @@ public sealed class ElevatedIndexerClient : IElevatedIndexerClient
 
         public bool Start() => _process.Start();
 
-        public Task<string> ReadStandardOutputToEndAsync(CancellationToken cancellationToken)
-            => _process.StandardOutput.ReadToEndAsync(cancellationToken);
-
         public Task<string> ReadStandardErrorToEndAsync(CancellationToken cancellationToken)
             => _process.StandardError.ReadToEndAsync(cancellationToken);
 
@@ -654,5 +731,18 @@ public sealed class ElevatedIndexerClient : IElevatedIndexerClient
         {
             _process.Dispose();
         }
+    }
+}
+
+internal sealed class ElevatedIndexerLaunchCanceledException : InvalidOperationException
+{
+    public ElevatedIndexerLaunchCanceledException(string message)
+        : base(message)
+    {
+    }
+
+    public ElevatedIndexerLaunchCanceledException(string message, Exception innerException)
+        : base(message, innerException)
+    {
     }
 }

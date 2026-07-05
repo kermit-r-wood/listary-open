@@ -4,7 +4,7 @@ using System.Security;
 
 namespace ListaryOpen.Infrastructure.Windows;
 
-public sealed class ExplorerTracker : IQuickSwitchWindowProvider
+public sealed class ExplorerTracker : IRefreshableQuickSwitchWindowProvider
 {
     private readonly Func<IntPtr> _foregroundWindowProvider;
     private readonly IExplorerShellWindowsProvider _shellWindowsProvider;
@@ -24,6 +24,11 @@ public sealed class ExplorerTracker : IQuickSwitchWindowProvider
     }
 
     public string? LastFolder => _lastFolder;
+
+    public void Refresh()
+    {
+        ObserveForegroundExplorerFolder();
+    }
 
     public IReadOnlyList<QuickSwitchFolderCandidate> GetFolderCandidates()
     {
@@ -68,6 +73,18 @@ public sealed class ExplorerTracker : IQuickSwitchWindowProvider
             }
 
             var rememberedFolderPath = NormalizeExistingFolderPath(_lastFolder);
+            if (candidates.Count == 0 && rememberedFolderPath is not null)
+            {
+                return new[]
+                {
+                    new QuickSwitchFolderCandidate(
+                        rememberedFolderPath,
+                        "Explorer",
+                        IntPtr.Zero,
+                        false)
+                };
+            }
+
             return candidates
                 .OrderByDescending(candidate => candidate.IsForeground)
                 .ThenByDescending(candidate => IsRememberedFolderCandidate(candidate, rememberedFolderPath))
@@ -75,7 +92,17 @@ public sealed class ExplorerTracker : IQuickSwitchWindowProvider
         }
         catch (Exception exception) when (IsExpectedExplorerObservationException(exception))
         {
-            return Array.Empty<QuickSwitchFolderCandidate>();
+            var rememberedFolderPath = NormalizeExistingFolderPath(_lastFolder);
+            return rememberedFolderPath is null
+                ? Array.Empty<QuickSwitchFolderCandidate>()
+                : new[]
+                {
+                    new QuickSwitchFolderCandidate(
+                        rememberedFolderPath,
+                        "Explorer",
+                        IntPtr.Zero,
+                        false)
+                };
         }
     }
 
@@ -199,6 +226,14 @@ internal sealed class ComExplorerShellWindowsProvider : IExplorerShellWindowsPro
                 {
                     dynamic window = shellWindow;
                     var handle = new IntPtr(Convert.ToInt64(window.HWND));
+                    var activeTabHandle = GetActiveExplorerTabHandle(handle);
+                    if (activeTabHandle != IntPtr.Zero &&
+                        TryGetShellBrowserWindowHandle(shellWindow, out var shellBrowserHandle) &&
+                        !ShouldIncludeShellWindowForActiveTab(activeTabHandle, shellBrowserHandle))
+                    {
+                        continue;
+                    }
+
                     var folderPath = window.Document?.Folder?.Self?.Path as string;
                     windows.Add(new ExplorerShellWindow(handle, folderPath));
                 }
@@ -218,6 +253,76 @@ internal sealed class ComExplorerShellWindowsProvider : IExplorerShellWindowsPro
         }
 
         return windows;
+    }
+
+    internal static bool ShouldIncludeShellWindowForActiveTab(IntPtr activeTabHandle, IntPtr shellBrowserHandle)
+    {
+        return activeTabHandle == IntPtr.Zero ||
+            shellBrowserHandle == IntPtr.Zero ||
+            activeTabHandle == shellBrowserHandle;
+    }
+
+    private static IntPtr GetActiveExplorerTabHandle(IntPtr explorerWindowHandle)
+    {
+        var activeTabHandle = IntPtr.Zero;
+        NativeMethods.EnumChildWindows(
+            explorerWindowHandle,
+            (childHandle, _) =>
+            {
+                if (string.Equals(GetClassName(childHandle), "ShellTabWindowClass", StringComparison.Ordinal))
+                {
+                    activeTabHandle = childHandle;
+                    return false;
+                }
+
+                return true;
+            },
+            IntPtr.Zero);
+
+        return activeTabHandle;
+    }
+
+    private static bool TryGetShellBrowserWindowHandle(object shellWindow, out IntPtr shellBrowserHandle)
+    {
+        shellBrowserHandle = IntPtr.Zero;
+        var shellBrowserInterfaceId = typeof(IShellBrowser).GUID;
+        var unknown = IntPtr.Zero;
+        var shellBrowserPointer = IntPtr.Zero;
+
+        try
+        {
+            unknown = Marshal.GetIUnknownForObject(shellWindow);
+            if (Marshal.QueryInterface(unknown, ref shellBrowserInterfaceId, out shellBrowserPointer) != 0 ||
+                shellBrowserPointer == IntPtr.Zero)
+            {
+                return false;
+            }
+
+            if (Marshal.GetObjectForIUnknown(shellBrowserPointer) is not IShellBrowser shellBrowser)
+            {
+                return false;
+            }
+
+            shellBrowser.GetWindow(out shellBrowserHandle);
+            return shellBrowserHandle != IntPtr.Zero;
+        }
+        catch (Exception exception) when (IsExpectedShellWindowException(exception))
+        {
+            shellBrowserHandle = IntPtr.Zero;
+            return false;
+        }
+        finally
+        {
+            if (shellBrowserPointer != IntPtr.Zero)
+            {
+                Marshal.Release(shellBrowserPointer);
+            }
+
+            if (unknown != IntPtr.Zero)
+            {
+                Marshal.Release(unknown);
+            }
+        }
     }
 
     private static bool IsExpectedShellWindowException(Exception exception)
@@ -243,5 +348,20 @@ internal sealed class ComExplorerShellWindowsProvider : IExplorerShellWindowsPro
         {
             Marshal.ReleaseComObject(value);
         }
+    }
+
+    private static string GetClassName(IntPtr handle)
+    {
+        var buffer = new char[256];
+        var length = NativeMethods.GetClassName(handle, buffer, buffer.Length);
+        return length <= 0 ? string.Empty : new string(buffer, 0, length);
+    }
+
+    [ComImport]
+    [Guid("000214E2-0000-0000-C000-000000000046")]
+    [InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+    private interface IShellBrowser
+    {
+        void GetWindow(out IntPtr windowHandle);
     }
 }

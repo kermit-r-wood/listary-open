@@ -71,6 +71,35 @@ public sealed class FallbackIndexProviderTests
     }
 
     [Fact]
+    public async Task ScanAsyncSkipsExcludedDirectorySubtrees()
+    {
+        var root = Path.Combine(Path.GetTempPath(), "listary-open-" + Guid.NewGuid());
+        Directory.CreateDirectory(root);
+
+        try
+        {
+            var keep = Directory.CreateDirectory(Path.Combine(root, "keep"));
+            await File.WriteAllTextAsync(Path.Combine(keep.FullName, "visible.txt"), "visible");
+            var excluded = Directory.CreateDirectory(Path.Combine(root, "node_modules"));
+            await File.WriteAllTextAsync(Path.Combine(excluded.FullName, "hidden.txt"), "hidden");
+
+            var provider = new FallbackIndexProvider();
+            var records = new List<FileRecord>();
+            await foreach (var record in provider.ScanAsync(new IndexRoot(root), CancellationToken.None))
+            {
+                records.Add(record);
+            }
+
+            Assert.Contains(records, record => record.FullPath.EndsWith("visible.txt", StringComparison.OrdinalIgnoreCase));
+            Assert.DoesNotContain(records, record => record.FullPath.Contains("node_modules", StringComparison.OrdinalIgnoreCase));
+        }
+        finally
+        {
+            Directory.Delete(root, recursive: true);
+        }
+    }
+
+    [Fact]
     public async Task ScanAsyncThrowsWhenCancellationTokenIsAlreadyCanceled()
     {
         var root = Path.Combine(Path.GetTempPath(), "listary-open-" + Guid.NewGuid());

@@ -22,13 +22,16 @@ public sealed class NtfsUsnJournalReader
 
         try
         {
-            var entries = ReadEntries(handle, cancellationToken);
-            foreach (var record in NtfsUsnRecordProjector.CreateFileRecords(
+            var volumeRootFileReferenceNumber = ReadFileReferenceNumber(scanRoot.VolumeRoot);
+            var directories = ReadDirectoryEntries(handle, cancellationToken);
+            foreach (var record in NtfsUsnRecordProjector.CreateFileRecordsFromDirectoryMap(
                          scanRoot.VolumeRoot,
                          scanRoot.RequestedRoot,
-                         entries.Values,
+                         directories,
+                         EnumerateEntries(handle, cancellationToken),
                          new NtfsFileMetadataReader(),
-                         cancellationToken))
+                         cancellationToken,
+                         volumeRootFileReferenceNumber))
             {
                 yield return record;
                 await Task.Yield();
@@ -59,7 +62,54 @@ public sealed class NtfsUsnJournalReader
         return handle;
     }
 
-    private static Dictionary<ulong, NtfsUsnEntry> ReadEntries(IntPtr handle, CancellationToken cancellationToken)
+    private static ulong ReadFileReferenceNumber(string path)
+    {
+        var handle = NtfsNativeMethods.CreateFileW(
+            path,
+            NtfsNativeMethods.GenericRead,
+            NtfsNativeMethods.FileShareRead | NtfsNativeMethods.FileShareWrite | NtfsNativeMethods.FileShareDelete,
+            IntPtr.Zero,
+            NtfsNativeMethods.OpenExisting,
+            NtfsNativeMethods.FileFlagBackupSemantics,
+            IntPtr.Zero);
+
+        if (handle == NtfsNativeMethods.InvalidHandleValue)
+        {
+            throw CreateWin32Exception("Failed to open NTFS volume root.");
+        }
+
+        try
+        {
+            if (!NtfsNativeMethods.GetFileInformationByHandle(handle, out var information))
+            {
+                throw CreateWin32Exception("Failed to read NTFS volume root file reference.");
+            }
+
+            return ((ulong)information.FileIndexHigh << 32) | information.FileIndexLow;
+        }
+        finally
+        {
+            NtfsNativeMethods.CloseHandle(handle);
+        }
+    }
+
+    private static Dictionary<ulong, NtfsUsnEntry> ReadDirectoryEntries(
+        IntPtr handle,
+        CancellationToken cancellationToken)
+    {
+        var entries = new Dictionary<ulong, NtfsUsnEntry>();
+        foreach (var entry in EnumerateEntries(handle, cancellationToken))
+        {
+            if (entry.IsDirectory)
+            {
+                entries[entry.FileReferenceNumber] = entry;
+            }
+        }
+
+        return entries;
+    }
+
+    private static IEnumerable<NtfsUsnEntry> EnumerateEntries(IntPtr handle, CancellationToken cancellationToken)
     {
         var journalData = QueryJournal(handle);
         var enumData = new NtfsNativeMethods.MftEnumDataV0
@@ -69,7 +119,6 @@ public sealed class NtfsUsnJournalReader
             HighUsn = journalData.NextUsn
         };
 
-        var entries = new Dictionary<ulong, NtfsUsnEntry>();
         var buffer = new byte[UsnBufferLength];
         var enumDataSize = Marshal.SizeOf<NtfsNativeMethods.MftEnumDataV0>();
 
@@ -104,10 +153,11 @@ public sealed class NtfsUsnJournalReader
             }
 
             enumData.StartFileReferenceNumber = BinaryPrimitives.ReadUInt64LittleEndian(buffer.AsSpan(0, UsnOutputPrefixLength));
-            ReadEntriesFromBuffer(buffer.AsSpan(UsnOutputPrefixLength, bytesReturned - UsnOutputPrefixLength), entries);
+            foreach (var entry in ReadEntriesFromBuffer(buffer.AsSpan(UsnOutputPrefixLength, bytesReturned - UsnOutputPrefixLength)))
+            {
+                yield return entry;
+            }
         }
-
-        return entries;
     }
 
     private static NtfsNativeMethods.UsnJournalDataV0 QueryJournal(IntPtr handle)
@@ -131,8 +181,9 @@ public sealed class NtfsUsnJournalReader
         return journalData;
     }
 
-    private static void ReadEntriesFromBuffer(ReadOnlySpan<byte> recordsBuffer, Dictionary<ulong, NtfsUsnEntry> entries)
+    private static IReadOnlyList<NtfsUsnEntry> ReadEntriesFromBuffer(ReadOnlySpan<byte> recordsBuffer)
     {
+        var entries = new List<NtfsUsnEntry>();
         var offset = 0;
         while (offset < recordsBuffer.Length)
         {
@@ -156,9 +207,11 @@ public sealed class NtfsUsnJournalReader
                 parsed.Name,
                 parsed.IsDirectory);
 
-            entries[entry.FileReferenceNumber] = entry;
+            entries.Add(entry);
             offset += (int)recordLength;
         }
+
+        return entries;
     }
 
     private static Win32Exception CreateWin32Exception(string message)

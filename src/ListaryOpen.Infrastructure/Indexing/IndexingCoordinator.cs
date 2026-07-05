@@ -20,14 +20,14 @@ public sealed class IndexingCoordinator
 
     private readonly SqliteSearchIndex _index;
     private readonly VolumeIndexer _volumeIndexer;
-    private readonly FallbackIndexProvider _fallbackProvider;
+    private readonly IIndexProvider _fallbackProvider;
     private readonly Func<IndexRoot, VolumeInfo> _volumeResolver;
     private readonly int _batchSize;
 
     public IndexingCoordinator(
         SqliteSearchIndex index,
         VolumeIndexer volumeIndexer,
-        FallbackIndexProvider fallbackProvider,
+        IIndexProvider fallbackProvider,
         Func<IndexRoot, VolumeInfo>? volumeResolver = null,
         int batchSize = DefaultBatchSize)
     {
@@ -55,6 +55,7 @@ public sealed class IndexingCoordinator
 
         var indexedCount = 0;
         var hadFailures = false;
+        long? indexGeneration = null;
         RaiseStatus(IndexingRunState.Indexing, "Indexing started.", indexedCount);
 
         foreach (var root in roots)
@@ -70,8 +71,14 @@ public sealed class IndexingCoordinator
 
             try
             {
+                indexGeneration ??= await _index.BeginIndexingRunAsync(cancellationToken).ConfigureAwait(false);
                 var provider = SelectProvider(root);
-                var result = await IndexRootWithProviderAsync(provider, root, indexedCount, cancellationToken).ConfigureAwait(false);
+                var result = await IndexRootWithProviderAsync(
+                    provider,
+                    root,
+                    indexedCount,
+                    indexGeneration.Value,
+                    cancellationToken).ConfigureAwait(false);
                 indexedCount += result.IndexedCount;
                 hadFailures |= result.HadFailure;
             }
@@ -112,23 +119,29 @@ public sealed class IndexingCoordinator
         IIndexProvider provider,
         IndexRoot root,
         int currentIndexedCount,
+        long indexGeneration,
         CancellationToken cancellationToken)
     {
         if (!IsNtfsProvider(provider))
         {
-            return new IndexRootResult(await ScanAndUpsertAsync(provider, root, cancellationToken).ConfigureAwait(false), HadFailure: false);
+            var count = await ScanAndUpsertAsync(provider, root, indexGeneration, cancellationToken).ConfigureAwait(false);
+            await _index.PruneStaleRecordsUnderRootAsync(root.Path, indexGeneration, cancellationToken).ConfigureAwait(false);
+            return new IndexRootResult(count, HadFailure: false);
         }
 
         try
         {
-            var count = await ScanAndUpsertAsync(provider, root, cancellationToken).ConfigureAwait(false);
+            var count = await ScanAndUpsertAsync(provider, root, indexGeneration, cancellationToken).ConfigureAwait(false);
             if (count > 0)
             {
+                await _index.PruneStaleRecordsUnderRootAsync(root.Path, indexGeneration, cancellationToken).ConfigureAwait(false);
                 return new IndexRootResult(count, HadFailure: false);
             }
 
             RaiseStatus(IndexingRunState.Indexing, $"NTFS returned no records; using fallback for {root.Path}.", currentIndexedCount);
-            return new IndexRootResult(await ScanAndUpsertAsync(_fallbackProvider, root, cancellationToken).ConfigureAwait(false), HadFailure: false);
+            var fallbackCount = await ScanAndUpsertAsync(_fallbackProvider, root, indexGeneration, cancellationToken).ConfigureAwait(false);
+            await _index.PruneStaleRecordsUnderRootAsync(root.Path, indexGeneration, cancellationToken).ConfigureAwait(false);
+            return new IndexRootResult(fallbackCount, HadFailure: false);
         }
         catch (OperationCanceledException)
         {
@@ -136,14 +149,23 @@ public sealed class IndexingCoordinator
         }
         catch (IndexProviderScanException exception)
         {
+            if (IsElevatedIndexerLaunchCanceled(exception))
+            {
+                RaiseStatus(IndexingRunState.Indexing, $"NTFS scan canceled for {root.Path}.", currentIndexedCount);
+                return new IndexRootResult(0, HadFailure: false);
+            }
+
             RaiseStatus(IndexingRunState.Failed, $"NTFS scan failed for {root.Path}; using fallback. {exception.Message}", currentIndexedCount);
-            return new IndexRootResult(await ScanAndUpsertAsync(_fallbackProvider, root, cancellationToken).ConfigureAwait(false), HadFailure: true);
+            var fallbackCount = await ScanAndUpsertAsync(_fallbackProvider, root, indexGeneration, cancellationToken).ConfigureAwait(false);
+            await _index.PruneStaleRecordsUnderRootAsync(root.Path, indexGeneration, cancellationToken).ConfigureAwait(false);
+            return new IndexRootResult(fallbackCount, HadFailure: true);
         }
     }
 
     private async Task<int> ScanAndUpsertAsync(
         IIndexProvider provider,
         IndexRoot root,
+        long indexGeneration,
         CancellationToken cancellationToken)
     {
         var indexedCount = 0;
@@ -191,7 +213,7 @@ public sealed class IndexingCoordinator
 
                 if (batch.Count == _batchSize)
                 {
-                    indexedCount += await FlushBatchAsync(batch, cancellationToken).ConfigureAwait(false);
+                    indexedCount += await FlushBatchAsync(batch, indexGeneration, cancellationToken).ConfigureAwait(false);
                 }
             }
         }
@@ -200,18 +222,21 @@ public sealed class IndexingCoordinator
             await enumerator.DisposeAsync().ConfigureAwait(false);
         }
 
-        indexedCount += await FlushBatchAsync(batch, cancellationToken).ConfigureAwait(false);
+        indexedCount += await FlushBatchAsync(batch, indexGeneration, cancellationToken).ConfigureAwait(false);
         return indexedCount;
     }
 
-    private async Task<int> FlushBatchAsync(List<FileRecord> batch, CancellationToken cancellationToken)
+    private async Task<int> FlushBatchAsync(
+        List<FileRecord> batch,
+        long indexGeneration,
+        CancellationToken cancellationToken)
     {
         if (batch.Count == 0)
         {
             return 0;
         }
 
-        await _index.UpsertManyAsync(batch, cancellationToken).ConfigureAwait(false);
+        await _index.UpsertManyAsync(batch, indexGeneration, cancellationToken).ConfigureAwait(false);
         var count = batch.Count;
         batch.Clear();
         return count;
@@ -225,6 +250,19 @@ public sealed class IndexingCoordinator
     private static bool IsNtfsProvider(IIndexProvider provider)
     {
         return string.Equals(provider.Name, NtfsIndexProvider.ProviderName, StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static bool IsElevatedIndexerLaunchCanceled(Exception exception)
+    {
+        for (var current = exception; current is not null; current = current.InnerException)
+        {
+            if (current is ElevatedIndexerLaunchCanceledException)
+            {
+                return true;
+            }
+        }
+
+        return false;
     }
 
     internal static VolumeInfo ResolveVolume(IndexRoot root)

@@ -10,3 +10,8 @@ public interface IQuickSwitchWindowProvider
 {
     IReadOnlyList<QuickSwitchFolderCandidate> GetFolderCandidates();
 }
+
+public interface IRefreshableQuickSwitchWindowProvider : IQuickSwitchWindowProvider
+{
+    void Refresh();
+}

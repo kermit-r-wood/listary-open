@@ -13,6 +13,7 @@ internal static partial class NativeMethods
     internal const ushort VkReturn = 0x0D;
     internal const ushort VkA = 0x41;
     internal const ushort VkControl = 0x11;
+    internal const ushort VkL = 0x4C;
 
     [StructLayout(LayoutKind.Sequential)]
     internal struct Input
@@ -115,6 +116,12 @@ internal static partial class NativeMethods
     [LibraryImport("user32.dll")]
     internal static partial IntPtr GetWindow(IntPtr hWnd, uint uCmd);
 
+    [LibraryImport("user32.dll")]
+    internal static partial IntPtr GetParent(IntPtr hWnd);
+
+    [LibraryImport("kernel32.dll")]
+    internal static partial uint GetCurrentThreadId();
+
     [LibraryImport("user32.dll", SetLastError = true)]
     [return: MarshalAs(UnmanagedType.Bool)]
     internal static partial bool GetGUIThreadInfo(uint idThread, ref GuiThreadInfo guiThreadInfo);
@@ -123,11 +130,18 @@ internal static partial class NativeMethods
     [return: MarshalAs(UnmanagedType.Bool)]
     internal static partial bool IsWindowVisible(IntPtr hWnd);
 
+    [LibraryImport("user32.dll")]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    internal static partial bool IsWindow(IntPtr hWnd);
+
     [LibraryImport("user32.dll", SetLastError = true)]
     internal static partial uint GetWindowThreadProcessId(IntPtr hWnd, out uint processId);
 
     [LibraryImport("user32.dll", EntryPoint = "GetClassNameW", StringMarshalling = StringMarshalling.Utf16)]
     internal static partial int GetClassName(IntPtr hWnd, char[] className, int maxCount);
+
+    [LibraryImport("user32.dll")]
+    internal static partial int GetDlgCtrlID(IntPtr hWnd);
 
     [LibraryImport("user32.dll", SetLastError = true)]
     [return: MarshalAs(UnmanagedType.Bool)]
@@ -142,6 +156,10 @@ internal static partial class NativeMethods
 
     [LibraryImport("user32.dll")]
     internal static partial IntPtr SetFocus(IntPtr hWnd);
+
+    [LibraryImport("user32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    internal static partial bool AttachThreadInput(uint idAttach, uint idAttachTo, [MarshalAs(UnmanagedType.Bool)] bool fAttach);
 
     [LibraryImport("user32.dll", SetLastError = true)]
     [return: MarshalAs(UnmanagedType.Bool)]

@@ -5,17 +5,23 @@ namespace ListaryOpen.Infrastructure.Tests.Indexing;
 public sealed class ElevatedIndexerProcessStartInfoFactoryTests
 {
     [Fact]
-    public void CreateRedirectedUsesStdoutAndStderrRedirection()
+    public void CreateRedirectedFileUsesScanToFileWithoutRunAs()
     {
-        var startInfo = ElevatedIndexerProcessStartInfoFactory.CreateRedirected(
+        var startInfo = ElevatedIndexerProcessStartInfoFactory.CreateRedirectedFile(
             "C:\\Tools\\ListaryOpen.Indexer.Elevated.exe",
-            "C:\\Users\\paulx");
+            "C:\\Users\\paulx",
+            "C:\\Temp\\records.jsonl",
+            "C:\\Temp\\error.txt");
 
         Assert.Equal("C:\\Tools\\ListaryOpen.Indexer.Elevated.exe", startInfo.FileName);
         Assert.False(startInfo.UseShellExecute);
-        Assert.True(startInfo.RedirectStandardOutput);
-        Assert.True(startInfo.RedirectStandardError);
-        Assert.Equal(new[] { "scan", "C:\\Users\\paulx" }, startInfo.ArgumentList);
+        Assert.Equal(string.Empty, startInfo.Verb);
+        Assert.False(startInfo.RedirectStandardOutput);
+        Assert.False(startInfo.RedirectStandardError);
+        Assert.True(startInfo.CreateNoWindow);
+        Assert.Equal(
+            new[] { "scan-to-file", "C:\\Users\\paulx", "C:\\Temp\\records.jsonl", "C:\\Temp\\error.txt" },
+            startInfo.ArgumentList);
     }
 
     [Fact]

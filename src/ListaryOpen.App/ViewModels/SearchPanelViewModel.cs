@@ -13,13 +13,18 @@ namespace ListaryOpen.App.ViewModels;
 
 public sealed class SearchPanelViewModel : INotifyPropertyChanged
 {
+    private static readonly TimeSpan DefaultSearchDelay = TimeSpan.FromMilliseconds(150);
+
     private readonly ISearchIndex _index;
     private readonly Func<string?, string?> _normalizeExistingFolder;
     private readonly Func<string, bool> _folderExists;
     private readonly Func<string, DateTimeOffset> _getFolderLastWriteTime;
     private readonly ISearchResultActivationService _activationService;
     private readonly Func<string, CancellationToken, Task<DialogJumpResult>> _dialogFolderActivation;
+    private readonly TimeSpan _searchDelay;
+    private readonly object _refreshCancellationGate = new();
     private int _refreshVersion;
+    private CancellationTokenSource? _refreshCancellation;
     private string _queryText = string.Empty;
     private string _statusText = string.Empty;
     private SearchMode _searchMode = SearchMode.FilesAndFolders;
@@ -68,7 +73,8 @@ public sealed class SearchPanelViewModel : INotifyPropertyChanged
         Func<string, bool> folderExists,
         Func<string, DateTimeOffset> getFolderLastWriteTime,
         ISearchResultActivationService activationService,
-        Func<string, CancellationToken, Task<DialogJumpResult>> dialogFolderActivation)
+        Func<string, CancellationToken, Task<DialogJumpResult>> dialogFolderActivation,
+        TimeSpan? searchDelay = null)
     {
         _index = index ?? throw new ArgumentNullException(nameof(index));
         _normalizeExistingFolder = normalizeExistingFolder ?? throw new ArgumentNullException(nameof(normalizeExistingFolder));
@@ -76,6 +82,7 @@ public sealed class SearchPanelViewModel : INotifyPropertyChanged
         _getFolderLastWriteTime = getFolderLastWriteTime ?? throw new ArgumentNullException(nameof(getFolderLastWriteTime));
         _activationService = activationService ?? throw new ArgumentNullException(nameof(activationService));
         _dialogFolderActivation = dialogFolderActivation ?? throw new ArgumentNullException(nameof(dialogFolderActivation));
+        _searchDelay = searchDelay ?? DefaultSearchDelay;
     }
 
     public event PropertyChangedEventHandler? PropertyChanged;
@@ -124,7 +131,7 @@ public sealed class SearchPanelViewModel : INotifyPropertyChanged
 
             _queryText = value;
             OnPropertyChanged();
-            _ = RefreshAsync();
+            _ = RefreshAsync(delaySearch: true);
         }
     }
 
@@ -248,82 +255,126 @@ public sealed class SearchPanelViewModel : INotifyPropertyChanged
             : FormatDialogJumpFailure(result);
     }
 
-    private async Task RefreshAsync()
+    private async Task RefreshAsync(bool delaySearch = false)
     {
-        var version = Interlocked.Increment(ref _refreshVersion);
-        var queryText = _queryText;
-        var searchMode = _searchMode;
-        var pinnedFolderResults = searchMode == SearchMode.FoldersOnly
-            ? CreatePinnedFolderResults(_pinnedFolderPaths)
-            : Array.Empty<SearchResult>();
-        var pinnedFolderPathKeys = new HashSet<string>(
-            pinnedFolderResults.Select(result => result.Record.PathKey),
-            StringComparer.Ordinal);
-        var hasQuery = !string.IsNullOrWhiteSpace(queryText);
-
-        if (hasQuery)
-        {
-            StatusText = "Searching...";
-        }
-
-        Results.Clear();
-        AddPinnedFolderResults(pinnedFolderResults);
-        UpdateSelectedResultAfterRefresh();
-
-        if (!hasQuery)
-        {
-            StatusText = searchMode == SearchMode.FoldersOnly
-                ? "Select a folder to jump the dialog."
-                : "Type to search.";
-            return;
-        }
-
-        IReadOnlyList<SearchResult> results;
+        using var refreshCancellation = BeginRefreshCancellation();
+        var cancellationToken = refreshCancellation.Token;
         try
         {
-            results = await _index.SearchAsync(
-                new SearchQuery(queryText, searchMode),
-                CancellationToken.None);
-        }
-        catch (Exception exception)
-        {
-            Trace.TraceError(exception.ToString());
+            var version = Interlocked.Increment(ref _refreshVersion);
+            var queryText = _queryText;
+            var searchMode = _searchMode;
+            var pinnedFolderResults = searchMode == SearchMode.FoldersOnly
+                ? CreatePinnedFolderResults(_pinnedFolderPaths)
+                : Array.Empty<SearchResult>();
+            var pinnedFolderPathKeys = new HashSet<string>(
+                pinnedFolderResults.Select(result => result.Record.PathKey),
+                StringComparer.Ordinal);
+            var hasQuery = !string.IsNullOrWhiteSpace(queryText);
 
-            if (version == _refreshVersion)
+            if (hasQuery)
             {
-                Results.Clear();
-                AddPinnedFolderResults(pinnedFolderResults);
-                UpdateSelectedResultAfterRefresh();
-                StatusText = $"Search failed: {exception.Message}";
+                StatusText = "Searching...";
             }
 
-            return;
-        }
+            Results.Clear();
+            AddPinnedFolderResults(pinnedFolderResults);
+            UpdateSelectedResultAfterRefresh();
 
-        if (version != _refreshVersion)
-        {
-            return;
-        }
-
-        Results.Clear();
-        AddPinnedFolderResults(pinnedFolderResults);
-        foreach (var result in results)
-        {
-            if (searchMode == SearchMode.FoldersOnly && !result.Record.IsDirectory)
+            if (!hasQuery)
             {
-                continue;
+                StatusText = searchMode == SearchMode.FoldersOnly
+                    ? "Select a folder to jump the dialog."
+                    : "Type to search.";
+                return;
             }
 
-            if (pinnedFolderPathKeys.Contains(result.Record.PathKey))
+            IReadOnlyList<SearchResult> results;
+            try
             {
-                continue;
+                if (delaySearch && _searchDelay > TimeSpan.Zero)
+                {
+                    await Task.Delay(_searchDelay, cancellationToken);
+                }
+
+                results = await _index.SearchAsync(
+                    new SearchQuery(queryText, searchMode),
+                    cancellationToken);
+            }
+            catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+            {
+                return;
+            }
+            catch (Exception exception)
+            {
+                Trace.TraceError(exception.ToString());
+
+                if (version == _refreshVersion)
+                {
+                    Results.Clear();
+                    AddPinnedFolderResults(pinnedFolderResults);
+                    UpdateSelectedResultAfterRefresh();
+                    StatusText = $"Search failed: {exception.Message}";
+                }
+
+                return;
             }
 
-            Results.Add(result);
+            if (version != _refreshVersion || cancellationToken.IsCancellationRequested)
+            {
+                return;
+            }
+
+            Results.Clear();
+            AddPinnedFolderResults(pinnedFolderResults);
+            foreach (var result in results)
+            {
+                if (searchMode == SearchMode.FoldersOnly && !result.Record.IsDirectory)
+                {
+                    continue;
+                }
+
+                if (pinnedFolderPathKeys.Contains(result.Record.PathKey))
+                {
+                    continue;
+                }
+
+                Results.Add(result);
+            }
+
+            UpdateSelectedResultAfterRefresh();
+            StatusText = Results.Count == 1 ? "1 result." : $"{Results.Count} results.";
+        }
+        finally
+        {
+            CompleteRefreshCancellation(refreshCancellation);
+        }
+    }
+
+    private CancellationTokenSource BeginRefreshCancellation()
+    {
+        var cancellation = new CancellationTokenSource();
+        CancellationTokenSource? previousCancellation;
+
+        lock (_refreshCancellationGate)
+        {
+            previousCancellation = _refreshCancellation;
+            _refreshCancellation = cancellation;
+            previousCancellation?.Cancel();
         }
 
-        UpdateSelectedResultAfterRefresh();
-        StatusText = Results.Count == 1 ? "1 result." : $"{Results.Count} results.";
+        return cancellation;
+    }
+
+    private void CompleteRefreshCancellation(CancellationTokenSource cancellation)
+    {
+        lock (_refreshCancellationGate)
+        {
+            if (ReferenceEquals(_refreshCancellation, cancellation))
+            {
+                _refreshCancellation = null;
+            }
+        }
     }
 
     private void UpdateSelectedResultAfterRefresh()

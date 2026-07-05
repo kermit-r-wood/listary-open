@@ -3,14 +3,15 @@
 Run date: 2026-07-04
 
 - [x] Run automated tests.
-  - PASS: `dotnet test ListaryOpen.sln -c Release --no-restore` passed 284/284 tests.
+  - PASS: `dotnet test ListaryOpen.sln -c Release --no-restore` passed in the latest verification run.
   - PASS: `dotnet build ListaryOpen.sln -c Release --no-restore` completed with 0 warnings and 0 errors.
   - PASS: SQLite performance regressions are covered by large-index, bounded-candidate, usage-window, combined-ranking-window, folder-only, and fuzzy-prefilter tests.
   - PASS: Quick Switch multi-Explorer candidate ordering, remembered-folder fallback, app routing helper, and folder-mode pinning are covered by unit tests.
   - PASS: Browser upload file picker dialog resolution for Firefox/Chrome process cases is covered by `WindowsDialogAutomationTests`.
 - [x] Start ListaryOpen.
   - PASS: `src/ListaryOpen.App/bin/Debug/net8.0-windows/ListaryOpen.App.exe` launched and remained alive during a 12 second smoke run.
-  - PASS: `%LocalAppData%\ListaryOpen\index.db` existed after startup.
+  - PASS: `src/ListaryOpen.App/bin/Debug/net8.0-windows/data/index.db` existed after startup.
+  - PASS: indexer temp files are created under `src/ListaryOpen.App/bin/Debug/net8.0-windows/data/tmp`.
   - PASS: background indexing wrote to the SQLite index; `files` contained 4500 rows after the smoke run.
   - PASS: SQLite performance indexes existed after startup: `ix_files_name`, `ix_files_is_directory_name`, `ix_files_search_text`, `ix_usage_path_key`.
 - [ ] Press Ctrl+Space and verify the global search panel opens.

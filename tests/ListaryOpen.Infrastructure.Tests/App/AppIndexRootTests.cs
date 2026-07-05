@@ -77,9 +77,9 @@ public sealed class AppIndexRootTests
     [Fact]
     public void EnableNtfsFastIndexingEnablesClientAndRequestsReindex()
     {
-        var helperPath = Path.Combine(Path.GetTempPath(), "listary-open-" + Guid.NewGuid(), "ListaryOpen.Indexer.Elevated.exe");
-        Directory.CreateDirectory(Path.GetDirectoryName(helperPath)!);
-        File.WriteAllText(helperPath, "placeholder");
+        var helperDirectory = Path.Combine(Path.GetTempPath(), "listary-open-" + Guid.NewGuid());
+        Directory.CreateDirectory(helperDirectory);
+        var helperPath = CreateUsableHelperBundle(helperDirectory);
         var client = new ElevatedIndexerClient(helperPath, () => false);
         var reindexRequested = false;
 
@@ -93,7 +93,7 @@ public sealed class AppIndexRootTests
         }
         finally
         {
-            Directory.Delete(Path.GetDirectoryName(helperPath)!, recursive: true);
+            Directory.Delete(helperDirectory, recursive: true);
         }
     }
 
@@ -171,5 +171,15 @@ public sealed class AppIndexRootTests
         await Task.WhenAll(firstRun, secondRun).WaitAsync(TimeSpan.FromSeconds(5));
 
         Assert.Equal(2, runCount);
+    }
+
+    private static string CreateUsableHelperBundle(string directory)
+    {
+        var helperPath = Path.Combine(directory, "ListaryOpen.Indexer.Elevated.exe");
+        File.WriteAllText(helperPath, "placeholder");
+        File.WriteAllText(Path.Combine(directory, "ListaryOpen.Indexer.Elevated.dll"), "placeholder");
+        File.WriteAllText(Path.Combine(directory, "ListaryOpen.Indexer.Elevated.deps.json"), "{}");
+        File.WriteAllText(Path.Combine(directory, "ListaryOpen.Indexer.Elevated.runtimeconfig.json"), "{}");
+        return helperPath;
     }
 }

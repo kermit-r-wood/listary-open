@@ -8,9 +8,9 @@ public sealed class ElevatedIndexerRecordWriterTests
     [Fact]
     public async Task WriteFileAsyncWritesWebJsonLines()
     {
-        var tempDirectory = Path.Combine(Path.GetTempPath(), "listary-open-" + Guid.NewGuid());
+        var tempDirectory = ElevatedIndexerOutputPathValidator.GetTrustedTempDirectory();
         Directory.CreateDirectory(tempDirectory);
-        var outputPath = Path.Combine(Path.GetTempPath(), "listary-open-indexer-" + Guid.NewGuid() + ".jsonl");
+        var outputPath = Path.Combine(tempDirectory, "listary-open-indexer-" + Guid.NewGuid() + ".jsonl");
 
         try
         {
@@ -43,19 +43,19 @@ public sealed class ElevatedIndexerRecordWriterTests
             {
                 File.Delete(outputPath);
             }
-
-            Directory.Delete(tempDirectory, recursive: true);
         }
     }
 
     [Fact]
     public async Task WriteFileAsyncDoesNotOverwriteExistingFile()
     {
-        var outputPath = Path.Combine(Path.GetTempPath(), "listary-open-indexer-" + Guid.NewGuid() + ".jsonl");
-        await File.WriteAllTextAsync(outputPath, "existing");
+        var tempDirectory = ElevatedIndexerOutputPathValidator.GetTrustedTempDirectory();
+        Directory.CreateDirectory(tempDirectory);
+        var outputPath = Path.Combine(tempDirectory, "listary-open-indexer-" + Guid.NewGuid() + ".jsonl");
 
         try
         {
+            await File.WriteAllTextAsync(outputPath, "existing");
             var records = Enumerate(FileRecord.Create(
                 "C:\\Docs\\Report.txt",
                 isDirectory: false,

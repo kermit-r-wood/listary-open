@@ -1,4 +1,5 @@
 using WpfApp = ListaryOpen.App.App;
+using ListaryOpen.Infrastructure.AppData;
 using ListaryOpen.Infrastructure.Hooks;
 
 namespace ListaryOpen.Infrastructure.Tests.App;
@@ -15,6 +16,18 @@ public sealed class AppStartupWindowTests
     public void ShouldShowSettingsOnStartupReturnsTrueForBlockingStartupMessage()
     {
         Assert.True(WpfApp.ShouldShowSettingsOnStartup(hasBlockingStartupMessage: true));
+    }
+
+    [Fact]
+    public void CreateAppDataStartupFailureMessageIncludesProgramDataPaths()
+    {
+        var paths = AppDataPaths.CreateUnderProgramDirectory("C:\\Tools\\ListaryOpen");
+
+        var message = WpfApp.CreateAppDataStartupFailureMessage(paths, new IOException("Access denied."));
+
+        Assert.Contains("C:\\Tools\\ListaryOpen\\data", message);
+        Assert.Contains("C:\\Tools\\ListaryOpen\\data\\index.db", message);
+        Assert.Contains("Access denied.", message);
     }
 
     [Fact]

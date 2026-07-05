@@ -21,7 +21,7 @@ public sealed class ElevatedIndexerClientTests
     }
 
     [Fact]
-    public void IsAvailableReturnsTrueWhenExplicitHelperPathExistsAndProcessIsElevated()
+    public void IsAvailableReturnsFalseWhenHelperExecutableExistsWithoutRequiredSidecarFiles()
     {
         var tempDirectory = Path.Combine(Path.GetTempPath(), "listary-open-" + Guid.NewGuid());
         Directory.CreateDirectory(tempDirectory);
@@ -30,6 +30,100 @@ public sealed class ElevatedIndexerClientTests
         {
             var helperPath = Path.Combine(tempDirectory, "ListaryOpen.Indexer.Elevated.exe");
             File.WriteAllText(helperPath, "placeholder");
+
+            var client = new ElevatedIndexerClient(helperPath, () => true);
+
+            Assert.False(client.IsAvailable);
+        }
+        finally
+        {
+            Directory.Delete(tempDirectory, recursive: true);
+        }
+    }
+
+    [Fact]
+    public void ResolveDefaultHelperPathSkipsIncompleteBesideAppHelperAndUsesRepositoryBuildOutput()
+    {
+        var repositoryRoot = Path.Combine(Path.GetTempPath(), "listary-open-" + Guid.NewGuid());
+        var appOutputDirectory = Path.Combine(
+            repositoryRoot,
+            "src",
+            "ListaryOpen.App",
+            "bin",
+            "Debug",
+            "net8.0-windows");
+        var helperOutputDirectory = Path.Combine(
+            repositoryRoot,
+            "src",
+            "ListaryOpen.Indexer.Elevated",
+            "bin",
+            "Debug",
+            "net8.0-windows");
+        Directory.CreateDirectory(appOutputDirectory);
+        Directory.CreateDirectory(helperOutputDirectory);
+
+        try
+        {
+            File.WriteAllText(Path.Combine(appOutputDirectory, "ListaryOpen.Indexer.Elevated.exe"), "incomplete");
+            var expectedHelperPath = CreateUsableHelperBundle(helperOutputDirectory);
+
+            var resolved = ElevatedIndexerClient.ResolveDefaultHelperPath(appOutputDirectory);
+
+            Assert.Equal(expectedHelperPath, resolved);
+        }
+        finally
+        {
+            Directory.Delete(repositoryRoot, recursive: true);
+        }
+    }
+
+    [Fact]
+    public void ResolveDefaultHelperPathSkipsIncompleteBesideAppHelperAndUsesRuntimeIdentifierRepositoryBuildOutput()
+    {
+        var repositoryRoot = Path.Combine(Path.GetTempPath(), "listary-open-" + Guid.NewGuid());
+        var appOutputDirectory = Path.Combine(
+            repositoryRoot,
+            "src",
+            "ListaryOpen.App",
+            "bin",
+            "Release",
+            "net8.0-windows",
+            "win-x64");
+        var helperOutputDirectory = Path.Combine(
+            repositoryRoot,
+            "src",
+            "ListaryOpen.Indexer.Elevated",
+            "bin",
+            "Release",
+            "net8.0-windows",
+            "win-x64");
+        Directory.CreateDirectory(appOutputDirectory);
+        Directory.CreateDirectory(helperOutputDirectory);
+
+        try
+        {
+            File.WriteAllText(Path.Combine(appOutputDirectory, "ListaryOpen.Indexer.Elevated.exe"), "incomplete");
+            var expectedHelperPath = CreateUsableHelperBundle(helperOutputDirectory);
+
+            var resolved = ElevatedIndexerClient.ResolveDefaultHelperPath(appOutputDirectory);
+
+            Assert.Equal(expectedHelperPath, resolved);
+        }
+        finally
+        {
+            Directory.Delete(repositoryRoot, recursive: true);
+        }
+    }
+
+    [Fact]
+    public void IsAvailableReturnsTrueWhenExplicitHelperPathExistsAndProcessIsElevated()
+    {
+        var tempDirectory = Path.Combine(Path.GetTempPath(), "listary-open-" + Guid.NewGuid());
+        Directory.CreateDirectory(tempDirectory);
+
+        try
+        {
+            var helperPath = CreateUsableHelperBundle(tempDirectory);
 
             var client = new ElevatedIndexerClient(helperPath, () => true);
 
@@ -49,8 +143,7 @@ public sealed class ElevatedIndexerClientTests
 
         try
         {
-            var helperPath = Path.Combine(tempDirectory, "ListaryOpen.Indexer.Elevated.exe");
-            File.WriteAllText(helperPath, "placeholder");
+            var helperPath = CreateUsableHelperBundle(tempDirectory);
 
             var client = new ElevatedIndexerClient(helperPath, () => false);
 
@@ -70,8 +163,7 @@ public sealed class ElevatedIndexerClientTests
 
         try
         {
-            var helperPath = Path.Combine(tempDirectory, "ListaryOpen.Indexer.Elevated.exe");
-            File.WriteAllText(helperPath, "placeholder");
+            var helperPath = CreateUsableHelperBundle(tempDirectory);
             var client = new ElevatedIndexerClient(helperPath, () => false);
 
             client.EnableUacElevation();
@@ -107,12 +199,11 @@ public sealed class ElevatedIndexerClientTests
 
         try
         {
-            var helperPath = Path.Combine(tempDirectory, "ListaryOpen.Indexer.Elevated.exe");
-            File.WriteAllText(helperPath, "placeholder");
+            var helperPath = CreateUsableHelperBundle(tempDirectory);
             var processCreated = false;
             var client = new ElevatedIndexerClient(
                 helperPath,
-                (_, _) =>
+                (_, _, _, _) =>
                 {
                     processCreated = true;
                     throw new InvalidOperationException("Helper process should not be created.");
@@ -138,12 +229,12 @@ public sealed class ElevatedIndexerClientTests
 
         try
         {
-            var helperPath = Path.Combine(tempDirectory, "ListaryOpen.Indexer.Elevated.exe");
-            File.WriteAllText(helperPath, "placeholder");
+            var helperPath = CreateUsableHelperBundle(tempDirectory);
+            var indexerTempDirectory = Path.Combine(tempDirectory, "data", "tmp");
             ElevatedFileHelperRequest? createdRequest = null;
             var client = new ElevatedIndexerClient(
                 helperPath,
-                (_, _) => throw new InvalidOperationException("Redirected helper should not be created."),
+                (_, _, _, _) => throw new InvalidOperationException("Redirected helper should not be created."),
                 () => false,
                 () => true,
                 (path, root, outputPath, errorPath) =>
@@ -155,7 +246,8 @@ public sealed class ElevatedIndexerClientTests
                         "{\"fullPath\":\"C:\\\\Docs\\\\Elevated.txt\",\"isDirectory\":false,\"sizeBytes\":15,\"lastWriteTime\":\"2026-07-04T00:00:00+00:00\"}",
                         error: string.Empty,
                         exitCode: 0);
-                });
+                },
+                indexerTempDirectory);
 
             var records = await CollectAsync(client.ScanNtfsAsync(new IndexRoot("C:\\Docs"), CancellationToken.None));
 
@@ -167,6 +259,8 @@ public sealed class ElevatedIndexerClientTests
             Assert.NotNull(createdRequest);
             Assert.Equal(helperPath, createdRequest!.HelperPath);
             Assert.Equal("C:\\Docs", createdRequest.RootPath);
+            Assert.Equal(indexerTempDirectory, Path.GetDirectoryName(createdRequest.OutputPath));
+            Assert.Equal(indexerTempDirectory, Path.GetDirectoryName(createdRequest.ErrorPath));
             Assert.False(File.Exists(createdRequest.OutputPath));
             Assert.False(File.Exists(createdRequest.ErrorPath));
         }
@@ -177,25 +271,52 @@ public sealed class ElevatedIndexerClientTests
     }
 
     [Fact]
-    public async Task ScanNtfsAsyncReturnsEmptyRecordsWhenUacElevationIsCanceled()
+    public async Task ScanNtfsAsyncThrowsLaunchCanceledWhenUacElevationIsCanceled()
     {
         var tempDirectory = Path.Combine(Path.GetTempPath(), "listary-open-" + Guid.NewGuid());
         Directory.CreateDirectory(tempDirectory);
 
         try
         {
-            var helperPath = Path.Combine(tempDirectory, "ListaryOpen.Indexer.Elevated.exe");
-            File.WriteAllText(helperPath, "placeholder");
+            var helperPath = CreateUsableHelperBundle(tempDirectory);
             var client = new ElevatedIndexerClient(
                 helperPath,
-                (_, _) => throw new InvalidOperationException("Redirected helper should not be created."),
+                (_, _, _, _) => throw new InvalidOperationException("Redirected helper should not be created."),
                 () => false,
                 () => true,
                 (_, _, _, _) => new StartThrowingElevatedIndexerProcess(new Win32Exception(1223, "The operation was canceled by the user.")));
 
-            var records = await CollectAsync(client.ScanNtfsAsync(new IndexRoot("C:\\Docs"), CancellationToken.None));
+            var exception = await Assert.ThrowsAsync<ElevatedIndexerLaunchCanceledException>(
+                () => CollectAsync(client.ScanNtfsAsync(new IndexRoot("C:\\Docs"), CancellationToken.None)));
 
-            Assert.Empty(records);
+            Assert.Contains("canceled", exception.Message, StringComparison.OrdinalIgnoreCase);
+        }
+        finally
+        {
+            Directory.Delete(tempDirectory, recursive: true);
+        }
+    }
+
+    [Fact]
+    public async Task ScanNtfsAsyncThrowsLaunchCanceledWhenUacElevationStartReturnsFalse()
+    {
+        var tempDirectory = Path.Combine(Path.GetTempPath(), "listary-open-" + Guid.NewGuid());
+        Directory.CreateDirectory(tempDirectory);
+
+        try
+        {
+            var helperPath = CreateUsableHelperBundle(tempDirectory);
+            var client = new ElevatedIndexerClient(
+                helperPath,
+                (_, _, _, _) => throw new InvalidOperationException("Redirected helper should not be created."),
+                () => false,
+                () => true,
+                (_, _, _, _) => new StartFalseElevatedIndexerProcess());
+
+            var exception = await Assert.ThrowsAsync<ElevatedIndexerLaunchCanceledException>(
+                () => CollectAsync(client.ScanNtfsAsync(new IndexRoot("C:\\Docs"), CancellationToken.None)));
+
+            Assert.Contains("canceled", exception.Message, StringComparison.OrdinalIgnoreCase);
         }
         finally
         {
@@ -211,8 +332,7 @@ public sealed class ElevatedIndexerClientTests
 
         try
         {
-            var helperPath = Path.Combine(tempDirectory, "ListaryOpen.Indexer.Elevated.exe");
-            File.WriteAllText(helperPath, "not a portable executable");
+            var helperPath = CreateUsableHelperBundle(tempDirectory, "not a portable executable");
             var client = new ElevatedIndexerClient(helperPath, () => true);
             await using var traceCapture = await TraceCapture.StartAsync();
 
@@ -235,9 +355,8 @@ public sealed class ElevatedIndexerClientTests
 
         try
         {
-            var helperPath = Path.Combine(tempDirectory, "ListaryOpen.Indexer.Elevated.exe");
-            File.WriteAllText(helperPath, "placeholder");
-            var client = new ElevatedIndexerClient(helperPath, (_, _) => new StartFalseElevatedIndexerProcess());
+            var helperPath = CreateUsableHelperBundle(tempDirectory);
+            var client = new ElevatedIndexerClient(helperPath, (_, _, _, _) => new StartFalseElevatedIndexerProcess());
 
             var exception = await Assert.ThrowsAnyAsync<InvalidOperationException>(
                 () => CollectAsync(client.ScanNtfsAsync(new IndexRoot("C:\\Docs"), CancellationToken.None)));
@@ -258,11 +377,15 @@ public sealed class ElevatedIndexerClientTests
 
         try
         {
-            var helperPath = Path.Combine(tempDirectory, "ListaryOpen.Indexer.Elevated.exe");
-            File.WriteAllText(helperPath, "placeholder");
+            var helperPath = CreateUsableHelperBundle(tempDirectory);
             var client = new ElevatedIndexerClient(
                 helperPath,
-                (_, _) => new CompletedElevatedIndexerProcess(stdout: string.Empty, stderr: "Access denied.", exitCode: 5));
+                (_, _, outputPath, errorPath) => new FileWritingElevatedIndexerProcess(
+                    outputPath,
+                    errorPath,
+                    output: string.Empty,
+                    error: "Access denied.",
+                    exitCode: 5));
 
             var exception = await Assert.ThrowsAnyAsync<InvalidOperationException>(
                 () => CollectAsync(client.ScanNtfsAsync(new IndexRoot("C:\\Docs"), CancellationToken.None)));
@@ -284,15 +407,19 @@ public sealed class ElevatedIndexerClientTests
 
         try
         {
-            var helperPath = Path.Combine(tempDirectory, "ListaryOpen.Indexer.Elevated.exe");
-            File.WriteAllText(helperPath, "placeholder");
-            var stdout = string.Join(
+            var helperPath = CreateUsableHelperBundle(tempDirectory);
+            var output = string.Join(
                 Environment.NewLine,
                 "{\"fullPath\":\"C:\\\\Docs\\\\Invoice.xlsx\",\"isDirectory\":false,\"sizeBytes\":12,\"lastWriteTime\":\"2026-07-03T00:00:00+00:00\"}",
                 "{\"fullPath\":\"C:\\\\Docs\\\\Projects\",\"isDirectory\":true,\"sizeBytes\":0,\"lastWriteTime\":\"2026-07-03T00:01:00+00:00\"}");
             var client = new ElevatedIndexerClient(
                 helperPath,
-                (_, _) => new CompletedElevatedIndexerProcess(stdout, stderr: string.Empty, exitCode: 0));
+                (_, _, outputPath, errorPath) => new FileWritingElevatedIndexerProcess(
+                    outputPath,
+                    errorPath,
+                    output,
+                    error: string.Empty,
+                    exitCode: 0));
 
             var records = await CollectAsync(client.ScanNtfsAsync(new IndexRoot("C:\\Docs"), CancellationToken.None));
 
@@ -327,11 +454,15 @@ public sealed class ElevatedIndexerClientTests
 
         try
         {
-            var helperPath = Path.Combine(tempDirectory, "ListaryOpen.Indexer.Elevated.exe");
-            File.WriteAllText(helperPath, "placeholder");
+            var helperPath = CreateUsableHelperBundle(tempDirectory);
             var client = new ElevatedIndexerClient(
                 helperPath,
-                (_, _) => new CompletedElevatedIndexerProcess("{not-json}", stderr: string.Empty, exitCode: 0));
+                (_, _, outputPath, errorPath) => new FileWritingElevatedIndexerProcess(
+                    outputPath,
+                    errorPath,
+                    output: "{not-json}",
+                    error: string.Empty,
+                    exitCode: 0));
 
             await Assert.ThrowsAsync<InvalidDataException>(
                 () => CollectAsync(client.ScanNtfsAsync(new IndexRoot("C:\\Docs"), CancellationToken.None)));
@@ -354,11 +485,15 @@ public sealed class ElevatedIndexerClientTests
 
         try
         {
-            var helperPath = Path.Combine(tempDirectory, "ListaryOpen.Indexer.Elevated.exe");
-            File.WriteAllText(helperPath, "placeholder");
+            var helperPath = CreateUsableHelperBundle(tempDirectory);
             var client = new ElevatedIndexerClient(
                 helperPath,
-                (_, _) => new CompletedElevatedIndexerProcess(stdout, stderr: string.Empty, exitCode: 0));
+                (_, _, outputPath, errorPath) => new FileWritingElevatedIndexerProcess(
+                    outputPath,
+                    errorPath,
+                    output: stdout,
+                    error: string.Empty,
+                    exitCode: 0));
 
             var exception = await Assert.ThrowsAsync<InvalidDataException>(
                 () => CollectAsync(client.ScanNtfsAsync(new IndexRoot("C:\\Docs"), CancellationToken.None)));
@@ -379,10 +514,9 @@ public sealed class ElevatedIndexerClientTests
 
         try
         {
-            var helperPath = Path.Combine(tempDirectory, "ListaryOpen.Indexer.Elevated.exe");
-            File.WriteAllText(helperPath, "placeholder");
+            var helperPath = CreateUsableHelperBundle(tempDirectory);
             var helperProcess = new RecordingElevatedIndexerProcess();
-            var client = new ElevatedIndexerClient(helperPath, (_, _) => helperProcess);
+            var client = new ElevatedIndexerClient(helperPath, (_, _, _, _) => helperProcess);
             using var cancellation = new CancellationTokenSource();
 
             var scanTask = Assert.ThrowsAnyAsync<OperationCanceledException>(async () =>
@@ -397,8 +531,6 @@ public sealed class ElevatedIndexerClientTests
             await scanTask.WaitAsync(TimeSpan.FromSeconds(5));
 
             Assert.True(helperProcess.KillCalled);
-            Assert.True(helperProcess.OutputReadObserved);
-            Assert.True(helperProcess.ErrorReadObserved);
             Assert.Equal(2, helperProcess.WaitForExitTokens.Count);
             Assert.True(helperProcess.WaitForExitTokens[0].CanBeCanceled);
             Assert.False(helperProcess.WaitForExitTokens[1].CanBeCanceled);
@@ -418,6 +550,16 @@ public sealed class ElevatedIndexerClientTests
         }
 
         return collected;
+    }
+
+    private static string CreateUsableHelperBundle(string directory, string executableContent = "placeholder")
+    {
+        var helperPath = Path.Combine(directory, "ListaryOpen.Indexer.Elevated.exe");
+        File.WriteAllText(helperPath, executableContent);
+        File.WriteAllText(Path.Combine(directory, "ListaryOpen.Indexer.Elevated.dll"), "placeholder");
+        File.WriteAllText(Path.Combine(directory, "ListaryOpen.Indexer.Elevated.deps.json"), "{}");
+        File.WriteAllText(Path.Combine(directory, "ListaryOpen.Indexer.Elevated.runtimeconfig.json"), "{}");
+        return helperPath;
     }
 
     private sealed record ElevatedFileHelperRequest(

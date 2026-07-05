@@ -265,6 +265,7 @@ public sealed class SearchPanelViewModelTests
         index.SetResults(new[] { replacement });
         viewModel.QueryText = "receipt";
         await index.WaitForSearchCountAsync(2);
+        await WaitUntilAsync(() => viewModel.SelectedResult?.Record.FullPath == replacement.Record.FullPath);
 
         Assert.Equal(replacement.Record.FullPath, viewModel.SelectedResult?.Record.FullPath);
     }
@@ -295,6 +296,71 @@ public sealed class SearchPanelViewModelTests
 
         index.Complete(Array.Empty<SearchResult>());
         await WaitUntilAsync(() => viewModel.StatusText == "0 results.");
+    }
+
+    [Fact]
+    public async Task QueryTextDelaysSearchWhileUserIsStillTyping()
+    {
+        var index = new RecordingSearchIndex(Array.Empty<SearchResult>());
+        var viewModel = new SearchPanelViewModel(
+            index,
+            NormalizeTestFolder,
+            _ => true,
+            _ => DateTimeOffset.UtcNow,
+            new RecordingActivationService(),
+            DialogJumpNotConfiguredAsync,
+            TimeSpan.FromMilliseconds(150));
+
+        viewModel.QueryText = "i";
+        await Task.Delay(TimeSpan.FromMilliseconds(25));
+        viewModel.QueryText = "in";
+        await Task.Delay(TimeSpan.FromMilliseconds(25));
+        viewModel.QueryText = "inv";
+
+        await Task.Delay(TimeSpan.FromMilliseconds(75));
+        Assert.Empty(index.ObservedQueries);
+
+        await index.WaitForSearchCountAsync(1);
+        var query = Assert.Single(index.ObservedQueries);
+        Assert.Equal("inv", query.NormalizedText);
+    }
+
+    [Fact]
+    public async Task QueryTextCancelsPreviousSearchWhenNewQueryStarts()
+    {
+        var firstResult = CreateResult("C:\\Docs\\Invoice.xlsx", isDirectory: false);
+        var secondResult = CreateResult("C:\\Docs\\Receipt.xlsx", isDirectory: false);
+        var index = new CancellableSearchIndex(
+            new[]
+            {
+                firstResult
+            },
+            new[]
+            {
+                secondResult
+            });
+        var viewModel = new SearchPanelViewModel(
+            index,
+            NormalizeTestFolder,
+            _ => true,
+            _ => DateTimeOffset.UtcNow,
+            new RecordingActivationService(),
+            DialogJumpNotConfiguredAsync,
+            TimeSpan.Zero);
+
+        viewModel.QueryText = "invoice";
+        await index.WaitForSearchCountAsync(1);
+
+        viewModel.QueryText = "receipt";
+        await index.WaitForCancellationCountAsync(1);
+        await index.WaitForSearchCountAsync(2);
+
+        index.CompleteSearch(1);
+        index.CompleteSearch(2);
+
+        await WaitUntilAsync(() => viewModel.StatusText == "1 result.");
+        Assert.Equal(secondResult.Record.FullPath, viewModel.SelectedResult?.Record.FullPath);
+        Assert.Equal(new[] { "invoice", "receipt" }, index.ObservedQueries.Select(query => query.NormalizedText));
     }
 
     [Fact]
@@ -622,6 +688,11 @@ public sealed class SearchPanelViewModelTests
         }
     }
 
+    private static Task<DialogJumpResult> DialogJumpNotConfiguredAsync(string folderPath, CancellationToken cancellationToken)
+    {
+        return Task.FromResult(new DialogJumpResult(DialogJumpStatus.Failed, "Dialog jump is not configured."));
+    }
+
     private sealed class RecordingActivationService : ISearchResultActivationService
     {
         public List<string> OpenedPaths { get; } = new();
@@ -710,6 +781,7 @@ public sealed class SearchPanelViewModelTests
             {
                 _queries.Add(query);
                 _searchObserved.TrySetResult();
+                _searchObserved = CreateCompletionSource();
             }
 
             return Task.FromResult(_results);
@@ -787,6 +859,7 @@ public sealed class SearchPanelViewModelTests
             {
                 _queries.Add(query);
                 _searchObserved.TrySetResult();
+                _searchObserved = CreateCompletionSource();
             }
 
             return _searchCompletion.Task;
@@ -818,6 +891,137 @@ public sealed class SearchPanelViewModelTests
                 if (completed != observedTask)
                 {
                     throw new TimeoutException("The expected search was not observed.");
+                }
+            }
+        }
+
+        private static TaskCompletionSource CreateCompletionSource()
+        {
+            return new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        }
+    }
+
+    private sealed class CancellableSearchIndex : ISearchIndex
+    {
+        private readonly object _lock = new();
+        private readonly IReadOnlyList<SearchResult>[] _resultsByCall;
+        private readonly List<SearchQuery> _queries = new();
+        private readonly List<TaskCompletionSource<IReadOnlyList<SearchResult>>> _searchCompletions = new();
+        private TaskCompletionSource _searchObserved = CreateCompletionSource();
+        private TaskCompletionSource _cancellationObserved = CreateCompletionSource();
+        private int _cancellationCount;
+
+        public CancellableSearchIndex(params IReadOnlyList<SearchResult>[] resultsByCall)
+        {
+            _resultsByCall = resultsByCall;
+        }
+
+        public IReadOnlyList<SearchQuery> ObservedQueries
+        {
+            get
+            {
+                lock (_lock)
+                {
+                    return _queries.ToArray();
+                }
+            }
+        }
+
+        public Task UpsertAsync(FileRecord record, CancellationToken cancellationToken)
+        {
+            return Task.CompletedTask;
+        }
+
+        public Task DeleteAsync(string fullPath, CancellationToken cancellationToken)
+        {
+            return Task.CompletedTask;
+        }
+
+        public Task<IReadOnlyList<SearchResult>> SearchAsync(SearchQuery query, CancellationToken cancellationToken)
+        {
+            TaskCompletionSource<IReadOnlyList<SearchResult>> completion;
+            lock (_lock)
+            {
+                _queries.Add(query);
+                completion = new TaskCompletionSource<IReadOnlyList<SearchResult>>(TaskCreationOptions.RunContinuationsAsynchronously);
+                _searchCompletions.Add(completion);
+                _searchObserved.TrySetResult();
+                _searchObserved = CreateCompletionSource();
+            }
+
+            cancellationToken.Register(() =>
+            {
+                lock (_lock)
+                {
+                    _cancellationCount++;
+                    _cancellationObserved.TrySetResult();
+                }
+
+                completion.TrySetCanceled(cancellationToken);
+            });
+
+            return completion.Task;
+        }
+
+        public void CompleteSearch(int oneBasedCallIndex)
+        {
+            TaskCompletionSource<IReadOnlyList<SearchResult>> completion;
+            IReadOnlyList<SearchResult> results;
+            lock (_lock)
+            {
+                completion = _searchCompletions[oneBasedCallIndex - 1];
+                results = _resultsByCall[Math.Min(oneBasedCallIndex - 1, _resultsByCall.Length - 1)];
+            }
+
+            completion.TrySetResult(results);
+        }
+
+        public async Task WaitForSearchCountAsync(int count)
+        {
+            using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(5));
+
+            while (true)
+            {
+                Task observedTask;
+                lock (_lock)
+                {
+                    if (_queries.Count >= count)
+                    {
+                        return;
+                    }
+
+                    observedTask = _searchObserved.Task;
+                }
+
+                var completed = await Task.WhenAny(observedTask, Task.Delay(Timeout.InfiniteTimeSpan, timeout.Token));
+                if (completed != observedTask)
+                {
+                    throw new TimeoutException("The expected search was not observed.");
+                }
+            }
+        }
+
+        public async Task WaitForCancellationCountAsync(int count)
+        {
+            using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(5));
+
+            while (true)
+            {
+                Task observedTask;
+                lock (_lock)
+                {
+                    if (_cancellationCount >= count)
+                    {
+                        return;
+                    }
+
+                    observedTask = _cancellationObserved.Task;
+                }
+
+                var completed = await Task.WhenAny(observedTask, Task.Delay(Timeout.InfiniteTimeSpan, timeout.Token));
+                if (completed != observedTask)
+                {
+                    throw new TimeoutException("The expected cancellation was not observed.");
                 }
             }
         }

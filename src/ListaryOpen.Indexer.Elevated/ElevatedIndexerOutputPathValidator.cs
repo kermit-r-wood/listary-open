@@ -6,7 +6,8 @@ internal static class ElevatedIndexerOutputPathValidator
 
     public static bool AreAllowed(string recordsPath, string errorPath)
     {
-        return IsAllowed(recordsPath, ".jsonl") && IsAllowed(errorPath, ".err");
+        return IsAllowed(recordsPath, ".jsonl")
+            && IsAllowed(errorPath, ".err");
     }
 
     public static bool IsAllowedErrorPath(string errorPath)
@@ -46,7 +47,7 @@ internal static class ElevatedIndexerOutputPathValidator
                 return false;
             }
 
-            var tempPath = Path.TrimEndingDirectorySeparator(Path.GetFullPath(Path.GetTempPath()));
+            var tempPath = Path.TrimEndingDirectorySeparator(GetTrustedTempDirectory());
             parentPath = Path.TrimEndingDirectorySeparator(Path.GetFullPath(parentPath));
             if (!string.Equals(parentPath, tempPath, StringComparison.OrdinalIgnoreCase))
             {
@@ -70,6 +71,11 @@ internal static class ElevatedIndexerOutputPathValidator
         {
             return false;
         }
+    }
+
+    public static string GetTrustedTempDirectory()
+    {
+        return Path.GetFullPath(Path.Combine(AppContext.BaseDirectory, "data", "tmp"));
     }
 
     private static bool IsReparsePointDirectory(string path)

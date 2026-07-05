@@ -1,3 +1,4 @@
+using System.ComponentModel;
 using System.Runtime.CompilerServices;
 using ListaryOpen.Core.Indexing;
 using ListaryOpen.Core.Search;
@@ -119,14 +120,13 @@ public sealed class IndexingCoordinatorTests
         try
         {
             await File.WriteAllTextAsync(Path.Combine(rootPath, "FallbackAfterHelperFailure.txt"), "indexed");
-            var helperPath = Path.Combine(rootPath, "ListaryOpen.Indexer.Elevated.exe");
-            File.WriteAllText(helperPath, "placeholder");
+            var helperPath = CreateUsableHelperBundle(rootPath);
 
             await using var index = await SqliteSearchIndex.OpenAsync(dbPath, CancellationToken.None);
             var statuses = new List<IndexingStatus>();
             var client = new ElevatedIndexerClient(
                 helperPath,
-                (_, _) => new CompletedElevatedIndexerProcess(stdout: string.Empty, stderr: "Access denied.", exitCode: 5));
+                (_, _, _, _) => new CompletedElevatedIndexerProcess(stdout: string.Empty, stderr: "Access denied.", exitCode: 5));
             var coordinator = new IndexingCoordinator(
                 index,
                 new VolumeIndexer(new IIndexProvider[] { new NtfsIndexProvider(client) }),
@@ -159,15 +159,14 @@ public sealed class IndexingCoordinatorTests
         try
         {
             await File.WriteAllTextAsync(Path.Combine(rootPath, "FallbackWhenElevatedUnavailable.txt"), "indexed");
-            var helperPath = Path.Combine(rootPath, "ListaryOpen.Indexer.Elevated.exe");
-            File.WriteAllText(helperPath, "placeholder");
+            var helperPath = CreateUsableHelperBundle(rootPath);
             var helperProcessCreated = false;
 
             await using var index = await SqliteSearchIndex.OpenAsync(dbPath, CancellationToken.None);
             var statuses = new List<IndexingStatus>();
             var client = new ElevatedIndexerClient(
                 helperPath,
-                (_, _) =>
+                (_, _, _, _) =>
                 {
                     helperProcessCreated = true;
                     throw new InvalidOperationException("Helper process should not be created.");
@@ -190,6 +189,133 @@ public sealed class IndexingCoordinatorTests
             Assert.DoesNotContain(statuses, status => status.State == IndexingRunState.Failed);
             Assert.DoesNotContain(statuses, status => status.Message.Contains("NTFS scan failed", StringComparison.OrdinalIgnoreCase));
             Assert.Equal(IndexingRunState.Completed, statuses[^1].State);
+        }
+        finally
+        {
+            DeleteDirectoryIfExists(rootPath);
+            DeleteFileIfExists(dbPath);
+        }
+    }
+
+    [Fact]
+    public async Task IndexRootsAsyncDoesNotUseFallbackWhenUacElevationIsCanceled()
+    {
+        var rootPath = CreateTempDirectory();
+        var dbPath = CreateTempDbPath();
+
+        try
+        {
+            await File.WriteAllTextAsync(Path.Combine(rootPath, "ShouldNotFallbackAfterUacCancel.txt"), "indexed");
+            var helperPath = CreateUsableHelperBundle(rootPath);
+
+            await using var index = await SqliteSearchIndex.OpenAsync(dbPath, CancellationToken.None);
+            var statuses = new List<IndexingStatus>();
+            var fallbackProvider = new CountingFallbackProvider();
+            var client = new ElevatedIndexerClient(
+                helperPath,
+                (_, _, _, _) => throw new InvalidOperationException("Redirected helper should not be created."),
+                () => false,
+                () => true,
+                (_, _, _, _) => new StartThrowingElevatedIndexerProcess(
+                    new Win32Exception(1223, "The operation was canceled by the user.")),
+                Path.Combine(rootPath, "data", "tmp"));
+            var coordinator = new IndexingCoordinator(
+                index,
+                new VolumeIndexer(new IIndexProvider[] { new NtfsIndexProvider(client), fallbackProvider }),
+                fallbackProvider,
+                _ => new VolumeInfo(Path.GetPathRoot(rootPath)!, NtfsIndexProvider.ProviderName, true));
+            coordinator.StatusChanged += (_, status) => statuses.Add(status);
+
+            await coordinator.IndexRootsAsync(new[] { new IndexRoot(rootPath) }, CancellationToken.None);
+
+            Assert.Equal(0, fallbackProvider.ScanCount);
+            Assert.Contains(statuses, status => status.Message.Contains("canceled", StringComparison.OrdinalIgnoreCase));
+            Assert.Equal(IndexingRunState.Completed, statuses[^1].State);
+        }
+        finally
+        {
+            DeleteDirectoryIfExists(rootPath);
+            DeleteFileIfExists(dbPath);
+        }
+    }
+
+    [Fact]
+    public async Task IndexRootsAsyncDoesNotUseFallbackWhenUacElevationStartReturnsFalse()
+    {
+        var rootPath = CreateTempDirectory();
+        var dbPath = CreateTempDbPath();
+
+        try
+        {
+            await File.WriteAllTextAsync(Path.Combine(rootPath, "ShouldNotFallbackAfterUacStartFalse.txt"), "indexed");
+            var helperPath = CreateUsableHelperBundle(rootPath);
+
+            await using var index = await SqliteSearchIndex.OpenAsync(dbPath, CancellationToken.None);
+            var statuses = new List<IndexingStatus>();
+            var fallbackProvider = new CountingFallbackProvider();
+            var client = new ElevatedIndexerClient(
+                helperPath,
+                (_, _, _, _) => throw new InvalidOperationException("Redirected helper should not be created."),
+                () => false,
+                () => true,
+                (_, _, _, _) => new StartFalseElevatedIndexerProcess(),
+                Path.Combine(rootPath, "data", "tmp"));
+            var coordinator = new IndexingCoordinator(
+                index,
+                new VolumeIndexer(new IIndexProvider[] { new NtfsIndexProvider(client), fallbackProvider }),
+                fallbackProvider,
+                _ => new VolumeInfo(Path.GetPathRoot(rootPath)!, NtfsIndexProvider.ProviderName, true));
+            coordinator.StatusChanged += (_, status) => statuses.Add(status);
+
+            await coordinator.IndexRootsAsync(new[] { new IndexRoot(rootPath) }, CancellationToken.None);
+
+            Assert.Equal(0, fallbackProvider.ScanCount);
+            Assert.Contains(statuses, status => status.Message.Contains("canceled", StringComparison.OrdinalIgnoreCase));
+            Assert.Equal(IndexingRunState.Completed, statuses[^1].State);
+        }
+        finally
+        {
+            DeleteDirectoryIfExists(rootPath);
+            DeleteFileIfExists(dbPath);
+        }
+    }
+
+    [Fact]
+    public async Task IndexRootsAsyncRemovesRecordsNotSeenInSuccessfulRootScan()
+    {
+        var rootPath = CreateTempDirectory();
+        var dbPath = CreateTempDbPath();
+
+        try
+        {
+            var currentRecord = FileRecord.Create(
+                Path.Combine(rootPath, "CurrentRecord.txt"),
+                isDirectory: false,
+                sizeBytes: 1,
+                DateTimeOffset.UtcNow);
+            var staleRecord = FileRecord.Create(
+                Path.Combine(rootPath, "StaleRecord.txt"),
+                isDirectory: false,
+                sizeBytes: 1,
+                DateTimeOffset.UtcNow);
+
+            await using var index = await SqliteSearchIndex.OpenAsync(dbPath, CancellationToken.None);
+            await index.UpsertManyAsync(new[] { currentRecord, staleRecord }, CancellationToken.None);
+
+            var coordinator = new IndexingCoordinator(
+                index,
+                new VolumeIndexer(new IIndexProvider[] { new AsynchronousSingleRecordProvider(currentRecord) }),
+                new FallbackIndexProvider(),
+                _ => new VolumeInfo(Path.GetPathRoot(rootPath)!, "AsyncProvider", true),
+                batchSize: 1);
+
+            await coordinator.IndexRootsAsync(new[] { new IndexRoot(rootPath) }, CancellationToken.None);
+
+            var currentResults = await index.SearchAsync(new SearchQuery("CurrentRecord", SearchMode.FilesAndFolders), CancellationToken.None);
+            var staleResults = await index.SearchAsync(new SearchQuery("StaleRecord", SearchMode.FilesAndFolders), CancellationToken.None);
+
+            Assert.Contains(currentResults, result => result.Record.PathKey == currentRecord.PathKey);
+            Assert.DoesNotContain(staleResults, result => result.Record.PathKey == staleRecord.PathKey);
         }
         finally
         {
@@ -455,6 +581,16 @@ public sealed class IndexingCoordinatorTests
         }
     }
 
+    private static string CreateUsableHelperBundle(string directory)
+    {
+        var helperPath = Path.Combine(directory, "ListaryOpen.Indexer.Elevated.exe");
+        File.WriteAllText(helperPath, "placeholder");
+        File.WriteAllText(Path.Combine(directory, "ListaryOpen.Indexer.Elevated.dll"), "placeholder");
+        File.WriteAllText(Path.Combine(directory, "ListaryOpen.Indexer.Elevated.deps.json"), "{}");
+        File.WriteAllText(Path.Combine(directory, "ListaryOpen.Indexer.Elevated.runtimeconfig.json"), "{}");
+        return helperPath;
+    }
+
     private sealed class EmptyNtfsProvider : IIndexProvider
     {
         public string Name => NtfsIndexProvider.ProviderName;
@@ -466,6 +602,24 @@ public sealed class IndexingCoordinatorTests
             [EnumeratorCancellation] CancellationToken cancellationToken)
         {
             cancellationToken.ThrowIfCancellationRequested();
+            await Task.CompletedTask;
+            yield break;
+        }
+    }
+
+    private sealed class CountingFallbackProvider : IIndexProvider
+    {
+        public int ScanCount { get; private set; }
+
+        public string Name => "Fallback";
+
+        public bool CanIndex(VolumeInfo volume) => volume.IsReady;
+
+        public async IAsyncEnumerable<FileRecord> ScanAsync(
+            IndexRoot root,
+            [EnumeratorCancellation] CancellationToken cancellationToken)
+        {
+            ScanCount++;
             await Task.CompletedTask;
             yield break;
         }
@@ -582,6 +736,32 @@ public sealed class IndexingCoordinatorTests
         }
     }
 
+    private sealed class StartFalseElevatedIndexerProcess : IElevatedIndexerProcess
+    {
+        public int ExitCode => -1;
+
+        public bool HasExited => true;
+
+        public bool Start() => false;
+
+        public Task<string> ReadStandardOutputToEndAsync(CancellationToken cancellationToken)
+            => Task.FromResult(string.Empty);
+
+        public Task<string> ReadStandardErrorToEndAsync(CancellationToken cancellationToken)
+            => Task.FromResult(string.Empty);
+
+        public Task WaitForExitAsync(CancellationToken cancellationToken)
+            => Task.CompletedTask;
+
+        public void Kill()
+        {
+        }
+
+        public void Dispose()
+        {
+        }
+    }
+
     private sealed class RecordingSynchronizationContext : SynchronizationContext
     {
         private int _postCount;
@@ -618,6 +798,39 @@ public sealed class IndexingCoordinatorTests
 
         public Task<string> ReadStandardErrorToEndAsync(CancellationToken cancellationToken)
             => Task.FromResult(_stderr);
+
+        public Task WaitForExitAsync(CancellationToken cancellationToken)
+            => Task.CompletedTask;
+
+        public void Kill()
+        {
+        }
+
+        public void Dispose()
+        {
+        }
+    }
+
+    private sealed class StartThrowingElevatedIndexerProcess : IElevatedIndexerProcess
+    {
+        private readonly Exception _exception;
+
+        public StartThrowingElevatedIndexerProcess(Exception exception)
+        {
+            _exception = exception;
+        }
+
+        public int ExitCode => -1;
+
+        public bool HasExited => true;
+
+        public bool Start() => throw _exception;
+
+        public Task<string> ReadStandardOutputToEndAsync(CancellationToken cancellationToken)
+            => Task.FromResult(string.Empty);
+
+        public Task<string> ReadStandardErrorToEndAsync(CancellationToken cancellationToken)
+            => Task.FromResult(string.Empty);
 
         public Task WaitForExitAsync(CancellationToken cancellationToken)
             => Task.CompletedTask;

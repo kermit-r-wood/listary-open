@@ -14,6 +14,18 @@ public sealed class FallbackIndexProvider : IIndexProvider
         RecurseSubdirectories = false
     };
 
+    private readonly IndexExclusionRules _exclusionRules;
+
+    public FallbackIndexProvider()
+        : this(IndexExclusionRules.Default)
+    {
+    }
+
+    public FallbackIndexProvider(IndexExclusionRules exclusionRules)
+    {
+        _exclusionRules = exclusionRules ?? throw new ArgumentNullException(nameof(exclusionRules));
+    }
+
     public string Name => "Fallback";
 
     public bool CanIndex(VolumeInfo volume) => volume.IsReady;
@@ -34,6 +46,10 @@ public sealed class FallbackIndexProvider : IIndexProvider
             foreach (var directory in EnumerateDirectories(current, cancellationToken))
             {
                 cancellationToken.ThrowIfCancellationRequested();
+                if (_exclusionRules.ShouldExcludeDirectoryPath(directory))
+                {
+                    continue;
+                }
 
                 if (!TryCreateDirectoryRecord(directory, out var record, out var fullName))
                 {

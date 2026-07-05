@@ -10,11 +10,17 @@ namespace ListaryOpen.Infrastructure.Search;
 
 public sealed class SqliteSearchIndex : ISearchIndex, IAsyncDisposable
 {
+    internal const long CurrentIndexContentVersion = 2;
+
     private const int FallbackCandidateLimit = 200;
     private const int CandidateLimitMultiplier = 20;
     private const int MinimumCandidateLimit = 200;
     private const int MaximumCandidateLimit = 5_000;
     private const int UsagePathKeyChunkSize = 500;
+    private const long DefaultIndexGeneration = 0;
+    private const string ContentVersionMetadataKey = "index_content_version";
+    private const string FilesGenerationMetadataKey = "files_generation";
+    private const string LegacyUsageImportMetadataKey = "legacy_usage_imported_from";
 
     private readonly SemaphoreSlim _connectionGate = new(1, 1);
     private readonly SqliteConnection _connection;
@@ -67,7 +73,7 @@ public sealed class SqliteSearchIndex : ISearchIndex, IAsyncDisposable
         try
         {
             ThrowIfDisposed();
-            await ExecuteUpsertAsync(record, null, cancellationToken).ConfigureAwait(false);
+            await ExecuteUpsertAsync(record, DefaultIndexGeneration, null, cancellationToken).ConfigureAwait(false);
         }
         finally
         {
@@ -89,7 +95,7 @@ public sealed class SqliteSearchIndex : ISearchIndex, IAsyncDisposable
             {
                 foreach (var record in records)
                 {
-                    await ExecuteUpsertAsync(record, transaction, cancellationToken).ConfigureAwait(false);
+                    await ExecuteUpsertAsync(record, DefaultIndexGeneration, transaction, cancellationToken).ConfigureAwait(false);
                 }
 
                 await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
@@ -98,6 +104,206 @@ public sealed class SqliteSearchIndex : ISearchIndex, IAsyncDisposable
             {
                 await transaction.RollbackAsync(CancellationToken.None).ConfigureAwait(false);
                 throw;
+            }
+        }
+        finally
+        {
+            _connectionGate.Release();
+        }
+    }
+
+    internal async Task<long> BeginIndexingRunAsync(CancellationToken cancellationToken)
+    {
+        await _connectionGate.WaitAsync(cancellationToken).ConfigureAwait(false);
+        try
+        {
+            ThrowIfDisposed();
+
+            using var transaction = _connection.BeginTransaction();
+            try
+            {
+                var currentGeneration = await ReadMetadataInt64Async(
+                    _connection,
+                    FilesGenerationMetadataKey,
+                    transaction,
+                    cancellationToken).ConfigureAwait(false) ?? DefaultIndexGeneration;
+                var nextGeneration = currentGeneration == long.MaxValue ? 1 : currentGeneration + 1;
+                await WriteMetadataAsync(
+                    _connection,
+                    FilesGenerationMetadataKey,
+                    nextGeneration.ToString(CultureInfo.InvariantCulture),
+                    transaction,
+                    cancellationToken).ConfigureAwait(false);
+
+                await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
+                return nextGeneration;
+            }
+            catch
+            {
+                await transaction.RollbackAsync(CancellationToken.None).ConfigureAwait(false);
+                throw;
+            }
+        }
+        finally
+        {
+            _connectionGate.Release();
+        }
+    }
+
+    internal async Task UpsertManyAsync(
+        IEnumerable<FileRecord> records,
+        long indexGeneration,
+        CancellationToken cancellationToken)
+    {
+        ArgumentNullException.ThrowIfNull(records);
+
+        if (indexGeneration <= DefaultIndexGeneration)
+        {
+            throw new ArgumentOutOfRangeException(nameof(indexGeneration), "Index generation must be positive.");
+        }
+
+        await _connectionGate.WaitAsync(cancellationToken).ConfigureAwait(false);
+        try
+        {
+            ThrowIfDisposed();
+
+            using var transaction = _connection.BeginTransaction();
+            try
+            {
+                foreach (var record in records)
+                {
+                    await ExecuteUpsertAsync(record, indexGeneration, transaction, cancellationToken).ConfigureAwait(false);
+                }
+
+                await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
+            }
+            catch
+            {
+                await transaction.RollbackAsync(CancellationToken.None).ConfigureAwait(false);
+                throw;
+            }
+        }
+        finally
+        {
+            _connectionGate.Release();
+        }
+    }
+
+    internal async Task<int> PruneStaleRecordsUnderRootAsync(
+        string rootPath,
+        long indexGeneration,
+        CancellationToken cancellationToken)
+    {
+        if (indexGeneration <= DefaultIndexGeneration)
+        {
+            throw new ArgumentOutOfRangeException(nameof(indexGeneration), "Index generation must be positive.");
+        }
+
+        var rootPathKey = CreatePathKey(rootPath);
+        var descendantPathKeyPattern = EscapeLike(CreateDescendantPathKeyPrefix(rootPathKey)) + "%";
+
+        await _connectionGate.WaitAsync(cancellationToken).ConfigureAwait(false);
+        try
+        {
+            ThrowIfDisposed();
+
+            using var command = _connection.CreateCommand();
+            command.CommandText = """
+                delete from files
+                where index_generation <> $index_generation
+                  and (
+                    path_key = $root_path_key
+                    or path_key like $descendant_path_key_pattern escape '\'
+                  );
+                """;
+            command.Parameters.AddWithValue("$index_generation", indexGeneration);
+            command.Parameters.AddWithValue("$root_path_key", rootPathKey);
+            command.Parameters.AddWithValue("$descendant_path_key_pattern", descendantPathKeyPattern);
+
+            return await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+        }
+        finally
+        {
+            _connectionGate.Release();
+        }
+    }
+
+    public async Task ImportUsageFromAsync(string legacyDbPath, CancellationToken cancellationToken)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(legacyDbPath);
+
+        var fullLegacyDbPath = Path.GetFullPath(legacyDbPath);
+        if (!File.Exists(fullLegacyDbPath))
+        {
+            return;
+        }
+
+        await _connectionGate.WaitAsync(cancellationToken).ConfigureAwait(false);
+        try
+        {
+            ThrowIfDisposed();
+
+            var importedFrom = await ReadMetadataStringAsync(
+                _connection,
+                LegacyUsageImportMetadataKey,
+                transaction: null,
+                cancellationToken).ConfigureAwait(false);
+            if (string.Equals(importedFrom, fullLegacyDbPath, StringComparison.OrdinalIgnoreCase))
+            {
+                return;
+            }
+
+            await AttachDatabaseAsync(_connection, fullLegacyDbPath, "legacy", cancellationToken).ConfigureAwait(false);
+            try
+            {
+                if (!await AttachedTableExistsAsync(_connection, "legacy", "usage", cancellationToken).ConfigureAwait(false))
+                {
+                    return;
+                }
+
+                using var transaction = _connection.BeginTransaction();
+                try
+                {
+                    using (var importCommand = _connection.CreateCommand())
+                    {
+                        importCommand.Transaction = transaction;
+                        importCommand.CommandText = """
+                            insert into usage(full_path, path_key, open_count, last_used_at)
+                            select full_path, path_key, open_count, last_used_at
+                            from legacy.usage
+                            where full_path is not null
+                              and path_key is not null
+                              and open_count >= 0
+                              and last_used_at is not null
+                            on conflict(path_key) do update set
+                                full_path = excluded.full_path,
+                                open_count = max(usage.open_count, excluded.open_count),
+                                last_used_at = case
+                                    when excluded.last_used_at > usage.last_used_at then excluded.last_used_at
+                                    else usage.last_used_at
+                                end;
+                            """;
+                        await importCommand.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+                    }
+
+                    await WriteMetadataAsync(
+                        _connection,
+                        LegacyUsageImportMetadataKey,
+                        fullLegacyDbPath,
+                        transaction,
+                        cancellationToken).ConfigureAwait(false);
+
+                    await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
+                }
+                catch
+                {
+                    await transaction.RollbackAsync(CancellationToken.None).ConfigureAwait(false);
+                    throw;
+                }
+            }
+            finally
+            {
+                await DetachDatabaseAsync(_connection, "legacy", cancellationToken).ConfigureAwait(false);
             }
         }
         finally
@@ -178,7 +384,8 @@ public sealed class SqliteSearchIndex : ISearchIndex, IAsyncDisposable
                 search_text text not null,
                 is_directory integer not null check(is_directory in (0, 1)),
                 size_bytes integer not null check(size_bytes >= 0),
-                last_write_time text not null
+                last_write_time text not null,
+                index_generation integer not null default 0 check(index_generation >= 0)
             );
 
             create table if not exists usage(
@@ -186,6 +393,11 @@ public sealed class SqliteSearchIndex : ISearchIndex, IAsyncDisposable
                 path_key text not null primary key,
                 open_count integer not null check(open_count >= 0),
                 last_used_at text not null
+            );
+
+            create table if not exists index_metadata(
+                key text not null primary key,
+                value text not null
             );
             """;
 
@@ -201,6 +413,14 @@ public sealed class SqliteSearchIndex : ISearchIndex, IAsyncDisposable
             await addColumnCommand.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
         }
 
+        if (!await HasColumnAsync(connection, "files", "index_generation", cancellationToken).ConfigureAwait(false))
+        {
+            using var addColumnCommand = connection.CreateCommand();
+            addColumnCommand.CommandText = "alter table files add column index_generation integer not null default 0;";
+            await addColumnCommand.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+        }
+
+        await EnsureIndexContentVersionAsync(connection, cancellationToken).ConfigureAwait(false);
         await BackfillSearchTextAsync(connection, cancellationToken).ConfigureAwait(false);
         await EnsureIndexesAsync(connection, cancellationToken).ConfigureAwait(false);
     }
@@ -222,6 +442,182 @@ public sealed class SqliteSearchIndex : ISearchIndex, IAsyncDisposable
 
         var result = await command.ExecuteScalarAsync(cancellationToken).ConfigureAwait(false);
         return Convert.ToInt64(result, CultureInfo.InvariantCulture) > 0;
+    }
+
+    private static async Task EnsureIndexContentVersionAsync(
+        SqliteConnection connection,
+        CancellationToken cancellationToken)
+    {
+        var contentVersion = await ReadMetadataInt64Async(
+            connection,
+            ContentVersionMetadataKey,
+            transaction: null,
+            cancellationToken).ConfigureAwait(false);
+        if (contentVersion == CurrentIndexContentVersion)
+        {
+            return;
+        }
+
+        var existingFileCount = await CountFilesAsync(connection, cancellationToken).ConfigureAwait(false);
+
+        using (var transaction = connection.BeginTransaction())
+        {
+            try
+            {
+                using (var deleteCommand = connection.CreateCommand())
+                {
+                    deleteCommand.Transaction = transaction;
+                    deleteCommand.CommandText = "delete from files;";
+                    await deleteCommand.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+                }
+
+                await WriteMetadataAsync(
+                    connection,
+                    ContentVersionMetadataKey,
+                    CurrentIndexContentVersion.ToString(CultureInfo.InvariantCulture),
+                    transaction,
+                    cancellationToken).ConfigureAwait(false);
+                await WriteMetadataAsync(
+                    connection,
+                    FilesGenerationMetadataKey,
+                    DefaultIndexGeneration.ToString(CultureInfo.InvariantCulture),
+                    transaction,
+                    cancellationToken).ConfigureAwait(false);
+
+                await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
+            }
+            catch
+            {
+                await transaction.RollbackAsync(CancellationToken.None).ConfigureAwait(false);
+                throw;
+            }
+        }
+
+        if (existingFileCount > 0)
+        {
+            await VacuumAsync(connection, cancellationToken).ConfigureAwait(false);
+        }
+    }
+
+    private static async Task<long> CountFilesAsync(SqliteConnection connection, CancellationToken cancellationToken)
+    {
+        using var command = connection.CreateCommand();
+        command.CommandText = "select count(*) from files;";
+
+        var result = await command.ExecuteScalarAsync(cancellationToken).ConfigureAwait(false);
+        return Convert.ToInt64(result, CultureInfo.InvariantCulture);
+    }
+
+    private static async Task<long?> ReadMetadataInt64Async(
+        SqliteConnection connection,
+        string key,
+        SqliteTransaction? transaction,
+        CancellationToken cancellationToken)
+    {
+        var value = await ReadMetadataStringAsync(connection, key, transaction, cancellationToken).ConfigureAwait(false);
+        if (value is null)
+        {
+            return null;
+        }
+
+        return long.TryParse(value, NumberStyles.Integer, CultureInfo.InvariantCulture, out var parsed)
+            ? parsed
+            : null;
+    }
+
+    private static async Task<string?> ReadMetadataStringAsync(
+        SqliteConnection connection,
+        string key,
+        SqliteTransaction? transaction,
+        CancellationToken cancellationToken)
+    {
+        using var command = connection.CreateCommand();
+        command.Transaction = transaction;
+        command.CommandText = """
+            select value
+            from index_metadata
+            where key = $key;
+            """;
+        command.Parameters.AddWithValue("$key", key);
+
+        var value = await command.ExecuteScalarAsync(cancellationToken).ConfigureAwait(false);
+        if (value is null || value is DBNull)
+        {
+            return null;
+        }
+
+        return Convert.ToString(value, CultureInfo.InvariantCulture);
+    }
+
+    private static async Task WriteMetadataAsync(
+        SqliteConnection connection,
+        string key,
+        string value,
+        SqliteTransaction? transaction,
+        CancellationToken cancellationToken)
+    {
+        using var command = connection.CreateCommand();
+        command.Transaction = transaction;
+        command.CommandText = """
+            insert into index_metadata(key, value)
+            values ($key, $value)
+            on conflict(key) do update set value = excluded.value;
+            """;
+        command.Parameters.AddWithValue("$key", key);
+        command.Parameters.AddWithValue("$value", value);
+
+        await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+    }
+
+    private static async Task AttachDatabaseAsync(
+        SqliteConnection connection,
+        string dbPath,
+        string alias,
+        CancellationToken cancellationToken)
+    {
+        using var command = connection.CreateCommand();
+        command.CommandText = $"attach database $db_path as {alias};";
+        command.Parameters.AddWithValue("$db_path", dbPath);
+
+        await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+    }
+
+    private static async Task DetachDatabaseAsync(
+        SqliteConnection connection,
+        string alias,
+        CancellationToken cancellationToken)
+    {
+        using var command = connection.CreateCommand();
+        command.CommandText = $"detach database {alias};";
+
+        await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+    }
+
+    private static async Task<bool> AttachedTableExistsAsync(
+        SqliteConnection connection,
+        string alias,
+        string tableName,
+        CancellationToken cancellationToken)
+    {
+        using var command = connection.CreateCommand();
+        command.CommandText = $"""
+            select count(*)
+            from {alias}.sqlite_master
+            where type = 'table'
+              and name = $table_name;
+            """;
+        command.Parameters.AddWithValue("$table_name", tableName);
+
+        var result = await command.ExecuteScalarAsync(cancellationToken).ConfigureAwait(false);
+        return Convert.ToInt64(result, CultureInfo.InvariantCulture) > 0;
+    }
+
+    private static async Task VacuumAsync(SqliteConnection connection, CancellationToken cancellationToken)
+    {
+        using var command = connection.CreateCommand();
+        command.CommandText = "vacuum;";
+
+        await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
     }
 
     private static async Task BackfillSearchTextAsync(SqliteConnection connection, CancellationToken cancellationToken)
@@ -296,6 +692,7 @@ public sealed class SqliteSearchIndex : ISearchIndex, IAsyncDisposable
 
     private async Task ExecuteUpsertAsync(
         FileRecord record,
+        long indexGeneration,
         SqliteTransaction? transaction,
         CancellationToken cancellationToken)
     {
@@ -312,7 +709,8 @@ public sealed class SqliteSearchIndex : ISearchIndex, IAsyncDisposable
                 search_text,
                 is_directory,
                 size_bytes,
-                last_write_time
+                last_write_time,
+                index_generation
             )
             values (
                 $full_path,
@@ -322,7 +720,8 @@ public sealed class SqliteSearchIndex : ISearchIndex, IAsyncDisposable
                 $search_text,
                 $is_directory,
                 $size_bytes,
-                $last_write_time
+                $last_write_time,
+                $index_generation
             )
             on conflict(path_key) do update set
                 full_path = excluded.full_path,
@@ -331,7 +730,8 @@ public sealed class SqliteSearchIndex : ISearchIndex, IAsyncDisposable
                 search_text = excluded.search_text,
                 is_directory = excluded.is_directory,
                 size_bytes = excluded.size_bytes,
-                last_write_time = excluded.last_write_time;
+                last_write_time = excluded.last_write_time,
+                index_generation = excluded.index_generation;
             """;
 
         command.Parameters.AddWithValue("$full_path", record.FullPath);
@@ -342,6 +742,7 @@ public sealed class SqliteSearchIndex : ISearchIndex, IAsyncDisposable
         command.Parameters.AddWithValue("$is_directory", record.IsDirectory ? 1 : 0);
         command.Parameters.AddWithValue("$size_bytes", record.SizeBytes);
         command.Parameters.AddWithValue("$last_write_time", FormatDateTime(record.LastWriteTime));
+        command.Parameters.AddWithValue("$index_generation", indexGeneration);
 
         await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
     }
@@ -687,6 +1088,17 @@ public sealed class SqliteSearchIndex : ISearchIndex, IAsyncDisposable
         {
             throw new ArgumentException("Path is invalid.", nameof(fullPath), ex);
         }
+    }
+
+    private static string CreateDescendantPathKeyPrefix(string rootPathKey)
+    {
+        if (rootPathKey.EndsWith(Path.DirectorySeparatorChar)
+            || rootPathKey.EndsWith(Path.AltDirectorySeparatorChar))
+        {
+            return rootPathKey;
+        }
+
+        return rootPathKey + Path.DirectorySeparatorChar;
     }
 
     private static string FormatDateTime(DateTimeOffset value)

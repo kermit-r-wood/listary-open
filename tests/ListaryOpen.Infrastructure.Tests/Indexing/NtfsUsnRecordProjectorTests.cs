@@ -1,4 +1,5 @@
 using ListaryOpen.Indexer.Elevated.Ntfs;
+using ListaryOpen.Infrastructure.Indexing;
 
 namespace ListaryOpen.Infrastructure.Tests.Indexing;
 
@@ -108,6 +109,66 @@ public sealed class NtfsUsnRecordProjectorTests
             new NtfsUsnEntry(11, 10, "Invoice.txt", IsDirectory: false));
 
         Assert.Empty(records);
+    }
+
+    [Fact]
+    public void CreateFileRecordsResolvesChildrenWhenVolumeRootRecordIsAbsent()
+    {
+        const ulong volumeRootFileReferenceNumber = 5;
+        const ulong volumeRootRecordReferenceNumber = 0x0001_0000_0000_0005;
+
+        var metadata = new StubMetadataReader();
+        metadata.Add("C:\\Users\\paulx", isDirectory: true, sizeBytes: 0, Timestamp);
+        metadata.Add("C:\\Users\\paulx\\Invoice.txt", isDirectory: false, sizeBytes: 42, Timestamp);
+
+        var records = NtfsUsnRecordProjector
+            .CreateFileRecords(
+                "C:\\",
+                "C:\\Users\\paulx",
+                [
+                    new NtfsUsnEntry(10, volumeRootRecordReferenceNumber, "Users", IsDirectory: true),
+                    new NtfsUsnEntry(11, 10, "paulx", IsDirectory: true),
+                    new NtfsUsnEntry(12, 11, "Invoice.txt", IsDirectory: false)
+                ],
+                metadata,
+                CancellationToken.None,
+                volumeRootFileReferenceNumber: volumeRootFileReferenceNumber)
+            .ToList();
+
+        Assert.Collection(
+            records,
+            record => Assert.Equal("C:\\Users\\paulx", record.FullPath),
+            record => Assert.Equal("C:\\Users\\paulx\\Invoice.txt", record.FullPath));
+    }
+
+    [Fact]
+    public void CreateFileRecordsSkipsExcludedDirectorySubtrees()
+    {
+        var metadata = new StubMetadataReader();
+        metadata.Add("C:\\Projects\\keep", isDirectory: true, sizeBytes: 0, Timestamp);
+        metadata.Add("C:\\Projects\\keep\\visible.txt", isDirectory: false, sizeBytes: 7, Timestamp);
+        metadata.Add("C:\\Projects\\node_modules", isDirectory: true, sizeBytes: 0, Timestamp);
+        metadata.Add("C:\\Projects\\node_modules\\hidden.txt", isDirectory: false, sizeBytes: 6, Timestamp);
+
+        var records = NtfsUsnRecordProjector
+            .CreateFileRecords(
+                "C:\\",
+                "C:\\Projects",
+                [
+                    new NtfsUsnEntry(5, 5, ".", IsDirectory: true),
+                    new NtfsUsnEntry(10, 5, "Projects", IsDirectory: true),
+                    new NtfsUsnEntry(11, 10, "keep", IsDirectory: true),
+                    new NtfsUsnEntry(12, 11, "visible.txt", IsDirectory: false),
+                    new NtfsUsnEntry(20, 10, "node_modules", IsDirectory: true),
+                    new NtfsUsnEntry(21, 20, "hidden.txt", IsDirectory: false)
+                ],
+                metadata,
+                CancellationToken.None,
+                exclusionRules: IndexExclusionRules.Default)
+            .ToList();
+
+        Assert.Contains(records, record => record.FullPath.EndsWith("visible.txt", StringComparison.OrdinalIgnoreCase));
+        Assert.DoesNotContain(records, record => record.FullPath.Contains("node_modules", StringComparison.OrdinalIgnoreCase));
     }
 
     [Fact]

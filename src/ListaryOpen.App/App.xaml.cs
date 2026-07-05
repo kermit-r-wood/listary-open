@@ -2,6 +2,7 @@ using ListaryOpen.App.Tray;
 using ListaryOpen.App.ViewModels;
 using ListaryOpen.Core.Indexing;
 using ListaryOpen.Core.Settings;
+using ListaryOpen.Infrastructure.AppData;
 using ListaryOpen.Infrastructure.Dialog;
 using ListaryOpen.Infrastructure.Hooks;
 using ListaryOpen.Infrastructure.Indexing;
@@ -30,6 +31,7 @@ public partial class App : Application
     private HotkeyService? _hotkeyService;
     private IndexingCoordinator? _indexingCoordinator;
     private NtfsIndexProvider? _ntfsIndexProvider;
+    private IQuickSwitchWindowProvider? _quickSwitchWindowProvider;
     private SearchPanel? _searchPanel;
     private SqliteSearchIndex? _searchIndex;
     private SettingsViewModel? _settingsViewModel;
@@ -71,7 +73,9 @@ public partial class App : Application
             await InvokeOnDispatcherAsync(Dispatcher, () =>
             {
                 MessageBox.Show(
-                    "ListaryOpen could not start.",
+                    exception is AppStartupException startupException
+                        ? startupException.UserMessage
+                        : "ListaryOpen could not start.",
                     "ListaryOpen",
                     MessageBoxButton.OK,
                     MessageBoxImage.Error);
@@ -116,13 +120,51 @@ public partial class App : Application
 
     private async Task<bool> InitializeApplicationServicesAsync()
     {
-        _searchIndex = await SqliteSearchIndex.OpenAsync(CreateIndexDatabasePath(), CancellationToken.None)
-            .ConfigureAwait(false);
+        var appDataPaths = CreateAppDataPaths();
+        try
+        {
+            appDataPaths.EnsureDirectories();
+            _searchIndex = await SqliteSearchIndex.OpenAsync(appDataPaths.IndexDatabasePath, CancellationToken.None)
+                .ConfigureAwait(false);
+            await ImportLegacyUsageIfAvailableAsync(_searchIndex, appDataPaths, CancellationToken.None)
+                .ConfigureAwait(false);
+        }
+        catch (Exception exception) when (IsAppDataStartupException(exception))
+        {
+            throw new AppStartupException(CreateAppDataStartupFailureMessage(appDataPaths, exception), exception);
+        }
 
         return await InvokeOnDispatcherAsync(
                 Dispatcher,
                 () => InitializeApplicationServices(_searchIndex))
             .ConfigureAwait(false);
+    }
+
+    private static async Task ImportLegacyUsageIfAvailableAsync(
+        SqliteSearchIndex searchIndex,
+        AppDataPaths appDataPaths,
+        CancellationToken cancellationToken)
+    {
+        var legacyDbPath = AppDataPaths.CreateLegacyLocalAppDataIndexDatabasePath();
+        if (string.Equals(
+                Path.GetFullPath(legacyDbPath),
+                Path.GetFullPath(appDataPaths.IndexDatabasePath),
+                StringComparison.OrdinalIgnoreCase))
+        {
+            return;
+        }
+
+        try
+        {
+            await searchIndex.ImportUsageFromAsync(legacyDbPath, cancellationToken).ConfigureAwait(false);
+        }
+        catch (Exception exception) when (exception is IOException
+                                         or UnauthorizedAccessException
+                                         or InvalidOperationException
+                                         or Microsoft.Data.Sqlite.SqliteException)
+        {
+            Trace.TraceWarning("Legacy usage import skipped for '{0}': {1}", legacyDbPath, exception.Message);
+        }
     }
 
     private bool InitializeApplicationServices(SqliteSearchIndex searchIndex)
@@ -150,6 +192,11 @@ public partial class App : Application
         _settingsViewModel.UpdateHookQuickSwitchStatus(_hookQuickSwitchBridge.Status);
         var settingsWindow = new MainWindow(_settingsViewModel);
         _explorerTracker = new ExplorerTracker();
+        _quickSwitchWindowProvider = new CompositeQuickSwitchWindowProvider(new IQuickSwitchWindowProvider[]
+        {
+            _explorerTracker,
+            new DirectoryOpusQuickSwitchProvider()
+        });
         _explorerObservationScheduler = StartPeriodicExplorerObservation(
             _explorerTracker,
             () => new DispatcherExplorerObservationTimer());
@@ -253,6 +300,21 @@ public partial class App : Application
         _ = startEnablement(bridge);
     }
 
+    internal static string CreateAppDataStartupFailureMessage(AppDataPaths paths, Exception exception)
+    {
+        ArgumentNullException.ThrowIfNull(paths);
+        ArgumentNullException.ThrowIfNull(exception);
+
+        return string.Join(
+            Environment.NewLine,
+            "ListaryOpen could not open its program data directory.",
+            string.Empty,
+            $"Data directory: {paths.DataDirectory}",
+            $"Index database: {paths.IndexDatabasePath}",
+            string.Empty,
+            exception.Message);
+    }
+
     internal static IReadOnlyList<IndexRoot> CreateIndexRoots(IEnumerable<string> rootPaths)
     {
         ArgumentNullException.ThrowIfNull(rootPaths);
@@ -305,17 +367,9 @@ public partial class App : Application
         return string.Join(", ", hotkeys.Select(hotkey => hotkey.Name));
     }
 
-    private static string CreateIndexDatabasePath()
+    internal static AppDataPaths CreateAppDataPaths()
     {
-        var localAppData = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
-        if (string.IsNullOrWhiteSpace(localAppData))
-        {
-            throw new InvalidOperationException("The local application data folder is unavailable.");
-        }
-
-        var appDataDirectory = Path.Combine(localAppData, "ListaryOpen");
-        Directory.CreateDirectory(appDataDirectory);
-        return Path.Combine(appDataDirectory, "index.db");
+        return AppDataPaths.CreateDefault();
     }
 
     private void RequestReindex()
@@ -542,6 +596,13 @@ public partial class App : Application
             or PathTooLongException;
     }
 
+    private static bool IsAppDataStartupException(Exception exception)
+    {
+        return exception is IOException
+            or UnauthorizedAccessException
+            or InvalidOperationException;
+    }
+
     private void OnHotkeyPressed(object? sender, string name)
     {
         if (!Dispatcher.CheckAccess())
@@ -574,7 +635,7 @@ public partial class App : Application
 
     private async Task HandleDialogHotkeyAsync()
     {
-        var candidates = ObserveQuickSwitchFolderCandidates(_explorerTracker);
+        var candidates = ObserveQuickSwitchFolderCandidates(_quickSwitchWindowProvider);
         DialogJumpResult? directJumpResult = null;
         if (await TryJumpToFirstQuickSwitchFolderAsync(
                 candidates,
@@ -604,21 +665,27 @@ public partial class App : Application
     }
 
     internal static IReadOnlyList<QuickSwitchFolderCandidate> ObserveQuickSwitchFolderCandidates(
-        ExplorerTracker? explorerTracker)
+        IQuickSwitchWindowProvider? quickSwitchWindowProvider)
     {
-        if (explorerTracker is null)
+        if (quickSwitchWindowProvider is null)
         {
             return Array.Empty<QuickSwitchFolderCandidate>();
         }
 
-        explorerTracker.ObserveForegroundExplorerFolder();
-        var candidates = explorerTracker.GetFolderCandidates();
+        if (quickSwitchWindowProvider is IRefreshableQuickSwitchWindowProvider refreshableProvider)
+        {
+            refreshableProvider.Refresh();
+        }
+
+        var candidates = quickSwitchWindowProvider.GetFolderCandidates();
         if (candidates.Count > 0)
         {
             return candidates;
         }
 
-        var lastFolder = explorerTracker.LastFolder;
+        var lastFolder = quickSwitchWindowProvider is ExplorerTracker explorerTracker
+            ? explorerTracker.LastFolder
+            : null;
         return !string.IsNullOrWhiteSpace(lastFolder) && Directory.Exists(lastFolder)
             ? new[]
             {
@@ -755,6 +822,17 @@ public partial class App : Application
 }
 
 internal sealed record HotkeyStartupDecision(bool ShouldContinue, string? Message, MessageBoxImage Image);
+
+internal sealed class AppStartupException : Exception
+{
+    public AppStartupException(string userMessage, Exception innerException)
+        : base(userMessage, innerException)
+    {
+        UserMessage = userMessage;
+    }
+
+    public string UserMessage { get; }
+}
 
 internal static class BackgroundIndexingTaskStarter
 {
