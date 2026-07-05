@@ -92,6 +92,53 @@ public sealed class SettingsHookQuickSwitchTests
         Assert.Contains(nameof(SettingsViewModel.HookQuickSwitchStatusText), changedProperties);
     }
 
+    [Fact]
+    public void HookPresentationStartsDisabled()
+    {
+        var viewModel = new SettingsViewModel(AppSettings.Defaults());
+
+        Assert.Equal("Disabled", viewModel.HookQuickSwitchBadgeText);
+        Assert.Equal("Enable", viewModel.HookQuickSwitchActionText);
+    }
+
+    [Fact]
+    public void EnableHookCommandShowsEnablingActionText()
+    {
+        var viewModel = new SettingsViewModel(
+            AppSettings.Defaults(),
+            enableNtfsFastIndexing: null,
+            enableHookQuickSwitch: () => { });
+
+        viewModel.EnableHookQuickSwitchCommand.Execute(null);
+
+        Assert.Equal("Enabling", viewModel.HookQuickSwitchActionText);
+    }
+
+    [Fact]
+    public void HookPresentationShowsReadyWhenBothHostsRun()
+    {
+        var viewModel = new SettingsViewModel(AppSettings.Defaults());
+
+        viewModel.UpdateHookQuickSwitchStatus(new HookQuickSwitchStatus(
+            true,
+            new HookArchitectureStatus(HookArchitecture.X64, true, true, true, "x64 running"),
+            new HookArchitectureStatus(HookArchitecture.X86, true, true, true, "x86 running")));
+
+        Assert.Equal("Ready", viewModel.HookQuickSwitchBadgeText);
+        Assert.Equal("Enabled", viewModel.HookQuickSwitchActionText);
+    }
+
+    [Fact]
+    public void HookPresentationShowsDegradedWhenOnlyOneHostRuns()
+    {
+        var viewModel = new SettingsViewModel(AppSettings.Defaults());
+
+        viewModel.UpdateHookQuickSwitchStatus(CreatePartialStatus());
+
+        Assert.Equal("Degraded", viewModel.HookQuickSwitchBadgeText);
+        Assert.Equal("Retry", viewModel.HookQuickSwitchActionText);
+    }
+
     private static HookQuickSwitchStatus CreatePartialStatus()
     {
         return new HookQuickSwitchStatus(

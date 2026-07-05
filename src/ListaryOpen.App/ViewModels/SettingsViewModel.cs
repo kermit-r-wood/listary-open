@@ -13,6 +13,7 @@ public sealed class SettingsViewModel : INotifyPropertyChanged
     private readonly Action _enableNtfsFastIndexing;
     private bool _hookQuickSwitchEnableInProgress;
     private HookQuickSwitchStatus _hookQuickSwitchStatus = HookQuickSwitchStatus.Disabled();
+    private IndexingRunState _indexingState = IndexingRunState.Idle;
     private string _indexingStatusText = "Indexing: idle";
     private bool _ntfsFastIndexingEnabled;
 
@@ -67,6 +68,62 @@ public sealed class SettingsViewModel : INotifyPropertyChanged
         }
     }
 
+    public string IndexingBadgeText => _indexingState switch
+    {
+        IndexingRunState.Idle => "Idle",
+        IndexingRunState.Indexing => "Indexing",
+        IndexingRunState.Completed => "Completed",
+        IndexingRunState.Failed => "Failed",
+        _ => "Idle"
+    };
+
+    public string NtfsFastIndexingBadgeText => NtfsFastIndexingEnabled ? "Enabled" : "Disabled";
+
+    public string NtfsFastIndexingActionText => NtfsFastIndexingEnabled ? "Enabled" : "Enable";
+
+    public string HookQuickSwitchBadgeText
+    {
+        get
+        {
+            if (!_hookQuickSwitchStatus.Enabled)
+            {
+                return "Disabled";
+            }
+
+            if (_hookQuickSwitchStatus.X64.HostRunning && _hookQuickSwitchStatus.X86.HostRunning)
+            {
+                return "Ready";
+            }
+
+            if (_hookQuickSwitchStatus.X64.HostRunning || _hookQuickSwitchStatus.X86.HostRunning)
+            {
+                return "Degraded";
+            }
+
+            return "Failed";
+        }
+    }
+
+    public string HookQuickSwitchActionText
+    {
+        get
+        {
+            if (_hookQuickSwitchEnableInProgress)
+            {
+                return "Enabling";
+            }
+
+            if (!_hookQuickSwitchStatus.Enabled)
+            {
+                return "Enable";
+            }
+
+            return HookQuickSwitchBadgeText == "Ready" ? "Enabled" : "Retry";
+        }
+    }
+
+    public string QuickSaveOpenBadgeText => Settings.QuickSaveOpenEnabled ? "Enabled" : "Disabled";
+
     public bool NtfsFastIndexingEnabled
     {
         get => _ntfsFastIndexingEnabled;
@@ -80,6 +137,8 @@ public sealed class SettingsViewModel : INotifyPropertyChanged
             _ntfsFastIndexingEnabled = value;
             OnPropertyChanged();
             OnPropertyChanged(nameof(NtfsFastIndexingStatusText));
+            OnPropertyChanged(nameof(NtfsFastIndexingBadgeText));
+            OnPropertyChanged(nameof(NtfsFastIndexingActionText));
             if (EnableNtfsFastIndexingCommand is RelayCommand command)
             {
                 command.RaiseCanExecuteChanged();
@@ -97,7 +156,14 @@ public sealed class SettingsViewModel : INotifyPropertyChanged
     {
         ArgumentNullException.ThrowIfNull(status);
 
+        var indexingStateChanged = _indexingState != status.State;
+        _indexingState = status.State;
         IndexingStatusText = $"Indexing: {status.Message} ({status.IndexedCount})";
+
+        if (indexingStateChanged)
+        {
+            OnPropertyChanged(nameof(IndexingBadgeText));
+        }
     }
 
     public void UpdateHookQuickSwitchStatus(HookQuickSwitchStatus status)
@@ -108,6 +174,8 @@ public sealed class SettingsViewModel : INotifyPropertyChanged
         {
             _hookQuickSwitchStatus = status;
             OnPropertyChanged(nameof(HookQuickSwitchStatusText));
+            OnPropertyChanged(nameof(HookQuickSwitchBadgeText));
+            OnPropertyChanged(nameof(HookQuickSwitchActionText));
         }
 
         SetHookQuickSwitchEnableInProgress(false);
@@ -135,6 +203,7 @@ public sealed class SettingsViewModel : INotifyPropertyChanged
         }
 
         _hookQuickSwitchEnableInProgress = value;
+        OnPropertyChanged(nameof(HookQuickSwitchActionText));
         if (EnableHookQuickSwitchCommand is RelayCommand command)
         {
             command.RaiseCanExecuteChanged();

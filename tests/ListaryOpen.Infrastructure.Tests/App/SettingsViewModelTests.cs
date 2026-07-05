@@ -47,4 +47,43 @@ public sealed class SettingsViewModelTests
         Assert.Contains(nameof(SettingsViewModel.NtfsFastIndexingEnabled), changedProperties);
         Assert.Contains(nameof(SettingsViewModel.NtfsFastIndexingStatusText), changedProperties);
     }
+
+    [Fact]
+    public void ConstructorStartsWithPresentationBadges()
+    {
+        var viewModel = new SettingsViewModel(AppSettings.Defaults());
+
+        Assert.Equal("Idle", viewModel.IndexingBadgeText);
+        Assert.Equal("Disabled", viewModel.NtfsFastIndexingBadgeText);
+        Assert.Equal("Enable", viewModel.NtfsFastIndexingActionText);
+        Assert.Equal("Enabled", viewModel.QuickSaveOpenBadgeText);
+    }
+
+    [Fact]
+    public void UpdateIndexingStatusUpdatesPresentationBadge()
+    {
+        var viewModel = new SettingsViewModel(AppSettings.Defaults());
+        var changedProperties = new List<string?>();
+        viewModel.PropertyChanged += (_, e) => changedProperties.Add(e.PropertyName);
+
+        viewModel.UpdateIndexingStatus(new IndexingStatus(IndexingRunState.Completed, "Indexing completed.", 42));
+
+        Assert.Equal("Completed", viewModel.IndexingBadgeText);
+        Assert.Contains(nameof(SettingsViewModel.IndexingBadgeText), changedProperties);
+    }
+
+    [Fact]
+    public void EnableNtfsFastIndexingCommandUpdatesPresentationBadges()
+    {
+        var viewModel = new SettingsViewModel(AppSettings.Defaults(), () => { });
+        var changedProperties = new List<string?>();
+        viewModel.PropertyChanged += (_, e) => changedProperties.Add(e.PropertyName);
+
+        viewModel.EnableNtfsFastIndexingCommand.Execute(null);
+
+        Assert.Equal("Enabled", viewModel.NtfsFastIndexingBadgeText);
+        Assert.Equal("Enabled", viewModel.NtfsFastIndexingActionText);
+        Assert.Contains(nameof(SettingsViewModel.NtfsFastIndexingBadgeText), changedProperties);
+        Assert.Contains(nameof(SettingsViewModel.NtfsFastIndexingActionText), changedProperties);
+    }
 }
