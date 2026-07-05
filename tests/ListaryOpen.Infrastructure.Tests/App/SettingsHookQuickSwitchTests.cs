@@ -53,15 +53,18 @@ public sealed class SettingsHookQuickSwitchTests
     [Fact]
     public void UpdateHookQuickSwitchStatusReenablesEnableHookCommand()
     {
+        var canExecuteChangedCount = 0;
         var viewModel = new SettingsViewModel(
             AppSettings.Defaults(),
             enableNtfsFastIndexing: null,
             enableHookQuickSwitch: () => { });
+        viewModel.EnableHookQuickSwitchCommand.CanExecuteChanged += (_, _) => canExecuteChangedCount++;
 
         viewModel.EnableHookQuickSwitchCommand.Execute(null);
         viewModel.UpdateHookQuickSwitchStatus(HookQuickSwitchStatus.Disabled());
 
         Assert.True(viewModel.EnableHookQuickSwitchCommand.CanExecute(null));
+        Assert.Equal(2, canExecuteChangedCount);
     }
 
     [Fact]

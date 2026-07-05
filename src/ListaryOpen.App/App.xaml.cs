@@ -322,6 +322,10 @@ public partial class App : Application
         try
         {
             await bridge.EnableAsync(_shutdownCancellation.Token).ConfigureAwait(false);
+            if (!_shutdownCancellation.IsCancellationRequested)
+            {
+                await UpdateHookQuickSwitchStatusAsync(bridge.Status).ConfigureAwait(false);
+            }
         }
         catch (OperationCanceledException) when (_shutdownCancellation.IsCancellationRequested)
         {
@@ -329,6 +333,10 @@ public partial class App : Application
         catch (Exception exception)
         {
             Trace.TraceError(exception.ToString());
+            if (!_shutdownCancellation.IsCancellationRequested)
+            {
+                await UpdateHookQuickSwitchStatusAsync(bridge.Status).ConfigureAwait(false);
+            }
         }
     }
 
