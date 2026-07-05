@@ -37,9 +37,9 @@ use windows_sys::Win32::System::Threading::{
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     ChangeWindowMessageFilterEx, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW,
-    EnumWindows, GetAncestor, GetClassNameW, GetDlgItem, GetForegroundWindow, GetMessageW,
-    GetWindowLongPtrW, GetWindowTextLengthW, GetWindowTextW, GetWindowThreadProcessId, IsWindow,
-    PeekMessageW, PostMessageW, PostQuitMessage, RegisterClassW, SendMessageTimeoutW,
+    EnumChildWindows, EnumWindows, GetAncestor, GetClassNameW, GetDlgCtrlID, GetForegroundWindow,
+    GetMessageW, GetWindowLongPtrW, GetWindowTextLengthW, GetWindowTextW, GetWindowThreadProcessId,
+    IsWindow, PeekMessageW, PostMessageW, PostQuitMessage, RegisterClassW, SendMessageTimeoutW,
     SetWindowLongPtrW, SetWindowsHookExW, TranslateMessage, UnhookWindowsHookEx,
     CHANGEFILTERSTRUCT, CREATESTRUCTW, GA_ROOT, GWLP_USERDATA, HHOOK, HWND_MESSAGE, MSG,
     MSGFLT_ALLOW, PM_REMOVE, SMTO_ABORTIFHUNG, WH_CALLWNDPROC, WM_APP, WM_COPYDATA, WM_DESTROY,
@@ -364,7 +364,78 @@ fn title_contains_supported_dialog_keyword(title: &str) -> bool {
 }
 
 fn has_address_control(hwnd: HWND) -> bool {
-    !unsafe { GetDlgItem(hwnd, ADDRESS_BAR_EDIT_CONTROL_ID) }.is_null()
+    find_address_edit_control(hwnd).is_some()
+}
+
+#[derive(Clone, Copy)]
+struct AddressControlCandidate<'a> {
+    hwnd: HWND,
+    control_id: i32,
+    class_name: &'a str,
+}
+
+fn select_address_edit_control<'a, I>(candidates: I) -> Option<HWND>
+where
+    I: IntoIterator<Item = AddressControlCandidate<'a>>,
+{
+    candidates
+        .into_iter()
+        .find(|candidate| {
+            candidate.control_id == ADDRESS_BAR_EDIT_CONTROL_ID
+                && candidate.class_name.eq_ignore_ascii_case("Edit")
+        })
+        .map(|candidate| candidate.hwnd)
+}
+
+struct AddressControlSearch {
+    found_hwnd: HWND,
+}
+
+fn find_address_edit_control(hwnd: HWND) -> Option<HWND> {
+    let mut search = AddressControlSearch {
+        found_hwnd: null_mut(),
+    };
+
+    unsafe {
+        EnumChildWindows(
+            hwnd,
+            Some(enum_address_edit_control_proc),
+            (&mut search as *mut AddressControlSearch) as LPARAM,
+        );
+    }
+
+    if search.found_hwnd.is_null() {
+        None
+    } else {
+        Some(search.found_hwnd)
+    }
+}
+
+unsafe extern "system" fn enum_address_edit_control_proc(hwnd: HWND, l_param: LPARAM) -> BOOL {
+    if l_param == 0 {
+        return TRUE;
+    }
+
+    let search = unsafe { &mut *(l_param as *mut AddressControlSearch) };
+    let control_id = unsafe { GetDlgCtrlID(hwnd) };
+    if control_id != ADDRESS_BAR_EDIT_CONTROL_ID {
+        return TRUE;
+    }
+
+    let Some(class_name) = class_name(hwnd) else {
+        return TRUE;
+    };
+    let candidate = AddressControlCandidate {
+        hwnd,
+        control_id,
+        class_name: &class_name,
+    };
+    if let Some(address_edit) = select_address_edit_control([candidate]) {
+        search.found_hwnd = address_edit;
+        return 0;
+    }
+
+    TRUE
 }
 
 fn should_hook_observed_dialog(
@@ -629,8 +700,7 @@ fn jump_dialog_to_folder(payload: JumpCommandPayload) -> String {
         );
     }
 
-    let address_edit = unsafe { GetDlgItem(hwnd, ADDRESS_BAR_EDIT_CONTROL_ID) };
-    if address_edit.is_null() {
+    if find_address_edit_control(hwnd).is_none() {
         return command_reply(
             "UnsupportedDialog",
             "Dialog does not expose the standard address edit control.",
@@ -688,7 +758,7 @@ fn jump_dialog_to_folder(payload: JumpCommandPayload) -> String {
         return command_reply(status, message);
     }
 
-    if unsafe { GetDlgItem(hwnd, ADDRESS_BAR_EDIT_CONTROL_ID) }.is_null() {
+    if find_address_edit_control(hwnd).is_none() {
         return command_reply(
             "UnsupportedDialog",
             "Dialog address edit control disappeared after jump command was acknowledged.",
@@ -1492,6 +1562,58 @@ mod tests {
             true
         ));
         assert!(!is_supported_dialog_shape("#32770", "Properties", false));
+    }
+
+    #[test]
+    fn address_control_selector_prefers_edit_with_address_control_id() {
+        let address_root = 101usize as HWND;
+        let combo_ex = 102usize as HWND;
+        let combo = 103usize as HWND;
+        let edit = 104usize as HWND;
+
+        let selected = select_address_edit_control([
+            AddressControlCandidate {
+                hwnd: address_root,
+                control_id: ADDRESS_BAR_EDIT_CONTROL_ID,
+                class_name: "Address Band Root",
+            },
+            AddressControlCandidate {
+                hwnd: combo_ex,
+                control_id: ADDRESS_BAR_EDIT_CONTROL_ID,
+                class_name: "ComboBoxEx32",
+            },
+            AddressControlCandidate {
+                hwnd: combo,
+                control_id: ADDRESS_BAR_EDIT_CONTROL_ID,
+                class_name: "ComboBox",
+            },
+            AddressControlCandidate {
+                hwnd: edit,
+                control_id: ADDRESS_BAR_EDIT_CONTROL_ID,
+                class_name: "Edit",
+            },
+        ]);
+
+        assert_eq!(Some(edit), selected);
+    }
+
+    #[test]
+    fn address_control_selector_rejects_non_address_ids_and_classes() {
+        assert_eq!(
+            None,
+            select_address_edit_control([
+                AddressControlCandidate {
+                    hwnd: 201usize as HWND,
+                    control_id: ADDRESS_BAR_EDIT_CONTROL_ID,
+                    class_name: "Button",
+                },
+                AddressControlCandidate {
+                    hwnd: 202usize as HWND,
+                    control_id: 42,
+                    class_name: "Edit",
+                },
+            ])
+        );
     }
 
     #[test]
