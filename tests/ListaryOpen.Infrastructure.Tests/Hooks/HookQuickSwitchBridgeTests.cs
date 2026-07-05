@@ -1,4 +1,6 @@
 using System.Diagnostics;
+using System.IO.Pipes;
+using System.Text;
 using ListaryOpen.Infrastructure.Hooks;
 
 namespace ListaryOpen.Infrastructure.Tests.Hooks;
@@ -286,6 +288,50 @@ public sealed class HookQuickSwitchBridgeTests
     }
 
     [Fact]
+    public async Task JumpReturnsHostUnavailableWhenActiveDialogQueryPipeIsMissing()
+    {
+        var client = new HookIpcClient("listary-open-missing-active-" + Guid.NewGuid(), TimeSpan.FromMilliseconds(50));
+        var bridge = new HookQuickSwitchBridge(
+            HookQuickSwitchStatus.Disabled(),
+            new Dictionary<HookArchitecture, IHookIpcClient>
+            {
+                [HookArchitecture.X64] = client
+            });
+
+        var result = await bridge.JumpActiveDialogToFolderAsync("C:\\Users\\paulx", CancellationToken.None);
+
+        Assert.Equal(HookJumpStatus.HostUnavailable, result.Status);
+        Assert.DoesNotContain("No active hook-controlled dialog", result.Message, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public async Task JumpReturnsTimeoutWhenActiveDialogQueryHostDoesNotReply()
+    {
+        var pipeName = "listary-open-active-timeout-" + Guid.NewGuid();
+        using var serverCancellation = new CancellationTokenSource(TimeSpan.FromSeconds(5));
+        var serverTask = ServeWithoutReplyOnceAsync(pipeName, serverCancellation.Token);
+        var client = new HookIpcClient(pipeName, TimeSpan.FromMilliseconds(100));
+        var bridge = new HookQuickSwitchBridge(
+            HookQuickSwitchStatus.Disabled(),
+            new Dictionary<HookArchitecture, IHookIpcClient>
+            {
+                [HookArchitecture.X64] = client
+            });
+
+        try
+        {
+            var result = await bridge.JumpActiveDialogToFolderAsync("C:\\Users\\paulx", CancellationToken.None);
+
+            Assert.Equal(HookJumpStatus.Timeout, result.Status);
+            Assert.DoesNotContain("No active hook-controlled dialog", result.Message, StringComparison.OrdinalIgnoreCase);
+        }
+        finally
+        {
+            await StopServerAsync(serverCancellation, serverTask);
+        }
+    }
+
+    [Fact]
     public async Task JumpUsesSnapshotOfClientDictionary()
     {
         var dialog = new HookDialogContext(
@@ -406,6 +452,71 @@ public sealed class HookQuickSwitchBridgeTests
 
     private static IReadOnlyDictionary<HookArchitecture, IHookIpcClient> CreateEmptyClients() =>
         new Dictionary<HookArchitecture, IHookIpcClient>();
+
+    private static async Task ServeWithoutReplyOnceAsync(
+        string pipeName,
+        CancellationToken cancellationToken)
+    {
+        using var server = new NamedPipeServerStream(
+            pipeName,
+            PipeDirection.InOut,
+            maxNumberOfServerInstances: 1,
+            PipeTransmissionMode.Byte,
+            PipeOptions.Asynchronous);
+
+        await server.WaitForConnectionAsync(cancellationToken);
+        _ = await ReadLineAsync(server, cancellationToken);
+        await Task.Delay(Timeout.InfiniteTimeSpan, cancellationToken);
+    }
+
+    private static async Task<string?> ReadLineAsync(Stream stream, CancellationToken cancellationToken)
+    {
+        var line = new List<byte>();
+        var buffer = new byte[256];
+
+        while (true)
+        {
+            var bytesRead = await stream.ReadAsync(buffer, cancellationToken);
+            if (bytesRead == 0)
+            {
+                return line.Count == 0 ? null : Encoding.UTF8.GetString(line.ToArray());
+            }
+
+            for (var index = 0; index < bytesRead; index++)
+            {
+                if (buffer[index] == '\n')
+                {
+                    if (line.Count > 0 && line[^1] == '\r')
+                    {
+                        line.RemoveAt(line.Count - 1);
+                    }
+
+                    return Encoding.UTF8.GetString(line.ToArray());
+                }
+
+                line.Add(buffer[index]);
+            }
+        }
+    }
+
+    private static async Task StopServerAsync(CancellationTokenSource cancellation, Task task)
+    {
+        await cancellation.CancelAsync();
+
+        try
+        {
+            await task.WaitAsync(TimeSpan.FromSeconds(1));
+        }
+        catch (OperationCanceledException)
+        {
+        }
+        catch (TimeoutException) when (cancellation.IsCancellationRequested)
+        {
+        }
+        catch (IOException) when (cancellation.IsCancellationRequested)
+        {
+        }
+    }
 
     private sealed class RecordingHookHostProcessFactory : HookHostProcessFactory
     {

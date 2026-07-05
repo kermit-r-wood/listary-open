@@ -173,7 +173,12 @@ public partial class App : Application
         }
 
         MainWindow = settingsWindow;
-        settingsWindow.Show();
+        if (ShouldShowSettingsOnStartup(hasBlockingStartupMessage: false))
+        {
+            settingsWindow.Show();
+        }
+
+        StartHookQuickSwitchEnablementOnStartup(_hookQuickSwitchBridge, EnableHookQuickSwitchAsync);
         StartBackgroundIndexing();
         return true;
     }
@@ -227,6 +232,25 @@ public partial class App : Application
             true,
             $"ListaryOpen could not register these global hotkeys: {failedHotkeys}. Registered hotkeys: {registeredHotkeys}. The app will keep running with the registered hotkeys.",
             MessageBoxImage.Warning);
+    }
+
+    internal static bool ShouldShowSettingsOnStartup(bool hasBlockingStartupMessage)
+    {
+        return hasBlockingStartupMessage;
+    }
+
+    internal static void StartHookQuickSwitchEnablementOnStartup(
+        IHookQuickSwitchBridge? bridge,
+        Func<IHookQuickSwitchBridge, Task> startEnablement)
+    {
+        ArgumentNullException.ThrowIfNull(startEnablement);
+
+        if (bridge is null)
+        {
+            return;
+        }
+
+        _ = startEnablement(bridge);
     }
 
     internal static IReadOnlyList<IndexRoot> CreateIndexRoots(IEnumerable<string> rootPaths)

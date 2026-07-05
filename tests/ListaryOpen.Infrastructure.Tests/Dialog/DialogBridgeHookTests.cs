@@ -62,6 +62,9 @@ public sealed class DialogBridgeHookTests
             var result = await bridge.JumpToFolderAsync(folder.FullName, CancellationToken.None);
 
             Assert.Equal(DialogJumpStatus.Success, result.Status);
+            Assert.Contains("fallback", result.Message, StringComparison.OrdinalIgnoreCase);
+            Assert.Contains("hook", result.Message, StringComparison.OrdinalIgnoreCase);
+            Assert.Contains("Hook host failed.", result.Message, StringComparison.Ordinal);
             Assert.Equal(1, hook.JumpCount);
             Assert.Equal(1, fallback.ProbeCallCount);
         }
@@ -156,6 +159,10 @@ public sealed class DialogBridgeHookTests
             var result = await bridge.JumpToFolderAsync(folder.FullName, CancellationToken.None);
 
             Assert.Equal(DialogJumpStatus.Success, result.Status);
+            Assert.Contains("fallback", result.Message, StringComparison.OrdinalIgnoreCase);
+            Assert.Contains("hook", result.Message, StringComparison.OrdinalIgnoreCase);
+            Assert.Contains(hookStatus.ToString(), result.Message, StringComparison.Ordinal);
+            Assert.Contains("Hook could not jump.", result.Message, StringComparison.Ordinal);
             Assert.Equal(1, hook.JumpCount);
             Assert.Equal(1, fallback.ProbeCallCount);
         }

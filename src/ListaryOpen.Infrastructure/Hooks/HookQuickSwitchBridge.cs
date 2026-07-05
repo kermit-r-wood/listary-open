@@ -88,16 +88,8 @@ public sealed class HookQuickSwitchBridge : IHookQuickSwitchBridge
 
     public async Task<HookDialogContext?> GetActiveDialogAsync(CancellationToken cancellationToken)
     {
-        foreach (var client in _clients.Values)
-        {
-            var dialog = await client.GetActiveDialogAsync(cancellationToken).ConfigureAwait(false);
-            if (dialog is not null)
-            {
-                return dialog;
-            }
-        }
-
-        return null;
+        var result = await QueryActiveDialogAsync(cancellationToken).ConfigureAwait(false);
+        return result.Dialog;
     }
 
     public async Task<HookJumpResult> JumpActiveDialogToFolderAsync(string folderPath, CancellationToken cancellationToken)
@@ -108,10 +100,13 @@ public sealed class HookQuickSwitchBridge : IHookQuickSwitchBridge
             throw new ArgumentException("Folder path cannot be empty.", nameof(folderPath));
         }
 
-        var dialog = await GetActiveDialogAsync(cancellationToken).ConfigureAwait(false);
+        var activeDialogResult = await QueryActiveDialogAsync(cancellationToken).ConfigureAwait(false);
+        var dialog = activeDialogResult.Dialog;
         if (dialog is null)
         {
-            return new HookJumpResult(HookJumpStatus.NoActiveDialog, "No active hook-controlled dialog.");
+            return activeDialogResult.Status == HookJumpStatus.NoActiveDialog
+                ? new HookJumpResult(HookJumpStatus.NoActiveDialog, activeDialogResult.Message)
+                : new HookJumpResult(activeDialogResult.Status, activeDialogResult.Message);
         }
 
         if (!_clients.TryGetValue(dialog.Architecture, out var client))
@@ -120,6 +115,42 @@ public sealed class HookQuickSwitchBridge : IHookQuickSwitchBridge
         }
 
         return await client.JumpDialogToFolderAsync(dialog.DialogId, folderPath, cancellationToken).ConfigureAwait(false);
+    }
+
+    private async Task<HookActiveDialogResult> QueryActiveDialogAsync(CancellationToken cancellationToken)
+    {
+        HookActiveDialogResult? firstFailure = null;
+
+        foreach (var client in _clients.Values)
+        {
+            var result = await GetActiveDialogResultAsync(client, cancellationToken).ConfigureAwait(false);
+            if (result.Dialog is not null)
+            {
+                return result;
+            }
+
+            if (result.Status != HookJumpStatus.NoActiveDialog)
+            {
+                firstFailure ??= result;
+            }
+        }
+
+        return firstFailure ?? HookActiveDialogResult.NoActiveDialog("No active hook-controlled dialog.");
+    }
+
+    private static async Task<HookActiveDialogResult> GetActiveDialogResultAsync(
+        IHookIpcClient client,
+        CancellationToken cancellationToken)
+    {
+        if (client is IHookActiveDialogQueryClient activeDialogQueryClient)
+        {
+            return await activeDialogQueryClient.GetActiveDialogResultAsync(cancellationToken).ConfigureAwait(false);
+        }
+
+        var dialog = await client.GetActiveDialogAsync(cancellationToken).ConfigureAwait(false);
+        return dialog is null
+            ? HookActiveDialogResult.NoActiveDialog("No active hook-controlled dialog.")
+            : HookActiveDialogResult.Active(dialog);
     }
 
     public void Dispose()

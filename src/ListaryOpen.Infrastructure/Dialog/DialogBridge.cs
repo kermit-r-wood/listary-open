@@ -22,6 +22,7 @@ public sealed class DialogBridge
             throw new ArgumentException("Folder path cannot be empty or whitespace.", nameof(folderPath));
         }
 
+        string? hookFallbackContext = null;
         if (_hookBridge is not null && Directory.Exists(folderPath))
         {
             try
@@ -41,13 +42,16 @@ public sealed class DialogBridge
                 {
                     return new DialogJumpResult(DialogJumpStatus.TargetGone, hookResult.Message);
                 }
+
+                hookFallbackContext = CreateHookFallbackContext(hookResult);
             }
             catch (OperationCanceledException)
             {
                 throw;
             }
-            catch (Exception)
+            catch (Exception exception)
             {
+                hookFallbackContext = $"hook failure: {exception.Message}";
                 // Hook quick switch is optional; existing automation remains the fallback boundary.
             }
         }
@@ -69,11 +73,21 @@ public sealed class DialogBridge
 
                 var success = await _automation.SetFolderAsync(folderPath, cancellationToken);
                 return success
-                    ? new DialogJumpResult(DialogJumpStatus.Success, "Dialog folder changed.")
+                    ? new DialogJumpResult(DialogJumpStatus.Success, CreateSuccessMessage(hookFallbackContext))
                     : new DialogJumpResult(DialogJumpStatus.Failed, "Dialog folder could not be changed.");
 
             default:
                 return new DialogJumpResult(DialogJumpStatus.Failed, $"Unknown dialog probe status: {(int)probe.Status}.");
         }
     }
+
+    private static string CreateSuccessMessage(string? hookFallbackContext) =>
+        string.IsNullOrWhiteSpace(hookFallbackContext)
+            ? "Dialog folder changed."
+            : $"Dialog folder changed via fallback automation after {hookFallbackContext}";
+
+    private static string CreateHookFallbackContext(HookJumpResult hookResult) =>
+        string.IsNullOrWhiteSpace(hookResult.Message)
+            ? $"hook {hookResult.Status}."
+            : $"hook {hookResult.Status}: {hookResult.Message}";
 }

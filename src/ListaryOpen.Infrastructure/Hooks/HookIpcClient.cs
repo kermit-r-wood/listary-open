@@ -12,12 +12,17 @@ public interface IHookIpcClient
     Task<HookJumpResult> JumpDialogToFolderAsync(string dialogId, string folderPath, CancellationToken cancellationToken);
 }
 
+public interface IHookActiveDialogQueryClient
+{
+    Task<HookActiveDialogResult> GetActiveDialogResultAsync(CancellationToken cancellationToken);
+}
+
 public interface IHookHealthProbeClient
 {
     Task<HookJumpResult> ProbeHealthAsync(CancellationToken cancellationToken);
 }
 
-public sealed class HookIpcClient : IHookIpcClient, IHookHealthProbeClient, IDisposable
+public sealed class HookIpcClient : IHookIpcClient, IHookActiveDialogQueryClient, IHookHealthProbeClient, IDisposable
 {
     private static readonly UTF8Encoding PipeEncoding = new(encoderShouldEmitUTF8Identifier: false);
 
@@ -42,31 +47,70 @@ public sealed class HookIpcClient : IHookIpcClient, IHookHealthProbeClient, IDis
 
     public async Task<HookDialogContext?> GetActiveDialogAsync(CancellationToken cancellationToken)
     {
+        var result = await GetActiveDialogResultAsync(cancellationToken).ConfigureAwait(false);
+        return result.Dialog;
+    }
+
+    public async Task<HookActiveDialogResult> GetActiveDialogResultAsync(CancellationToken cancellationToken)
+    {
         cancellationToken.ThrowIfCancellationRequested();
 
         var exchange = await SendRequestAsync(
                 HookIpcEnvelope.Command(new HookActiveDialogQuery()),
                 cancellationToken)
             .ConfigureAwait(false);
-        if (exchange.Envelope is null)
+        if (exchange.Failure is not null)
         {
-            return null;
+            return HookActiveDialogResult.FromJumpResult(exchange.Failure);
         }
 
-        if (string.Equals(exchange.Envelope.MessageType, "ActiveDialog", StringComparison.Ordinal)
-            && exchange.Envelope.Payload is HookActiveDialogEvent activeDialog)
+        var replyEnvelope = exchange.Envelope;
+        if (replyEnvelope is null)
         {
-            return CreateDialogContext(activeDialog);
+            return new HookActiveDialogResult(
+                HookJumpStatus.Failed,
+                "Hook host returned no active dialog response.",
+                null);
         }
 
-        if (string.Equals(exchange.Envelope.MessageType, "CommandReply", StringComparison.Ordinal)
-            && exchange.Envelope.Payload is HookCommandReply reply
-            && string.Equals(reply.Status, HookJumpStatus.NoActiveDialog.ToString(), StringComparison.OrdinalIgnoreCase))
+        if (string.Equals(replyEnvelope.MessageType, "ActiveDialog", StringComparison.Ordinal)
+            && replyEnvelope.Payload is HookActiveDialogEvent activeDialog)
         {
-            return null;
+            var dialog = CreateDialogContext(activeDialog);
+            return dialog is null
+                ? new HookActiveDialogResult(
+                    HookJumpStatus.Failed,
+                    "Hook host returned an invalid active dialog payload.",
+                    null)
+                : HookActiveDialogResult.Active(dialog);
         }
 
-        return null;
+        if (string.Equals(replyEnvelope.MessageType, "CommandReply", StringComparison.Ordinal)
+            && replyEnvelope.Payload is HookCommandReply reply)
+        {
+            if (!Enum.TryParse<HookJumpStatus>(reply.Status, ignoreCase: true, out var status))
+            {
+                return new HookActiveDialogResult(
+                    HookJumpStatus.Failed,
+                    $"Hook host returned unknown status '{reply.Status}'.",
+                    null);
+            }
+
+            if (status == HookJumpStatus.NoActiveDialog)
+            {
+                return HookActiveDialogResult.NoActiveDialog(reply.Message);
+            }
+
+            return new HookActiveDialogResult(
+                status == HookJumpStatus.Success ? HookJumpStatus.Failed : status,
+                reply.Message,
+                null);
+        }
+
+        return new HookActiveDialogResult(
+            HookJumpStatus.Failed,
+            $"Hook host returned unexpected message type '{replyEnvelope.MessageType}'.",
+            null);
     }
 
     public Task<HookJumpResult> ProbeHealthAsync(CancellationToken cancellationToken) =>
