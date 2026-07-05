@@ -1,15 +1,25 @@
+#![windows_subsystem = "windows"]
+
+use listary_open_hook_common::{DIALOG_CLASS, HOOK_DLL_EXPORT};
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 use std::env;
 use std::io;
 use std::ptr::{null, null_mut};
 use std::thread;
 use windows_sys::Win32::Foundation::{
-    CloseHandle, GetLastError, ERROR_PIPE_CONNECTED, HANDLE, INVALID_HANDLE_VALUE,
+    CloseHandle, FreeLibrary, GetLastError, BOOL, ERROR_PIPE_CONNECTED, HANDLE, HMODULE, HWND,
+    INVALID_HANDLE_VALUE, LPARAM, LRESULT, TRUE, WPARAM,
 };
 use windows_sys::Win32::Storage::FileSystem::{ReadFile, WriteFile, PIPE_ACCESS_DUPLEX};
+use windows_sys::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryW};
 use windows_sys::Win32::System::Pipes::{
     ConnectNamedPipe, CreateNamedPipeW, DisconnectNamedPipe, PIPE_READMODE_BYTE, PIPE_TYPE_BYTE,
     PIPE_UNLIMITED_INSTANCES, PIPE_WAIT,
+};
+use windows_sys::Win32::UI::WindowsAndMessaging::{
+    DispatchMessageW, EnumWindows, GetClassNameW, GetMessageW, GetWindowThreadProcessId,
+    SetWindowsHookExW, TranslateMessage, UnhookWindowsHookEx, HHOOK, MSG, WH_CALLWNDPROC,
 };
 
 const DEFAULT_PIPE_NAME: &str = "listary-open-hook-x64";
@@ -19,6 +29,7 @@ const BUFFER_SIZE: usize = 64 * 1024;
 fn main() -> io::Result<()> {
     let pipe_name = pipe_name_from_args();
     let pipe_path = format!(r"\\.\pipe\{}", pipe_name);
+    start_hook_thread(arg_value("--dll"));
 
     println!("ListaryOpen hook host started on pipe '{}'.", pipe_name);
 
@@ -38,16 +49,227 @@ fn main() -> io::Result<()> {
 }
 
 fn pipe_name_from_args() -> String {
-    let mut args = env::args().skip(1);
+    arg_value("--pipe").unwrap_or_else(|| DEFAULT_PIPE_NAME.to_string())
+}
+
+fn arg_value(name: &str) -> Option<String> {
+    arg_value_from(env::args(), name)
+}
+
+fn arg_value_from<I, S>(args: I, name: &str) -> Option<String>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<str>,
+{
+    let mut args = args.into_iter();
     while let Some(arg) = args.next() {
-        if arg == "--pipe" {
-            if let Some(pipe_name) = args.next() {
-                return pipe_name;
+        if arg.as_ref() == name {
+            let value = args.next()?;
+            if value.as_ref().starts_with("--") {
+                return None;
             }
+
+            return Some(value.as_ref().to_string());
         }
     }
 
-    DEFAULT_PIPE_NAME.to_string()
+    None
+}
+
+fn start_hook_thread(dll_path: Option<String>) {
+    let Some(dll_path) = dll_path else {
+        eprintln!("Hook host started without --dll; health IPC will run without native hooks.");
+        return;
+    };
+
+    thread::spawn(move || run_hook_thread(&dll_path));
+}
+
+fn run_hook_thread(dll_path: &str) {
+    match HookState::install(dll_path) {
+        Ok(hook_state) => {
+            eprintln!(
+                "Hook host installed {} native dialog hook(s).",
+                hook_state.hook_count()
+            );
+            message_loop(hook_state);
+        }
+        Err(error) => {
+            eprintln!("Hook host native hook setup failed: {error}");
+        }
+    }
+}
+
+fn message_loop(_hook_state: HookState) {
+    let mut message = unsafe { std::mem::zeroed::<MSG>() };
+    loop {
+        let result = unsafe { GetMessageW(&mut message, null_mut(), 0, 0) };
+        if result <= 0 {
+            if result < 0 {
+                eprintln!(
+                    "Hook host message loop failed: {}",
+                    io::Error::last_os_error()
+                );
+            }
+
+            break;
+        }
+
+        unsafe {
+            TranslateMessage(&message);
+            DispatchMessageW(&message);
+        }
+    }
+}
+
+struct HookState {
+    module: HMODULE,
+    hooks: Vec<HHOOK>,
+}
+
+impl HookState {
+    fn install(dll_path: &str) -> Result<Self, String> {
+        let module = load_hook_module(dll_path)?;
+        let hook_proc = match hook_proc(module) {
+            Ok(hook_proc) => hook_proc,
+            Err(error) => {
+                unsafe {
+                    FreeLibrary(module);
+                }
+                return Err(error);
+            }
+        };
+
+        let threads = match discover_dialog_threads() {
+            Ok(threads) => threads,
+            Err(error) => {
+                unsafe {
+                    FreeLibrary(module);
+                }
+                return Err(format!("dialog discovery failed: {error}"));
+            }
+        };
+
+        if threads.is_empty() {
+            eprintln!("Hook host found no top-level {DIALOG_CLASS} dialog windows to hook.");
+        }
+
+        let mut hooks = Vec::new();
+        for thread_id in threads {
+            match install_thread_hook(module, hook_proc, thread_id) {
+                Ok(hook) => hooks.push(hook),
+                Err(error) => eprintln!("Hook host failed to hook thread {thread_id}: {error}"),
+            }
+        }
+
+        Ok(Self { module, hooks })
+    }
+
+    fn hook_count(&self) -> usize {
+        self.hooks.len()
+    }
+}
+
+impl Drop for HookState {
+    fn drop(&mut self) {
+        for hook in self.hooks.drain(..) {
+            let unhooked = unsafe { UnhookWindowsHookEx(hook) };
+            if unhooked == 0 {
+                eprintln!(
+                    "Hook host failed to unhook native dialog hook: {}",
+                    io::Error::last_os_error()
+                );
+            }
+        }
+
+        if !self.module.is_null() {
+            unsafe {
+                FreeLibrary(self.module);
+            }
+        }
+    }
+}
+
+type DialogHookProc = unsafe extern "system" fn(i32, WPARAM, LPARAM) -> LRESULT;
+
+fn load_hook_module(dll_path: &str) -> Result<HMODULE, String> {
+    let wide_path = to_wide_null(dll_path);
+    let module = unsafe { LoadLibraryW(wide_path.as_ptr()) };
+    if module.is_null() {
+        return Err(format!(
+            "LoadLibraryW failed for '{dll_path}': {}",
+            io::Error::last_os_error()
+        ));
+    }
+
+    Ok(module)
+}
+
+fn hook_proc(module: HMODULE) -> Result<DialogHookProc, String> {
+    let raw_proc = unsafe { GetProcAddress(module, HOOK_DLL_EXPORT.as_ptr()) };
+    let Some(raw_proc) = raw_proc else {
+        return Err(format!(
+            "GetProcAddress failed for ListaryOpenHookProc: {}",
+            io::Error::last_os_error()
+        ));
+    };
+
+    Ok(unsafe {
+        std::mem::transmute::<unsafe extern "system" fn() -> isize, DialogHookProc>(raw_proc)
+    })
+}
+
+fn install_thread_hook(
+    module: HMODULE,
+    hook_proc: DialogHookProc,
+    thread_id: u32,
+) -> Result<HHOOK, String> {
+    let hook = unsafe { SetWindowsHookExW(WH_CALLWNDPROC, Some(hook_proc), module, thread_id) };
+    if hook.is_null() {
+        return Err(io::Error::last_os_error().to_string());
+    }
+
+    Ok(hook)
+}
+
+fn discover_dialog_threads() -> io::Result<HashSet<u32>> {
+    let mut threads = HashSet::new();
+    let enumerated = unsafe {
+        EnumWindows(
+            Some(enum_windows_proc),
+            (&mut threads as *mut HashSet<u32>) as LPARAM,
+        )
+    };
+
+    if enumerated == 0 {
+        return Err(io::Error::last_os_error());
+    }
+
+    Ok(threads)
+}
+
+unsafe extern "system" fn enum_windows_proc(hwnd: HWND, l_param: LPARAM) -> BOOL {
+    if is_dialog_window(hwnd) {
+        let mut process_id = 0u32;
+        let thread_id = unsafe { GetWindowThreadProcessId(hwnd, &mut process_id) };
+        if thread_id != 0 {
+            let threads = unsafe { &mut *(l_param as *mut HashSet<u32>) };
+            threads.insert(thread_id);
+        }
+    }
+
+    TRUE
+}
+
+fn is_dialog_window(hwnd: HWND) -> bool {
+    let mut class_buffer = [0u16; 64];
+    let class_len =
+        unsafe { GetClassNameW(hwnd, class_buffer.as_mut_ptr(), class_buffer.len() as i32) };
+
+    class_len > 0
+        && DIALOG_CLASS
+            .encode_utf16()
+            .eq(class_buffer[..class_len as usize].iter().copied())
 }
 
 fn serve_connection(pipe: NamedPipeHandle) -> io::Result<()> {
@@ -266,4 +488,42 @@ struct OutgoingEnvelope<'a> {
 struct CommandReplyPayload<'a> {
     status: &'a str,
     message: &'a str,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn arg_value_from_returns_value_after_named_option() {
+        let args = [
+            "ListaryOpen.HookHost.exe",
+            "--pipe",
+            "listary-open-hook-x64",
+            "--dll",
+            "C:\\ListaryOpen\\hooks\\x64\\ListaryOpen.Hook.dll",
+        ];
+
+        assert_eq!(
+            Some("listary-open-hook-x64".to_string()),
+            arg_value_from(args, "--pipe")
+        );
+        assert_eq!(
+            Some("C:\\ListaryOpen\\hooks\\x64\\ListaryOpen.Hook.dll".to_string()),
+            arg_value_from(args, "--dll")
+        );
+    }
+
+    #[test]
+    fn arg_value_from_returns_none_for_missing_or_unvalued_option() {
+        assert_eq!(None, arg_value_from(["host.exe", "--dll"], "--dll"));
+        assert_eq!(
+            None,
+            arg_value_from(["host.exe", "--dll", "--pipe", "pipe"], "--dll")
+        );
+        assert_eq!(
+            None,
+            arg_value_from(["host.exe", "--pipe", "pipe"], "--dll")
+        );
+    }
 }
