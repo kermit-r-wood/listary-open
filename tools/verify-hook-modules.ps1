@@ -1,6 +1,8 @@
 param(
     [string[]]$ProcessNames = @("Antigravity", "notepad++", "chrome", "firefox", "MobaXterm"),
     [string]$ModuleName = "ListaryOpen.Hook.dll",
+    [string]$ExpectedHooksRoot = (Join-Path $PSScriptRoot "..\src\ListaryOpen.App\bin\Debug\net8.0-windows\hooks"),
+    [switch]$AllowSubset,
     [switch]$AllMatchingProcesses,
     [switch]$SkipDialogPing
 )
@@ -73,8 +75,44 @@ function Get-AllMatchingTargetProcesses {
         [string[]]$TargetNames
     )
 
+    foreach ($process in Get-Process -ErrorAction SilentlyContinue) {
+        if (Test-TargetProcessName -ProcessName $process.ProcessName -TargetNames $TargetNames) {
+            $process
+        }
+    }
+}
+
+function Get-MissingRequiredTargetRows {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string[]]$TargetNames,
+        [Parameter(Mandatory = $true)]
+        [AllowEmptyCollection()]
+        [object[]]$DialogOwnerTargets
+    )
+
     foreach ($targetName in $TargetNames) {
-        Get-Process -Name $targetName -ErrorAction SilentlyContinue
+        if ([string]::IsNullOrWhiteSpace($targetName)) {
+            continue
+        }
+
+        $found = $false
+        foreach ($dialogOwnerTarget in $DialogOwnerTargets) {
+            if (Test-TargetProcessName -ProcessName $dialogOwnerTarget.Process.ProcessName -TargetNames @($targetName)) {
+                $found = $true
+                break
+            }
+        }
+
+        if (-not $found) {
+            [pscustomobject]@{
+                ProcessName = $targetName
+                Id = $null
+                HookLoaded = $false
+                HookModulePath = "visible dialog-owner process not found"
+                Status = "RequiredTargetMissing"
+            }
+        }
     }
 }
 
@@ -150,12 +188,41 @@ function Invoke-DialogPing {
     }
 }
 
+function Test-PathUnderRoot {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Path,
+        [Parameter(Mandatory = $true)]
+        [string]$Root
+    )
+
+    if ([string]::IsNullOrWhiteSpace($Path) -or [string]::IsNullOrWhiteSpace($Root)) {
+        return $false
+    }
+
+    try {
+        $fullPath = [System.IO.Path]::GetFullPath($Path)
+        $fullRoot = [System.IO.Path]::GetFullPath($Root)
+        $directorySeparators = [char[]]@([System.IO.Path]::DirectorySeparatorChar, [System.IO.Path]::AltDirectorySeparatorChar)
+        $trimmedRoot = $fullRoot.TrimEnd($directorySeparators)
+        $rootWithSeparator = $trimmedRoot + [System.IO.Path]::DirectorySeparatorChar
+
+        return [string]::Equals($fullPath, $trimmedRoot, [System.StringComparison]::OrdinalIgnoreCase) -or
+            $fullPath.StartsWith($rootWithSeparator, [System.StringComparison]::OrdinalIgnoreCase)
+    }
+    catch {
+        return $false
+    }
+}
+
 function Test-HookModule {
     param(
         [Parameter(Mandatory = $true)]
         [System.Diagnostics.Process]$Process,
         [Parameter(Mandatory = $true)]
-        [string]$ExpectedModuleName
+        [string]$ExpectedModuleName,
+        [Parameter(Mandatory = $true)]
+        [string]$ExpectedHooksRoot
     )
 
     $processName = $Process.ProcessName
@@ -196,9 +263,15 @@ function Test-HookModule {
 
         foreach ($module in $modules) {
             if ([string]::Equals($module.ModuleName, $ExpectedModuleName, [System.StringComparison]::OrdinalIgnoreCase)) {
-                $hookLoaded = $true
                 $hookModulePath = $module.FileName
-                $status = "HookLoaded"
+                if (Test-PathUnderRoot -Path $hookModulePath -Root $ExpectedHooksRoot) {
+                    $hookLoaded = $true
+                    $status = "HookLoaded"
+                }
+                else {
+                    $status = "HookPathMismatch"
+                }
+
                 break
             }
         }
@@ -219,9 +292,16 @@ function Test-HookModule {
 
 if ($AllMatchingProcesses) {
     $targetProcesses = @(Get-AllMatchingTargetProcesses -TargetNames $ProcessNames)
+    $requiredTargetRows = @()
 }
 else {
     $dialogOwnerTargets = @(Get-DialogOwnerTargetProcesses -TargetNames $ProcessNames)
+    if ($AllowSubset) {
+        $requiredTargetRows = @()
+    }
+    else {
+        $requiredTargetRows = @(Get-MissingRequiredTargetRows -TargetNames $ProcessNames -DialogOwnerTargets $dialogOwnerTargets)
+    }
 
     if (-not $SkipDialogPing) {
         foreach ($dialogOwnerTarget in $dialogOwnerTargets) {
@@ -238,7 +318,11 @@ else {
 
 $results = @(
     foreach ($process in $targetProcesses) {
-        Test-HookModule -Process $process -ExpectedModuleName $ModuleName
+        Test-HookModule -Process $process -ExpectedModuleName $ModuleName -ExpectedHooksRoot $ExpectedHooksRoot
+    }
+
+    foreach ($requiredTargetRow in $requiredTargetRows) {
+        $requiredTargetRow
     }
 )
 
@@ -248,9 +332,19 @@ if ($results.Count -eq 0) {
 
 $results | Format-Table -AutoSize
 
+$missingRequiredTargets = $results | Where-Object { $_.Status -eq "RequiredTargetMissing" }
+if ($missingRequiredTargets) {
+    throw "Required target dialog owner processes were not found."
+}
+
 $verificationFailures = $results | Where-Object { $_.Status -eq "ProcessExited" -or $_.Status -eq "ModuleEnumerationFailed" }
 if ($verificationFailures) {
     throw "Hook module could not be verified for one or more target processes."
+}
+
+$hookPathMismatch = $results | Where-Object { $_.Status -eq "HookPathMismatch" }
+if ($hookPathMismatch) {
+    throw "Hook module path did not match expected hooks root for one or more target processes."
 }
 
 $missingHook = $results | Where-Object { $_.Status -eq "HookMissing" }

@@ -5,6 +5,9 @@ Use this checklist to validate hook-based quick switch coverage for the Task 11 
 ## Setup
 
 - Build and run `ListaryOpen.App` with native hooks packaged.
+- Open Settings and click **Enable Hook Quick Switch**.
+- Approve the expected UAC prompts for both the `x64` and `x86` hook hosts.
+- If Windows reports an unknown publisher, treat that as expected for unsigned local binaries; signed builds should show the configured publisher instead.
 - Confirm Settings reports hook quick switch enabled for both `x64` and `x86`.
 - Use `C:\Users\paulx` as the target folder for each `Ctrl+G` jump.
 - Keep the target file/open/upload dialog in the foreground before pressing `Ctrl+G`.
