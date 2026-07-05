@@ -234,25 +234,40 @@ public sealed class AppDialogHotkeyTests
     }
 
     [Fact]
-    public void ActivateQuickSwitchFolderSearchWithDirectJumpStatusReportsFailureAfterActivation()
+    public async Task ActivateQuickSwitchFolderSearchWithDirectJumpStatusAsyncReportsFailureAfterActivationCompletes()
     {
         var events = new List<string>();
+        var activationCompletion = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         var candidates = new[]
         {
             new QuickSwitchFolderCandidate("C:\\Projects", "Explorer", IntPtr.Zero, true)
         };
 
-        ListaryOpen.App.App.ActivateQuickSwitchFolderSearchWithDirectJumpStatus(
+        var activationTask = ListaryOpen.App.App.ActivateQuickSwitchFolderSearchWithDirectJumpStatusAsync(
             candidates,
             new DialogJumpResult(DialogJumpStatus.UnsupportedDialog, "No standard dialog."),
-            activatedCandidates => events.Add("activate:" + activatedCandidates.Count),
+            async activatedCandidates =>
+            {
+                events.Add("activate:" + activatedCandidates.Count);
+                await activationCompletion.Task;
+                events.Add("activation-complete");
+            },
             result => events.Add("report:" + result.Status + ":" + result.Message),
             message => events.Add("tray:" + message));
+
+        await Task.Yield();
+
+        Assert.Equal(new[] { "activate:1" }, events);
+        Assert.False(activationTask.IsCompleted);
+
+        activationCompletion.SetResult();
+        await activationTask;
 
         Assert.Equal(
             new[]
             {
                 "activate:1",
+                "activation-complete",
                 "report:UnsupportedDialog:No standard dialog."
             },
             events);

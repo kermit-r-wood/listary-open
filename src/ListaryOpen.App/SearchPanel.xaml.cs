@@ -46,7 +46,12 @@ public partial class SearchPanel : Window
 
     public void ActivateQuickSwitchFolderSearch(IReadOnlyList<QuickSwitchFolderCandidate> candidates)
     {
-        _ = ViewModel.ActivateQuickSwitchFolderSearchAsync(candidates);
+        _ = ActivateQuickSwitchFolderSearchAsync(candidates);
+    }
+
+    public async Task ActivateQuickSwitchFolderSearchAsync(IReadOnlyList<QuickSwitchFolderCandidate> candidates)
+    {
+        await ViewModel.ActivateQuickSwitchFolderSearchAsync(candidates);
         ShowAndFocusQuery();
     }
 

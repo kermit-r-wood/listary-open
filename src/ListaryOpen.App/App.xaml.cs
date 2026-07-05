@@ -593,10 +593,12 @@ public partial class App : Application
             return;
         }
 
-        ActivateQuickSwitchFolderSearchWithDirectJumpStatus(
+        await ActivateQuickSwitchFolderSearchWithDirectJumpStatusAsync(
             candidates,
             directJumpResult,
-            folderCandidates => _searchPanel?.ActivateQuickSwitchFolderSearch(folderCandidates),
+            folderCandidates => _searchPanel is null
+                ? Task.CompletedTask
+                : _searchPanel.ActivateQuickSwitchFolderSearchAsync(folderCandidates),
             result => _searchPanel?.ReportDialogJumpResult(result),
             message => _trayController?.ShowStatus(message));
     }
@@ -687,10 +689,10 @@ public partial class App : Application
         }
     }
 
-    internal static void ActivateQuickSwitchFolderSearchWithDirectJumpStatus(
+    internal static async Task ActivateQuickSwitchFolderSearchWithDirectJumpStatusAsync(
         IReadOnlyList<QuickSwitchFolderCandidate> candidates,
         DialogJumpResult? directJumpResult,
-        Action<IReadOnlyList<QuickSwitchFolderCandidate>> activateFolderSearch,
+        Func<IReadOnlyList<QuickSwitchFolderCandidate>, Task> activateFolderSearch,
         Action<DialogJumpResult> reportPanelStatus,
         Action<string> showStatus)
     {
@@ -699,7 +701,7 @@ public partial class App : Application
         ArgumentNullException.ThrowIfNull(reportPanelStatus);
         ArgumentNullException.ThrowIfNull(showStatus);
 
-        activateFolderSearch(candidates);
+        await activateFolderSearch(candidates);
         if (directJumpResult is not null)
         {
             ReportDirectDialogJumpStatus(directJumpResult, reportPanelStatus, showStatus);
