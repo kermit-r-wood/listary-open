@@ -24,7 +24,10 @@ fn main() -> io::Result<()> {
 
     loop {
         let pipe = NamedPipeHandle::create(&pipe_path)?;
-        connect_pipe(pipe.raw())?;
+        if let Err(error) = connect_pipe(pipe.raw()) {
+            eprintln!("Hook host connect failed: {error}");
+            continue;
+        }
 
         thread::spawn(move || {
             if let Err(error) = serve_connection(pipe) {

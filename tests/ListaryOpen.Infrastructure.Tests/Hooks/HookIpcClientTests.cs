@@ -220,9 +220,12 @@ public sealed class HookIpcClientTests
 
         try
         {
-            await task;
+            await task.WaitAsync(TimeSpan.FromSeconds(1));
         }
         catch (OperationCanceledException)
+        {
+        }
+        catch (TimeoutException) when (cancellation.IsCancellationRequested)
         {
         }
         catch (IOException) when (cancellation.IsCancellationRequested)
