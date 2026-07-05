@@ -89,6 +89,35 @@ public sealed class HookQuickSwitchBridgeTests
     }
 
     [Fact]
+    public async Task DisposeDuringHostStartTerminatesReturnedProcessAndSkipsStatusUpdate()
+    {
+        using var hookFiles = HookFileFixture.Create();
+        hookFiles.CreateHostAndDll(HookArchitecture.X64);
+        hookFiles.CreateHostAndDll(HookArchitecture.X86);
+        var processFactory = new BlockingHookHostProcessFactory();
+        var bridge = new HookQuickSwitchBridge(
+            HookQuickSwitchStatus.Disabled(),
+            CreateEmptyClients(),
+            hookFiles.Paths,
+            processFactory);
+        var statusChangedCount = 0;
+        bridge.StatusChanged += (_, _) => statusChangedCount++;
+
+        var enableTask = Task.Run(() => bridge.EnableAsync(CancellationToken.None));
+        await processFactory.FirstStartEntered.Task.WaitAsync(TimeSpan.FromSeconds(2));
+
+        bridge.Dispose();
+        processFactory.Release();
+        await enableTask.WaitAsync(TimeSpan.FromSeconds(2));
+        bridge.Dispose();
+
+        Assert.Single(processFactory.Starts);
+        var terminated = Assert.Single(processFactory.TerminatedProcesses);
+        Assert.Same(processFactory.ReturnedProcesses.Single(), terminated);
+        Assert.Equal(0, statusChangedCount);
+    }
+
+    [Fact]
     public async Task EnableReportsMissingHostAndDllPerArchitecture()
     {
         using var hookFiles = HookFileFixture.Create();
@@ -383,6 +412,10 @@ public sealed class HookQuickSwitchBridgeTests
 
         public List<RecordedStart> Starts { get; } = new();
 
+        public List<Process> ReturnedProcesses { get; } = new();
+
+        public List<Process> TerminatedProcesses { get; } = new();
+
         public override Process? Start(ProcessStartInfo startInfo)
         {
             lock (_gate)
@@ -395,7 +428,21 @@ public sealed class HookQuickSwitchBridgeTests
             }
 
             _release.Task.GetAwaiter().GetResult();
-            return new Process();
+            var process = new Process();
+            lock (_gate)
+            {
+                ReturnedProcesses.Add(process);
+            }
+
+            return process;
+        }
+
+        public override void Terminate(Process process)
+        {
+            lock (_gate)
+            {
+                TerminatedProcesses.Add(process);
+            }
         }
 
         public void Release() => _release.TrySetResult();

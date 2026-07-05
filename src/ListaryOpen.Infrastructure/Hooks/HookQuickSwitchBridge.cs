@@ -1,4 +1,3 @@
-using System.ComponentModel;
 using System.Diagnostics;
 
 namespace ListaryOpen.Infrastructure.Hooks;
@@ -14,6 +13,7 @@ public sealed class HookQuickSwitchBridge : IHookQuickSwitchBridge
     private readonly SemaphoreSlim _enableGate = new(1, 1);
     private readonly object _hostProcessGate = new();
     private readonly Dictionary<HookArchitecture, Process> _hostProcesses = new();
+    private bool _disposed;
 
     public HookQuickSwitchBridge(
         HookQuickSwitchStatus initialStatus,
@@ -55,15 +55,30 @@ public sealed class HookQuickSwitchBridge : IHookQuickSwitchBridge
         await _enableGate.WaitAsync(cancellationToken).ConfigureAwait(false);
         try
         {
+            if (IsDisposed())
+            {
+                return;
+            }
+
             if (_hostPaths is not null)
             {
-                Status = new HookQuickSwitchStatus(
+                var status = new HookQuickSwitchStatus(
                     true,
                     await EnableArchitectureAsync(HookArchitecture.X64, cancellationToken).ConfigureAwait(false),
                     await EnableArchitectureAsync(HookArchitecture.X86, cancellationToken).ConfigureAwait(false));
+
+                if (IsDisposed())
+                {
+                    return;
+                }
+
+                Status = status;
             }
 
-            StatusChanged?.Invoke(this, Status);
+            if (!IsDisposed())
+            {
+                StatusChanged?.Invoke(this, Status);
+            }
         }
         finally
         {
@@ -109,24 +124,28 @@ public sealed class HookQuickSwitchBridge : IHookQuickSwitchBridge
 
     public void Dispose()
     {
+        Process[] hostProcesses;
+        lock (_hostProcessGate)
+        {
+            if (_disposed)
+            {
+                return;
+            }
+
+            _disposed = true;
+            hostProcesses = _hostProcesses.Values.Distinct().ToArray();
+            _hostProcesses.Clear();
+        }
+
         foreach (var client in _clients.Values.OfType<IDisposable>())
         {
             client.Dispose();
         }
 
-        Process[] hostProcesses;
-        lock (_hostProcessGate)
-        {
-            hostProcesses = _hostProcesses.Values.Distinct().ToArray();
-            _hostProcesses.Clear();
-        }
-
         foreach (var process in hostProcesses)
         {
-            TerminateAndDispose(process);
+            _processFactory.Terminate(process);
         }
-
-        _enableGate.Dispose();
     }
 
     private async Task<HookArchitectureStatus> EnableArchitectureAsync(
@@ -134,10 +153,19 @@ public sealed class HookQuickSwitchBridge : IHookQuickSwitchBridge
         CancellationToken cancellationToken)
     {
         cancellationToken.ThrowIfCancellationRequested();
+        var architectureName = architecture.ToFolderName();
+        if (IsDisposed())
+        {
+            return new HookArchitectureStatus(
+                architecture,
+                true,
+                false,
+                false,
+                $"{architectureName} hook host start was abandoned.");
+        }
 
         var paths = _hostPaths!.ForArchitecture(architecture);
         var snapshot = paths.Snapshot();
-        var architectureName = architecture.ToFolderName();
 
         if (TryGetRunningTrackedProcess(architecture, out _))
         {
@@ -182,9 +210,29 @@ public sealed class HookQuickSwitchBridge : IHookQuickSwitchBridge
                     $"{architectureName} hook host start did not return a process.");
             }
 
+            var terminateStartedProcess = false;
             lock (_hostProcessGate)
             {
-                _hostProcesses[architecture] = process;
+                if (_disposed || cancellationToken.IsCancellationRequested)
+                {
+                    terminateStartedProcess = true;
+                }
+                else
+                {
+                    _hostProcesses[architecture] = process;
+                }
+            }
+
+            if (terminateStartedProcess)
+            {
+                _processFactory.Terminate(process);
+                cancellationToken.ThrowIfCancellationRequested();
+                return new HookArchitectureStatus(
+                    architecture,
+                    true,
+                    false,
+                    true,
+                    $"{architectureName} hook host start was abandoned.");
             }
 
             return new HookArchitectureStatus(
@@ -275,7 +323,7 @@ public sealed class HookQuickSwitchBridge : IHookQuickSwitchBridge
                 return false;
             }
 
-            if (IsProcessRunning(process))
+            if (_processFactory.IsRunning(process))
             {
                 return true;
             }
@@ -283,42 +331,16 @@ public sealed class HookQuickSwitchBridge : IHookQuickSwitchBridge
             _hostProcesses.Remove(architecture);
         }
 
-        TerminateAndDispose(process);
+        _processFactory.Terminate(process);
         process = null;
         return false;
     }
 
-    private static bool IsProcessRunning(Process process)
+    private bool IsDisposed()
     {
-        try
+        lock (_hostProcessGate)
         {
-            return !process.HasExited;
-        }
-        catch (InvalidOperationException)
-        {
-            return true;
-        }
-        catch (Win32Exception)
-        {
-            return true;
-        }
-    }
-
-    private static void TerminateAndDispose(Process process)
-    {
-        try
-        {
-            if (IsProcessRunning(process))
-            {
-                process.Kill(entireProcessTree: true);
-            }
-        }
-        catch (Exception exception) when (exception is InvalidOperationException or Win32Exception or NotSupportedException)
-        {
-        }
-        finally
-        {
-            process.Dispose();
+            return _disposed;
         }
     }
 

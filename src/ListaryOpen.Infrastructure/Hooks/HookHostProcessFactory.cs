@@ -1,3 +1,4 @@
+using System.ComponentModel;
 using System.Diagnostics;
 
 namespace ListaryOpen.Infrastructure.Hooks;
@@ -51,5 +52,43 @@ public class HookHostProcessFactory
         ArgumentNullException.ThrowIfNull(startInfo);
 
         return Process.Start(startInfo);
+    }
+
+    public virtual void Terminate(Process process)
+    {
+        ArgumentNullException.ThrowIfNull(process);
+
+        try
+        {
+            if (IsRunning(process))
+            {
+                process.Kill(entireProcessTree: true);
+            }
+        }
+        catch (Exception exception) when (exception is InvalidOperationException or Win32Exception or NotSupportedException)
+        {
+        }
+        finally
+        {
+            process.Dispose();
+        }
+    }
+
+    public virtual bool IsRunning(Process process)
+    {
+        ArgumentNullException.ThrowIfNull(process);
+
+        try
+        {
+            return !process.HasExited;
+        }
+        catch (InvalidOperationException)
+        {
+            return true;
+        }
+        catch (Win32Exception)
+        {
+            return true;
+        }
     }
 }

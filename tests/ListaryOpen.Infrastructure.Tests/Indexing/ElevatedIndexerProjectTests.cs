@@ -23,7 +23,8 @@ public sealed class ElevatedIndexerProjectTests
     [Fact]
     public void AppBuildOutputContainsCompleteElevatedIndexerBundle()
     {
-        var appOutputDirectory = FindAppBuildOutputDirectory();
+        using var appBuild = BuildAppProjectIntoTemporaryOutput();
+        var appOutputDirectory = appBuild.OutputDirectory;
 
         Assert.True(
             File.Exists(Path.Combine(appOutputDirectory, "ListaryOpen.Indexer.Elevated.exe")),
@@ -40,20 +41,10 @@ public sealed class ElevatedIndexerProjectTests
     }
 
     [Fact]
-    public void AppBuildOutputDirectoryUsesCurrentTestRunOutput()
-    {
-        Assert.True(
-            string.Equals(
-                Path.GetFullPath(AppContext.BaseDirectory).TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar),
-                Path.GetFullPath(FindAppBuildOutputDirectory()).TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar),
-                StringComparison.OrdinalIgnoreCase),
-            "Elevated indexer output tests must inspect the current test run output directory.");
-    }
-
-    [Fact]
     public void AppBuildOutputElevatedIndexerStartsFromCopiedBundle()
     {
-        var helperPath = Path.Combine(FindAppBuildOutputDirectory(), "ListaryOpen.Indexer.Elevated.exe");
+        using var appBuild = BuildAppProjectIntoTemporaryOutput();
+        var helperPath = Path.Combine(appBuild.OutputDirectory, "ListaryOpen.Indexer.Elevated.exe");
         var process = Process.Start(new ProcessStartInfo
         {
             FileName = helperPath,
@@ -164,8 +155,85 @@ public sealed class ElevatedIndexerProjectTests
         throw new DirectoryNotFoundException("Could not find repository root.");
     }
 
-    private static string FindAppBuildOutputDirectory()
+    private static AppBuildOutput BuildAppProjectIntoTemporaryOutput()
     {
-        return AppContext.BaseDirectory;
+        var outputRoot = Directory.CreateTempSubdirectory("listary-open-app-build-");
+        var baseOutputPath = outputRoot.FullName + Path.DirectorySeparatorChar;
+        var projectPath = Path.Combine(
+            FindRepositoryRoot(),
+            "src",
+            "ListaryOpen.App",
+            "ListaryOpen.App.csproj");
+        var startInfo = new ProcessStartInfo
+        {
+            FileName = "dotnet",
+            UseShellExecute = false,
+            RedirectStandardError = true,
+            RedirectStandardOutput = true,
+            CreateNoWindow = true
+        };
+        startInfo.ArgumentList.Add("build");
+        startInfo.ArgumentList.Add(projectPath);
+        startInfo.ArgumentList.Add("--no-restore");
+        startInfo.ArgumentList.Add("--nologo");
+        startInfo.ArgumentList.Add("-p:BuildNativeHooks=false");
+        startInfo.ArgumentList.Add("-p:BaseOutputPath=" + baseOutputPath);
+
+        using var process = Process.Start(startInfo);
+        Assert.NotNull(process);
+        var stdoutTask = process.StandardOutput.ReadToEndAsync();
+        var stderrTask = process.StandardError.ReadToEndAsync();
+
+        if (!process.WaitForExit(milliseconds: 120_000))
+        {
+            process.Kill(entireProcessTree: true);
+            outputRoot.Delete(recursive: true);
+            throw new TimeoutException("The temporary app build did not exit within the test timeout.");
+        }
+
+        var stdout = stdoutTask.GetAwaiter().GetResult();
+        var stderr = stderrTask.GetAwaiter().GetResult();
+        if (process.ExitCode != 0)
+        {
+            outputRoot.Delete(recursive: true);
+            throw new InvalidOperationException(
+                $"Temporary app build failed with exit code {process.ExitCode}.{Environment.NewLine}{stdout}{Environment.NewLine}{stderr}");
+        }
+
+        var outputDirectory = Path.Combine(outputRoot.FullName, "Debug", "net8.0-windows");
+        if (!Directory.Exists(outputDirectory))
+        {
+            outputRoot.Delete(recursive: true);
+            throw new DirectoryNotFoundException($"Temporary app build output was not found: {outputDirectory}");
+        }
+
+        return new AppBuildOutput(outputRoot, outputDirectory);
+    }
+
+    private sealed class AppBuildOutput : IDisposable
+    {
+        private readonly DirectoryInfo _outputRoot;
+
+        public AppBuildOutput(DirectoryInfo outputRoot, string outputDirectory)
+        {
+            _outputRoot = outputRoot;
+            OutputDirectory = outputDirectory;
+        }
+
+        public string OutputDirectory { get; }
+
+        public void Dispose()
+        {
+            try
+            {
+                _outputRoot.Delete(recursive: true);
+            }
+            catch (IOException)
+            {
+            }
+            catch (UnauthorizedAccessException)
+            {
+            }
+        }
     }
 }
