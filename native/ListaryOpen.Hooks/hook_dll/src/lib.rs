@@ -6,8 +6,8 @@ use listary_open_hook_common::{
 use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
 use windows_sys::Win32::System::DataExchange::COPYDATASTRUCT;
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    CallNextHookEx, GetClassNameW, GetDlgItem, SendMessageW, CWPSTRUCT, WM_COPYDATA, WM_KEYDOWN,
-    WM_KEYUP, WM_SETTEXT,
+    CallNextHookEx, GetClassNameW, GetDlgItem, GetWindowTextLengthW, GetWindowTextW, SendMessageW,
+    CWPSTRUCT, WM_COPYDATA, WM_KEYDOWN, WM_KEYUP, WM_SETTEXT,
 };
 
 const ADDRESS_BAR_EDIT_CONTROL_ID: i32 = 41477;
@@ -33,14 +33,56 @@ pub unsafe extern "system" fn ListaryOpenHookProc(
 }
 
 fn is_supported_dialog(hwnd: HWND) -> bool {
+    let Some(class_name) = class_name(hwnd) else {
+        return false;
+    };
+
+    is_supported_dialog_shape(&class_name, &window_text(hwnd), has_address_control(hwnd))
+}
+
+fn is_supported_dialog_shape(class_name: &str, title: &str, has_address_control: bool) -> bool {
+    class_name == DIALOG_CLASS
+        && (has_address_control || title_contains_supported_dialog_keyword(title))
+}
+
+fn title_contains_supported_dialog_keyword(title: &str) -> bool {
+    let title = title.to_ascii_lowercase();
+    ["open", "upload", "choose", "folder"]
+        .iter()
+        .any(|keyword| title.contains(keyword))
+}
+
+fn has_address_control(hwnd: HWND) -> bool {
+    !unsafe { GetDlgItem(hwnd, ADDRESS_BAR_EDIT_CONTROL_ID) }.is_null()
+}
+
+fn class_name(hwnd: HWND) -> Option<String> {
     let mut class_buffer = [0u16; 64];
     let class_len =
         unsafe { GetClassNameW(hwnd, class_buffer.as_mut_ptr(), class_buffer.len() as i32) };
 
-    class_len > 0
-        && DIALOG_CLASS
-            .encode_utf16()
-            .eq(class_buffer[..class_len as usize].iter().copied())
+    if class_len <= 0 {
+        return None;
+    }
+
+    Some(String::from_utf16_lossy(
+        &class_buffer[..class_len as usize],
+    ))
+}
+
+fn window_text(hwnd: HWND) -> String {
+    let text_len = unsafe { GetWindowTextLengthW(hwnd) };
+    if text_len <= 0 {
+        return String::new();
+    }
+
+    let mut buffer = vec![0u16; text_len as usize + 1];
+    let copied = unsafe { GetWindowTextW(hwnd, buffer.as_mut_ptr(), buffer.len() as i32) };
+    if copied <= 0 {
+        return String::new();
+    }
+
+    String::from_utf16_lossy(&buffer[..copied as usize])
 }
 
 fn handle_dialog_message(hwnd: HWND, message: u32, _w_param: WPARAM, l_param: LPARAM) {
@@ -278,6 +320,28 @@ mod tests {
             None,
             decode_jump_copydata_payload(listary_open_hook_common::JUMP_COPYDATA_MAGIC, &payload)
         );
+    }
+
+    #[test]
+    fn supported_dialog_shape_accepts_file_and_upload_dialogs_without_process_names() {
+        assert!(is_supported_dialog_shape("#32770", "Open", false));
+        assert!(is_supported_dialog_shape("#32770", "File Upload", false));
+        assert!(is_supported_dialog_shape(
+            "#32770",
+            "Choose which file(s) to upload...",
+            false
+        ));
+        assert!(is_supported_dialog_shape("#32770", "Firefox", true));
+    }
+
+    #[test]
+    fn supported_dialog_shape_rejects_unknown_or_non_dialog_shapes() {
+        assert!(!is_supported_dialog_shape("#32770", "Properties", false));
+        assert!(!is_supported_dialog_shape(
+            "MozillaWindowClass",
+            "File Upload",
+            true
+        ));
     }
 
     #[test]

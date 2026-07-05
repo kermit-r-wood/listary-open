@@ -166,6 +166,7 @@ struct HookState {
     module: HMODULE,
     hook_proc: DialogHookProc,
     hooked_threads: HashSet<u32>,
+    logged_mobaxterm_threads: HashSet<u32>,
     hooks: Vec<HHOOK>,
 }
 
@@ -186,19 +187,37 @@ impl HookState {
             module,
             hook_proc,
             hooked_threads: HashSet::new(),
+            logged_mobaxterm_threads: HashSet::new(),
             hooks: Vec::new(),
         })
     }
 
     fn install_new_dialog_hooks(&mut self) {
-        let threads = match discover_dialog_threads() {
-            Ok(threads) => threads,
+        let dialogs = match discover_observed_dialogs() {
+            Ok(dialogs) => dialogs,
             Err(error) => {
                 eprintln!("Hook host dialog discovery failed: {error}");
                 return;
             }
         };
 
+        for dialog in &dialogs {
+            self.log_dialog_diagnostics(dialog);
+        }
+
+        let threads = dialogs
+            .iter()
+            .filter(|dialog| {
+                should_hook_observed_dialog(
+                    host_architecture(),
+                    dialog.architecture,
+                    &dialog.class_name,
+                    &dialog.title,
+                    has_address_control(dialog.window_handle),
+                )
+            })
+            .map(|dialog| dialog.thread_id)
+            .collect::<HashSet<_>>();
         for thread_id in unhooked_threads(&threads, &self.hooked_threads) {
             match install_thread_hook(self.module, self.hook_proc, thread_id) {
                 Ok(hook) => {
@@ -209,6 +228,19 @@ impl HookState {
                 Err(error) => eprintln!("Hook host failed to hook thread {thread_id}: {error}"),
             }
         }
+    }
+
+    fn log_dialog_diagnostics(&mut self, dialog: &ObservedDialog) {
+        if !should_log_mobaxterm_dialog(host_architecture(), &dialog.process_name)
+            || !self.logged_mobaxterm_threads.insert(dialog.thread_id)
+        {
+            return;
+        }
+
+        eprintln!(
+            "Hook host observed MobaXterm dialog: architecture={}, class={}, title='{}'.",
+            dialog.architecture, dialog.class_name, dialog.title
+        );
     }
 }
 
@@ -274,12 +306,12 @@ fn install_thread_hook(
     Ok(hook)
 }
 
-fn discover_dialog_threads() -> io::Result<HashSet<u32>> {
-    let mut threads = HashSet::new();
+fn discover_observed_dialogs() -> io::Result<Vec<ObservedDialog>> {
+    let mut dialogs = Vec::new();
     let enumerated = unsafe {
         EnumWindows(
             Some(enum_windows_proc),
-            (&mut threads as *mut HashSet<u32>) as LPARAM,
+            (&mut dialogs as *mut Vec<ObservedDialog>) as LPARAM,
         )
     };
 
@@ -287,7 +319,7 @@ fn discover_dialog_threads() -> io::Result<HashSet<u32>> {
         return Err(io::Error::last_os_error());
     }
 
-    Ok(threads)
+    Ok(dialogs)
 }
 
 fn unhooked_threads(discovered: &HashSet<u32>, hooked_threads: &HashSet<u32>) -> Vec<u32> {
@@ -301,27 +333,83 @@ fn unhooked_threads(discovered: &HashSet<u32>, hooked_threads: &HashSet<u32>) ->
 }
 
 unsafe extern "system" fn enum_windows_proc(hwnd: HWND, l_param: LPARAM) -> BOOL {
-    if is_dialog_window(hwnd) {
-        let mut process_id = 0u32;
-        let thread_id = unsafe { GetWindowThreadProcessId(hwnd, &mut process_id) };
-        if thread_id != 0 {
-            let threads = unsafe { &mut *(l_param as *mut HashSet<u32>) };
-            threads.insert(thread_id);
-        }
-    }
+    let Some(dialog) = observed_dialog(hwnd) else {
+        return TRUE;
+    };
+
+    let dialogs = unsafe { &mut *(l_param as *mut Vec<ObservedDialog>) };
+    dialogs.push(dialog);
 
     TRUE
 }
 
-fn is_dialog_window(hwnd: HWND) -> bool {
+fn is_supported_dialog_window(hwnd: HWND) -> bool {
+    let Some(class_name) = class_name(hwnd) else {
+        return false;
+    };
+
+    is_supported_dialog_shape(&class_name, &window_text(hwnd), has_address_control(hwnd))
+}
+
+fn is_supported_dialog_shape(class_name: &str, title: &str, has_address_control: bool) -> bool {
+    class_name == DIALOG_CLASS
+        && (has_address_control || title_contains_supported_dialog_keyword(title))
+}
+
+fn title_contains_supported_dialog_keyword(title: &str) -> bool {
+    let title = title.to_ascii_lowercase();
+    ["open", "upload", "choose", "folder"]
+        .iter()
+        .any(|keyword| title.contains(keyword))
+}
+
+fn has_address_control(hwnd: HWND) -> bool {
+    !unsafe { GetDlgItem(hwnd, ADDRESS_BAR_EDIT_CONTROL_ID) }.is_null()
+}
+
+fn should_hook_observed_dialog(
+    host_architecture: &str,
+    dialog_architecture: &str,
+    class_name: &str,
+    title: &str,
+    has_address_control: bool,
+) -> bool {
+    dialog_architecture.eq_ignore_ascii_case(host_architecture)
+        && is_supported_dialog_shape(class_name, title, has_address_control)
+}
+
+fn observed_dialog(hwnd: HWND) -> Option<ObservedDialog> {
     let mut class_buffer = [0u16; 64];
     let class_len =
         unsafe { GetClassNameW(hwnd, class_buffer.as_mut_ptr(), class_buffer.len() as i32) };
 
-    class_len > 0
-        && DIALOG_CLASS
-            .encode_utf16()
-            .eq(class_buffer[..class_len as usize].iter().copied())
+    if class_len <= 0 {
+        return None;
+    }
+
+    let class_name = String::from_utf16_lossy(&class_buffer[..class_len as usize]);
+    if class_name != DIALOG_CLASS {
+        return None;
+    }
+
+    let mut process_id = 0u32;
+    let thread_id = unsafe { GetWindowThreadProcessId(hwnd, &mut process_id) };
+    if thread_id == 0 || process_id == 0 {
+        return None;
+    }
+
+    let architecture = process_architecture(process_id)?;
+
+    Some(ObservedDialog {
+        dialog_id: dialog_id_for_window(process_id, hwnd),
+        window_handle: hwnd,
+        thread_id,
+        process_id,
+        process_name: process_name(process_id),
+        class_name,
+        title: window_text(hwnd),
+        architecture,
+    })
 }
 
 fn serve_connection(pipe: NamedPipeHandle) -> io::Result<()> {
@@ -484,26 +572,20 @@ fn response_for_request(request: &str) -> String {
 
 fn active_dialog_response() -> Option<String> {
     let hwnd = resolve_active_dialog_window()?;
-    let mut process_id = 0u32;
-    let thread_id = unsafe { GetWindowThreadProcessId(hwnd, &mut process_id) };
-    if thread_id == 0 || process_id == 0 {
-        return None;
-    }
-
-    let architecture = process_architecture(process_id)?;
-    if architecture != host_architecture() {
+    let dialog = observed_dialog(hwnd)?;
+    if dialog.architecture != host_architecture() {
         return None;
     }
 
     let payload = ActiveDialogPayload {
-        dialog_id: dialog_id_for_window(process_id, hwnd),
-        window_handle: hwnd as usize,
-        process_id,
-        thread_id,
-        architecture,
-        process_name: process_name(process_id),
-        class_name: class_name(hwnd).unwrap_or_else(|| DIALOG_CLASS.to_string()),
-        title: window_text(hwnd),
+        dialog_id: dialog.dialog_id,
+        window_handle: dialog.window_handle as usize,
+        process_id: dialog.process_id,
+        thread_id: dialog.thread_id,
+        architecture: dialog.architecture,
+        process_name: dialog.process_name,
+        class_name: dialog.class_name,
+        title: dialog.title,
     };
 
     let envelope = OutgoingEnvelope {
@@ -540,10 +622,10 @@ fn jump_dialog_to_folder(payload: JumpCommandPayload) -> String {
         );
     }
 
-    if !is_dialog_window(hwnd) {
+    if !is_supported_dialog_window(hwnd) {
         return command_reply(
             "UnsupportedDialog",
-            "Target window is not a standard dialog.",
+            "Target window is not a supported standard file dialog.",
         );
     }
 
@@ -618,7 +700,7 @@ fn jump_dialog_to_folder(payload: JumpCommandPayload) -> String {
 
 fn resolve_active_dialog_window() -> Option<HWND> {
     let foreground = unsafe { GetForegroundWindow() };
-    resolve_active_dialog_candidate(foreground, is_dialog_window, |hwnd| unsafe {
+    resolve_active_dialog_candidate(foreground, is_supported_dialog_window, |hwnd| unsafe {
         GetAncestor(hwnd, GA_ROOT)
     })
 }
@@ -1183,6 +1265,20 @@ fn process_name_from_image_path(path: &str) -> Option<String> {
     }
 }
 
+fn should_log_mobaxterm_dialog(host_architecture: &str, process_name: &str) -> bool {
+    host_architecture.eq_ignore_ascii_case("x86") && is_mobaxterm_process_name(process_name)
+}
+
+fn is_mobaxterm_process_name(process_name: &str) -> bool {
+    let name = process_name.trim();
+    let stem = name
+        .strip_suffix(".exe")
+        .or_else(|| name.strip_suffix(".EXE"))
+        .unwrap_or(name);
+
+    stem.eq_ignore_ascii_case("MobaXterm")
+}
+
 fn class_name(hwnd: HWND) -> Option<String> {
     let mut class_buffer = [0u16; 256];
     let class_len =
@@ -1308,6 +1404,17 @@ struct ActiveDialogPayload {
     title: String,
 }
 
+struct ObservedDialog {
+    dialog_id: String,
+    window_handle: HWND,
+    thread_id: u32,
+    process_id: u32,
+    process_name: String,
+    class_name: String,
+    title: String,
+    architecture: &'static str,
+}
+
 #[derive(Serialize)]
 struct CommandReplyPayload<'a> {
     status: &'a str,
@@ -1357,6 +1464,71 @@ mod tests {
         let hooked = HashSet::from([7, 11, 99]);
 
         assert_eq!(vec![5, 42], unhooked_threads(&discovered, &hooked));
+    }
+
+    #[test]
+    fn supported_dialog_shape_accepts_standard_file_dialog_titles() {
+        assert!(is_supported_dialog_shape("#32770", "Open", false));
+        assert!(is_supported_dialog_shape("#32770", "Open Folder", false));
+        assert!(is_supported_dialog_shape("#32770", "File Upload", false));
+        assert!(is_supported_dialog_shape(
+            "#32770",
+            "Choose which file(s) to upload...",
+            false
+        ));
+    }
+
+    #[test]
+    fn supported_dialog_shape_accepts_address_control_without_process_whitelist() {
+        assert!(is_supported_dialog_shape("#32770", "Firefox", true));
+        assert!(is_supported_dialog_shape("#32770", "Untitled", true));
+    }
+
+    #[test]
+    fn supported_dialog_shape_rejects_non_dialog_class_and_unknown_shape() {
+        assert!(!is_supported_dialog_shape(
+            "Chrome_WidgetWin_1",
+            "Open",
+            true
+        ));
+        assert!(!is_supported_dialog_shape("#32770", "Properties", false));
+    }
+
+    #[test]
+    fn observed_dialog_hooking_requires_matching_host_architecture_and_supported_shape() {
+        assert!(should_hook_observed_dialog(
+            "x64",
+            "x64",
+            "#32770",
+            "File Upload",
+            false
+        ));
+        assert!(should_hook_observed_dialog(
+            "x86", "x86", "#32770", "Firefox", true
+        ));
+        assert!(!should_hook_observed_dialog(
+            "x64",
+            "x86",
+            "#32770",
+            "File Upload",
+            true
+        ));
+        assert!(!should_hook_observed_dialog(
+            "x86",
+            "x86",
+            "#32770",
+            "Properties",
+            false
+        ));
+    }
+
+    #[test]
+    fn mobaxterm_diagnostics_are_emitted_only_by_x86_host() {
+        assert!(should_log_mobaxterm_dialog("x86", "MobaXterm"));
+        assert!(should_log_mobaxterm_dialog("x86", "MobaXterm.exe"));
+        assert!(should_log_mobaxterm_dialog("x86", "mobaxterm.EXE"));
+        assert!(!should_log_mobaxterm_dialog("x64", "MobaXterm.exe"));
+        assert!(!should_log_mobaxterm_dialog("x86", "firefox.exe"));
     }
 
     #[test]
