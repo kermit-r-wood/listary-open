@@ -12,6 +12,10 @@
         MinWidth="560"
         Background="{StaticResource Brush.AppBackground}"
         WindowStartupLocation="CenterScreen">
+    <Window.Resources>
+        <BooleanToVisibilityConverter x:Key="BooleanToVisibilityConverter" />
+    </Window.Resources>
+
     <Grid x:Name="SettingsContentRoot"
           Margin="20">
         <Grid.RowDefinitions>
@@ -79,6 +83,7 @@
                                     Style="{StaticResource ActionButtonStyle}"
                                     Content="{Binding NtfsFastIndexingActionText}"
                                     Command="{Binding EnableNtfsFastIndexingCommand}"
+                                    Visibility="{Binding IsNtfsFastIndexingActionVisible, Converter={StaticResource BooleanToVisibilityConverter}}"
                                     VerticalAlignment="Center" />
                         </Grid>
                     </StackPanel>
@@ -135,6 +140,7 @@
                                 Style="{StaticResource ActionButtonStyle}"
                                 Content="{Binding HookQuickSwitchActionText}"
                                 Command="{Binding EnableHookQuickSwitchCommand}"
+                                Visibility="{Binding IsHookQuickSwitchActionVisible, Converter={StaticResource BooleanToVisibilityConverter}}"
                                 VerticalAlignment="Center" />
                     </Grid>
                 </Border>

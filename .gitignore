@@ -7,3 +7,4 @@ TestResults/
 .test-*/
 *.user
 *.suo
+artifacts/

@@ -14,8 +14,11 @@ public sealed class SettingsXamlTests
         Assert.Contains("IndexingBadgeText", xaml);
         Assert.Contains("NtfsFastIndexingBadgeText", xaml);
         Assert.Contains("NtfsFastIndexingActionText", xaml);
+        Assert.Contains("IsNtfsFastIndexingActionVisible", xaml);
         Assert.Contains("HookQuickSwitchBadgeText", xaml);
         Assert.Contains("HookQuickSwitchActionText", xaml);
+        Assert.Contains("IsHookQuickSwitchActionVisible", xaml);
+        Assert.Contains("BooleanToVisibilityConverter", xaml);
         Assert.Contains("QuickSaveOpenBadgeText", xaml);
     }
 

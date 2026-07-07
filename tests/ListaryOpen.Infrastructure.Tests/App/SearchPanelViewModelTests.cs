@@ -326,6 +326,22 @@ public sealed class SearchPanelViewModelTests
     }
 
     [Fact]
+    public async Task QueryTextUsesLongerDefaultDelayBeforeSearching()
+    {
+        var index = new RecordingSearchIndex(Array.Empty<SearchResult>());
+        var viewModel = new SearchPanelViewModel(index);
+
+        viewModel.QueryText = "invoice";
+
+        await Task.Delay(TimeSpan.FromMilliseconds(250));
+        Assert.Empty(index.ObservedQueries);
+
+        await index.WaitForSearchCountAsync(1);
+        var query = Assert.Single(index.ObservedQueries);
+        Assert.Equal("invoice", query.NormalizedText);
+    }
+
+    [Fact]
     public async Task QueryTextCancelsPreviousSearchWhenNewQueryStarts()
     {
         var firstResult = CreateResult("C:\\Docs\\Invoice.xlsx", isDirectory: false);

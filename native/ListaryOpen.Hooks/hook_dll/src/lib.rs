@@ -6,11 +6,13 @@ use listary_open_hook_common::{
 use windows_sys::Win32::Foundation::{BOOL, HWND, LPARAM, LRESULT, TRUE, WPARAM};
 use windows_sys::Win32::System::DataExchange::COPYDATASTRUCT;
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    CallNextHookEx, EnumChildWindows, GetClassNameW, GetDlgCtrlID, GetWindowTextLengthW,
-    GetWindowTextW, SendMessageW, CWPSTRUCT, WM_COPYDATA, WM_KEYDOWN, WM_KEYUP, WM_SETTEXT,
+    CallNextHookEx, EnumChildWindows, GetClassNameW, GetDlgCtrlID, GetDlgItem,
+    GetWindowTextLengthW, GetWindowTextW, SendMessageW, CWPSTRUCT, WM_COPYDATA, WM_KEYDOWN,
+    WM_KEYUP, WM_SETTEXT,
 };
 
 const ADDRESS_BAR_EDIT_CONTROL_ID: i32 = 41477;
+const FILE_NAME_EDIT_CONTROL_ID: i32 = 1148;
 const VK_RETURN_KEY: WPARAM = 0x0D;
 
 #[no_mangle]
@@ -72,7 +74,7 @@ fn title_contains_supported_dialog_keyword(title: &str) -> bool {
 }
 
 fn has_address_control(hwnd: HWND) -> bool {
-    find_address_edit_control(hwnd).is_some()
+    find_navigation_edit_control(hwnd).is_some()
 }
 
 #[derive(Clone, Copy)]
@@ -86,17 +88,37 @@ fn select_address_edit_control<'a, I>(candidates: I) -> Option<HWND>
 where
     I: IntoIterator<Item = AddressControlCandidate<'a>>,
 {
+    select_edit_control_by_id(candidates, ADDRESS_BAR_EDIT_CONTROL_ID)
+}
+
+fn select_navigation_edit_control<'a, I>(candidates: I) -> Option<HWND>
+where
+    I: IntoIterator<Item = AddressControlCandidate<'a>>,
+{
+    let candidates = candidates.into_iter().collect::<Vec<_>>();
+    select_edit_control_by_id(candidates.iter().copied(), ADDRESS_BAR_EDIT_CONTROL_ID).or_else(
+        || select_edit_control_by_id(candidates.iter().copied(), FILE_NAME_EDIT_CONTROL_ID),
+    )
+}
+
+fn select_edit_control_by_id<'a, I>(candidates: I, control_id: i32) -> Option<HWND>
+where
+    I: IntoIterator<Item = AddressControlCandidate<'a>>,
+{
     candidates
         .into_iter()
         .find(|candidate| {
-            candidate.control_id == ADDRESS_BAR_EDIT_CONTROL_ID
-                && candidate.class_name.eq_ignore_ascii_case("Edit")
+            candidate.control_id == control_id && candidate.class_name.eq_ignore_ascii_case("Edit")
         })
         .map(|candidate| candidate.hwnd)
 }
 
 struct AddressControlSearch {
     found_hwnd: HWND,
+}
+
+fn find_navigation_edit_control(hwnd: HWND) -> Option<HWND> {
+    find_address_edit_control(hwnd).or_else(|| find_file_name_edit_control(hwnd))
 }
 
 fn find_address_edit_control(hwnd: HWND) -> Option<HWND> {
@@ -144,6 +166,59 @@ unsafe extern "system" fn enum_address_edit_control_proc(hwnd: HWND, l_param: LP
     }
 
     TRUE
+}
+
+fn find_file_name_edit_control(hwnd: HWND) -> Option<HWND> {
+    let container = unsafe { GetDlgItem(hwnd, FILE_NAME_EDIT_CONTROL_ID) };
+    if container.is_null() {
+        return None;
+    }
+
+    if let Some(class_name) = class_name(container) {
+        let candidate = AddressControlCandidate {
+            hwnd: container,
+            control_id: FILE_NAME_EDIT_CONTROL_ID,
+            class_name: &class_name,
+        };
+        if let Some(file_name_edit) = select_navigation_edit_control([candidate]) {
+            return Some(file_name_edit);
+        }
+    }
+
+    let mut search = AddressControlSearch {
+        found_hwnd: std::ptr::null_mut(),
+    };
+    unsafe {
+        EnumChildWindows(
+            container,
+            Some(enum_file_name_edit_control_proc),
+            (&mut search as *mut AddressControlSearch) as LPARAM,
+        );
+    }
+
+    if search.found_hwnd.is_null() {
+        None
+    } else {
+        Some(search.found_hwnd)
+    }
+}
+
+unsafe extern "system" fn enum_file_name_edit_control_proc(hwnd: HWND, l_param: LPARAM) -> BOOL {
+    if l_param == 0 {
+        return TRUE;
+    }
+
+    let Some(class_name) = class_name(hwnd) else {
+        return TRUE;
+    };
+
+    if !class_name.eq_ignore_ascii_case("Edit") {
+        return TRUE;
+    }
+
+    let search = unsafe { &mut *(l_param as *mut AddressControlSearch) };
+    search.found_hwnd = hwnd;
+    0
 }
 
 fn class_name(hwnd: HWND) -> Option<String> {
@@ -303,20 +378,19 @@ fn decode_jump_copydata_payload(dw_data: usize, bytes: &[u8]) -> Option<JumpComm
 }
 
 fn navigate_dialog_to_folder(hwnd: HWND, folder_path: &str) -> JumpAckStatus {
-    let Some(address_edit) = find_address_edit_control(hwnd) else {
+    let Some(path_edit) = find_navigation_edit_control(hwnd) else {
         return JumpAckStatus::UnsupportedDialog;
     };
 
     let wide_path = to_wide_null(folder_path);
-    let set_text =
-        unsafe { SendMessageW(address_edit, WM_SETTEXT, 0, wide_path.as_ptr() as LPARAM) };
+    let set_text = unsafe { SendMessageW(path_edit, WM_SETTEXT, 0, wide_path.as_ptr() as LPARAM) };
     if set_text == 0 {
         return JumpAckStatus::Failed;
     }
 
     unsafe {
-        SendMessageW(address_edit, WM_KEYDOWN, VK_RETURN_KEY, 0);
-        SendMessageW(address_edit, WM_KEYUP, VK_RETURN_KEY, 0);
+        SendMessageW(path_edit, WM_KEYDOWN, VK_RETURN_KEY, 0);
+        SendMessageW(path_edit, WM_KEYUP, VK_RETURN_KEY, 0);
     }
 
     JumpAckStatus::Success
@@ -516,6 +590,40 @@ mod tests {
                 },
             ])
         );
+    }
+
+    #[test]
+    fn navigation_edit_selector_accepts_classic_file_name_edit_when_address_edit_is_missing() {
+        let file_name_edit = 301usize as HWND;
+
+        let selected = select_navigation_edit_control([AddressControlCandidate {
+            hwnd: file_name_edit,
+            control_id: FILE_NAME_EDIT_CONTROL_ID,
+            class_name: "Edit",
+        }]);
+
+        assert_eq!(Some(file_name_edit), selected);
+    }
+
+    #[test]
+    fn navigation_edit_selector_prefers_address_edit_over_file_name_edit() {
+        let file_name_edit = 401usize as HWND;
+        let address_edit = 402usize as HWND;
+
+        let selected = select_navigation_edit_control([
+            AddressControlCandidate {
+                hwnd: file_name_edit,
+                control_id: FILE_NAME_EDIT_CONTROL_ID,
+                class_name: "Edit",
+            },
+            AddressControlCandidate {
+                hwnd: address_edit,
+                control_id: ADDRESS_BAR_EDIT_CONTROL_ID,
+                class_name: "Edit",
+            },
+        ]);
+
+        assert_eq!(Some(address_edit), selected);
     }
 
     #[test]

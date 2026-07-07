@@ -24,6 +24,16 @@ public sealed class SearchPanelXamlTests
         Assert.Contains("SearchPanelResultListStyle", xaml);
     }
 
+    [Fact]
+    public void SearchQueryBoxUsesCompactInputSizing()
+    {
+        var xaml = File.ReadAllText(GetRepositoryPath("src", "ListaryOpen.App", "Styles", "SearchPanel.xaml"));
+
+        Assert.Contains("<Setter Property=\"Height\" Value=\"40\" />", xaml);
+        Assert.Contains("<Setter Property=\"Padding\" Value=\"14,6\" />", xaml);
+        Assert.Contains("<Setter Property=\"FontSize\" Value=\"18\" />", xaml);
+    }
+
     private static string GetRepositoryPath(params string[] segments)
     {
         return Path.GetFullPath(Path.Combine(

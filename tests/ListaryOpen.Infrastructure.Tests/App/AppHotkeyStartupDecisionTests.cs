@@ -5,6 +5,14 @@ namespace ListaryOpen.Infrastructure.Tests.App;
 
 public sealed class AppHotkeyStartupDecisionTests
 {
+    [Theory]
+    [InlineData(false, "Activate")]
+    [InlineData(true, "Hide")]
+    public void SearchHotkeyTogglesSearchPanelVisibility(bool panelIsVisible, string expected)
+    {
+        Assert.Equal(expected, ListaryOpen.App.App.GetSearchHotkeyPanelAction(panelIsVisible).ToString());
+    }
+
     [Fact]
     public void CreateHotkeyStartupDecisionContinuesSilentlyWhenAllHotkeysRegister()
     {

@@ -62,10 +62,12 @@ public sealed class HookQuickSwitchBridge : IHookQuickSwitchBridge
 
             if (_hostPaths is not null)
             {
-                var status = new HookQuickSwitchStatus(
-                    true,
-                    await EnableArchitectureAsync(HookArchitecture.X64, cancellationToken).ConfigureAwait(false),
-                    await EnableArchitectureAsync(HookArchitecture.X86, cancellationToken).ConfigureAwait(false));
+                var status = await TryEnableBothArchitecturesWithSingleElevatedLaunchAsync(cancellationToken)
+                        .ConfigureAwait(false)
+                    ?? new HookQuickSwitchStatus(
+                        true,
+                        await EnableArchitectureAsync(HookArchitecture.X64, cancellationToken).ConfigureAwait(false),
+                        await EnableArchitectureAsync(HookArchitecture.X86, cancellationToken).ConfigureAwait(false));
 
                 if (IsDisposed())
                 {
@@ -295,6 +297,160 @@ public sealed class HookQuickSwitchBridge : IHookQuickSwitchBridge
         }
     }
 
+    private async Task<HookQuickSwitchStatus?> TryEnableBothArchitecturesWithSingleElevatedLaunchAsync(
+        CancellationToken cancellationToken)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        if (_hostPaths is null || IsDisposed())
+        {
+            return null;
+        }
+
+        if (TryGetRunningTrackedProcess(HookArchitecture.X64, out _)
+            || TryGetRunningTrackedProcess(HookArchitecture.X86, out _))
+        {
+            return null;
+        }
+
+        var x64Paths = _hostPaths.ForArchitecture(HookArchitecture.X64);
+        var x86Paths = _hostPaths.ForArchitecture(HookArchitecture.X86);
+        var x64Snapshot = x64Paths.Snapshot();
+        var x86Snapshot = x86Paths.Snapshot();
+        if (!x64Snapshot.HostExists
+            || !x64Snapshot.HookDllExists
+            || !x86Snapshot.HostExists
+            || !x86Snapshot.HookDllExists)
+        {
+            return null;
+        }
+
+        var x64HealthyStatus = await TryCreateHealthyExistingHostStatusAsync(
+                HookArchitecture.X64,
+                x64Snapshot,
+                cancellationToken)
+            .ConfigureAwait(false);
+        if (x64HealthyStatus is not null)
+        {
+            return null;
+        }
+
+        var x86HealthyStatus = await TryCreateHealthyExistingHostStatusAsync(
+                HookArchitecture.X86,
+                x86Snapshot,
+                cancellationToken)
+            .ConfigureAwait(false);
+        if (x86HealthyStatus is not null)
+        {
+            return null;
+        }
+
+        cancellationToken.ThrowIfCancellationRequested();
+        if (IsDisposed())
+        {
+            return null;
+        }
+
+        try
+        {
+            var startInfo = _processFactory.CreateStartInfo(
+                x64Paths.HostExePath,
+                GetPipeName(HookArchitecture.X64),
+                x64Paths.HookDllPath,
+                elevated: true,
+                new[]
+                {
+                    new HookHostLaunchRequest(
+                        x86Paths.HostExePath,
+                        GetPipeName(HookArchitecture.X86),
+                        x86Paths.HookDllPath)
+                });
+            var process = _processFactory.Start(startInfo);
+            if (process is null)
+            {
+                return new HookQuickSwitchStatus(
+                    true,
+                    new HookArchitectureStatus(
+                        HookArchitecture.X64,
+                        true,
+                        false,
+                        true,
+                        "x64 hook host start did not return a process."),
+                    new HookArchitectureStatus(
+                        HookArchitecture.X86,
+                        true,
+                        false,
+                        true,
+                        "x86 hook host launch was skipped because x64 hook host failed to start."));
+            }
+
+            var terminateStartedProcess = false;
+            lock (_hostProcessGate)
+            {
+                if (_disposed || cancellationToken.IsCancellationRequested)
+                {
+                    terminateStartedProcess = true;
+                }
+                else
+                {
+                    _hostProcesses[HookArchitecture.X64] = process;
+                    _hostProcesses[HookArchitecture.X86] = process;
+                }
+            }
+
+            if (terminateStartedProcess)
+            {
+                _processFactory.Terminate(process);
+                cancellationToken.ThrowIfCancellationRequested();
+                return new HookQuickSwitchStatus(
+                    true,
+                    new HookArchitectureStatus(
+                        HookArchitecture.X64,
+                        true,
+                        false,
+                        true,
+                        "x64 hook host start was abandoned."),
+                    new HookArchitectureStatus(
+                        HookArchitecture.X86,
+                        true,
+                        false,
+                        true,
+                        "x86 hook host launch was abandoned."));
+            }
+
+            return new HookQuickSwitchStatus(
+                true,
+                new HookArchitectureStatus(
+                    HookArchitecture.X64,
+                    true,
+                    true,
+                    true,
+                    "x64 hook host started."),
+                new HookArchitectureStatus(
+                    HookArchitecture.X86,
+                    true,
+                    true,
+                    true,
+                    "x86 hook host launch requested by x64 hook host."));
+        }
+        catch (Exception exception) when (exception is not OperationCanceledException)
+        {
+            return new HookQuickSwitchStatus(
+                true,
+                new HookArchitectureStatus(
+                    HookArchitecture.X64,
+                    true,
+                    false,
+                    true,
+                    $"x64 hook host failed to start: {exception.Message}"),
+                new HookArchitectureStatus(
+                    HookArchitecture.X86,
+                    true,
+                    false,
+                    true,
+                    "x86 hook host launch was skipped because x64 hook host failed to start."));
+        }
+    }
+
     private async Task<HookArchitectureStatus?> TryCreateHealthyExistingHostStatusAsync(
         HookArchitecture architecture,
         HookArchitecturePathSnapshot snapshot,
@@ -370,7 +526,14 @@ public sealed class HookQuickSwitchBridge : IHookQuickSwitchBridge
                 return true;
             }
 
-            _hostProcesses.Remove(architecture);
+            var staleProcess = process;
+            foreach (var staleArchitecture in _hostProcesses
+                         .Where(entry => ReferenceEquals(entry.Value, staleProcess))
+                         .Select(entry => entry.Key)
+                         .ToArray())
+            {
+                _hostProcesses.Remove(staleArchitecture);
+            }
         }
 
         _processFactory.Terminate(process);

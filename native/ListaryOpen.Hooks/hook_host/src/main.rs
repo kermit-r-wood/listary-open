@@ -10,6 +10,7 @@ use std::collections::{HashMap, HashSet};
 use std::env;
 use std::ffi::c_void;
 use std::io;
+use std::process::{Child, Command};
 use std::ptr::{null, null_mut};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{mpsc, Mutex, OnceLock};
@@ -46,13 +47,13 @@ use windows_sys::Win32::System::Threading::{
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     ChangeWindowMessageFilterEx, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW,
-    EnumChildWindows, EnumWindows, GetAncestor, GetClassNameW, GetDlgCtrlID, GetForegroundWindow,
-    GetMessageW, GetWindowLongPtrW, GetWindowTextLengthW, GetWindowTextW, GetWindowThreadProcessId,
-    IsWindow, PeekMessageW, PostMessageW, PostQuitMessage, RegisterClassW, SendMessageTimeoutW,
-    SetWindowLongPtrW, SetWindowsHookExW, TranslateMessage, UnhookWindowsHookEx,
-    CHANGEFILTERSTRUCT, CREATESTRUCTW, GA_ROOT, GWLP_USERDATA, HHOOK, HWND_MESSAGE, MSG,
-    MSGFLT_ALLOW, PM_REMOVE, SMTO_ABORTIFHUNG, WH_CALLWNDPROC, WM_APP, WM_COPYDATA, WM_DESTROY,
-    WM_NCCREATE, WM_QUIT, WNDCLASSW,
+    EnumChildWindows, EnumWindows, GetAncestor, GetClassNameW, GetDlgCtrlID, GetDlgItem,
+    GetForegroundWindow, GetMessageW, GetWindowLongPtrW, GetWindowTextLengthW, GetWindowTextW,
+    GetWindowThreadProcessId, IsWindow, PeekMessageW, PostMessageW, PostQuitMessage,
+    RegisterClassW, SendMessageTimeoutW, SetWindowLongPtrW, SetWindowsHookExW, TranslateMessage,
+    UnhookWindowsHookEx, CHANGEFILTERSTRUCT, CREATESTRUCTW, GA_ROOT, GWLP_USERDATA, HHOOK,
+    HWND_MESSAGE, MSG, MSGFLT_ALLOW, PM_REMOVE, SMTO_ABORTIFHUNG, WH_CALLWNDPROC, WM_APP,
+    WM_COPYDATA, WM_DESTROY, WM_NCCREATE, WM_QUIT, WNDCLASSW,
 };
 
 const DEFAULT_PIPE_NAME: &str = pipe_name_for_pointer_width(usize::BITS);
@@ -61,6 +62,7 @@ const BUFFER_SIZE: usize = 64 * 1024;
 const HOOK_RESCAN_INTERVAL: Duration = Duration::from_millis(500);
 const HOOK_LOOP_SLEEP: Duration = Duration::from_millis(50);
 const ADDRESS_BAR_EDIT_CONTROL_ID: i32 = 41477;
+const FILE_NAME_EDIT_CONTROL_ID: i32 = 1148;
 const ACK_WINDOW_CLASS: &str = "ListaryOpenHookAckWindow";
 const ACK_STARTUP_ACCEPT_TIMEOUT: Duration = Duration::from_secs(2);
 const ACK_STARTUP_SHUTDOWN_GRACE: Duration = Duration::from_millis(100);
@@ -71,6 +73,7 @@ static NEXT_COMMAND_ID: AtomicU64 = AtomicU64::new(1);
 fn main() -> io::Result<()> {
     let pipe_name = pipe_name_from_args();
     let pipe_path = format!(r"\\.\pipe\{}", pipe_name);
+    let _child_hosts = start_child_hosts(child_host_launches_from_args(env::args()));
     start_hook_thread(arg_value("--dll"));
 
     println!("ListaryOpen hook host started on pipe '{}'.", pipe_name);
@@ -123,6 +126,68 @@ where
     }
 
     None
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ChildHostLaunch {
+    host_exe_path: String,
+    pipe_name: String,
+    dll_path: String,
+}
+
+fn child_host_launches_from_args<I, S>(args: I) -> Vec<ChildHostLaunch>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<str>,
+{
+    let args = args
+        .into_iter()
+        .map(|arg| arg.as_ref().to_string())
+        .collect::<Vec<_>>();
+    let mut launches = Vec::new();
+    let mut index = 0;
+    while index + 5 < args.len() {
+        if args[index] == "--launch-host"
+            && args[index + 2] == "--launch-pipe"
+            && args[index + 4] == "--launch-dll"
+            && !args[index + 1].starts_with("--")
+            && !args[index + 3].starts_with("--")
+            && !args[index + 5].starts_with("--")
+        {
+            launches.push(ChildHostLaunch {
+                host_exe_path: args[index + 1].clone(),
+                pipe_name: args[index + 3].clone(),
+                dll_path: args[index + 5].clone(),
+            });
+            index += 6;
+            continue;
+        }
+
+        index += 1;
+    }
+
+    launches
+}
+
+fn start_child_hosts(launches: Vec<ChildHostLaunch>) -> Vec<Child> {
+    let mut children = Vec::new();
+    for launch in launches {
+        match Command::new(&launch.host_exe_path)
+            .arg("--pipe")
+            .arg(&launch.pipe_name)
+            .arg("--dll")
+            .arg(&launch.dll_path)
+            .spawn()
+        {
+            Ok(child) => children.push(child),
+            Err(error) => eprintln!(
+                "Hook host failed to launch child host '{}': {error}",
+                launch.host_exe_path
+            ),
+        }
+    }
+
+    children
 }
 
 fn start_hook_thread(dll_path: Option<String>) {
@@ -478,7 +543,7 @@ fn title_contains_supported_dialog_keyword(title: &str) -> bool {
 }
 
 fn has_address_control(hwnd: HWND) -> bool {
-    find_address_edit_control(hwnd).is_some()
+    find_navigation_edit_control(hwnd).is_some()
 }
 
 #[derive(Clone, Copy)]
@@ -492,17 +557,37 @@ fn select_address_edit_control<'a, I>(candidates: I) -> Option<HWND>
 where
     I: IntoIterator<Item = AddressControlCandidate<'a>>,
 {
+    select_edit_control_by_id(candidates, ADDRESS_BAR_EDIT_CONTROL_ID)
+}
+
+fn select_navigation_edit_control<'a, I>(candidates: I) -> Option<HWND>
+where
+    I: IntoIterator<Item = AddressControlCandidate<'a>>,
+{
+    let candidates = candidates.into_iter().collect::<Vec<_>>();
+    select_edit_control_by_id(candidates.iter().copied(), ADDRESS_BAR_EDIT_CONTROL_ID).or_else(
+        || select_edit_control_by_id(candidates.iter().copied(), FILE_NAME_EDIT_CONTROL_ID),
+    )
+}
+
+fn select_edit_control_by_id<'a, I>(candidates: I, control_id: i32) -> Option<HWND>
+where
+    I: IntoIterator<Item = AddressControlCandidate<'a>>,
+{
     candidates
         .into_iter()
         .find(|candidate| {
-            candidate.control_id == ADDRESS_BAR_EDIT_CONTROL_ID
-                && candidate.class_name.eq_ignore_ascii_case("Edit")
+            candidate.control_id == control_id && candidate.class_name.eq_ignore_ascii_case("Edit")
         })
         .map(|candidate| candidate.hwnd)
 }
 
 struct AddressControlSearch {
     found_hwnd: HWND,
+}
+
+fn find_navigation_edit_control(hwnd: HWND) -> Option<HWND> {
+    find_address_edit_control(hwnd).or_else(|| find_file_name_edit_control(hwnd))
 }
 
 fn find_address_edit_control(hwnd: HWND) -> Option<HWND> {
@@ -550,6 +635,59 @@ unsafe extern "system" fn enum_address_edit_control_proc(hwnd: HWND, l_param: LP
     }
 
     TRUE
+}
+
+fn find_file_name_edit_control(hwnd: HWND) -> Option<HWND> {
+    let container = unsafe { GetDlgItem(hwnd, FILE_NAME_EDIT_CONTROL_ID) };
+    if container.is_null() {
+        return None;
+    }
+
+    if let Some(class_name) = class_name(container) {
+        let candidate = AddressControlCandidate {
+            hwnd: container,
+            control_id: FILE_NAME_EDIT_CONTROL_ID,
+            class_name: &class_name,
+        };
+        if let Some(file_name_edit) = select_navigation_edit_control([candidate]) {
+            return Some(file_name_edit);
+        }
+    }
+
+    let mut search = AddressControlSearch {
+        found_hwnd: null_mut(),
+    };
+    unsafe {
+        EnumChildWindows(
+            container,
+            Some(enum_file_name_edit_control_proc),
+            (&mut search as *mut AddressControlSearch) as LPARAM,
+        );
+    }
+
+    if search.found_hwnd.is_null() {
+        None
+    } else {
+        Some(search.found_hwnd)
+    }
+}
+
+unsafe extern "system" fn enum_file_name_edit_control_proc(hwnd: HWND, l_param: LPARAM) -> BOOL {
+    if l_param == 0 {
+        return TRUE;
+    }
+
+    let Some(class_name) = class_name(hwnd) else {
+        return TRUE;
+    };
+
+    if !class_name.eq_ignore_ascii_case("Edit") {
+        return TRUE;
+    }
+
+    let search = unsafe { &mut *(l_param as *mut AddressControlSearch) };
+    search.found_hwnd = hwnd;
+    0
 }
 
 fn should_hook_observed_dialog(
@@ -834,10 +972,10 @@ fn jump_dialog_to_folder(payload: JumpCommandPayload) -> String {
         );
     }
 
-    if find_address_edit_control(hwnd).is_none() {
+    if find_navigation_edit_control(hwnd).is_none() {
         return command_reply(
             "UnsupportedDialog",
-            "Dialog does not expose the standard address edit control.",
+            "Dialog does not expose a supported path edit control.",
         );
     }
 
@@ -902,10 +1040,10 @@ fn jump_dialog_to_folder(payload: JumpCommandPayload) -> String {
         return command_reply(status, message);
     }
 
-    if find_address_edit_control(hwnd).is_none() {
+    if find_navigation_edit_control(hwnd).is_none() {
         return command_reply(
             "UnsupportedDialog",
-            "Dialog address edit control disappeared after jump command was acknowledged.",
+            "Dialog path edit control disappeared after jump command was acknowledged.",
         );
     }
 
@@ -1853,6 +1991,32 @@ mod tests {
     }
 
     #[test]
+    fn child_host_launches_from_args_returns_launch_triplets() {
+        let launches = child_host_launches_from_args([
+            "ListaryOpen.HookHost.exe",
+            "--pipe",
+            "listary-open-hook-x64",
+            "--dll",
+            "C:\\ListaryOpen\\hooks\\x64\\ListaryOpen.Hook.dll",
+            "--launch-host",
+            "C:\\ListaryOpen\\hooks\\x86\\ListaryOpen.HookHost.exe",
+            "--launch-pipe",
+            "listary-open-hook-x86",
+            "--launch-dll",
+            "C:\\ListaryOpen\\hooks\\x86\\ListaryOpen.Hook.dll",
+        ]);
+
+        assert_eq!(
+            vec![ChildHostLaunch {
+                host_exe_path: "C:\\ListaryOpen\\hooks\\x86\\ListaryOpen.HookHost.exe".to_string(),
+                pipe_name: "listary-open-hook-x86".to_string(),
+                dll_path: "C:\\ListaryOpen\\hooks\\x86\\ListaryOpen.Hook.dll".to_string(),
+            }],
+            launches
+        );
+    }
+
+    #[test]
     fn unhooked_threads_returns_only_new_dialog_threads() {
         let discovered = HashSet::from([42, 7, 11, 5]);
         let hooked = HashSet::from([7, 11, 99]);
@@ -2077,6 +2241,40 @@ mod tests {
                 },
             ])
         );
+    }
+
+    #[test]
+    fn navigation_edit_selector_accepts_classic_file_name_edit_when_address_edit_is_missing() {
+        let file_name_edit = 301usize as HWND;
+
+        let selected = select_navigation_edit_control([AddressControlCandidate {
+            hwnd: file_name_edit,
+            control_id: FILE_NAME_EDIT_CONTROL_ID,
+            class_name: "Edit",
+        }]);
+
+        assert_eq!(Some(file_name_edit), selected);
+    }
+
+    #[test]
+    fn navigation_edit_selector_prefers_address_edit_over_file_name_edit() {
+        let file_name_edit = 401usize as HWND;
+        let address_edit = 402usize as HWND;
+
+        let selected = select_navigation_edit_control([
+            AddressControlCandidate {
+                hwnd: file_name_edit,
+                control_id: FILE_NAME_EDIT_CONTROL_ID,
+                class_name: "Edit",
+            },
+            AddressControlCandidate {
+                hwnd: address_edit,
+                control_id: ADDRESS_BAR_EDIT_CONTROL_ID,
+                class_name: "Edit",
+            },
+        ]);
+
+        assert_eq!(Some(address_edit), selected);
     }
 
     #[test]

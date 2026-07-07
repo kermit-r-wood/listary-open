@@ -8,10 +8,10 @@
     </Style>
 
     <Style x:Key="SearchQueryBoxStyle" TargetType="TextBox">
-        <Setter Property="Height" Value="48" />
-        <Setter Property="Padding" Value="16,8" />
+        <Setter Property="Height" Value="40" />
+        <Setter Property="Padding" Value="14,6" />
         <Setter Property="FontFamily" Value="{StaticResource Font.Primary}" />
-        <Setter Property="FontSize" Value="{StaticResource FontSize.SearchQuery}" />
+        <Setter Property="FontSize" Value="18" />
         <Setter Property="Foreground" Value="{StaticResource Brush.TextPrimary}" />
         <Setter Property="Background" Value="{StaticResource Brush.Surface}" />
         <Setter Property="BorderBrush" Value="{StaticResource Brush.Border}" />

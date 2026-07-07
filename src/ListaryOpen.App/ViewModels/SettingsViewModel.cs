@@ -32,11 +32,16 @@ public sealed class SettingsViewModel : INotifyPropertyChanged
     {
     }
 
-    public SettingsViewModel(AppSettings settings, Action? enableNtfsFastIndexing, Action? enableHookQuickSwitch)
+    public SettingsViewModel(
+        AppSettings settings,
+        Action? enableNtfsFastIndexing,
+        Action? enableHookQuickSwitch,
+        bool ntfsFastIndexingEnabled = false)
     {
         Settings = settings;
         _enableNtfsFastIndexing = enableNtfsFastIndexing ?? (() => { });
         _enableHookQuickSwitch = enableHookQuickSwitch ?? (() => { });
+        _ntfsFastIndexingEnabled = ntfsFastIndexingEnabled;
         EnableNtfsFastIndexingCommand = new RelayCommand(
             EnableNtfsFastIndexing,
             () => !NtfsFastIndexingEnabled);
@@ -81,6 +86,8 @@ public sealed class SettingsViewModel : INotifyPropertyChanged
 
     public string NtfsFastIndexingActionText => NtfsFastIndexingEnabled ? "Enabled" : "Enable";
 
+    public bool IsNtfsFastIndexingActionVisible => !NtfsFastIndexingEnabled;
+
     public string HookQuickSwitchBadgeText
     {
         get
@@ -122,6 +129,10 @@ public sealed class SettingsViewModel : INotifyPropertyChanged
         }
     }
 
+    public bool IsHookQuickSwitchActionVisible => _hookQuickSwitchEnableInProgress
+        || !_hookQuickSwitchStatus.Enabled
+        || !IsHookQuickSwitchReady;
+
     public string QuickSaveOpenBadgeText => Settings.QuickSaveOpenEnabled ? "Enabled" : "Disabled";
 
     public bool NtfsFastIndexingEnabled
@@ -139,6 +150,7 @@ public sealed class SettingsViewModel : INotifyPropertyChanged
             OnPropertyChanged(nameof(NtfsFastIndexingStatusText));
             OnPropertyChanged(nameof(NtfsFastIndexingBadgeText));
             OnPropertyChanged(nameof(NtfsFastIndexingActionText));
+            OnPropertyChanged(nameof(IsNtfsFastIndexingActionVisible));
             if (EnableNtfsFastIndexingCommand is RelayCommand command)
             {
                 command.RaiseCanExecuteChanged();
@@ -178,6 +190,7 @@ public sealed class SettingsViewModel : INotifyPropertyChanged
             if (!_hookQuickSwitchEnableInProgress)
             {
                 OnPropertyChanged(nameof(HookQuickSwitchActionText));
+                OnPropertyChanged(nameof(IsHookQuickSwitchActionVisible));
             }
         }
 
@@ -207,6 +220,7 @@ public sealed class SettingsViewModel : INotifyPropertyChanged
 
         _hookQuickSwitchEnableInProgress = value;
         OnPropertyChanged(nameof(HookQuickSwitchActionText));
+        OnPropertyChanged(nameof(IsHookQuickSwitchActionVisible));
         if (EnableHookQuickSwitchCommand is RelayCommand command)
         {
             command.RaiseCanExecuteChanged();

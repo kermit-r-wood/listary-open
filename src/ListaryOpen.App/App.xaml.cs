@@ -171,6 +171,7 @@ public partial class App : Application
     {
         _fallbackIndexProvider = new FallbackIndexProvider();
         _elevatedIndexerClient = new ElevatedIndexerClient();
+        var ntfsFastIndexingEnabled = EnableNtfsFastIndexingOnStartup(_elevatedIndexerClient);
         _ntfsIndexProvider = new NtfsIndexProvider(_elevatedIndexerClient);
         _volumeIndexer = new VolumeIndexer(new IIndexProvider[]
         {
@@ -188,7 +189,8 @@ public partial class App : Application
         _settingsViewModel = new SettingsViewModel(
             AppSettings.Defaults(),
             EnableNtfsFastIndexing,
-            EnableHookQuickSwitch);
+            EnableHookQuickSwitch,
+            ntfsFastIndexingEnabled);
         _settingsViewModel.UpdateHookQuickSwitchStatus(_hookQuickSwitchBridge.Status);
         var settingsWindow = new MainWindow(_settingsViewModel);
         _explorerTracker = new ExplorerTracker();
@@ -281,6 +283,11 @@ public partial class App : Application
             MessageBoxImage.Warning);
     }
 
+    internal static SearchHotkeyPanelAction GetSearchHotkeyPanelAction(bool panelIsVisible)
+    {
+        return panelIsVisible ? SearchHotkeyPanelAction.Hide : SearchHotkeyPanelAction.Activate;
+    }
+
     internal static bool ShouldShowSettingsOnStartup(bool hasBlockingStartupMessage)
     {
         return hasBlockingStartupMessage;
@@ -341,6 +348,22 @@ public partial class App : Application
 
         client?.EnableUacElevation();
         requestReindex();
+    }
+
+    internal static bool EnableNtfsFastIndexingOnStartup(ElevatedIndexerClient? client)
+    {
+        if (client is null)
+        {
+            return false;
+        }
+
+        if (!client.IsAvailable)
+        {
+            return false;
+        }
+
+        client.EnableUacElevation();
+        return true;
     }
 
     internal static ExplorerObservationScheduler? StartPeriodicExplorerObservation(
@@ -618,7 +641,18 @@ public partial class App : Application
     {
         if (IsSearchHotkey(name))
         {
-            _searchPanel?.ActivateSearch();
+            if (_searchPanel is not null)
+            {
+                if (GetSearchHotkeyPanelAction(_searchPanel.IsVisible) == SearchHotkeyPanelAction.Hide)
+                {
+                    _searchPanel.Hide();
+                }
+                else
+                {
+                    _searchPanel.ActivateSearch();
+                }
+            }
+
             return;
         }
 
@@ -822,6 +856,12 @@ public partial class App : Application
 }
 
 internal sealed record HotkeyStartupDecision(bool ShouldContinue, string? Message, MessageBoxImage Image);
+
+internal enum SearchHotkeyPanelAction
+{
+    Activate,
+    Hide
+}
 
 internal sealed class AppStartupException : Exception
 {

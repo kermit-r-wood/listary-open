@@ -50,7 +50,7 @@
                        VerticalAlignment="Center"
                        IsHitTestVisible="False"
                        FontFamily="{StaticResource Font.Primary}"
-                       FontSize="{StaticResource FontSize.SearchQuery}"
+                       FontSize="18"
                        Foreground="{StaticResource Brush.TextMuted}"
                        Text="{Binding QueryPlaceholderText}">
                 <TextBlock.Style>

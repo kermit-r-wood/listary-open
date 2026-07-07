@@ -8,7 +8,7 @@ namespace ListaryOpen.Infrastructure.Tests.Hooks;
 public sealed class HookQuickSwitchBridgeTests
 {
     [Fact]
-    public async Task EnableStartsAvailableHostsAndRaisesOneStatusChangedEvent()
+    public async Task EnableStartsAvailableHostsWithSingleElevatedLaunchAndRaisesOneStatusChangedEvent()
     {
         using var hookFiles = HookFileFixture.Create();
         hookFiles.CreateHostAndDll(HookArchitecture.X64);
@@ -30,12 +30,23 @@ public sealed class HookQuickSwitchBridgeTests
         Assert.True(bridge.Status.X64.HookDllPresent);
         Assert.True(bridge.Status.X86.HostRunning);
         Assert.True(bridge.Status.X86.HookDllPresent);
+        var start = Assert.Single(processFactory.Starts);
+        Assert.Equal(hookFiles.ForArchitecture(HookArchitecture.X64).HostExePath, start.StartInfo.FileName);
         Assert.Equal(
-            new[] { "listary-open-hook-x64", "listary-open-hook-x86" },
-            processFactory.Starts.Select(start => start.StartInfo.ArgumentList[1]));
-        Assert.Equal(
-            new[] { hookFiles.ForArchitecture(HookArchitecture.X64).HookDllPath, hookFiles.ForArchitecture(HookArchitecture.X86).HookDllPath },
-            processFactory.Starts.Select(start => start.StartInfo.ArgumentList[3]));
+            new[]
+            {
+                "--pipe",
+                "listary-open-hook-x64",
+                "--dll",
+                hookFiles.ForArchitecture(HookArchitecture.X64).HookDllPath,
+                "--launch-host",
+                hookFiles.ForArchitecture(HookArchitecture.X86).HostExePath,
+                "--launch-pipe",
+                "listary-open-hook-x86",
+                "--launch-dll",
+                hookFiles.ForArchitecture(HookArchitecture.X86).HookDllPath
+            },
+            start.StartInfo.ArgumentList);
     }
 
     [Fact]
@@ -84,10 +95,9 @@ public sealed class HookQuickSwitchBridgeTests
         processFactory.Release();
         await Task.WhenAll(firstEnable, secondEnable).WaitAsync(TimeSpan.FromSeconds(2));
 
-        Assert.Equal(2, processFactory.Starts.Count);
-        Assert.Equal(
-            new[] { "listary-open-hook-x64", "listary-open-hook-x86" },
-            processFactory.Starts.Select(start => start.StartInfo.ArgumentList[1]));
+        var start = Assert.Single(processFactory.Starts);
+        Assert.Equal("listary-open-hook-x64", start.StartInfo.ArgumentList[1]);
+        Assert.Contains("--launch-pipe", start.StartInfo.ArgumentList);
     }
 
     [Fact]
@@ -202,7 +212,7 @@ public sealed class HookQuickSwitchBridgeTests
         Assert.False(bridge.Status.X64.HostRunning);
         Assert.Contains("did not return a process", bridge.Status.X64.Message, StringComparison.OrdinalIgnoreCase);
         Assert.False(bridge.Status.X86.HostRunning);
-        Assert.Contains("UAC was canceled", bridge.Status.X86.Message, StringComparison.Ordinal);
+        Assert.Contains("x86 hook host launch was skipped", bridge.Status.X86.Message, StringComparison.OrdinalIgnoreCase);
     }
 
     [Fact]
@@ -221,7 +231,7 @@ public sealed class HookQuickSwitchBridgeTests
         await bridge.EnableAsync(CancellationToken.None);
         await bridge.EnableAsync(CancellationToken.None);
 
-        Assert.Equal(2, processFactory.Starts.Count);
+        Assert.Single(processFactory.Starts);
     }
 
     [Fact]

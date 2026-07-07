@@ -13,7 +13,7 @@ namespace ListaryOpen.App.ViewModels;
 
 public sealed class SearchPanelViewModel : INotifyPropertyChanged
 {
-    private static readonly TimeSpan DefaultSearchDelay = TimeSpan.FromMilliseconds(150);
+    private static readonly TimeSpan DefaultSearchDelay = TimeSpan.FromMilliseconds(400);
 
     private readonly ISearchIndex _index;
     private readonly Func<string?, string?> _normalizeExistingFolder;

@@ -98,6 +98,50 @@ public sealed class AppIndexRootTests
     }
 
     [Fact]
+    public void EnableNtfsFastIndexingOnStartupEnablesClientWithoutRequestingImmediateReindex()
+    {
+        var helperDirectory = Path.Combine(Path.GetTempPath(), "listary-open-" + Guid.NewGuid());
+        Directory.CreateDirectory(helperDirectory);
+        var helperPath = CreateUsableHelperBundle(helperDirectory);
+        var client = new ElevatedIndexerClient(helperPath, () => true);
+
+        try
+        {
+            var enabled = WpfApp.EnableNtfsFastIndexingOnStartup(client);
+
+            Assert.True(enabled);
+            Assert.True(client.UacElevationEnabled);
+            Assert.True(client.IsAvailable);
+        }
+        finally
+        {
+            Directory.Delete(helperDirectory, recursive: true);
+        }
+    }
+
+    [Fact]
+    public void EnableNtfsFastIndexingOnStartupDoesNotEnableUacWhenProcessIsNotElevated()
+    {
+        var helperDirectory = Path.Combine(Path.GetTempPath(), "listary-open-" + Guid.NewGuid());
+        Directory.CreateDirectory(helperDirectory);
+        var helperPath = CreateUsableHelperBundle(helperDirectory);
+        var client = new ElevatedIndexerClient(helperPath, () => false);
+
+        try
+        {
+            var enabled = WpfApp.EnableNtfsFastIndexingOnStartup(client);
+
+            Assert.False(enabled);
+            Assert.False(client.UacElevationEnabled);
+            Assert.False(client.IsAvailable);
+        }
+        finally
+        {
+            Directory.Delete(helperDirectory, recursive: true);
+        }
+    }
+
+    [Fact]
     public void IndexingRunCancellationManagerCancelsActiveRunWhenRestarting()
     {
         using var shutdown = new CancellationTokenSource();

@@ -56,6 +56,7 @@ public sealed class SettingsViewModelTests
         Assert.Equal("Idle", viewModel.IndexingBadgeText);
         Assert.Equal("Disabled", viewModel.NtfsFastIndexingBadgeText);
         Assert.Equal("Enable", viewModel.NtfsFastIndexingActionText);
+        Assert.True(viewModel.IsNtfsFastIndexingActionVisible);
         Assert.Equal("Enabled", viewModel.QuickSaveOpenBadgeText);
     }
 
@@ -83,7 +84,28 @@ public sealed class SettingsViewModelTests
 
         Assert.Equal("Enabled", viewModel.NtfsFastIndexingBadgeText);
         Assert.Equal("Enabled", viewModel.NtfsFastIndexingActionText);
+        Assert.False(viewModel.IsNtfsFastIndexingActionVisible);
         Assert.Contains(nameof(SettingsViewModel.NtfsFastIndexingBadgeText), changedProperties);
         Assert.Contains(nameof(SettingsViewModel.NtfsFastIndexingActionText), changedProperties);
+        Assert.Contains(nameof(SettingsViewModel.IsNtfsFastIndexingActionVisible), changedProperties);
+    }
+
+    [Fact]
+    public void ConstructorCanStartWithNtfsFastIndexingEnabled()
+    {
+        var enableCount = 0;
+        var viewModel = new SettingsViewModel(
+            AppSettings.Defaults(),
+            () => enableCount++,
+            enableHookQuickSwitch: null,
+            ntfsFastIndexingEnabled: true);
+
+        viewModel.EnableNtfsFastIndexingCommand.Execute(null);
+
+        Assert.True(viewModel.NtfsFastIndexingEnabled);
+        Assert.Equal("NTFS fast indexing: enabled for this session", viewModel.NtfsFastIndexingStatusText);
+        Assert.False(viewModel.EnableNtfsFastIndexingCommand.CanExecute(null));
+        Assert.False(viewModel.IsNtfsFastIndexingActionVisible);
+        Assert.Equal(0, enableCount);
     }
 }

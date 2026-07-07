@@ -99,6 +99,7 @@ public sealed class SettingsHookQuickSwitchTests
 
         Assert.Equal("Disabled", viewModel.HookQuickSwitchBadgeText);
         Assert.Equal("Enable", viewModel.HookQuickSwitchActionText);
+        Assert.True(viewModel.IsHookQuickSwitchActionVisible);
     }
 
     [Fact]
@@ -112,6 +113,7 @@ public sealed class SettingsHookQuickSwitchTests
         viewModel.EnableHookQuickSwitchCommand.Execute(null);
 
         Assert.Equal("Enabling", viewModel.HookQuickSwitchActionText);
+        Assert.True(viewModel.IsHookQuickSwitchActionVisible);
     }
 
     [Fact]
@@ -126,6 +128,7 @@ public sealed class SettingsHookQuickSwitchTests
 
         Assert.Equal("Ready", viewModel.HookQuickSwitchBadgeText);
         Assert.Equal("Enabled", viewModel.HookQuickSwitchActionText);
+        Assert.False(viewModel.IsHookQuickSwitchActionVisible);
     }
 
     [Fact]
@@ -137,6 +140,7 @@ public sealed class SettingsHookQuickSwitchTests
 
         Assert.Equal("Degraded", viewModel.HookQuickSwitchBadgeText);
         Assert.Equal("Retry", viewModel.HookQuickSwitchActionText);
+        Assert.True(viewModel.IsHookQuickSwitchActionVisible);
     }
 
     [Fact]
@@ -151,6 +155,7 @@ public sealed class SettingsHookQuickSwitchTests
 
         Assert.Equal("Failed", viewModel.HookQuickSwitchBadgeText);
         Assert.Equal("Retry", viewModel.HookQuickSwitchActionText);
+        Assert.True(viewModel.IsHookQuickSwitchActionVisible);
     }
 
     [Fact]
@@ -178,6 +183,7 @@ public sealed class SettingsHookQuickSwitchTests
 
         Assert.DoesNotContain("Enabling", observedActionTexts);
         Assert.Contains("Enabled", observedActionTexts);
+        Assert.False(viewModel.IsHookQuickSwitchActionVisible);
     }
 
     private static HookQuickSwitchStatus CreatePartialStatus()

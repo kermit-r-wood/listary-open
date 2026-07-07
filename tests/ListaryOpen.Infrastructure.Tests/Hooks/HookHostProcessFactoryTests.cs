@@ -57,4 +57,39 @@ public sealed class HookHostProcessFactoryTests
             },
             startInfo.ArgumentList);
     }
+
+    [Fact]
+    public void CreateStartInfoCanAttachChildHostLaunchArguments()
+    {
+        var factory = new HookHostProcessFactory();
+
+        var startInfo = factory.CreateStartInfo(
+            "C:\\Program Files\\ListaryOpen\\hooks\\x64\\ListaryOpen.HookHost.exe",
+            "listary-open-hook-x64",
+            "C:\\Program Files\\ListaryOpen\\hooks\\x64\\ListaryOpen.Hook.dll",
+            elevated: true,
+            new[]
+            {
+                new HookHostLaunchRequest(
+                    "C:\\Program Files\\ListaryOpen\\hooks\\x86\\ListaryOpen.HookHost.exe",
+                    "listary-open-hook-x86",
+                    "C:\\Program Files\\ListaryOpen\\hooks\\x86\\ListaryOpen.Hook.dll")
+            });
+
+        Assert.Equal(
+            new[]
+            {
+                "--pipe",
+                "listary-open-hook-x64",
+                "--dll",
+                "C:\\Program Files\\ListaryOpen\\hooks\\x64\\ListaryOpen.Hook.dll",
+                "--launch-host",
+                "C:\\Program Files\\ListaryOpen\\hooks\\x86\\ListaryOpen.HookHost.exe",
+                "--launch-pipe",
+                "listary-open-hook-x86",
+                "--launch-dll",
+                "C:\\Program Files\\ListaryOpen\\hooks\\x86\\ListaryOpen.Hook.dll"
+            },
+            startInfo.ArgumentList);
+    }
 }
