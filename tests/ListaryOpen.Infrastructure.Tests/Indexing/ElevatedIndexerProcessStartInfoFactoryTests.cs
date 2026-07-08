@@ -64,6 +64,7 @@ public sealed class ElevatedIndexerProcessStartInfoFactoryTests
         var startInfo = ElevatedIndexerProcessStartInfoFactory.CreateRedirectedJournalChangesFile(
             "C:\\Tools\\ListaryOpen.Indexer.Elevated.exe",
             "C:\\Users\\paulx",
+            expectedUsnJournalId: 9,
             startUsn: 100,
             endUsn: 200,
             "C:\\Temp\\changes.jsonl",
@@ -71,7 +72,7 @@ public sealed class ElevatedIndexerProcessStartInfoFactoryTests
 
         Assert.False(startInfo.UseShellExecute);
         Assert.Equal(
-            new[] { "read-journal-to-file", "C:\\Users\\paulx", "100", "200", "C:\\Temp\\changes.jsonl", "C:\\Temp\\error.txt" },
+            new[] { "read-journal-to-file", "C:\\Users\\paulx", "9", "100", "200", "C:\\Temp\\changes.jsonl", "C:\\Temp\\error.txt" },
             startInfo.ArgumentList);
     }
 }

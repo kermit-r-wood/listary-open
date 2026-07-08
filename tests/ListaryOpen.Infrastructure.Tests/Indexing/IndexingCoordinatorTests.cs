@@ -709,6 +709,46 @@ public sealed class IndexingCoordinatorTests
     }
 
     [Fact]
+    public async Task IndexRootsAsyncDoesNotSaveNtfsCheckpointAfterFullScanWithoutPreScanJournalState()
+    {
+        var rootPath = CreateTempDirectory();
+        var dbPath = CreateTempDbPath();
+
+        try
+        {
+            var record = FileRecord.Create(
+                Path.Combine(rootPath, "IndexedWithoutJournalState.txt"),
+                isDirectory: false,
+                sizeBytes: 1,
+                DateTimeOffset.UtcNow);
+            await using var index = await SqliteSearchIndex.OpenAsync(dbPath, CancellationToken.None);
+            var provider = new JournalAwareNtfsProvider(
+                journalStates: new UsnJournalState?[]
+                {
+                    null,
+                    new(9, LowestValidUsn: 100, NextUsn: 200)
+                },
+                records: new[] { record });
+            var coordinator = new IndexingCoordinator(
+                index,
+                new VolumeIndexer(new IIndexProvider[] { provider }),
+                new FallbackIndexProvider(),
+                _ => new VolumeInfo(rootPath, NtfsIndexProvider.ProviderName, true));
+
+            await coordinator.IndexRootsAsync(new[] { new IndexRoot(rootPath) }, CancellationToken.None);
+
+            var checkpoint = await index.ReadVolumeCheckpointAsync(rootPath, CancellationToken.None);
+            Assert.Null(checkpoint);
+            Assert.Equal(1, provider.QueryJournalStateCount);
+        }
+        finally
+        {
+            DeleteDirectoryIfExists(rootPath);
+            DeleteFileIfExists(dbPath);
+        }
+    }
+
+    [Fact]
     public async Task IndexRootsAsyncAppliesNtfsJournalChangesWhenCheckpointCanCatchUp()
     {
         var rootPath = CreateTempDirectory();
@@ -754,6 +794,7 @@ public sealed class IndexingCoordinatorTests
             await coordinator.IndexRootsAsync(new[] { new IndexRoot(rootPath) }, CancellationToken.None);
 
             Assert.Equal(1, provider.ReadJournalChangesCount);
+            Assert.Equal(9ul, provider.LastReadExpectedUsnJournalId);
             var oldResults = await index.SearchAsync(new SearchQuery("OldName", SearchMode.FilesAndFolders), CancellationToken.None);
             var newResults = await index.SearchAsync(new SearchQuery("NewName", SearchMode.FilesAndFolders), CancellationToken.None);
             var checkpoint = await index.ReadVolumeCheckpointAsync(rootPath, CancellationToken.None);
@@ -945,6 +986,7 @@ public sealed class IndexingCoordinatorTests
     private sealed class JournalAwareNtfsProvider : IIndexProvider, INtfsJournalProvider
     {
         private readonly UsnJournalState? _journalState;
+        private readonly Queue<UsnJournalState?> _journalStates;
         private readonly IReadOnlyList<FileRecord> _records;
         private readonly IReadOnlyList<UsnJournalChange> _changes;
 
@@ -952,15 +994,31 @@ public sealed class IndexingCoordinatorTests
             UsnJournalState? journalState,
             IReadOnlyList<FileRecord>? records = null,
             IReadOnlyList<UsnJournalChange>? changes = null)
+            : this(
+                new[] { journalState },
+                records,
+                changes)
         {
-            _journalState = journalState;
+        }
+
+        public JournalAwareNtfsProvider(
+            IEnumerable<UsnJournalState?> journalStates,
+            IReadOnlyList<FileRecord>? records = null,
+            IReadOnlyList<UsnJournalChange>? changes = null)
+        {
+            _journalStates = new Queue<UsnJournalState?>(journalStates);
+            _journalState = _journalStates.Count > 0 ? _journalStates.Peek() : null;
             _records = records ?? Array.Empty<FileRecord>();
             _changes = changes ?? Array.Empty<UsnJournalChange>();
         }
 
         public int ScanCount { get; private set; }
 
+        public int QueryJournalStateCount { get; private set; }
+
         public int ReadJournalChangesCount { get; private set; }
+
+        public ulong? LastReadExpectedUsnJournalId { get; private set; }
 
         public string Name => NtfsIndexProvider.ProviderName;
 
@@ -982,16 +1040,19 @@ public sealed class IndexingCoordinatorTests
         public Task<UsnJournalState?> QueryJournalStateAsync(IndexRoot root, CancellationToken cancellationToken)
         {
             cancellationToken.ThrowIfCancellationRequested();
-            return Task.FromResult(_journalState);
+            QueryJournalStateCount++;
+            return Task.FromResult(_journalStates.Count > 0 ? _journalStates.Dequeue() : _journalState);
         }
 
         public async IAsyncEnumerable<UsnJournalChange> ReadJournalChangesAsync(
             IndexRoot root,
+            ulong expectedUsnJournalId,
             long startUsn,
             long endUsn,
             [EnumeratorCancellation] CancellationToken cancellationToken)
         {
             ReadJournalChangesCount++;
+            LastReadExpectedUsnJournalId = expectedUsnJournalId;
             foreach (var change in _changes)
             {
                 cancellationToken.ThrowIfCancellationRequested();

@@ -20,6 +20,7 @@ public sealed class NtfsUsnJournalReader
     private const uint UsnReasonBasicInfoChange = 0x0000_8000;
     private const uint UsnReasonRenameOldName = 0x0000_1000;
     private const uint UsnReasonRenameNewName = 0x0000_2000;
+    private const uint UsnReasonClose = 0x8000_0000;
     private const uint UsnReasonUpsertMask = UsnReasonDataOverwrite
         | UsnReasonDataExtend
         | UsnReasonDataTruncation
@@ -137,6 +138,7 @@ public sealed class NtfsUsnJournalReader
 
     public async IAsyncEnumerable<UsnJournalChange> EnumerateChangesAsync(
         string volumeRoot,
+        ulong expectedUsnJournalId,
         long startUsn,
         long endUsn,
         [EnumeratorCancellation] CancellationToken cancellationToken)
@@ -147,6 +149,12 @@ public sealed class NtfsUsnJournalReader
         try
         {
             var journalData = QueryJournal(handle);
+            if (RequiresFullRescanForJournalSnapshot(journalData, expectedUsnJournalId, endUsn))
+            {
+                yield return UsnJournalChange.DirectoryRenameOrMove();
+                yield break;
+            }
+
             var volumeRootFileReferenceNumber = ReadFileReferenceNumber(scanRoot.VolumeRoot);
             var directories = ReadDirectoryEntries(handle, journalData, cancellationToken);
             var metadataReader = new NtfsFileMetadataReader();
@@ -217,6 +225,15 @@ public sealed class NtfsUsnJournalReader
             BytesToWaitFor = 0,
             UsnJournalId = usnJournalId
         };
+    }
+
+    internal static bool RequiresFullRescanForJournalSnapshot(
+        NtfsNativeMethods.UsnJournalDataV0 journalData,
+        ulong expectedUsnJournalId,
+        long endUsn)
+    {
+        return journalData.UsnJournalId != expectedUsnJournalId
+            || journalData.NextUsn != endUsn;
     }
 
     private static IEnumerable<NtfsUsnEntry> EnumerateEntries(
@@ -345,6 +362,11 @@ public sealed class NtfsUsnJournalReader
             return UsnJournalChange.DirectoryRenameOrMove();
         }
 
+        if (IsAmbiguousJournalChange(entry))
+        {
+            return UsnJournalChange.DirectoryRenameOrMove();
+        }
+
         if (!NtfsUsnRecordProjector.TryResolvePath(
                 entry,
                 scanRoot.VolumeRoot,
@@ -384,6 +406,13 @@ public sealed class NtfsUsnJournalReader
     private static bool HasAnyReason(NtfsUsnEntry entry, uint reasonMask)
     {
         return (entry.Reason & reasonMask) != 0;
+    }
+
+    internal static bool IsAmbiguousJournalChange(NtfsUsnEntry entry)
+    {
+        return !entry.IsDirectory
+            && HasAnyReason(entry, UsnReasonRenameOldName)
+            && (HasAnyReason(entry, UsnReasonClose) || HasAnyReason(entry, UsnReasonRenameNewName));
     }
 
     private static NtfsNativeMethods.UsnJournalDataV0 QueryJournal(IntPtr handle)

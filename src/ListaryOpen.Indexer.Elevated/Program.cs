@@ -17,15 +17,15 @@ if (args.Length == 4 && args[0] == "journal-state-to-file")
     return await JournalStateToFileAsync(args[1], args[2], args[3]).ConfigureAwait(false);
 }
 
-if (args.Length == 6 && args[0] == "read-journal-to-file")
+if (args.Length == 7 && args[0] == "read-journal-to-file")
 {
-    return await ReadJournalToFileAsync(args[1], args[2], args[3], args[4], args[5]).ConfigureAwait(false);
+    return await ReadJournalToFileAsync(args[1], args[2], args[3], args[4], args[5], args[6]).ConfigureAwait(false);
 }
 
 Console.Error.WriteLine("Usage: ListaryOpen.Indexer.Elevated scan <root>");
 Console.Error.WriteLine("Usage: ListaryOpen.Indexer.Elevated scan-to-file <root> <records-path> <error-path>");
 Console.Error.WriteLine("Usage: ListaryOpen.Indexer.Elevated journal-state-to-file <root> <state-path> <error-path>");
-Console.Error.WriteLine("Usage: ListaryOpen.Indexer.Elevated read-journal-to-file <root> <start-usn> <end-usn> <changes-path> <error-path>");
+Console.Error.WriteLine("Usage: ListaryOpen.Indexer.Elevated read-journal-to-file <root> <expected-journal-id> <start-usn> <end-usn> <changes-path> <error-path>");
 return 2;
 
 static async Task<int> ScanToConsoleAsync(string root)
@@ -128,12 +128,14 @@ static async Task<int> JournalStateToFileAsync(string root, string statePath, st
 
 static async Task<int> ReadJournalToFileAsync(
     string root,
+    string expectedUsnJournalIdText,
     string startUsnText,
     string endUsnText,
     string changesPath,
     string errorPath)
 {
-    if (!long.TryParse(startUsnText, System.Globalization.NumberStyles.Integer, System.Globalization.CultureInfo.InvariantCulture, out var startUsn)
+    if (!ulong.TryParse(expectedUsnJournalIdText, System.Globalization.NumberStyles.Integer, System.Globalization.CultureInfo.InvariantCulture, out var expectedUsnJournalId)
+        || !long.TryParse(startUsnText, System.Globalization.NumberStyles.Integer, System.Globalization.CultureInfo.InvariantCulture, out var startUsn)
         || !long.TryParse(endUsnText, System.Globalization.NumberStyles.Integer, System.Globalization.CultureInfo.InvariantCulture, out var endUsn)
         || startUsn > endUsn)
     {
@@ -148,7 +150,7 @@ static async Task<int> ReadJournalToFileAsync(
 
     if (!TryValidateRoot(root, message => WriteErrorFile(errorPath, message)))
     {
-        WriteErrorFile(errorPath, "Usage: ListaryOpen.Indexer.Elevated read-journal-to-file <root> <start-usn> <end-usn> <changes-path> <error-path>");
+        WriteErrorFile(errorPath, "Usage: ListaryOpen.Indexer.Elevated read-journal-to-file <root> <expected-journal-id> <start-usn> <end-usn> <changes-path> <error-path>");
         return 2;
     }
 
@@ -156,7 +158,7 @@ static async Task<int> ReadJournalToFileAsync(
     {
         var reader = new NtfsUsnJournalReader();
         await ElevatedIndexerRecordWriter.WriteJournalChangesFileAsync(
-                reader.EnumerateChangesAsync(root, startUsn, endUsn, CancellationToken.None),
+                reader.EnumerateChangesAsync(root, expectedUsnJournalId, startUsn, endUsn, CancellationToken.None),
                 changesPath,
                 CancellationToken.None)
             .ConfigureAwait(false);

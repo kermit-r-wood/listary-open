@@ -163,6 +163,7 @@ public sealed class ProviderSelectionTests
 
         public async IAsyncEnumerable<UsnJournalChange> ReadJournalChangesAsync(
             IndexRoot root,
+            ulong expectedUsnJournalId,
             long startUsn,
             long endUsn,
             [System.Runtime.CompilerServices.EnumeratorCancellation] CancellationToken cancellationToken)

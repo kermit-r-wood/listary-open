@@ -103,7 +103,10 @@ public sealed class FallbackIndexProvider : IIndexProvider
         CancellationToken cancellationToken,
         bool failOnEnumerationFailure)
         => EnumerateEntries(
-            () => Directory.EnumerateDirectories(path, "*", EnumerationOptions),
+            () => Directory.EnumerateDirectories(
+                path,
+                "*",
+                failOnEnumerationFailure ? RootProbeEnumerationOptions : EnumerationOptions),
             cancellationToken,
             failOnEnumerationFailure);
 
@@ -112,7 +115,10 @@ public sealed class FallbackIndexProvider : IIndexProvider
         CancellationToken cancellationToken,
         bool failOnEnumerationFailure)
         => EnumerateEntries(
-            () => Directory.EnumerateFiles(path, "*", EnumerationOptions),
+            () => Directory.EnumerateFiles(
+                path,
+                "*",
+                failOnEnumerationFailure ? RootProbeEnumerationOptions : EnumerationOptions),
             cancellationToken,
             failOnEnumerationFailure);
 

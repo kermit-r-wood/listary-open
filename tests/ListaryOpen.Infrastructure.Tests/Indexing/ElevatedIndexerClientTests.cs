@@ -502,7 +502,7 @@ public sealed class ElevatedIndexerClientTests
                     exitCode: 0));
 
             var changes = new List<UsnJournalChange>();
-            await foreach (var change in client.ReadJournalChangesAsync(new IndexRoot("C:\\Docs"), 100, 200, CancellationToken.None))
+            await foreach (var change in client.ReadJournalChangesAsync(new IndexRoot("C:\\Docs"), 9, 100, 200, CancellationToken.None))
             {
                 changes.Add(change);
             }
@@ -526,6 +526,15 @@ public sealed class ElevatedIndexerClientTests
         {
             Directory.Delete(tempDirectory, recursive: true);
         }
+    }
+
+    [Fact]
+    public async Task ReadJournalChangesAsyncThrowsWhenHelperIsUnavailable()
+    {
+        var client = new ElevatedIndexerClient("C:\\Missing\\ListaryOpen.Indexer.Elevated.exe");
+
+        await Assert.ThrowsAsync<InvalidOperationException>(
+            () => CollectChangesAsync(client.ReadJournalChangesAsync(new IndexRoot("C:\\Docs"), 9, 100, 200, CancellationToken.None)));
     }
 
     [Fact]
@@ -629,6 +638,17 @@ public sealed class ElevatedIndexerClientTests
         await foreach (var record in records)
         {
             collected.Add(record);
+        }
+
+        return collected;
+    }
+
+    private static async Task<List<UsnJournalChange>> CollectChangesAsync(IAsyncEnumerable<UsnJournalChange> changes)
+    {
+        var collected = new List<UsnJournalChange>();
+        await foreach (var change in changes)
+        {
+            collected.Add(change);
         }
 
         return collected;

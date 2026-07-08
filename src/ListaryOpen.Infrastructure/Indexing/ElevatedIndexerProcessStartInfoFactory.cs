@@ -45,6 +45,7 @@ internal static class ElevatedIndexerProcessStartInfoFactory
     public static ProcessStartInfo CreateRedirectedJournalChangesFile(
         string helperPath,
         string rootPath,
+        ulong expectedUsnJournalId,
         long startUsn,
         long endUsn,
         string outputPath,
@@ -59,7 +60,7 @@ internal static class ElevatedIndexerProcessStartInfoFactory
             CreateNoWindow = true
         };
 
-        AddJournalChangesFileArguments(startInfo, rootPath, startUsn, endUsn, outputPath, errorPath);
+        AddJournalChangesFileArguments(startInfo, rootPath, expectedUsnJournalId, startUsn, endUsn, outputPath, errorPath);
         return startInfo;
     }
 
@@ -102,6 +103,7 @@ internal static class ElevatedIndexerProcessStartInfoFactory
     public static ProcessStartInfo CreateUacJournalChangesFile(
         string helperPath,
         string rootPath,
+        ulong expectedUsnJournalId,
         long startUsn,
         long endUsn,
         string outputPath,
@@ -115,7 +117,7 @@ internal static class ElevatedIndexerProcessStartInfoFactory
             CreateNoWindow = true
         };
 
-        AddJournalChangesFileArguments(startInfo, rootPath, startUsn, endUsn, outputPath, errorPath);
+        AddJournalChangesFileArguments(startInfo, rootPath, expectedUsnJournalId, startUsn, endUsn, outputPath, errorPath);
         return startInfo;
     }
 
@@ -146,6 +148,7 @@ internal static class ElevatedIndexerProcessStartInfoFactory
     private static void AddJournalChangesFileArguments(
         ProcessStartInfo startInfo,
         string rootPath,
+        ulong expectedUsnJournalId,
         long startUsn,
         long endUsn,
         string outputPath,
@@ -153,6 +156,7 @@ internal static class ElevatedIndexerProcessStartInfoFactory
     {
         startInfo.ArgumentList.Add("read-journal-to-file");
         startInfo.ArgumentList.Add(rootPath);
+        startInfo.ArgumentList.Add(expectedUsnJournalId.ToString(System.Globalization.CultureInfo.InvariantCulture));
         startInfo.ArgumentList.Add(startUsn.ToString(System.Globalization.CultureInfo.InvariantCulture));
         startInfo.ArgumentList.Add(endUsn.ToString(System.Globalization.CultureInfo.InvariantCulture));
         startInfo.ArgumentList.Add(outputPath);

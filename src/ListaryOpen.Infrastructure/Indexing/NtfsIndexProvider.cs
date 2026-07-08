@@ -36,10 +36,11 @@ public sealed class NtfsIndexProvider : IIndexProvider, INtfsJournalProvider
 
     public IAsyncEnumerable<UsnJournalChange> ReadJournalChangesAsync(
         IndexRoot root,
+        ulong expectedUsnJournalId,
         long startUsn,
         long endUsn,
         CancellationToken cancellationToken)
     {
-        return _client.ReadJournalChangesAsync(root, startUsn, endUsn, cancellationToken);
+        return _client.ReadJournalChangesAsync(root, expectedUsnJournalId, startUsn, endUsn, cancellationToken);
     }
 }

@@ -161,7 +161,7 @@ public sealed class IndexingCoordinator
             if (count > 0)
             {
                 await _index.PruneStaleRecordsUnderRootAsync(root.Path, indexGeneration, cancellationToken).ConfigureAwait(false);
-                await SaveNtfsCheckpointAsync(provider, root, catchUp.JournalState, cancellationToken).ConfigureAwait(false);
+                await SaveNtfsCheckpointAsync(root, catchUp.JournalState, cancellationToken).ConfigureAwait(false);
                 return new IndexRootResult(count, HadFailure: false, WasCanceled: false);
             }
 
@@ -258,7 +258,12 @@ public sealed class IndexingCoordinator
         try
         {
             var nextCheckpoint = CreateCheckpoint(root, journalState, plan.EndUsn);
-            var changes = journalProvider.ReadJournalChangesAsync(root, plan.StartUsn, plan.EndUsn, cancellationToken);
+            var changes = journalProvider.ReadJournalChangesAsync(
+                root,
+                journalState.UsnJournalId,
+                plan.StartUsn,
+                plan.EndUsn,
+                cancellationToken);
             applyResult = await UsnJournalChangeApplier
                 .ApplyAsync(_index, changes, nextCheckpoint, cancellationToken)
                 .ConfigureAwait(false);
@@ -288,19 +293,10 @@ public sealed class IndexingCoordinator
     }
 
     private async Task SaveNtfsCheckpointAsync(
-        IIndexProvider provider,
         IndexRoot root,
         UsnJournalState? journalState,
         CancellationToken cancellationToken)
     {
-        if (provider is not INtfsJournalProvider journalProvider)
-        {
-            return;
-        }
-
-        journalState ??= await journalProvider
-            .QueryJournalStateAsync(root, cancellationToken)
-            .ConfigureAwait(false);
         if (journalState is null)
         {
             return;

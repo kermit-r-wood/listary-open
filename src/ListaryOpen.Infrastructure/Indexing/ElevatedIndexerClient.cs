@@ -22,6 +22,7 @@ public interface IElevatedIndexerClient
 
     IAsyncEnumerable<UsnJournalChange> ReadJournalChangesAsync(
         IndexRoot root,
+        ulong expectedUsnJournalId,
         long startUsn,
         long endUsn,
         CancellationToken cancellationToken);
@@ -61,15 +62,15 @@ public sealed class DisabledElevatedIndexerClient : IElevatedIndexerClient
         return Task.FromResult<UsnJournalState?>(null);
     }
 
-    public async IAsyncEnumerable<UsnJournalChange> ReadJournalChangesAsync(
+    public IAsyncEnumerable<UsnJournalChange> ReadJournalChangesAsync(
         IndexRoot root,
+        ulong expectedUsnJournalId,
         long startUsn,
         long endUsn,
-        [EnumeratorCancellation] CancellationToken cancellationToken)
+        CancellationToken cancellationToken)
     {
         cancellationToken.ThrowIfCancellationRequested();
-        await Task.CompletedTask;
-        yield break;
+        throw new InvalidOperationException("Elevated indexer helper is not available.");
     }
 }
 
@@ -81,8 +82,8 @@ public sealed class ElevatedIndexerClient : IElevatedIndexerClient
     private const string HelperRuntimeConfigName = "ListaryOpen.Indexer.Elevated.runtimeconfig.json";
 
     private readonly Func<string?> _resolveHelperPath;
-    private readonly Func<HelperFileCommand, string, string, long, long, string, string, IElevatedIndexerProcess> _createFileProcess;
-    private readonly Func<HelperFileCommand, string, string, long, long, string, string, IElevatedIndexerProcess> _createElevatedProcess;
+    private readonly Func<HelperFileCommand, string, string, ulong, long, long, string, string, IElevatedIndexerProcess> _createFileProcess;
+    private readonly Func<HelperFileCommand, string, string, ulong, long, long, string, string, IElevatedIndexerProcess> _createElevatedProcess;
     private readonly Func<bool> _isProcessElevated;
     private readonly Func<bool>? _isUacElevationEnabledOverride;
     private readonly string _indexerTempDirectory;
@@ -172,8 +173,8 @@ public sealed class ElevatedIndexerClient : IElevatedIndexerClient
 
     private ElevatedIndexerClient(
         Func<string?> resolveHelperPath,
-        Func<HelperFileCommand, string, string, long, long, string, string, IElevatedIndexerProcess> createFileProcess,
-        Func<HelperFileCommand, string, string, long, long, string, string, IElevatedIndexerProcess> createElevatedProcess,
+        Func<HelperFileCommand, string, string, ulong, long, long, string, string, IElevatedIndexerProcess> createFileProcess,
+        Func<HelperFileCommand, string, string, ulong, long, long, string, string, IElevatedIndexerProcess> createElevatedProcess,
         Func<bool> isProcessElevated,
         Func<bool>? isUacElevationEnabled,
         string indexerTempDirectory)
@@ -246,6 +247,7 @@ public sealed class ElevatedIndexerClient : IElevatedIndexerClient
                     HelperFileCommand.JournalState,
                     helperPath!,
                     root.Path,
+                    expectedUsnJournalId: 0,
                     startUsn: 0,
                     endUsn: 0,
                     outputPath,
@@ -265,6 +267,7 @@ public sealed class ElevatedIndexerClient : IElevatedIndexerClient
 
     public async IAsyncEnumerable<UsnJournalChange> ReadJournalChangesAsync(
         IndexRoot root,
+        ulong expectedUsnJournalId,
         long startUsn,
         long endUsn,
         [EnumeratorCancellation] CancellationToken cancellationToken)
@@ -275,7 +278,7 @@ public sealed class ElevatedIndexerClient : IElevatedIndexerClient
         if (!TryResolveAvailableHelperPath(out var helperPath, out var launchMode))
         {
             Trace.TraceWarning("Elevated indexer helper is not available at '{0}'.", helperPath ?? "<unresolved>");
-            yield break;
+            throw new InvalidOperationException("Elevated indexer helper is not available.");
         }
 
         var outputPath = CreateTempIndexerFilePath(".jsonl");
@@ -286,6 +289,7 @@ public sealed class ElevatedIndexerClient : IElevatedIndexerClient
                     HelperFileCommand.JournalChanges,
                     helperPath!,
                     root.Path,
+                    expectedUsnJournalId,
                     startUsn,
                     endUsn,
                     outputPath,
@@ -322,6 +326,7 @@ public sealed class ElevatedIndexerClient : IElevatedIndexerClient
                     HelperFileCommand.Scan,
                     helperPath,
                     rootPath,
+                    expectedUsnJournalId: 0,
                     startUsn: 0,
                     endUsn: 0,
                     outputPath,
@@ -345,6 +350,7 @@ public sealed class ElevatedIndexerClient : IElevatedIndexerClient
         HelperFileCommand command,
         string helperPath,
         string rootPath,
+        ulong expectedUsnJournalId,
         long startUsn,
         long endUsn,
         string outputPath,
@@ -353,8 +359,8 @@ public sealed class ElevatedIndexerClient : IElevatedIndexerClient
         CancellationToken cancellationToken)
     {
         using var process = launchMode == HelperLaunchMode.UacFile
-            ? _createElevatedProcess(command, helperPath, rootPath, startUsn, endUsn, outputPath, errorPath)
-            : _createFileProcess(command, helperPath, rootPath, startUsn, endUsn, outputPath, errorPath);
+            ? _createElevatedProcess(command, helperPath, rootPath, expectedUsnJournalId, startUsn, endUsn, outputPath, errorPath)
+            : _createFileProcess(command, helperPath, rootPath, expectedUsnJournalId, startUsn, endUsn, outputPath, errorPath);
 
         try
         {
@@ -585,10 +591,10 @@ public sealed class ElevatedIndexerClient : IElevatedIndexerClient
         }
     }
 
-    private static Func<HelperFileCommand, string, string, long, long, string, string, IElevatedIndexerProcess> WrapFileProcess(
+    private static Func<HelperFileCommand, string, string, ulong, long, long, string, string, IElevatedIndexerProcess> WrapFileProcess(
         Func<string, string, string, string, IElevatedIndexerProcess> createProcess)
     {
-        return (_, helperPath, rootPath, _, _, outputPath, errorPath) =>
+        return (_, helperPath, rootPath, _, _, _, outputPath, errorPath) =>
             createProcess(helperPath, rootPath, outputPath, errorPath);
     }
 
@@ -596,6 +602,7 @@ public sealed class ElevatedIndexerClient : IElevatedIndexerClient
         HelperFileCommand command,
         string helperPath,
         string rootPath,
+        ulong expectedUsnJournalId,
         long startUsn,
         long endUsn,
         string outputPath,
@@ -618,6 +625,7 @@ public sealed class ElevatedIndexerClient : IElevatedIndexerClient
                 HelperFileCommand.JournalChanges => ElevatedIndexerProcessStartInfoFactory.CreateRedirectedJournalChangesFile(
                     helperPath,
                     rootPath,
+                    expectedUsnJournalId,
                     startUsn,
                     endUsn,
                     outputPath,
@@ -633,6 +641,7 @@ public sealed class ElevatedIndexerClient : IElevatedIndexerClient
         HelperFileCommand command,
         string helperPath,
         string rootPath,
+        ulong expectedUsnJournalId,
         long startUsn,
         long endUsn,
         string outputPath,
@@ -655,6 +664,7 @@ public sealed class ElevatedIndexerClient : IElevatedIndexerClient
                 HelperFileCommand.JournalChanges => ElevatedIndexerProcessStartInfoFactory.CreateUacJournalChangesFile(
                     helperPath,
                     rootPath,
+                    expectedUsnJournalId,
                     startUsn,
                     endUsn,
                     outputPath,

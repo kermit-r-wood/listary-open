@@ -69,6 +69,46 @@ public sealed class NtfsUsnJournalReaderTests
         Assert.False(entry.IsDirectory);
     }
 
+    [Fact]
+    public void JournalSnapshotHasAdvancedPastRequestedEndRequiresFullRescan()
+    {
+        var journal = new NtfsNativeMethods.UsnJournalDataV0
+        {
+            UsnJournalId = 9,
+            LowestValidUsn = 50,
+            NextUsn = 201
+        };
+
+        Assert.True(NtfsUsnJournalReader.RequiresFullRescanForJournalSnapshot(journal, expectedUsnJournalId: 9, endUsn: 200));
+    }
+
+    [Fact]
+    public void JournalSnapshotWithDifferentJournalIdRequiresFullRescan()
+    {
+        var journal = new NtfsNativeMethods.UsnJournalDataV0
+        {
+            UsnJournalId = 10,
+            LowestValidUsn = 50,
+            NextUsn = 200
+        };
+
+        Assert.True(NtfsUsnJournalReader.RequiresFullRescanForJournalSnapshot(journal, expectedUsnJournalId: 9, endUsn: 200));
+    }
+
+    [Fact]
+    public void CloseSummaryWithRenameOldNameIsAmbiguous()
+    {
+        var entry = new NtfsUsnEntry(
+            FileReferenceNumber: 10,
+            ParentFileReferenceNumber: 5,
+            Usn: 1234,
+            Reason: 0x8000_0000 | 0x0000_1000,
+            Name: "NewName.txt",
+            IsDirectory: false);
+
+        Assert.True(NtfsUsnJournalReader.IsAmbiguousJournalChange(entry));
+    }
+
     private static byte[] CreateUsnRecordBuffer(
         string name,
         ulong fileReferenceNumber,

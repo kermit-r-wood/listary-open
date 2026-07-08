@@ -8,6 +8,7 @@ internal interface INtfsJournalProvider
 
     IAsyncEnumerable<UsnJournalChange> ReadJournalChangesAsync(
         IndexRoot root,
+        ulong expectedUsnJournalId,
         long startUsn,
         long endUsn,
         CancellationToken cancellationToken);
