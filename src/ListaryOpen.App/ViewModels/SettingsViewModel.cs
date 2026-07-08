@@ -78,6 +78,7 @@ public sealed class SettingsViewModel : INotifyPropertyChanged
         IndexingRunState.Idle => "Idle",
         IndexingRunState.Indexing => "Indexing",
         IndexingRunState.Completed => "Completed",
+        IndexingRunState.Canceled => "Canceled",
         IndexingRunState.Failed => "Failed",
         _ => "Idle"
     };

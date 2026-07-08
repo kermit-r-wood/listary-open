@@ -230,7 +230,7 @@ public sealed class IndexingCoordinatorTests
 
             Assert.Equal(0, fallbackProvider.ScanCount);
             Assert.Contains(statuses, status => status.Message.Contains("canceled", StringComparison.OrdinalIgnoreCase));
-            Assert.Equal(IndexingRunState.Completed, statuses[^1].State);
+            Assert.Equal(IndexingRunState.Canceled, statuses[^1].State);
         }
         finally
         {
@@ -271,7 +271,7 @@ public sealed class IndexingCoordinatorTests
 
             Assert.Equal(0, fallbackProvider.ScanCount);
             Assert.Contains(statuses, status => status.Message.Contains("canceled", StringComparison.OrdinalIgnoreCase));
-            Assert.Equal(IndexingRunState.Completed, statuses[^1].State);
+            Assert.Equal(IndexingRunState.Canceled, statuses[^1].State);
         }
         finally
         {

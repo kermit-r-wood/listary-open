@@ -18,7 +18,8 @@ internal static class NtfsUsnRecordProjector
         INtfsFileMetadataReader metadataReader,
         CancellationToken cancellationToken,
         ulong? volumeRootFileReferenceNumber = null,
-        IndexExclusionRules? exclusionRules = null)
+        IndexExclusionRules? exclusionRules = null,
+        bool failOnSkippedRecords = false)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(volumeRoot);
         ArgumentException.ThrowIfNullOrWhiteSpace(requestedRoot);
@@ -39,7 +40,8 @@ internal static class NtfsUsnRecordProjector
                      metadataReader,
                      cancellationToken,
                      volumeRootFileReferenceNumber,
-                     exclusionRules))
+                     exclusionRules,
+                     failOnSkippedRecords))
         {
             yield return record;
         }
@@ -53,7 +55,8 @@ internal static class NtfsUsnRecordProjector
         INtfsFileMetadataReader metadataReader,
         CancellationToken cancellationToken,
         ulong? volumeRootFileReferenceNumber = null,
-        IndexExclusionRules? exclusionRules = null)
+        IndexExclusionRules? exclusionRules = null,
+        bool failOnSkippedRecords = false)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(volumeRoot);
         ArgumentException.ThrowIfNullOrWhiteSpace(requestedRoot);
@@ -74,11 +77,30 @@ internal static class NtfsUsnRecordProjector
                     resolvedPaths,
                     new HashSet<ulong>(),
                     volumeRootFileReferenceNumber,
-                    out var fullPath)
-                || IsExcludedByRules(fullPath, entry.IsDirectory, rules)
-                || !IsRequestedRootOrDescendant(fullPath, requestedRoot)
-                || !metadataReader.TryRead(fullPath, entry.IsDirectory, cancellationToken, out var metadata))
+                    out var fullPath))
             {
+                if (failOnSkippedRecords)
+                {
+                    throw new InvalidDataException(
+                        $"NTFS record path could not be resolved for file reference {entry.FileReferenceNumber}.");
+                }
+
+                continue;
+            }
+
+            if (IsExcludedByRules(fullPath, entry.IsDirectory, rules)
+                || !IsRequestedRootOrDescendant(fullPath, requestedRoot))
+            {
+                continue;
+            }
+
+            if (!metadataReader.TryRead(fullPath, entry.IsDirectory, cancellationToken, out var metadata))
+            {
+                if (failOnSkippedRecords)
+                {
+                    throw new IOException($"NTFS record metadata could not be read for {fullPath}.");
+                }
+
                 continue;
             }
 

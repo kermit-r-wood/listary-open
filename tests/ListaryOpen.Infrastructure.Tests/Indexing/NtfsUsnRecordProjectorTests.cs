@@ -112,6 +112,24 @@ public sealed class NtfsUsnRecordProjectorTests
     }
 
     [Fact]
+    public void CreateFileRecordsThrowsInStrictModeWhenParentCannotBeResolved()
+    {
+        var metadata = new StubMetadataReader();
+        metadata.Add("C:\\Missing\\Invoice.txt", isDirectory: false, sizeBytes: 42, Timestamp);
+
+        Assert.Throws<InvalidDataException>(() =>
+            NtfsUsnRecordProjector
+                .CreateFileRecords(
+                    "C:\\",
+                    "C:\\Missing",
+                    [new NtfsUsnEntry(11, 10, "Invoice.txt", IsDirectory: false)],
+                    metadata,
+                    CancellationToken.None,
+                    failOnSkippedRecords: true)
+                .ToList());
+    }
+
+    [Fact]
     public void CreateFileRecordsResolvesChildrenWhenVolumeRootRecordIsAbsent()
     {
         const ulong volumeRootFileReferenceNumber = 5;
@@ -224,6 +242,28 @@ public sealed class NtfsUsnRecordProjectorTests
 
         var record = Assert.Single(records);
         Assert.Equal("C:\\Docs", record.FullPath);
+    }
+
+    [Fact]
+    public void CreateFileRecordsThrowsInStrictModeWhenMetadataCannotBeRead()
+    {
+        var metadata = new StubMetadataReader();
+        metadata.Add("C:\\Docs", isDirectory: true, sizeBytes: 0, Timestamp);
+
+        Assert.Throws<IOException>(() =>
+            NtfsUsnRecordProjector
+                .CreateFileRecords(
+                    "C:\\",
+                    "C:\\Docs",
+                    [
+                        new NtfsUsnEntry(5, 5, ".", IsDirectory: true),
+                        new NtfsUsnEntry(10, 5, "Docs", IsDirectory: true),
+                        new NtfsUsnEntry(11, 10, "Missing.txt", IsDirectory: false)
+                    ],
+                    metadata,
+                    CancellationToken.None,
+                    failOnSkippedRecords: true)
+                .ToList());
     }
 
     [Fact]

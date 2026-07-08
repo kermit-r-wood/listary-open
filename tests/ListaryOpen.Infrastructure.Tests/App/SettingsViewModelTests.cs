@@ -74,6 +74,16 @@ public sealed class SettingsViewModelTests
     }
 
     [Fact]
+    public void UpdateIndexingStatusShowsCanceledPresentationBadge()
+    {
+        var viewModel = new SettingsViewModel(AppSettings.Defaults());
+
+        viewModel.UpdateIndexingStatus(new IndexingStatus(IndexingRunState.Canceled, "Indexing canceled.", 0));
+
+        Assert.Equal("Canceled", viewModel.IndexingBadgeText);
+    }
+
+    [Fact]
     public void EnableNtfsFastIndexingCommandUpdatesPresentationBadges()
     {
         var viewModel = new SettingsViewModel(AppSettings.Defaults(), () => { });

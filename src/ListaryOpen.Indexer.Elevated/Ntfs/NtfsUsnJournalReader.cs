@@ -32,7 +32,8 @@ public sealed class NtfsUsnJournalReader
                          EnumerateEntries(handle, journalData, cancellationToken),
                          new NtfsFileMetadataReader(),
                          cancellationToken,
-                         volumeRootFileReferenceNumber))
+                         volumeRootFileReferenceNumber,
+                         failOnSkippedRecords: true))
             {
                 yield return record;
                 await Task.Yield();

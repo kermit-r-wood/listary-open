@@ -14,6 +14,13 @@ public sealed class FallbackIndexProvider : IIndexProvider
         RecurseSubdirectories = false
     };
 
+    private static readonly EnumerationOptions RootProbeEnumerationOptions = new()
+    {
+        AttributesToSkip = 0,
+        IgnoreInaccessible = false,
+        RecurseSubdirectories = false
+    };
+
     private readonly IndexExclusionRules _exclusionRules;
 
     public FallbackIndexProvider()
@@ -27,6 +34,8 @@ public sealed class FallbackIndexProvider : IIndexProvider
     }
 
     public string Name => "Fallback";
+
+    internal static bool RootProbeIgnoresInaccessibleForTests => RootProbeEnumerationOptions.IgnoreInaccessible;
 
     public bool CanIndex(VolumeInfo volume) => volume.IsReady;
 
@@ -96,7 +105,7 @@ public sealed class FallbackIndexProvider : IIndexProvider
         try
         {
             using var enumerator = Directory
-                .EnumerateFileSystemEntries(path, "*", EnumerationOptions)
+                .EnumerateFileSystemEntries(path, "*", RootProbeEnumerationOptions)
                 .GetEnumerator();
             _ = enumerator.MoveNext();
         }

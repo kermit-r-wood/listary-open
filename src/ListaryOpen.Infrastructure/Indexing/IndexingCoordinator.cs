@@ -9,6 +9,7 @@ public enum IndexingRunState
     Idle,
     Indexing,
     Completed,
+    Canceled,
     Failed
 }
 
@@ -55,6 +56,7 @@ public sealed class IndexingCoordinator
 
         var indexedCount = 0;
         var hadFailures = false;
+        var hadCancellations = false;
         long? indexGeneration = null;
         RaiseStatus(IndexingRunState.Indexing, "Indexing started.", indexedCount);
 
@@ -81,6 +83,7 @@ public sealed class IndexingCoordinator
                     cancellationToken).ConfigureAwait(false);
                 indexedCount += result.IndexedCount;
                 hadFailures |= result.HadFailure;
+                hadCancellations |= result.WasCanceled;
             }
             catch (OperationCanceledException)
             {
@@ -93,9 +96,20 @@ public sealed class IndexingCoordinator
             }
         }
 
+        var finalState = hadFailures
+            ? IndexingRunState.Failed
+            : hadCancellations
+                ? IndexingRunState.Canceled
+                : IndexingRunState.Completed;
+        var finalMessage = hadFailures
+            ? "Indexing completed with errors."
+            : hadCancellations
+                ? "Indexing canceled."
+                : "Indexing completed.";
+
         RaiseStatus(
-            hadFailures ? IndexingRunState.Failed : IndexingRunState.Completed,
-            hadFailures ? "Indexing completed with errors." : "Indexing completed.",
+            finalState,
+            finalMessage,
             indexedCount);
     }
 
@@ -126,7 +140,7 @@ public sealed class IndexingCoordinator
         {
             var count = await ScanAndUpsertAsync(provider, root, indexGeneration, cancellationToken).ConfigureAwait(false);
             await _index.PruneStaleRecordsUnderRootAsync(root.Path, indexGeneration, cancellationToken).ConfigureAwait(false);
-            return new IndexRootResult(count, HadFailure: false);
+            return new IndexRootResult(count, HadFailure: false, WasCanceled: false);
         }
 
         try
@@ -135,13 +149,13 @@ public sealed class IndexingCoordinator
             if (count > 0)
             {
                 await _index.PruneStaleRecordsUnderRootAsync(root.Path, indexGeneration, cancellationToken).ConfigureAwait(false);
-                return new IndexRootResult(count, HadFailure: false);
+                return new IndexRootResult(count, HadFailure: false, WasCanceled: false);
             }
 
             RaiseStatus(IndexingRunState.Indexing, $"NTFS returned no records; using fallback for {root.Path}.", currentIndexedCount);
             var fallbackCount = await ScanAndUpsertAsync(_fallbackProvider, root, indexGeneration, cancellationToken).ConfigureAwait(false);
             await _index.PruneStaleRecordsUnderRootAsync(root.Path, indexGeneration, cancellationToken).ConfigureAwait(false);
-            return new IndexRootResult(fallbackCount, HadFailure: false);
+            return new IndexRootResult(fallbackCount, HadFailure: false, WasCanceled: false);
         }
         catch (OperationCanceledException)
         {
@@ -152,7 +166,7 @@ public sealed class IndexingCoordinator
             if (IsElevatedIndexerLaunchCanceled(exception))
             {
                 RaiseStatus(IndexingRunState.Indexing, $"NTFS scan canceled for {root.Path}.", currentIndexedCount);
-                return new IndexRootResult(0, HadFailure: false);
+                return new IndexRootResult(0, HadFailure: false, WasCanceled: true);
             }
 
             if (exception.PartialRecordsAccepted)
@@ -161,13 +175,13 @@ public sealed class IndexingCoordinator
                     IndexingRunState.Failed,
                     $"NTFS scan failed after partial output for {root.Path}; preserving existing index. {exception.Message}",
                     currentIndexedCount);
-                return new IndexRootResult(0, HadFailure: true);
+                return new IndexRootResult(0, HadFailure: true, WasCanceled: false);
             }
 
             RaiseStatus(IndexingRunState.Failed, $"NTFS scan failed for {root.Path}; using fallback. {exception.Message}", currentIndexedCount);
             var fallbackCount = await ScanAndUpsertAsync(_fallbackProvider, root, indexGeneration, cancellationToken).ConfigureAwait(false);
             await _index.PruneStaleRecordsUnderRootAsync(root.Path, indexGeneration, cancellationToken).ConfigureAwait(false);
-            return new IndexRootResult(fallbackCount, HadFailure: true);
+            return new IndexRootResult(fallbackCount, HadFailure: true, WasCanceled: false);
         }
     }
 
@@ -336,5 +350,5 @@ public sealed class IndexingCoordinator
         public bool PartialRecordsAccepted { get; }
     }
 
-    private sealed record IndexRootResult(int IndexedCount, bool HadFailure);
+    private sealed record IndexRootResult(int IndexedCount, bool HadFailure, bool WasCanceled);
 }

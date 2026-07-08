@@ -139,6 +139,12 @@ public sealed class FallbackIndexProviderTests
         });
     }
 
+    [Fact]
+    public void RootProbeDoesNotIgnoreInaccessibleRoots()
+    {
+        Assert.False(FallbackIndexProvider.RootProbeIgnoresInaccessibleForTests);
+    }
+
     [Theory]
     [InlineData(true, true)]
     [InlineData(false, false)]
