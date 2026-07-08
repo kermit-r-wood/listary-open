@@ -206,6 +206,57 @@ public sealed class SqliteSearchIndexTests
     }
 
     [Fact]
+    public async Task SearchAppliesExtensionFilterBeforeCandidateLimit()
+    {
+        var dbPath = CreateTempDbPath();
+
+        try
+        {
+            await using (var index = await SqliteSearchIndex.OpenAsync(dbPath, CancellationToken.None))
+            {
+                await InsertMatchingInvoiceFilesAsync(index, 1_100);
+                await index.UpsertAsync(FileRecord.Create("C:\\Docs\\ZTargetInvoice.pdf", false, 10, DateTimeOffset.UtcNow), CancellationToken.None);
+
+                var results = await index.SearchAsync(new SearchQuery("ext:pdf invoice", SearchMode.FilesAndFolders), CancellationToken.None);
+
+                var result = Assert.Single(results);
+                Assert.Equal("ZTargetInvoice.pdf", result.Record.Name);
+            }
+        }
+        finally
+        {
+            DeleteIfExists(dbPath);
+        }
+    }
+
+    [Fact]
+    public async Task SearchSupportsPureExtensionExclusion()
+    {
+        var dbPath = CreateTempDbPath();
+
+        try
+        {
+            await using (var index = await SqliteSearchIndex.OpenAsync(dbPath, CancellationToken.None))
+            {
+                await index.UpsertManyAsync(new[]
+                {
+                    FileRecord.Create("C:\\Docs\\Keep.txt", false, 10, DateTimeOffset.UtcNow),
+                    FileRecord.Create("C:\\Docs\\Drop.tmp", false, 10, DateTimeOffset.UtcNow)
+                }, CancellationToken.None);
+
+                var results = await index.SearchAsync(new SearchQuery("!ext:tmp", SearchMode.FilesAndFolders), CancellationToken.None);
+
+                var result = Assert.Single(results);
+                Assert.Equal("Keep.txt", result.Record.Name);
+            }
+        }
+        finally
+        {
+            DeleteIfExists(dbPath);
+        }
+    }
+
+    [Fact]
     public async Task SearchFolderFilterReturnsOnlyFolders()
     {
         var dbPath = CreateTempDbPath();

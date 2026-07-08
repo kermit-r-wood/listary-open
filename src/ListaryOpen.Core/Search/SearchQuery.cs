@@ -32,9 +32,7 @@ public sealed record SearchQuery
 
     public ParsedSearchQuery Parsed { get; }
 
-    public string NormalizedText => string.IsNullOrWhiteSpace(Parsed.RankingText)
-        ? Text.Trim()
-        : Parsed.RankingText;
+    public string NormalizedText => Parsed.RankingText;
 }
 
 public enum SearchMode

@@ -55,6 +55,11 @@ public static class ResultRanker
         DateTimeOffset now)
     {
         var queryText = query.NormalizedText;
+        if (string.IsNullOrWhiteSpace(queryText))
+        {
+            return new SearchResult(record, 1, "filter");
+        }
+
         var nameScore = FuzzyMatcher.Score(queryText, record.Name);
         var pathScore = FuzzyMatcher.Score(queryText, record.FullPath) * 0.6;
         var pinyinScore = PinyinMatcher.Score(queryText, record.Name) * 0.9;

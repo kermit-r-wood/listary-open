@@ -153,7 +153,7 @@ public sealed record ParsedSearchQuery(
 
         if (builder.Length > 0)
         {
-            yield return new QueryToken(builder.ToString(), tokenWasQuoted);
+            yield return new QueryToken(builder.ToString(), tokenWasQuoted && !inQuote);
         }
     }
 
@@ -171,8 +171,7 @@ public sealed record ParsedSearchQuery(
 
     private static bool IsModeToken(string value, string token)
     {
-        return string.Equals(value, token, StringComparison.OrdinalIgnoreCase)
-            || string.Equals(value, token.TrimEnd(':'), StringComparison.OrdinalIgnoreCase);
+        return string.Equals(value, token, StringComparison.OrdinalIgnoreCase);
     }
 
     private static string NormalizeExtension(string value)

@@ -900,6 +900,7 @@ public sealed class SqliteSearchIndex : ISearchIndex, IAsyncDisposable
         var directoryFilter = CreateDirectoryFilter(query);
 
         using var command = _connection.CreateCommand();
+        var parsedFilter = CreateParsedFilter(query, command);
         command.CommandText = $"""
             select
                 full_path,
@@ -907,7 +908,7 @@ public sealed class SqliteSearchIndex : ISearchIndex, IAsyncDisposable
                 size_bytes,
                 last_write_time
             from files
-            where search_text like $contains escape '\'{directoryFilter}
+            where search_text like $contains escape '\'{directoryFilter}{parsedFilter}
             order by
                 case
                     when name = $query then 0
@@ -939,6 +940,7 @@ public sealed class SqliteSearchIndex : ISearchIndex, IAsyncDisposable
         var directoryFilter = CreateDirectoryFilter(query);
 
         using var command = _connection.CreateCommand();
+        var parsedFilter = CreateParsedFilter(query, command);
         command.CommandText = $"""
             select
                 full_path,
@@ -946,7 +948,7 @@ public sealed class SqliteSearchIndex : ISearchIndex, IAsyncDisposable
                 size_bytes,
                 last_write_time
             from files
-            where search_text like $ordered escape '\'{directoryFilter}
+            where search_text like $ordered escape '\'{directoryFilter}{parsedFilter}
             order by
                 listary_rank_score($query, full_path, name) desc,
                 length(name),
@@ -974,6 +976,7 @@ public sealed class SqliteSearchIndex : ISearchIndex, IAsyncDisposable
         var directoryFilter = CreateDirectoryFilter(query, "files.");
 
         using var command = _connection.CreateCommand();
+        var parsedFilter = CreateParsedFilter(query, command, "files.");
         command.CommandText = $"""
             select
                 files.full_path,
@@ -985,7 +988,7 @@ public sealed class SqliteSearchIndex : ISearchIndex, IAsyncDisposable
             where (
                 files.search_text like $contains escape '\'
                 or files.search_text like $ordered escape '\'
-            ){directoryFilter}
+            ){directoryFilter}{parsedFilter}
             order by
                 min(usage.open_count * 5, 50) desc,
                 usage.last_used_at desc,
@@ -1012,6 +1015,7 @@ public sealed class SqliteSearchIndex : ISearchIndex, IAsyncDisposable
         var directoryFilter = CreateDirectoryFilter(query, "files.");
 
         using var command = _connection.CreateCommand();
+        var parsedFilter = CreateParsedFilter(query, command, "files.");
         command.CommandText = $"""
             select
                 files.full_path,
@@ -1023,7 +1027,7 @@ public sealed class SqliteSearchIndex : ISearchIndex, IAsyncDisposable
             where (
                 files.search_text like $contains escape '\'
                 or files.search_text like $ordered escape '\'
-            ){directoryFilter}
+            ){directoryFilter}{parsedFilter}
             order by
                 (
                     listary_rank_score($query, files.full_path, files.name)
@@ -1050,13 +1054,8 @@ public sealed class SqliteSearchIndex : ISearchIndex, IAsyncDisposable
         IDictionary<string, FileRecord> records,
         CancellationToken cancellationToken)
     {
-        var whereClause = query.Parsed.FileOnly
-            ? "where is_directory = 0"
-            : query.EffectiveMode == SearchMode.FoldersOnly
-                ? "where is_directory = 1"
-                : string.Empty;
-
         using var command = _connection.CreateCommand();
+        var whereClause = CreateFallbackWhereClause(query, command);
         command.CommandText = $"""
             select
                 full_path,
@@ -1123,6 +1122,68 @@ public sealed class SqliteSearchIndex : ISearchIndex, IAsyncDisposable
         }
 
         return true;
+    }
+
+    private static string CreateFallbackWhereClause(SearchQuery query, SqliteCommand command)
+    {
+        var clauses = new List<string>();
+        if (query.Parsed.FileOnly)
+        {
+            clauses.Add("is_directory = 0");
+        }
+        else if (query.EffectiveMode == SearchMode.FoldersOnly)
+        {
+            clauses.Add("is_directory = 1");
+        }
+
+        var parsedFilter = CreateParsedFilter(query, command);
+        if (!string.IsNullOrWhiteSpace(parsedFilter))
+        {
+            clauses.Add(parsedFilter[" and ".Length..]);
+        }
+
+        return clauses.Count == 0 ? string.Empty : "where " + string.Join(" and ", clauses);
+    }
+
+    private static string CreateParsedFilter(
+        SearchQuery query,
+        SqliteCommand command,
+        string tablePrefix = "")
+    {
+        var clauses = new List<string>();
+        AddLikeFilters(clauses, command, query.Parsed.Extensions, $"lower({tablePrefix}name)", "include_ext", include: true, extension: true);
+        AddLikeFilters(clauses, command, query.Parsed.ExcludedExtensions, $"lower({tablePrefix}name)", "exclude_ext", include: false, extension: true);
+        AddLikeFilters(clauses, command, query.Parsed.PathTerms, $"{tablePrefix}search_text", "path", include: true, extension: false);
+        AddLikeFilters(clauses, command, query.Parsed.Phrases, $"{tablePrefix}search_text", "phrase", include: true, extension: false);
+        AddLikeFilters(clauses, command, query.Parsed.ExcludedTerms, $"{tablePrefix}search_text", "exclude", include: false, extension: false);
+
+        return clauses.Count == 0 ? string.Empty : " and " + string.Join(" and ", clauses);
+    }
+
+    private static void AddLikeFilters(
+        ICollection<string> clauses,
+        SqliteCommand command,
+        IReadOnlyList<string> values,
+        string column,
+        string namePrefix,
+        bool include,
+        bool extension)
+    {
+        for (var index = 0; index < values.Count; index++)
+        {
+            var value = NormalizeSearchText(values[index]);
+            if (string.IsNullOrWhiteSpace(value))
+            {
+                continue;
+            }
+
+            var parameterName = $"${namePrefix}_{index}";
+            var pattern = extension
+                ? $"%.{EscapeLike(value)}"
+                : $"%{EscapeLike(value)}%";
+            clauses.Add($"{column} {(include ? string.Empty : "not ")}like {parameterName} escape '\\'");
+            command.Parameters.AddWithValue(parameterName, pattern);
+        }
     }
 
     private static string GetExtension(FileRecord record)

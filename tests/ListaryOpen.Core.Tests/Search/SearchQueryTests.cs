@@ -59,4 +59,23 @@ public sealed class SearchQueryTests
         Assert.Equal(SearchMode.FilesAndFolders, query.EffectiveMode);
         Assert.Equal(new[] { "report" }, query.Parsed.Terms);
     }
+
+    [Fact]
+    public void ParsedQueryTreatsBareFileAndFolderAsSearchTerms()
+    {
+        var query = new SearchQuery("folder file", SearchMode.FilesAndFolders);
+
+        Assert.Null(query.Parsed.ModeOverride);
+        Assert.False(query.Parsed.FileOnly);
+        Assert.Equal(new[] { "folder", "file" }, query.Parsed.Terms);
+    }
+
+    [Fact]
+    public void ParsedQueryTreatsUnclosedQuoteAsTerm()
+    {
+        var query = new SearchQuery("foo \"bar baz", SearchMode.FilesAndFolders);
+
+        Assert.Equal(new[] { "foo", "bar baz" }, query.Parsed.Terms);
+        Assert.Empty(query.Parsed.Phrases);
+    }
 }
