@@ -22,13 +22,14 @@ public sealed class NtfsUsnJournalReader
 
         try
         {
+            var journalData = QueryJournal(handle);
             var volumeRootFileReferenceNumber = ReadFileReferenceNumber(scanRoot.VolumeRoot);
-            var directories = ReadDirectoryEntries(handle, cancellationToken);
+            var directories = ReadDirectoryEntries(handle, journalData, cancellationToken);
             foreach (var record in NtfsUsnRecordProjector.CreateFileRecordsFromDirectoryMap(
                          scanRoot.VolumeRoot,
                          scanRoot.RequestedRoot,
                          directories,
-                         EnumerateEntries(handle, cancellationToken),
+                         EnumerateEntries(handle, journalData, cancellationToken),
                          new NtfsFileMetadataReader(),
                          cancellationToken,
                          volumeRootFileReferenceNumber))
@@ -95,10 +96,11 @@ public sealed class NtfsUsnJournalReader
 
     private static Dictionary<ulong, NtfsUsnEntry> ReadDirectoryEntries(
         IntPtr handle,
+        NtfsNativeMethods.UsnJournalDataV0 journalData,
         CancellationToken cancellationToken)
     {
         var entries = new Dictionary<ulong, NtfsUsnEntry>();
-        foreach (var entry in EnumerateEntries(handle, cancellationToken))
+        foreach (var entry in EnumerateEntries(handle, journalData, cancellationToken))
         {
             if (entry.IsDirectory)
             {
@@ -109,15 +111,23 @@ public sealed class NtfsUsnJournalReader
         return entries;
     }
 
-    private static IEnumerable<NtfsUsnEntry> EnumerateEntries(IntPtr handle, CancellationToken cancellationToken)
+    internal static NtfsNativeMethods.MftEnumDataV0 CreateFullScanEnumData(
+        NtfsNativeMethods.UsnJournalDataV0 journalData)
     {
-        var journalData = QueryJournal(handle);
-        var enumData = new NtfsNativeMethods.MftEnumDataV0
+        return new NtfsNativeMethods.MftEnumDataV0
         {
             StartFileReferenceNumber = 0,
             LowUsn = 0,
             HighUsn = journalData.NextUsn
         };
+    }
+
+    private static IEnumerable<NtfsUsnEntry> EnumerateEntries(
+        IntPtr handle,
+        NtfsNativeMethods.UsnJournalDataV0 journalData,
+        CancellationToken cancellationToken)
+    {
+        var enumData = CreateFullScanEnumData(journalData);
 
         var buffer = new byte[UsnBufferLength];
         var enumDataSize = Marshal.SizeOf<NtfsNativeMethods.MftEnumDataV0>();
