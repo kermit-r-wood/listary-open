@@ -21,7 +21,11 @@ public sealed record IndexRoot
     public string Path { get; }
 }
 
-public sealed record VolumeInfo(string RootPath, string FileSystemName, bool IsReady);
+public sealed record VolumeInfo(
+    string RootPath,
+    string FileSystemName,
+    bool IsReady,
+    System.IO.DriveType DriveType = System.IO.DriveType.Unknown);
 
 public sealed record IndexProviderStatus(string ProviderName, string RootPath, bool IsAvailable, string Message);
 

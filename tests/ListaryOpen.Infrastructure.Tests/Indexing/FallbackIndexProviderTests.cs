@@ -125,6 +125,20 @@ public sealed class FallbackIndexProviderTests
         }
     }
 
+    [Fact]
+    public async Task ScanAsyncThrowsForMissingRootInsteadOfReturningSuccessfulEmptyScan()
+    {
+        var root = Path.Combine(Path.GetTempPath(), "listary-open-missing-" + Guid.NewGuid());
+        var provider = new FallbackIndexProvider();
+
+        await Assert.ThrowsAnyAsync<IOException>(async () =>
+        {
+            await foreach (var _ in provider.ScanAsync(new IndexRoot(root), CancellationToken.None))
+            {
+            }
+        });
+    }
+
     [Theory]
     [InlineData(true, true)]
     [InlineData(false, false)]

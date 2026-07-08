@@ -34,6 +34,8 @@ public sealed class FallbackIndexProvider : IIndexProvider
         IndexRoot root,
         [EnumeratorCancellation] CancellationToken cancellationToken)
     {
+        EnsureRootCanBeEnumerated(root.Path, cancellationToken);
+
         var pending = new Stack<string>();
         pending.Push(root.Path);
 
@@ -81,6 +83,28 @@ public sealed class FallbackIndexProvider : IIndexProvider
 
     private static IEnumerable<string> EnumerateFiles(string path, CancellationToken cancellationToken)
         => EnumerateEntries(() => Directory.EnumerateFiles(path, "*", EnumerationOptions), cancellationToken);
+
+    private static void EnsureRootCanBeEnumerated(string path, CancellationToken cancellationToken)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+
+        if (!Directory.Exists(path))
+        {
+            throw new DirectoryNotFoundException($"Index root does not exist: {path}");
+        }
+
+        try
+        {
+            using var enumerator = Directory
+                .EnumerateFileSystemEntries(path, "*", EnumerationOptions)
+                .GetEnumerator();
+            _ = enumerator.MoveNext();
+        }
+        catch (Exception exception) when (IsExpectedFileSystemException(exception))
+        {
+            throw new IOException($"Index root could not be enumerated: {path}", exception);
+        }
+    }
 
     private static IEnumerable<string> EnumerateEntries(
         Func<IEnumerable<string>> enumerate,

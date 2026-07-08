@@ -325,6 +325,52 @@ public sealed class IndexingCoordinatorTests
     }
 
     [Fact]
+    public async Task IndexRootsAsyncDoesNotPruneWhenProviderFailsAfterPartialOutput()
+    {
+        var rootPath = CreateTempDirectory();
+        var dbPath = CreateTempDbPath();
+
+        try
+        {
+            var currentRecord = FileRecord.Create(
+                Path.Combine(rootPath, "CurrentRecord.txt"),
+                isDirectory: false,
+                sizeBytes: 1,
+                DateTimeOffset.UtcNow);
+            var staleRecord = FileRecord.Create(
+                Path.Combine(rootPath, "KeepBecauseScanIncomplete.txt"),
+                isDirectory: false,
+                sizeBytes: 1,
+                DateTimeOffset.UtcNow);
+
+            await using var index = await SqliteSearchIndex.OpenAsync(dbPath, CancellationToken.None);
+            await index.UpsertManyAsync(new[] { currentRecord, staleRecord }, CancellationToken.None);
+            var statuses = new List<IndexingStatus>();
+            var coordinator = new IndexingCoordinator(
+                index,
+                new VolumeIndexer(new IIndexProvider[] { new PartialThenThrowingProvider(currentRecord) }),
+                new FallbackIndexProvider(),
+                _ => new VolumeInfo(Path.GetPathRoot(rootPath)!, NtfsIndexProvider.ProviderName, true),
+                batchSize: 1);
+            coordinator.StatusChanged += (_, status) => statuses.Add(status);
+
+            await coordinator.IndexRootsAsync(new[] { new IndexRoot(rootPath) }, CancellationToken.None);
+
+            var currentResults = await index.SearchAsync(new SearchQuery("CurrentRecord", SearchMode.FilesAndFolders), CancellationToken.None);
+            var staleResults = await index.SearchAsync(new SearchQuery("KeepBecauseScanIncomplete", SearchMode.FilesAndFolders), CancellationToken.None);
+
+            Assert.Contains(currentResults, result => result.Record.PathKey == currentRecord.PathKey);
+            Assert.Contains(staleResults, result => result.Record.PathKey == staleRecord.PathKey);
+            Assert.Equal(IndexingRunState.Failed, statuses[^1].State);
+        }
+        finally
+        {
+            DeleteDirectoryIfExists(rootPath);
+            DeleteFileIfExists(dbPath);
+        }
+    }
+
+    [Fact]
     public async Task IndexRootsAsyncReportsFailedStatusForMissingRootAndContinues()
     {
         var existingRootPath = CreateTempDirectory();
@@ -661,6 +707,28 @@ public sealed class IndexingCoordinatorTests
             cancellationToken.ThrowIfCancellationRequested();
             await Task.CompletedTask;
             yield return _record;
+        }
+    }
+
+    private sealed class PartialThenThrowingProvider : IIndexProvider
+    {
+        private readonly FileRecord _record;
+
+        public PartialThenThrowingProvider(FileRecord record)
+        {
+            _record = record;
+        }
+
+        public string Name => NtfsIndexProvider.ProviderName;
+
+        public bool CanIndex(VolumeInfo volume) => volume.IsReady;
+
+        public async IAsyncEnumerable<FileRecord> ScanAsync(
+            IndexRoot root,
+            [EnumeratorCancellation] CancellationToken cancellationToken)
+        {
+            yield return _record;
+            await Task.FromException(new IOException("Scan failed after partial output."));
         }
     }
 

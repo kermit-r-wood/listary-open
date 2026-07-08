@@ -61,6 +61,18 @@ public sealed class ProviderSelectionTests
         Assert.Equal("Fallback", selected.Name);
     }
 
+    [Fact]
+    public void SelectProviderFallsBackForMappedNetworkDriveEvenWhenFormatReportsNtfs()
+    {
+        var ntfs = new NtfsIndexProvider(new RecordingElevatedIndexerClient());
+        var fallback = new FallbackIndexProvider();
+        var indexer = new VolumeIndexer(new IIndexProvider[] { ntfs, fallback });
+
+        var selected = indexer.SelectProvider(new VolumeInfo("Z:\\", "NTFS", true, DriveType.Network));
+
+        Assert.Equal("Fallback", selected.Name);
+    }
+
     [Theory]
     [InlineData("NTFS")]
     [InlineData("ntfs")]

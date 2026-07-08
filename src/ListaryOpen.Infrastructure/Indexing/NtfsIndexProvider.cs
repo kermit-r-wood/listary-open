@@ -18,6 +18,7 @@ public sealed class NtfsIndexProvider : IIndexProvider
     public bool CanIndex(VolumeInfo volume)
     {
         return volume.IsReady
+            && volume.DriveType != System.IO.DriveType.Network
             && string.Equals(volume.FileSystemName, ProviderName, StringComparison.OrdinalIgnoreCase)
             && _client.IsAvailable;
     }

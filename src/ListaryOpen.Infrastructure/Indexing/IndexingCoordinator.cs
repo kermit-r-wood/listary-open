@@ -155,6 +155,15 @@ public sealed class IndexingCoordinator
                 return new IndexRootResult(0, HadFailure: false);
             }
 
+            if (exception.PartialRecordsAccepted)
+            {
+                RaiseStatus(
+                    IndexingRunState.Failed,
+                    $"NTFS scan failed after partial output for {root.Path}; preserving existing index. {exception.Message}",
+                    currentIndexedCount);
+                return new IndexRootResult(0, HadFailure: true);
+            }
+
             RaiseStatus(IndexingRunState.Failed, $"NTFS scan failed for {root.Path}; using fallback. {exception.Message}", currentIndexedCount);
             var fallbackCount = await ScanAndUpsertAsync(_fallbackProvider, root, indexGeneration, cancellationToken).ConfigureAwait(false);
             await _index.PruneStaleRecordsUnderRootAsync(root.Path, indexGeneration, cancellationToken).ConfigureAwait(false);
@@ -206,7 +215,10 @@ public sealed class IndexingCoordinator
                 }
                 catch (Exception exception)
                 {
-                    throw new IndexProviderScanException($"Provider {provider.Name} failed while scanning {root.Path}: {exception.Message}", exception);
+                    throw new IndexProviderScanException(
+                        $"Provider {provider.Name} failed while scanning {root.Path}: {exception.Message}",
+                        exception,
+                        partialRecordsAccepted: indexedCount > 0 || batch.Count > 0);
                 }
 
                 batch.Add(record);
@@ -271,12 +283,12 @@ public sealed class IndexingCoordinator
 
         if (IsUncRoot(volumeRoot))
         {
-            return new VolumeInfo(volumeRoot, "Network", Directory.Exists(root.Path));
+            return new VolumeInfo(volumeRoot, "Network", Directory.Exists(root.Path), DriveType.Network);
         }
 
         volumeRoot = NormalizeDriveRoot(volumeRoot);
         var drive = new DriveInfo(volumeRoot);
-        return new VolumeInfo(volumeRoot, drive.DriveFormat, drive.IsReady);
+        return new VolumeInfo(volumeRoot, drive.DriveFormat, drive.IsReady, drive.DriveType);
     }
 
     private static bool IsUncRoot(string path)
@@ -312,10 +324,16 @@ public sealed class IndexingCoordinator
 
     private sealed class IndexProviderScanException : Exception
     {
-        public IndexProviderScanException(string message, Exception innerException)
+        public IndexProviderScanException(
+            string message,
+            Exception innerException,
+            bool partialRecordsAccepted = false)
             : base(message, innerException)
         {
+            PartialRecordsAccepted = partialRecordsAccepted;
         }
+
+        public bool PartialRecordsAccepted { get; }
     }
 
     private sealed record IndexRootResult(int IndexedCount, bool HadFailure);
