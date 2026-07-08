@@ -123,6 +123,21 @@ public sealed class NtfsUsnJournalReader
         };
     }
 
+    internal static NtfsNativeMethods.ReadUsnJournalDataV0 CreateReadJournalData(
+        long startUsn,
+        ulong usnJournalId)
+    {
+        return new NtfsNativeMethods.ReadUsnJournalDataV0
+        {
+            StartUsn = startUsn,
+            ReasonMask = uint.MaxValue,
+            ReturnOnlyOnClose = 0,
+            Timeout = 0,
+            BytesToWaitFor = 0,
+            UsnJournalId = usnJournalId
+        };
+    }
+
     private static IEnumerable<NtfsUsnEntry> EnumerateEntries(
         IntPtr handle,
         NtfsNativeMethods.UsnJournalDataV0 journalData,
@@ -171,6 +186,70 @@ public sealed class NtfsUsnJournalReader
         }
     }
 
+    internal static IEnumerable<NtfsUsnEntry> EnumerateJournalEntries(
+        IntPtr handle,
+        NtfsNativeMethods.UsnJournalDataV0 journalData,
+        long startUsn,
+        long endUsn,
+        CancellationToken cancellationToken)
+    {
+        if (startUsn < journalData.LowestValidUsn || startUsn > endUsn)
+        {
+            throw new ArgumentOutOfRangeException(nameof(startUsn), "USN start is outside the readable journal range.");
+        }
+
+        var readData = CreateReadJournalData(startUsn, journalData.UsnJournalId);
+        var buffer = new byte[UsnBufferLength];
+        var readDataSize = Marshal.SizeOf<NtfsNativeMethods.ReadUsnJournalDataV0>();
+
+        while (readData.StartUsn < endUsn)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+
+            var success = NtfsNativeMethods.DeviceIoControl(
+                handle,
+                NtfsNativeMethods.FsctlReadUsnJournal,
+                ref readData,
+                readDataSize,
+                buffer,
+                buffer.Length,
+                out var bytesReturned,
+                IntPtr.Zero);
+
+            if (!success)
+            {
+                var error = Marshal.GetLastWin32Error();
+                if (error == NtfsNativeMethods.ErrorHandleEof)
+                {
+                    yield break;
+                }
+
+                throw new Win32Exception(error, "Failed to read NTFS USN journal.");
+            }
+
+            if (bytesReturned <= UsnOutputPrefixLength)
+            {
+                yield break;
+            }
+
+            var nextUsn = BinaryPrimitives.ReadInt64LittleEndian(buffer.AsSpan(0, UsnOutputPrefixLength));
+            foreach (var entry in ReadEntriesFromBuffer(buffer.AsSpan(UsnOutputPrefixLength, bytesReturned - UsnOutputPrefixLength)))
+            {
+                if (entry.Usn < endUsn)
+                {
+                    yield return entry;
+                }
+            }
+
+            if (nextUsn <= readData.StartUsn)
+            {
+                yield break;
+            }
+
+            readData.StartUsn = nextUsn;
+        }
+    }
+
     private static NtfsNativeMethods.UsnJournalDataV0 QueryJournal(IntPtr handle)
     {
         var journalDataSize = Marshal.SizeOf<NtfsNativeMethods.UsnJournalDataV0>();
@@ -192,7 +271,7 @@ public sealed class NtfsUsnJournalReader
         return journalData;
     }
 
-    private static IReadOnlyList<NtfsUsnEntry> ReadEntriesFromBuffer(ReadOnlySpan<byte> recordsBuffer)
+    internal static IReadOnlyList<NtfsUsnEntry> ReadEntriesFromBuffer(ReadOnlySpan<byte> recordsBuffer)
     {
         var entries = new List<NtfsUsnEntry>();
         var offset = 0;
@@ -216,7 +295,9 @@ public sealed class NtfsUsnJournalReader
                 BinaryPrimitives.ReadUInt64LittleEndian(record[8..16]),
                 BinaryPrimitives.ReadUInt64LittleEndian(record[16..24]),
                 parsed.Name,
-                parsed.IsDirectory);
+                parsed.IsDirectory,
+                BinaryPrimitives.ReadInt64LittleEndian(record[24..32]),
+                BinaryPrimitives.ReadUInt32LittleEndian(record[40..44]));
 
             entries.Add(entry);
             offset += (int)recordLength;

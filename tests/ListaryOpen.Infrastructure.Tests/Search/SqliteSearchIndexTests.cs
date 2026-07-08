@@ -416,6 +416,123 @@ public sealed class SqliteSearchIndexTests
     }
 
     [Fact]
+    public async Task ApplyUsnJournalChangesDeletesUpsertsAndSavesCheckpointAtomically()
+    {
+        var dbPath = CreateTempDbPath();
+        var oldRecord = FileRecord.Create("C:\\Docs\\OldName.txt", false, 10, DateTimeOffset.UtcNow);
+        var newRecord = FileRecord.Create("C:\\Docs\\NewName.txt", false, 20, DateTimeOffset.UtcNow);
+        var checkpoint = new UsnJournalCheckpoint(
+            "C:\\",
+            "NTFS",
+            99,
+            500,
+            SqliteSearchIndex.CurrentIndexContentVersion,
+            new DateTimeOffset(2026, 7, 9, 3, 0, 0, TimeSpan.Zero));
+
+        try
+        {
+            await using (var index = await SqliteSearchIndex.OpenAsync(dbPath, CancellationToken.None))
+            {
+                await index.UpsertAsync(oldRecord, CancellationToken.None);
+
+                await index.ApplyUsnJournalChangesAsync(
+                    [
+                        UsnJournalIndexChange.Delete(oldRecord.FullPath),
+                        UsnJournalIndexChange.Upsert(newRecord)
+                    ],
+                    checkpoint,
+                    CancellationToken.None);
+
+                var oldResults = await index.SearchAsync(new SearchQuery("OldName", SearchMode.FilesAndFolders), CancellationToken.None);
+                var newResults = await index.SearchAsync(new SearchQuery("NewName", SearchMode.FilesAndFolders), CancellationToken.None);
+                var savedCheckpoint = await index.ReadVolumeCheckpointAsync("C:\\", CancellationToken.None);
+
+                Assert.Empty(oldResults);
+                Assert.Equal("NewName.txt", Assert.Single(newResults).Record.Name);
+                Assert.Equal(checkpoint, savedCheckpoint);
+            }
+        }
+        finally
+        {
+            DeleteIfExists(dbPath);
+        }
+    }
+
+    [Fact]
+    public async Task ApplyUsnJournalChangesRollsBackFilesAndCheckpointWhenAChangeFails()
+    {
+        var dbPath = CreateTempDbPath();
+        var newRecord = FileRecord.Create("C:\\Docs\\ShouldRollback.txt", false, 20, DateTimeOffset.UtcNow);
+        var checkpoint = new UsnJournalCheckpoint(
+            "C:\\",
+            "NTFS",
+            99,
+            500,
+            SqliteSearchIndex.CurrentIndexContentVersion,
+            new DateTimeOffset(2026, 7, 9, 3, 0, 0, TimeSpan.Zero));
+
+        try
+        {
+            await using (var index = await SqliteSearchIndex.OpenAsync(dbPath, CancellationToken.None))
+            {
+                await Assert.ThrowsAsync<ArgumentException>(() =>
+                    index.ApplyUsnJournalChangesAsync(
+                        [
+                            UsnJournalIndexChange.Upsert(newRecord),
+                            UsnJournalIndexChange.Delete("relative.txt")
+                        ],
+                        checkpoint,
+                        CancellationToken.None));
+
+                var results = await index.SearchAsync(new SearchQuery("ShouldRollback", SearchMode.FilesAndFolders), CancellationToken.None);
+                var savedCheckpoint = await index.ReadVolumeCheckpointAsync("C:\\", CancellationToken.None);
+
+                Assert.Empty(results);
+                Assert.Null(savedCheckpoint);
+            }
+        }
+        finally
+        {
+            DeleteIfExists(dbPath);
+        }
+    }
+
+    [Fact]
+    public async Task UsnJournalChangeApplierRequestsFullRescanForDirectoryRenameWithoutSavingCheckpoint()
+    {
+        var dbPath = CreateTempDbPath();
+        var checkpoint = new UsnJournalCheckpoint(
+            "C:\\",
+            "NTFS",
+            99,
+            500,
+            SqliteSearchIndex.CurrentIndexContentVersion,
+            new DateTimeOffset(2026, 7, 9, 3, 0, 0, TimeSpan.Zero));
+
+        try
+        {
+            await using (var index = await SqliteSearchIndex.OpenAsync(dbPath, CancellationToken.None))
+            {
+                var result = await UsnJournalChangeApplier.ApplyAsync(
+                    index,
+                    [UsnJournalChange.DirectoryRenameOrMove()],
+                    checkpoint,
+                    CancellationToken.None);
+
+                var savedCheckpoint = await index.ReadVolumeCheckpointAsync("C:\\", CancellationToken.None);
+
+                Assert.True(result.RequiresFullRescan);
+                Assert.Equal(0, result.AppliedCount);
+                Assert.Null(savedCheckpoint);
+            }
+        }
+        finally
+        {
+            DeleteIfExists(dbPath);
+        }
+    }
+
+    [Fact]
     public async Task OpenClearsFilesWhenIndexContentVersionIsMissingAndPreservesUsage()
     {
         var dbPath = CreateTempDbPath();

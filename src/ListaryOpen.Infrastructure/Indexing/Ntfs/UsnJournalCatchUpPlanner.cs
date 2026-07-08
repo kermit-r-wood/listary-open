@@ -13,10 +13,14 @@ public sealed record UsnCatchUpPlan(UsnCatchUpAction Action, long StartUsn, long
 
 public static class UsnJournalCatchUpPlanner
 {
-    public static UsnCatchUpPlan Plan(UsnJournalCheckpoint? checkpoint, UsnJournalState journal)
+    public static UsnCatchUpPlan Plan(
+        UsnJournalCheckpoint? checkpoint,
+        UsnJournalState journal,
+        long currentRulesVersion)
     {
         if (checkpoint is null
             || checkpoint.UsnJournalId != journal.UsnJournalId
+            || checkpoint.RulesVersion != currentRulesVersion
             || checkpoint.NextUsn < journal.LowestValidUsn)
         {
             return new UsnCatchUpPlan(UsnCatchUpAction.FullRescan, 0, journal.NextUsn);

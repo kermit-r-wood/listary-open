@@ -54,6 +54,18 @@ internal static class NtfsNativeMethods
 
     [DllImport("kernel32.dll", SetLastError = true)]
     [return: MarshalAs(UnmanagedType.Bool)]
+    internal static extern bool DeviceIoControl(
+        IntPtr hDevice,
+        uint dwIoControlCode,
+        ref ReadUsnJournalDataV0 lpInBuffer,
+        int nInBufferSize,
+        [Out] byte[] lpOutBuffer,
+        int nOutBufferSize,
+        out int lpBytesReturned,
+        IntPtr lpOverlapped);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
     internal static extern bool CloseHandle(IntPtr hObject);
 
     [DllImport("kernel32.dll", SetLastError = true)]

@@ -315,18 +315,72 @@ public sealed class SqliteSearchIndex : ISearchIndex, IAsyncDisposable
 
     public async Task DeleteAsync(string fullPath, CancellationToken cancellationToken)
     {
-        var pathKey = CreatePathKey(fullPath);
+        await _connectionGate.WaitAsync(cancellationToken).ConfigureAwait(false);
+        try
+        {
+            ThrowIfDisposed();
+
+            await ExecuteDeleteAsync(fullPath, null, cancellationToken).ConfigureAwait(false);
+        }
+        finally
+        {
+            _connectionGate.Release();
+        }
+    }
+
+    internal async Task ApplyUsnJournalChangesAsync(
+        IEnumerable<UsnJournalIndexChange> changes,
+        UsnJournalCheckpoint checkpoint,
+        CancellationToken cancellationToken)
+    {
+        ArgumentNullException.ThrowIfNull(changes);
+        ArgumentNullException.ThrowIfNull(checkpoint);
+
+        var materializedChanges = changes.ToArray();
 
         await _connectionGate.WaitAsync(cancellationToken).ConfigureAwait(false);
         try
         {
             ThrowIfDisposed();
 
-            using var command = _connection.CreateCommand();
-            command.CommandText = "delete from files where path_key = $path_key;";
-            command.Parameters.AddWithValue("$path_key", pathKey);
+            using var transaction = _connection.BeginTransaction();
+            try
+            {
+                foreach (var change in materializedChanges)
+                {
+                    switch (change.Kind)
+                    {
+                        case UsnJournalIndexChangeKind.Upsert:
+                            await ExecuteUpsertAsync(
+                                change.Record!,
+                                DefaultIndexGeneration,
+                                transaction,
+                                cancellationToken).ConfigureAwait(false);
+                            break;
 
-            await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+                        case UsnJournalIndexChangeKind.Delete:
+                            await ExecuteDeleteAsync(
+                                change.FullPath!,
+                                transaction,
+                                cancellationToken).ConfigureAwait(false);
+                            break;
+
+                        default:
+                            throw new NotSupportedException($"Unsupported USN index change kind: {change.Kind}.");
+                    }
+                }
+
+                await ExecuteSaveVolumeCheckpointAsync(
+                    checkpoint,
+                    transaction,
+                    cancellationToken).ConfigureAwait(false);
+                await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
+            }
+            catch
+            {
+                await transaction.RollbackAsync(CancellationToken.None).ConfigureAwait(false);
+                throw;
+            }
         }
         finally
         {
@@ -594,39 +648,7 @@ public sealed class SqliteSearchIndex : ISearchIndex, IAsyncDisposable
         {
             ThrowIfDisposed();
 
-            using var command = _connection.CreateCommand();
-            command.CommandText = """
-                insert into volume_checkpoints(
-                    volume_root,
-                    file_system_name,
-                    usn_journal_id,
-                    next_usn,
-                    rules_version,
-                    last_full_scan_at
-                )
-                values(
-                    $volume_root,
-                    $file_system_name,
-                    $usn_journal_id,
-                    $next_usn,
-                    $rules_version,
-                    $last_full_scan_at
-                )
-                on conflict(volume_root) do update set
-                    file_system_name = excluded.file_system_name,
-                    usn_journal_id = excluded.usn_journal_id,
-                    next_usn = excluded.next_usn,
-                    rules_version = excluded.rules_version,
-                    last_full_scan_at = excluded.last_full_scan_at;
-                """;
-            command.Parameters.AddWithValue("$volume_root", checkpoint.VolumeRoot);
-            command.Parameters.AddWithValue("$file_system_name", checkpoint.FileSystemName);
-            command.Parameters.AddWithValue("$usn_journal_id", checkpoint.UsnJournalId.ToString(CultureInfo.InvariantCulture));
-            command.Parameters.AddWithValue("$next_usn", checkpoint.NextUsn.ToString(CultureInfo.InvariantCulture));
-            command.Parameters.AddWithValue("$rules_version", checkpoint.RulesVersion);
-            command.Parameters.AddWithValue("$last_full_scan_at", FormatDateTime(checkpoint.LastFullScanAt));
-
-            await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+            await ExecuteSaveVolumeCheckpointAsync(checkpoint, null, cancellationToken).ConfigureAwait(false);
         }
         finally
         {
@@ -856,6 +878,62 @@ public sealed class SqliteSearchIndex : ISearchIndex, IAsyncDisposable
         command.Parameters.AddWithValue("$size_bytes", record.SizeBytes);
         command.Parameters.AddWithValue("$last_write_time", FormatDateTime(record.LastWriteTime));
         command.Parameters.AddWithValue("$index_generation", indexGeneration);
+
+        await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+    }
+
+    private async Task ExecuteDeleteAsync(
+        string fullPath,
+        SqliteTransaction? transaction,
+        CancellationToken cancellationToken)
+    {
+        var pathKey = CreatePathKey(fullPath);
+
+        using var command = _connection.CreateCommand();
+        command.Transaction = transaction;
+        command.CommandText = "delete from files where path_key = $path_key;";
+        command.Parameters.AddWithValue("$path_key", pathKey);
+
+        await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+    }
+
+    private async Task ExecuteSaveVolumeCheckpointAsync(
+        UsnJournalCheckpoint checkpoint,
+        SqliteTransaction? transaction,
+        CancellationToken cancellationToken)
+    {
+        using var command = _connection.CreateCommand();
+        command.Transaction = transaction;
+        command.CommandText = """
+            insert into volume_checkpoints(
+                volume_root,
+                file_system_name,
+                usn_journal_id,
+                next_usn,
+                rules_version,
+                last_full_scan_at
+            )
+            values(
+                $volume_root,
+                $file_system_name,
+                $usn_journal_id,
+                $next_usn,
+                $rules_version,
+                $last_full_scan_at
+            )
+            on conflict(volume_root) do update set
+                file_system_name = excluded.file_system_name,
+                usn_journal_id = excluded.usn_journal_id,
+                next_usn = excluded.next_usn,
+                rules_version = excluded.rules_version,
+                last_full_scan_at = excluded.last_full_scan_at;
+            """;
+        command.Parameters.AddWithValue("$volume_root", checkpoint.VolumeRoot);
+        command.Parameters.AddWithValue("$file_system_name", checkpoint.FileSystemName);
+        command.Parameters.AddWithValue("$usn_journal_id", checkpoint.UsnJournalId.ToString(CultureInfo.InvariantCulture));
+        command.Parameters.AddWithValue("$next_usn", checkpoint.NextUsn.ToString(CultureInfo.InvariantCulture));
+        command.Parameters.AddWithValue("$rules_version", checkpoint.RulesVersion);
+        command.Parameters.AddWithValue("$last_full_scan_at", FormatDateTime(checkpoint.LastFullScanAt));
 
         await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
     }

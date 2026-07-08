@@ -7,7 +7,9 @@ internal sealed record NtfsUsnEntry(
     ulong FileReferenceNumber,
     ulong ParentFileReferenceNumber,
     string Name,
-    bool IsDirectory);
+    bool IsDirectory,
+    long Usn = 0,
+    uint Reason = 0);
 
 internal static class NtfsUsnRecordProjector
 {
