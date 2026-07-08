@@ -28,4 +28,35 @@ public sealed class SearchQueryTests
 
         Assert.Equal(500, query.Limit);
     }
+
+    [Fact]
+    public void ParsedQueryReadsExtensionPathPhraseAndExclusions()
+    {
+        var query = new SearchQuery("ext:pdf path:src \"search panel\" !archive", SearchMode.FilesAndFolders);
+
+        Assert.Equal(new[] { "search panel" }, query.Parsed.Phrases);
+        Assert.Equal(new[] { "src" }, query.Parsed.PathTerms);
+        Assert.Equal(new[] { "pdf" }, query.Parsed.Extensions);
+        Assert.Equal(new[] { "archive" }, query.Parsed.ExcludedTerms);
+        Assert.Equal("search panel", query.NormalizedText);
+    }
+
+    [Fact]
+    public void ParsedQueryReadsFolderFilter()
+    {
+        var query = new SearchQuery("folder: report", SearchMode.FilesAndFolders);
+
+        Assert.Equal(SearchMode.FoldersOnly, query.EffectiveMode);
+        Assert.Equal(new[] { "report" }, query.Parsed.Terms);
+    }
+
+    [Fact]
+    public void ParsedQueryReadsFileFilter()
+    {
+        var query = new SearchQuery("file: report", SearchMode.FoldersOnly);
+
+        Assert.True(query.Parsed.FileOnly);
+        Assert.Equal(SearchMode.FilesAndFolders, query.EffectiveMode);
+        Assert.Equal(new[] { "report" }, query.Parsed.Terms);
+    }
 }

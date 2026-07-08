@@ -337,20 +337,24 @@ public sealed class SqliteSearchIndex : ISearchIndex, IAsyncDisposable
     {
         ArgumentNullException.ThrowIfNull(query);
 
+        IReadOnlyList<FileRecord> candidates;
+        IReadOnlyList<UsageRecord> usage;
+
         await _connectionGate.WaitAsync(cancellationToken).ConfigureAwait(false);
         try
         {
             ThrowIfDisposed();
 
-            var candidates = await ReadCandidatesAsync(query, cancellationToken).ConfigureAwait(false);
-            var usage = await ReadUsageAsync(candidates.Select(record => record.PathKey), cancellationToken).ConfigureAwait(false);
-
-            return ResultRanker.Rank(query, candidates, usage, Array.Empty<string>());
+            candidates = await ReadCandidatesAsync(query, cancellationToken).ConfigureAwait(false);
+            usage = await ReadUsageAsync(candidates.Select(record => record.PathKey), cancellationToken).ConfigureAwait(false);
         }
         finally
         {
             _connectionGate.Release();
         }
+
+        cancellationToken.ThrowIfCancellationRequested();
+        return ResultRanker.Rank(query, candidates, usage, Array.Empty<string>());
     }
 
     public async ValueTask DisposeAsync()
@@ -751,14 +755,29 @@ public sealed class SqliteSearchIndex : ISearchIndex, IAsyncDisposable
     {
         var records = new Dictionary<string, FileRecord>(StringComparer.Ordinal);
         var candidateLimit = CreateCandidateLimit(query);
+        var useExpensiveFuzzy = NormalizeSearchText(query.NormalizedText).Length > 1;
 
         await AddExactCandidatesAsync(query, candidateLimit, records, cancellationToken).ConfigureAwait(false);
-        await AddFuzzyCandidatesAsync(query, candidateLimit, records, cancellationToken).ConfigureAwait(false);
+        cancellationToken.ThrowIfCancellationRequested();
+        if (useExpensiveFuzzy)
+        {
+            await AddFuzzyCandidatesAsync(query, candidateLimit, records, cancellationToken).ConfigureAwait(false);
+        }
+
+        cancellationToken.ThrowIfCancellationRequested();
         await AddUsageCandidatesAsync(query, candidateLimit, records, cancellationToken).ConfigureAwait(false);
-        await AddCombinedScoreCandidatesAsync(query, candidateLimit, records, cancellationToken).ConfigureAwait(false);
+        cancellationToken.ThrowIfCancellationRequested();
+        if (useExpensiveFuzzy)
+        {
+            await AddCombinedScoreCandidatesAsync(query, candidateLimit, records, cancellationToken).ConfigureAwait(false);
+        }
+
+        cancellationToken.ThrowIfCancellationRequested();
         await AddFallbackCandidatesAsync(query, records, cancellationToken).ConfigureAwait(false);
 
-        return records.Values.ToArray();
+        return records.Values
+            .Where(record => MatchesParsedFilters(query, record))
+            .ToArray();
     }
 
     private async Task AddExactCandidatesAsync(
@@ -922,9 +941,11 @@ public sealed class SqliteSearchIndex : ISearchIndex, IAsyncDisposable
         IDictionary<string, FileRecord> records,
         CancellationToken cancellationToken)
     {
-        var whereClause = query.Mode == SearchMode.FoldersOnly
-            ? "where is_directory = 1"
-            : string.Empty;
+        var whereClause = query.Parsed.FileOnly
+            ? "where is_directory = 0"
+            : query.EffectiveMode == SearchMode.FoldersOnly
+                ? "where is_directory = 1"
+                : string.Empty;
 
         using var command = _connection.CreateCommand();
         command.CommandText = $"""
@@ -943,6 +964,66 @@ public sealed class SqliteSearchIndex : ISearchIndex, IAsyncDisposable
         command.Parameters.AddWithValue("$limit", FallbackCandidateLimit);
 
         await AddRecordsAsync(command, records, cancellationToken).ConfigureAwait(false);
+    }
+
+    private static bool MatchesParsedFilters(SearchQuery query, FileRecord record)
+    {
+        if (query.Parsed.FileOnly && record.IsDirectory)
+        {
+            return false;
+        }
+
+        if (query.EffectiveMode == SearchMode.FoldersOnly && !record.IsDirectory)
+        {
+            return false;
+        }
+
+        if (query.Parsed.Extensions.Count > 0 &&
+            !query.Parsed.Extensions.Contains(GetExtension(record), StringComparer.OrdinalIgnoreCase))
+        {
+            return false;
+        }
+
+        if (query.Parsed.ExcludedExtensions.Contains(GetExtension(record), StringComparer.OrdinalIgnoreCase))
+        {
+            return false;
+        }
+
+        foreach (var term in query.Parsed.PathTerms)
+        {
+            if (!ContainsIgnoreCase(record.FullPath, term))
+            {
+                return false;
+            }
+        }
+
+        foreach (var phrase in query.Parsed.Phrases)
+        {
+            if (!ContainsIgnoreCase(record.FullPath, phrase))
+            {
+                return false;
+            }
+        }
+
+        foreach (var term in query.Parsed.ExcludedTerms)
+        {
+            if (ContainsIgnoreCase(record.FullPath, term))
+            {
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+    private static string GetExtension(FileRecord record)
+    {
+        return Path.GetExtension(record.Name).TrimStart('.');
+    }
+
+    private static bool ContainsIgnoreCase(string value, string term)
+    {
+        return value.Contains(term, StringComparison.OrdinalIgnoreCase);
     }
 
     private static async Task AddRecordsAsync(
@@ -1025,7 +1106,12 @@ public sealed class SqliteSearchIndex : ISearchIndex, IAsyncDisposable
 
     private static string CreateDirectoryFilter(SearchQuery query, string tablePrefix = "")
     {
-        return query.Mode == SearchMode.FoldersOnly ? $" and {tablePrefix}is_directory = 1" : string.Empty;
+        if (query.Parsed.FileOnly)
+        {
+            return $" and {tablePrefix}is_directory = 0";
+        }
+
+        return query.EffectiveMode == SearchMode.FoldersOnly ? $" and {tablePrefix}is_directory = 1" : string.Empty;
     }
 
     private static void RegisterSearchFunctions(SqliteConnection connection)

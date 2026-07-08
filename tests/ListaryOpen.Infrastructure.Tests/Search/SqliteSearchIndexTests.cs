@@ -174,6 +174,91 @@ public sealed class SqliteSearchIndexTests
     }
 
     [Fact]
+    public async Task SearchAppliesExtensionPathPhraseAndExclusionFilters()
+    {
+        var dbPath = CreateTempDbPath();
+
+        try
+        {
+            await using (var index = await SqliteSearchIndex.OpenAsync(dbPath, CancellationToken.None))
+            {
+                await index.UpsertManyAsync(new[]
+                {
+                    FileRecord.Create("C:\\src\\Search Panel.pdf", false, 10, DateTimeOffset.UtcNow),
+                    FileRecord.Create("C:\\src\\Search Panel archive.pdf", false, 10, DateTimeOffset.UtcNow),
+                    FileRecord.Create("C:\\docs\\Search Panel.pdf", false, 10, DateTimeOffset.UtcNow),
+                    FileRecord.Create("C:\\src\\Search Panel.txt", false, 10, DateTimeOffset.UtcNow)
+                }, CancellationToken.None);
+
+                var results = await index.SearchAsync(
+                    new SearchQuery("ext:pdf path:src \"Search Panel\" !archive", SearchMode.FilesAndFolders),
+                    CancellationToken.None);
+
+                var result = Assert.Single(results);
+                Assert.Equal("C:\\src\\Search Panel.pdf", result.Record.FullPath);
+            }
+        }
+        finally
+        {
+            DeleteIfExists(dbPath);
+        }
+    }
+
+    [Fact]
+    public async Task SearchFolderFilterReturnsOnlyFolders()
+    {
+        var dbPath = CreateTempDbPath();
+
+        try
+        {
+            await using (var index = await SqliteSearchIndex.OpenAsync(dbPath, CancellationToken.None))
+            {
+                await index.UpsertManyAsync(new[]
+                {
+                    FileRecord.Create("C:\\Reports", true, 0, DateTimeOffset.UtcNow),
+                    FileRecord.Create("C:\\Reports.txt", false, 10, DateTimeOffset.UtcNow)
+                }, CancellationToken.None);
+
+                var results = await index.SearchAsync(new SearchQuery("folder: report", SearchMode.FilesAndFolders), CancellationToken.None);
+
+                var result = Assert.Single(results);
+                Assert.True(result.Record.IsDirectory);
+            }
+        }
+        finally
+        {
+            DeleteIfExists(dbPath);
+        }
+    }
+
+    [Fact]
+    public async Task SearchFileFilterReturnsOnlyFiles()
+    {
+        var dbPath = CreateTempDbPath();
+
+        try
+        {
+            await using (var index = await SqliteSearchIndex.OpenAsync(dbPath, CancellationToken.None))
+            {
+                await index.UpsertManyAsync(new[]
+                {
+                    FileRecord.Create("C:\\Reports", true, 0, DateTimeOffset.UtcNow),
+                    FileRecord.Create("C:\\Reports.txt", false, 10, DateTimeOffset.UtcNow)
+                }, CancellationToken.None);
+
+                var results = await index.SearchAsync(new SearchQuery("file: report", SearchMode.FoldersOnly), CancellationToken.None);
+
+                var result = Assert.Single(results);
+                Assert.False(result.Record.IsDirectory);
+            }
+        }
+        finally
+        {
+            DeleteIfExists(dbPath);
+        }
+    }
+
+    [Fact]
     public async Task SearchReturnsFuzzyMatchOutsideFirstFiveThousandNames()
     {
         var dbPath = CreateTempDbPath();

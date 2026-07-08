@@ -34,7 +34,8 @@ public static class ResultRanker
         var now = DateTimeOffset.UtcNow;
 
         return records
-            .Where(record => query.Mode == SearchMode.FilesAndFolders || record.IsDirectory)
+            .Where(record => (query.EffectiveMode == SearchMode.FilesAndFolders || record.IsDirectory)
+                && (!query.Parsed.FileOnly || !record.IsDirectory))
             .Select(record => ScoreRecord(query, record, usage, pinned, now))
             .Where(result => result.Score > 0)
             .OrderByDescending(result => result.Score)

@@ -19,15 +19,22 @@ public sealed record SearchQuery
         Text = text;
         Mode = mode;
         Limit = Math.Min(limit, MaximumLimit);
+        Parsed = ParsedSearchQuery.Parse(text);
     }
 
     public string Text { get; }
 
     public SearchMode Mode { get; }
 
+    public SearchMode EffectiveMode => Parsed.FileOnly ? SearchMode.FilesAndFolders : Parsed.ModeOverride ?? Mode;
+
     public int Limit { get; }
 
-    public string NormalizedText => Text.Trim();
+    public ParsedSearchQuery Parsed { get; }
+
+    public string NormalizedText => string.IsNullOrWhiteSpace(Parsed.RankingText)
+        ? Text.Trim()
+        : Parsed.RankingText;
 }
 
 public enum SearchMode
