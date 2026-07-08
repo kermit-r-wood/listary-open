@@ -3,6 +3,7 @@ using System.Globalization;
 using ListaryOpen.Core.Indexing;
 using ListaryOpen.Core.Search;
 using ListaryOpen.Core.Usage;
+using ListaryOpen.Infrastructure.Indexing.Ntfs;
 using ListaryOpen.Infrastructure.Search;
 using Microsoft.Data.Sqlite;
 
@@ -326,6 +327,35 @@ public sealed class SqliteSearchIndexTests
 
                 var result = Assert.Single(results);
                 Assert.Equal("Invoice.xlsx", result.Record.Name);
+            }
+        }
+        finally
+        {
+            DeleteIfExists(dbPath);
+        }
+    }
+
+    [Fact]
+    public async Task VolumeCheckpointRoundTripsUnsignedValuesAsText()
+    {
+        var dbPath = CreateTempDbPath();
+
+        try
+        {
+            await using (var index = await SqliteSearchIndex.OpenAsync(dbPath, CancellationToken.None))
+            {
+                var checkpoint = new UsnJournalCheckpoint(
+                    "C:\\",
+                    "NTFS",
+                    ulong.MaxValue,
+                    long.MaxValue,
+                    SqliteSearchIndex.CurrentIndexContentVersion,
+                    new DateTimeOffset(2026, 7, 9, 1, 2, 3, TimeSpan.Zero));
+
+                await index.SaveVolumeCheckpointAsync(checkpoint, CancellationToken.None);
+                var roundTripped = await index.ReadVolumeCheckpointAsync("C:\\", CancellationToken.None);
+
+                Assert.Equal(checkpoint, roundTripped);
             }
         }
         finally

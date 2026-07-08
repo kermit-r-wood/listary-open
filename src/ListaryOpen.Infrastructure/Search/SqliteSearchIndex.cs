@@ -4,6 +4,7 @@ using System.Text;
 using ListaryOpen.Core.Indexing;
 using ListaryOpen.Core.Search;
 using ListaryOpen.Core.Usage;
+using ListaryOpen.Infrastructure.Indexing.Ntfs;
 using Microsoft.Data.Sqlite;
 
 namespace ListaryOpen.Infrastructure.Search;
@@ -403,6 +404,15 @@ public sealed class SqliteSearchIndex : ISearchIndex, IAsyncDisposable
                 key text not null primary key,
                 value text not null
             );
+
+            create table if not exists volume_checkpoints(
+                volume_root text not null primary key,
+                file_system_name text not null,
+                usn_journal_id text not null,
+                next_usn text not null,
+                rules_version integer not null,
+                last_full_scan_at text not null
+            );
             """;
 
         await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
@@ -571,6 +581,105 @@ public sealed class SqliteSearchIndex : ISearchIndex, IAsyncDisposable
         command.Parameters.AddWithValue("$value", value);
 
         await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+    }
+
+    internal async Task SaveVolumeCheckpointAsync(
+        UsnJournalCheckpoint checkpoint,
+        CancellationToken cancellationToken)
+    {
+        ArgumentNullException.ThrowIfNull(checkpoint);
+
+        await _connectionGate.WaitAsync(cancellationToken).ConfigureAwait(false);
+        try
+        {
+            ThrowIfDisposed();
+
+            using var command = _connection.CreateCommand();
+            command.CommandText = """
+                insert into volume_checkpoints(
+                    volume_root,
+                    file_system_name,
+                    usn_journal_id,
+                    next_usn,
+                    rules_version,
+                    last_full_scan_at
+                )
+                values(
+                    $volume_root,
+                    $file_system_name,
+                    $usn_journal_id,
+                    $next_usn,
+                    $rules_version,
+                    $last_full_scan_at
+                )
+                on conflict(volume_root) do update set
+                    file_system_name = excluded.file_system_name,
+                    usn_journal_id = excluded.usn_journal_id,
+                    next_usn = excluded.next_usn,
+                    rules_version = excluded.rules_version,
+                    last_full_scan_at = excluded.last_full_scan_at;
+                """;
+            command.Parameters.AddWithValue("$volume_root", checkpoint.VolumeRoot);
+            command.Parameters.AddWithValue("$file_system_name", checkpoint.FileSystemName);
+            command.Parameters.AddWithValue("$usn_journal_id", checkpoint.UsnJournalId.ToString(CultureInfo.InvariantCulture));
+            command.Parameters.AddWithValue("$next_usn", checkpoint.NextUsn.ToString(CultureInfo.InvariantCulture));
+            command.Parameters.AddWithValue("$rules_version", checkpoint.RulesVersion);
+            command.Parameters.AddWithValue("$last_full_scan_at", FormatDateTime(checkpoint.LastFullScanAt));
+
+            await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+        }
+        finally
+        {
+            _connectionGate.Release();
+        }
+    }
+
+    internal async Task<UsnJournalCheckpoint?> ReadVolumeCheckpointAsync(
+        string volumeRoot,
+        CancellationToken cancellationToken)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(volumeRoot);
+
+        await _connectionGate.WaitAsync(cancellationToken).ConfigureAwait(false);
+        try
+        {
+            ThrowIfDisposed();
+
+            using var command = _connection.CreateCommand();
+            command.CommandText = """
+                select
+                    volume_root,
+                    file_system_name,
+                    usn_journal_id,
+                    next_usn,
+                    rules_version,
+                    last_full_scan_at
+                from volume_checkpoints
+                where volume_root = $volume_root;
+                """;
+            command.Parameters.AddWithValue("$volume_root", volumeRoot);
+
+            var reader = await command.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
+            await using (reader.ConfigureAwait(false))
+            {
+                if (!await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
+                {
+                    return null;
+                }
+
+                return new UsnJournalCheckpoint(
+                    reader.GetString(0),
+                    reader.GetString(1),
+                    ulong.Parse(reader.GetString(2), NumberStyles.Integer, CultureInfo.InvariantCulture),
+                    long.Parse(reader.GetString(3), NumberStyles.Integer, CultureInfo.InvariantCulture),
+                    reader.GetInt64(4),
+                    ParseDateTime(reader.GetString(5)));
+            }
+        }
+        finally
+        {
+            _connectionGate.Release();
+        }
     }
 
     private static async Task AttachDatabaseAsync(

@@ -5,6 +5,7 @@ namespace ListaryOpen.Indexer.Elevated.Ntfs;
 internal static class NtfsNativeMethods
 {
     internal const uint FsctlEnumUsnData = 0x000900b3;
+    internal const uint FsctlReadUsnJournal = 0x000900bb;
     internal const uint FsctlQueryUsnJournal = 0x000900f4;
 
     internal const uint GenericRead = 0x80000000;
@@ -87,6 +88,22 @@ internal static class NtfsNativeMethods
         public ulong MaximumSize;
 
         public ulong AllocationDelta;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    internal struct ReadUsnJournalDataV0
+    {
+        public long StartUsn;
+
+        public uint ReasonMask;
+
+        public uint ReturnOnlyOnClose;
+
+        public ulong Timeout;
+
+        public ulong BytesToWaitFor;
+
+        public ulong UsnJournalId;
     }
 
     [StructLayout(LayoutKind.Sequential)]
