@@ -109,6 +109,21 @@ public sealed class NtfsUsnJournalReaderTests
         Assert.True(NtfsUsnJournalReader.IsAmbiguousJournalChange(entry));
     }
 
+    [Fact]
+    public void ThrowIfJournalRangeIncompleteRejectsShortRead()
+    {
+        var exception = Assert.Throws<InvalidDataException>(() =>
+            NtfsUsnJournalReader.ThrowIfJournalRangeIncomplete(reachedUsn: 199, endUsn: 200));
+
+        Assert.Contains("ended before requested range", exception.Message, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public void ThrowIfJournalRangeIncompleteAcceptsCompleteRead()
+    {
+        NtfsUsnJournalReader.ThrowIfJournalRangeIncomplete(reachedUsn: 200, endUsn: 200);
+    }
+
     private static byte[] CreateUsnRecordBuffer(
         string name,
         ulong fileReferenceNumber,

@@ -319,6 +319,7 @@ public sealed class NtfsUsnJournalReader
                 var error = Marshal.GetLastWin32Error();
                 if (error == NtfsNativeMethods.ErrorHandleEof)
                 {
+                    ThrowIfJournalRangeIncomplete(readData.StartUsn, endUsn);
                     yield break;
                 }
 
@@ -327,6 +328,7 @@ public sealed class NtfsUsnJournalReader
 
             if (bytesReturned <= UsnOutputPrefixLength)
             {
+                ThrowIfJournalRangeIncomplete(readData.StartUsn, endUsn);
                 yield break;
             }
 
@@ -341,6 +343,7 @@ public sealed class NtfsUsnJournalReader
 
             if (nextUsn <= readData.StartUsn)
             {
+                ThrowIfJournalRangeIncomplete(nextUsn, endUsn);
                 yield break;
             }
 
@@ -413,6 +416,14 @@ public sealed class NtfsUsnJournalReader
         return !entry.IsDirectory
             && HasAnyReason(entry, UsnReasonRenameOldName)
             && (HasAnyReason(entry, UsnReasonClose) || HasAnyReason(entry, UsnReasonRenameNewName));
+    }
+
+    internal static void ThrowIfJournalRangeIncomplete(long reachedUsn, long endUsn)
+    {
+        if (reachedUsn < endUsn)
+        {
+            throw new InvalidDataException("NTFS USN journal read ended before requested range was complete.");
+        }
     }
 
     private static NtfsNativeMethods.UsnJournalDataV0 QueryJournal(IntPtr handle)

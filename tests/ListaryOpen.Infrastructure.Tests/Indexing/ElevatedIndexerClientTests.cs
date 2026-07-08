@@ -538,6 +538,28 @@ public sealed class ElevatedIndexerClientTests
     }
 
     [Fact]
+    public async Task ReadJournalChangesAsyncThrowsWhenHelperDoesNotWriteChangesFile()
+    {
+        var tempDirectory = Path.Combine(Path.GetTempPath(), "listary-open-" + Guid.NewGuid());
+        Directory.CreateDirectory(tempDirectory);
+
+        try
+        {
+            var helperPath = CreateUsableHelperBundle(tempDirectory);
+            var client = new ElevatedIndexerClient(
+                helperPath,
+                (_, _, _, _) => new NoOutputElevatedIndexerProcess(exitCode: 0));
+
+            await Assert.ThrowsAsync<InvalidDataException>(
+                () => CollectChangesAsync(client.ReadJournalChangesAsync(new IndexRoot("C:\\Docs"), 9, 100, 200, CancellationToken.None)));
+        }
+        finally
+        {
+            Directory.Delete(tempDirectory, recursive: true);
+        }
+    }
+
+    [Fact]
     public async Task ScanNtfsAsyncThrowsInvalidDataExceptionWhenHelperOutputIsMalformed()
     {
         var tempDirectory = Path.Combine(Path.GetTempPath(), "listary-open-" + Guid.NewGuid());
@@ -763,6 +785,37 @@ public sealed class ElevatedIndexerClientTests
             File.WriteAllText(_errorPath, _error);
             return true;
         }
+
+        public Task<string> ReadStandardOutputToEndAsync(CancellationToken cancellationToken)
+            => Task.FromResult(string.Empty);
+
+        public Task<string> ReadStandardErrorToEndAsync(CancellationToken cancellationToken)
+            => Task.FromResult(string.Empty);
+
+        public Task WaitForExitAsync(CancellationToken cancellationToken)
+            => Task.CompletedTask;
+
+        public void Kill()
+        {
+        }
+
+        public void Dispose()
+        {
+        }
+    }
+
+    private sealed class NoOutputElevatedIndexerProcess : IElevatedIndexerProcess
+    {
+        public NoOutputElevatedIndexerProcess(int exitCode)
+        {
+            ExitCode = exitCode;
+        }
+
+        public int ExitCode { get; }
+
+        public bool HasExited => true;
+
+        public bool Start() => true;
 
         public Task<string> ReadStandardOutputToEndAsync(CancellationToken cancellationToken)
             => Task.FromResult(string.Empty);

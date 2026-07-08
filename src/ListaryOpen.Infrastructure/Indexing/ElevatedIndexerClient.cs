@@ -532,7 +532,7 @@ public sealed class ElevatedIndexerClient : IElevatedIndexerClient
     {
         if (!File.Exists(path))
         {
-            yield break;
+            throw new InvalidDataException("Elevated indexer journal changes output is missing.");
         }
 
         using var stream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read, bufferSize: 64 * 1024, useAsync: true);
