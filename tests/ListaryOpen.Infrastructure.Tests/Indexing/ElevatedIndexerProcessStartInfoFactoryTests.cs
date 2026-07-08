@@ -42,4 +42,36 @@ public sealed class ElevatedIndexerProcessStartInfoFactoryTests
             new[] { "scan-to-file", "C:\\Users\\paulx", "C:\\Temp\\records.jsonl", "C:\\Temp\\error.txt" },
             startInfo.ArgumentList);
     }
+
+    [Fact]
+    public void CreateRedirectedJournalStateFileUsesJournalStateCommand()
+    {
+        var startInfo = ElevatedIndexerProcessStartInfoFactory.CreateRedirectedJournalStateFile(
+            "C:\\Tools\\ListaryOpen.Indexer.Elevated.exe",
+            "C:\\Users\\paulx",
+            "C:\\Temp\\state.jsonl",
+            "C:\\Temp\\error.txt");
+
+        Assert.False(startInfo.UseShellExecute);
+        Assert.Equal(
+            new[] { "journal-state-to-file", "C:\\Users\\paulx", "C:\\Temp\\state.jsonl", "C:\\Temp\\error.txt" },
+            startInfo.ArgumentList);
+    }
+
+    [Fact]
+    public void CreateRedirectedJournalChangesFileUsesReadJournalCommand()
+    {
+        var startInfo = ElevatedIndexerProcessStartInfoFactory.CreateRedirectedJournalChangesFile(
+            "C:\\Tools\\ListaryOpen.Indexer.Elevated.exe",
+            "C:\\Users\\paulx",
+            startUsn: 100,
+            endUsn: 200,
+            "C:\\Temp\\changes.jsonl",
+            "C:\\Temp\\error.txt");
+
+        Assert.False(startInfo.UseShellExecute);
+        Assert.Equal(
+            new[] { "read-journal-to-file", "C:\\Users\\paulx", "100", "200", "C:\\Temp\\changes.jsonl", "C:\\Temp\\error.txt" },
+            startInfo.ArgumentList);
+    }
 }

@@ -1130,6 +1130,14 @@ public sealed class SqliteSearchIndexTests
         }
     }
 
+    [Fact]
+    public void SearchSkipsExpensiveFuzzyCandidatePassesForOneCharacterQueries()
+    {
+        Assert.False(SqliteSearchIndex.UsesExpensiveFuzzyCandidatesForTests(new SearchQuery("a", SearchMode.FilesAndFolders)));
+        Assert.False(SqliteSearchIndex.UsesExpensiveFuzzyCandidatesForTests(new SearchQuery("ext:txt a", SearchMode.FilesAndFolders)));
+        Assert.True(SqliteSearchIndex.UsesExpensiveFuzzyCandidatesForTests(new SearchQuery("ab", SearchMode.FilesAndFolders)));
+    }
+
     private static async Task InsertAlphabeticallyEarlierRowsAsync(SqliteSearchIndex index)
     {
         var lastWriteTime = DateTimeOffset.UtcNow;

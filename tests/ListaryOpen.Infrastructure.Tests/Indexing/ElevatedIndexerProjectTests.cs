@@ -176,6 +176,7 @@ public sealed class ElevatedIndexerProjectTests
         startInfo.ArgumentList.Add(projectPath);
         startInfo.ArgumentList.Add("--no-restore");
         startInfo.ArgumentList.Add("--nologo");
+        startInfo.ArgumentList.Add("--disable-build-servers");
         startInfo.ArgumentList.Add("-nr:false");
         startInfo.ArgumentList.Add("-p:BuildNativeHooks=false");
         startInfo.ArgumentList.Add("-p:BaseOutputPath=" + baseOutputPath);
@@ -191,6 +192,12 @@ public sealed class ElevatedIndexerProjectTests
             process.Kill(entireProcessTree: true);
             outputRoot.Delete(recursive: true);
             throw new TimeoutException("The temporary app build did not exit within the test timeout.");
+        }
+
+        if (!Task.WaitAll([stdoutTask, stderrTask], millisecondsTimeout: 10_000))
+        {
+            outputRoot.Delete(recursive: true);
+            throw new TimeoutException("The temporary app build output pipes did not close within the test timeout.");
         }
 
         var stdout = stdoutTask.GetAwaiter().GetResult();

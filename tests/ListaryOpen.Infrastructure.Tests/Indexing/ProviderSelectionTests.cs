@@ -1,5 +1,6 @@
 using ListaryOpen.Core.Indexing;
 using ListaryOpen.Infrastructure.Indexing;
+using ListaryOpen.Infrastructure.Indexing.Ntfs;
 
 namespace ListaryOpen.Infrastructure.Tests.Indexing;
 
@@ -152,6 +153,23 @@ public sealed class ProviderSelectionTests
             Root = root;
             CancellationToken = cancellationToken;
             return ScanResult;
+        }
+
+        public Task<UsnJournalState?> QueryJournalStateAsync(IndexRoot root, CancellationToken cancellationToken)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            return Task.FromResult<UsnJournalState?>(null);
+        }
+
+        public async IAsyncEnumerable<UsnJournalChange> ReadJournalChangesAsync(
+            IndexRoot root,
+            long startUsn,
+            long endUsn,
+            [System.Runtime.CompilerServices.EnumeratorCancellation] CancellationToken cancellationToken)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            await Task.CompletedTask;
+            yield break;
         }
 
         private static async IAsyncEnumerable<FileRecord> Empty()

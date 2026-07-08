@@ -1,8 +1,9 @@
 using ListaryOpen.Core.Indexing;
+using ListaryOpen.Infrastructure.Indexing.Ntfs;
 
 namespace ListaryOpen.Infrastructure.Indexing;
 
-public sealed class NtfsIndexProvider : IIndexProvider
+public sealed class NtfsIndexProvider : IIndexProvider, INtfsJournalProvider
 {
     public const string ProviderName = "NTFS";
 
@@ -26,5 +27,19 @@ public sealed class NtfsIndexProvider : IIndexProvider
     public IAsyncEnumerable<FileRecord> ScanAsync(IndexRoot root, CancellationToken cancellationToken)
     {
         return _client.ScanNtfsAsync(root, cancellationToken);
+    }
+
+    public Task<UsnJournalState?> QueryJournalStateAsync(IndexRoot root, CancellationToken cancellationToken)
+    {
+        return _client.QueryJournalStateAsync(root, cancellationToken);
+    }
+
+    public IAsyncEnumerable<UsnJournalChange> ReadJournalChangesAsync(
+        IndexRoot root,
+        long startUsn,
+        long endUsn,
+        CancellationToken cancellationToken)
+    {
+        return _client.ReadJournalChangesAsync(root, startUsn, endUsn, cancellationToken);
     }
 }

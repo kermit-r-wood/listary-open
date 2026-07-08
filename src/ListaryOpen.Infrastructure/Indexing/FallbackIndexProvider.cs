@@ -47,14 +47,19 @@ public sealed class FallbackIndexProvider : IIndexProvider
 
         var pending = new Stack<string>();
         pending.Push(root.Path);
+        var normalizedRootPath = NormalizePath(root.Path);
 
         while (pending.Count > 0)
         {
             cancellationToken.ThrowIfCancellationRequested();
 
             var current = pending.Pop();
+            var isRootEnumeration = string.Equals(
+                NormalizePath(current),
+                normalizedRootPath,
+                StringComparison.OrdinalIgnoreCase);
 
-            foreach (var directory in EnumerateDirectories(current, cancellationToken))
+            foreach (var directory in EnumerateDirectories(current, cancellationToken, isRootEnumeration))
             {
                 cancellationToken.ThrowIfCancellationRequested();
                 if (_exclusionRules.ShouldExcludeDirectoryPath(directory))
@@ -72,7 +77,7 @@ public sealed class FallbackIndexProvider : IIndexProvider
                 await Task.Yield();
             }
 
-            foreach (var file in EnumerateFiles(current, cancellationToken))
+            foreach (var file in EnumerateFiles(current, cancellationToken, isRootEnumeration))
             {
                 cancellationToken.ThrowIfCancellationRequested();
 
@@ -87,11 +92,29 @@ public sealed class FallbackIndexProvider : IIndexProvider
         }
     }
 
-    private static IEnumerable<string> EnumerateDirectories(string path, CancellationToken cancellationToken)
-        => EnumerateEntries(() => Directory.EnumerateDirectories(path, "*", EnumerationOptions), cancellationToken);
+    internal static IEnumerable<string> EnumerateEntriesForTests(
+        Func<IEnumerable<string>> enumerate,
+        CancellationToken cancellationToken,
+        bool failOnEnumerationFailure)
+        => EnumerateEntries(enumerate, cancellationToken, failOnEnumerationFailure);
 
-    private static IEnumerable<string> EnumerateFiles(string path, CancellationToken cancellationToken)
-        => EnumerateEntries(() => Directory.EnumerateFiles(path, "*", EnumerationOptions), cancellationToken);
+    private static IEnumerable<string> EnumerateDirectories(
+        string path,
+        CancellationToken cancellationToken,
+        bool failOnEnumerationFailure)
+        => EnumerateEntries(
+            () => Directory.EnumerateDirectories(path, "*", EnumerationOptions),
+            cancellationToken,
+            failOnEnumerationFailure);
+
+    private static IEnumerable<string> EnumerateFiles(
+        string path,
+        CancellationToken cancellationToken,
+        bool failOnEnumerationFailure)
+        => EnumerateEntries(
+            () => Directory.EnumerateFiles(path, "*", EnumerationOptions),
+            cancellationToken,
+            failOnEnumerationFailure);
 
     private static void EnsureRootCanBeEnumerated(string path, CancellationToken cancellationToken)
     {
@@ -117,7 +140,8 @@ public sealed class FallbackIndexProvider : IIndexProvider
 
     private static IEnumerable<string> EnumerateEntries(
         Func<IEnumerable<string>> enumerate,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        bool failOnEnumerationFailure)
     {
         IEnumerator<string> enumerator;
         try
@@ -126,6 +150,11 @@ public sealed class FallbackIndexProvider : IIndexProvider
         }
         catch (Exception exception) when (IsExpectedFileSystemException(exception))
         {
+            if (failOnEnumerationFailure)
+            {
+                throw new IOException("Index root could not be enumerated.", exception);
+            }
+
             yield break;
         }
 
@@ -147,6 +176,11 @@ public sealed class FallbackIndexProvider : IIndexProvider
                 }
                 catch (Exception exception) when (IsExpectedFileSystemException(exception))
                 {
+                    if (failOnEnumerationFailure)
+                    {
+                        throw new IOException("Index root could not be enumerated.", exception);
+                    }
+
                     yield break;
                 }
 
@@ -199,5 +233,11 @@ public sealed class FallbackIndexProvider : IIndexProvider
         return exception is IOException
             or UnauthorizedAccessException
             or SecurityException;
+    }
+
+    private static string NormalizePath(string path)
+    {
+        var fullPath = Path.GetFullPath(path);
+        return Path.TrimEndingDirectorySeparator(fullPath);
     }
 }

@@ -77,11 +77,32 @@ public static class UsnJournalChangeApplier
         UsnJournalCheckpoint nextCheckpoint,
         CancellationToken cancellationToken)
     {
+        ArgumentNullException.ThrowIfNull(changes);
+
+        return await ApplyAsync(
+                index,
+                ToAsyncEnumerable(changes, cancellationToken),
+                nextCheckpoint,
+                cancellationToken)
+            .ConfigureAwait(false);
+    }
+
+    public static async Task<UsnJournalApplyResult> ApplyAsync(
+        SqliteSearchIndex index,
+        IAsyncEnumerable<UsnJournalChange> changes,
+        UsnJournalCheckpoint nextCheckpoint,
+        CancellationToken cancellationToken)
+    {
         ArgumentNullException.ThrowIfNull(index);
         ArgumentNullException.ThrowIfNull(changes);
         ArgumentNullException.ThrowIfNull(nextCheckpoint);
 
-        var materializedChanges = changes.ToArray();
+        var materializedChanges = new List<UsnJournalChange>();
+        await foreach (var change in changes.WithCancellation(cancellationToken).ConfigureAwait(false))
+        {
+            materializedChanges.Add(change);
+        }
+
         if (materializedChanges.Any(change => change.Kind == UsnJournalChangeKind.DirectoryRenameOrMove))
         {
             return new UsnJournalApplyResult(
@@ -122,7 +143,19 @@ public static class UsnJournalChangeApplier
 
         return new UsnJournalApplyResult(
             RequiresFullRescan: false,
-            AppliedCount: materializedChanges.Length,
+            AppliedCount: materializedChanges.Count,
             nextCheckpoint.NextUsn);
+    }
+
+    private static async IAsyncEnumerable<UsnJournalChange> ToAsyncEnumerable(
+        IEnumerable<UsnJournalChange> changes,
+        [System.Runtime.CompilerServices.EnumeratorCancellation] CancellationToken cancellationToken)
+    {
+        foreach (var change in changes)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            yield return change;
+            await Task.Yield();
+        }
     }
 }

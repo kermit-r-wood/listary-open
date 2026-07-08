@@ -145,6 +145,37 @@ public sealed class FallbackIndexProviderTests
         Assert.False(FallbackIndexProvider.RootProbeIgnoresInaccessibleForTests);
     }
 
+    [Fact]
+    public void RootEnumerationFailureIsFatalAfterProbeSucceeds()
+    {
+        static IEnumerable<string> ThrowAccessDenied()
+        {
+            throw new UnauthorizedAccessException("root became inaccessible");
+        }
+
+        var exception = Assert.Throws<IOException>(() =>
+            FallbackIndexProvider
+                .EnumerateEntriesForTests(ThrowAccessDenied, CancellationToken.None, failOnEnumerationFailure: true)
+                .ToList());
+
+        Assert.Contains("could not be enumerated", exception.Message, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public void ChildEnumerationFailureIsSkippedAfterProbeSucceeds()
+    {
+        static IEnumerable<string> ThrowAccessDenied()
+        {
+            throw new UnauthorizedAccessException("child is inaccessible");
+        }
+
+        var entries = FallbackIndexProvider
+            .EnumerateEntriesForTests(ThrowAccessDenied, CancellationToken.None, failOnEnumerationFailure: false)
+            .ToList();
+
+        Assert.Empty(entries);
+    }
+
     [Theory]
     [InlineData(true, true)]
     [InlineData(false, false)]

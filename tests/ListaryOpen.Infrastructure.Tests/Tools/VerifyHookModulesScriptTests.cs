@@ -5,7 +5,7 @@ namespace ListaryOpen.Infrastructure.Tests.Tools;
 public sealed class VerifyHookModulesScriptTests
 {
     [Fact]
-    public void DefaultModeReportsMissingRequiredTargetsForUnknownProcessName()
+    public async Task DefaultModeReportsMissingRequiredTargetsForUnknownProcessName()
     {
         var missingProcessName = "__listary_missing_target_" + Guid.NewGuid().ToString("N");
         using var process = StartPowerShell(
@@ -17,11 +17,32 @@ public sealed class VerifyHookModulesScriptTests
             "-ProcessNames",
             missingProcessName,
             "-SkipDialogPing");
+        var stdoutTask = process.StandardOutput.ReadToEndAsync();
+        var stderrTask = process.StandardError.ReadToEndAsync();
 
-        var stdout = process.StandardOutput.ReadToEnd();
-        var stderr = process.StandardError.ReadToEnd();
+        using var processTimeout = new CancellationTokenSource(TimeSpan.FromSeconds(30));
+        try
+        {
+            await process.WaitForExitAsync(processTimeout.Token);
+        }
+        catch (OperationCanceledException)
+        {
+            process.Kill(entireProcessTree: true);
+            throw new TimeoutException("Hook verification script did not exit within the test timeout.");
+        }
 
-        Assert.True(process.WaitForExit(milliseconds: 30_000), "Hook verification script did not exit within the test timeout.");
+        using var outputTimeout = new CancellationTokenSource(TimeSpan.FromSeconds(5));
+        try
+        {
+            await Task.WhenAll(stdoutTask, stderrTask).WaitAsync(outputTimeout.Token);
+        }
+        catch (OperationCanceledException)
+        {
+            throw new TimeoutException("Hook verification script output pipes did not close within the test timeout.");
+        }
+
+        var stdout = await stdoutTask;
+        var stderr = await stderrTask;
         Assert.NotEqual(0, process.ExitCode);
         Assert.Contains("RequiredTargetMissing", stdout + stderr, StringComparison.Ordinal);
         Assert.Contains("Required target dialog owner processes were not found.", stdout + stderr, StringComparison.Ordinal);

@@ -8,6 +8,7 @@ using System.Text.Json;
 using System.Text.Json.Serialization;
 using ListaryOpen.Core.Indexing;
 using ListaryOpen.Infrastructure.AppData;
+using ListaryOpen.Infrastructure.Indexing.Ntfs;
 
 namespace ListaryOpen.Infrastructure.Indexing;
 
@@ -16,6 +17,14 @@ public interface IElevatedIndexerClient
     bool IsAvailable { get; }
 
     IAsyncEnumerable<FileRecord> ScanNtfsAsync(IndexRoot root, CancellationToken cancellationToken);
+
+    Task<UsnJournalState?> QueryJournalStateAsync(IndexRoot root, CancellationToken cancellationToken);
+
+    IAsyncEnumerable<UsnJournalChange> ReadJournalChangesAsync(
+        IndexRoot root,
+        long startUsn,
+        long endUsn,
+        CancellationToken cancellationToken);
 }
 
 internal interface IElevatedIndexerProcess : IDisposable
@@ -45,6 +54,23 @@ public sealed class DisabledElevatedIndexerClient : IElevatedIndexerClient
         await Task.CompletedTask;
         yield break;
     }
+
+    public Task<UsnJournalState?> QueryJournalStateAsync(IndexRoot root, CancellationToken cancellationToken)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        return Task.FromResult<UsnJournalState?>(null);
+    }
+
+    public async IAsyncEnumerable<UsnJournalChange> ReadJournalChangesAsync(
+        IndexRoot root,
+        long startUsn,
+        long endUsn,
+        [EnumeratorCancellation] CancellationToken cancellationToken)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        await Task.CompletedTask;
+        yield break;
+    }
 }
 
 public sealed class ElevatedIndexerClient : IElevatedIndexerClient
@@ -55,8 +81,8 @@ public sealed class ElevatedIndexerClient : IElevatedIndexerClient
     private const string HelperRuntimeConfigName = "ListaryOpen.Indexer.Elevated.runtimeconfig.json";
 
     private readonly Func<string?> _resolveHelperPath;
-    private readonly Func<string, string, string, string, IElevatedIndexerProcess> _createFileProcess;
-    private readonly Func<string, string, string, string, IElevatedIndexerProcess> _createElevatedProcess;
+    private readonly Func<HelperFileCommand, string, string, long, long, string, string, IElevatedIndexerProcess> _createFileProcess;
+    private readonly Func<HelperFileCommand, string, string, long, long, string, string, IElevatedIndexerProcess> _createElevatedProcess;
     private readonly Func<bool> _isProcessElevated;
     private readonly Func<bool>? _isUacElevationEnabledOverride;
     private readonly string _indexerTempDirectory;
@@ -102,7 +128,7 @@ public sealed class ElevatedIndexerClient : IElevatedIndexerClient
         Func<string, string, string, string, IElevatedIndexerProcess> createFileProcess)
         : this(
             () => helperPath,
-            createFileProcess,
+            WrapFileProcess(createFileProcess),
             CreateElevatedProcess,
             () => true,
             null,
@@ -117,7 +143,7 @@ public sealed class ElevatedIndexerClient : IElevatedIndexerClient
         Func<bool> isProcessElevated)
         : this(
             () => helperPath,
-            createFileProcess,
+            WrapFileProcess(createFileProcess),
             CreateElevatedProcess,
             isProcessElevated,
             null,
@@ -135,8 +161,8 @@ public sealed class ElevatedIndexerClient : IElevatedIndexerClient
         string? indexerTempDirectory = null)
         : this(
             () => helperPath,
-            createFileProcess,
-            createElevatedProcess,
+            WrapFileProcess(createFileProcess),
+            WrapFileProcess(createElevatedProcess),
             isProcessElevated,
             isUacElevationEnabled,
             indexerTempDirectory ?? AppDataPaths.CreateDefault().IndexerTempDirectory)
@@ -146,8 +172,8 @@ public sealed class ElevatedIndexerClient : IElevatedIndexerClient
 
     private ElevatedIndexerClient(
         Func<string?> resolveHelperPath,
-        Func<string, string, string, string, IElevatedIndexerProcess> createFileProcess,
-        Func<string, string, string, string, IElevatedIndexerProcess> createElevatedProcess,
+        Func<HelperFileCommand, string, string, long, long, string, string, IElevatedIndexerProcess> createFileProcess,
+        Func<HelperFileCommand, string, string, long, long, string, string, IElevatedIndexerProcess> createElevatedProcess,
         Func<bool> isProcessElevated,
         Func<bool>? isUacElevationEnabled,
         string indexerTempDirectory)
@@ -199,6 +225,87 @@ public sealed class ElevatedIndexerClient : IElevatedIndexerClient
         }
     }
 
+    public async Task<UsnJournalState?> QueryJournalStateAsync(
+        IndexRoot root,
+        CancellationToken cancellationToken)
+    {
+        ArgumentNullException.ThrowIfNull(root);
+        cancellationToken.ThrowIfCancellationRequested();
+
+        if (!TryResolveAvailableHelperPath(out var helperPath, out var launchMode))
+        {
+            Trace.TraceWarning("Elevated indexer helper is not available at '{0}'.", helperPath ?? "<unresolved>");
+            return null;
+        }
+
+        var outputPath = CreateTempIndexerFilePath(".jsonl");
+        var errorPath = CreateTempIndexerFilePath(".err");
+        try
+        {
+            await WriteHelperOutputFileAsync(
+                    HelperFileCommand.JournalState,
+                    helperPath!,
+                    root.Path,
+                    startUsn: 0,
+                    endUsn: 0,
+                    outputPath,
+                    errorPath,
+                    launchMode,
+                    cancellationToken)
+                .ConfigureAwait(false);
+
+            return await ParseJournalStateFileIfExistsAsync(outputPath, cancellationToken).ConfigureAwait(false);
+        }
+        finally
+        {
+            TryDeleteFile(outputPath);
+            TryDeleteFile(errorPath);
+        }
+    }
+
+    public async IAsyncEnumerable<UsnJournalChange> ReadJournalChangesAsync(
+        IndexRoot root,
+        long startUsn,
+        long endUsn,
+        [EnumeratorCancellation] CancellationToken cancellationToken)
+    {
+        ArgumentNullException.ThrowIfNull(root);
+        cancellationToken.ThrowIfCancellationRequested();
+
+        if (!TryResolveAvailableHelperPath(out var helperPath, out var launchMode))
+        {
+            Trace.TraceWarning("Elevated indexer helper is not available at '{0}'.", helperPath ?? "<unresolved>");
+            yield break;
+        }
+
+        var outputPath = CreateTempIndexerFilePath(".jsonl");
+        var errorPath = CreateTempIndexerFilePath(".err");
+        try
+        {
+            await WriteHelperOutputFileAsync(
+                    HelperFileCommand.JournalChanges,
+                    helperPath!,
+                    root.Path,
+                    startUsn,
+                    endUsn,
+                    outputPath,
+                    errorPath,
+                    launchMode,
+                    cancellationToken)
+                .ConfigureAwait(false);
+
+            await foreach (var change in ParseJournalChangesFileIfExistsAsync(outputPath, cancellationToken).ConfigureAwait(false))
+            {
+                yield return change;
+            }
+        }
+        finally
+        {
+            TryDeleteFile(outputPath);
+            TryDeleteFile(errorPath);
+        }
+    }
+
     private async IAsyncEnumerable<FileRecord> RunHelperToFileAsync(
         string helperPath,
         string rootPath,
@@ -212,8 +319,11 @@ public sealed class ElevatedIndexerClient : IElevatedIndexerClient
         try
         {
             await WriteHelperOutputFileAsync(
+                    HelperFileCommand.Scan,
                     helperPath,
                     rootPath,
+                    startUsn: 0,
+                    endUsn: 0,
                     outputPath,
                     errorPath,
                     launchMode,
@@ -232,16 +342,19 @@ public sealed class ElevatedIndexerClient : IElevatedIndexerClient
     }
 
     private async Task WriteHelperOutputFileAsync(
+        HelperFileCommand command,
         string helperPath,
         string rootPath,
+        long startUsn,
+        long endUsn,
         string outputPath,
         string errorPath,
         HelperLaunchMode launchMode,
         CancellationToken cancellationToken)
     {
         using var process = launchMode == HelperLaunchMode.UacFile
-            ? _createElevatedProcess(helperPath, rootPath, outputPath, errorPath)
-            : _createFileProcess(helperPath, rootPath, outputPath, errorPath);
+            ? _createElevatedProcess(command, helperPath, rootPath, startUsn, endUsn, outputPath, errorPath)
+            : _createFileProcess(command, helperPath, rootPath, startUsn, endUsn, outputPath, errorPath);
 
         try
         {
@@ -371,37 +484,183 @@ public sealed class ElevatedIndexerClient : IElevatedIndexerClient
         }
     }
 
+    private static async Task<UsnJournalState?> ParseJournalStateFileIfExistsAsync(
+        string path,
+        CancellationToken cancellationToken)
+    {
+        if (!File.Exists(path))
+        {
+            return null;
+        }
+
+        using var stream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read, bufferSize: 64 * 1024, useAsync: true);
+        using var reader = new StreamReader(stream);
+        var line = await reader.ReadLineAsync(cancellationToken).ConfigureAwait(false);
+        if (string.IsNullOrWhiteSpace(line))
+        {
+            return null;
+        }
+
+        try
+        {
+            var dto = JsonSerializer.Deserialize<UsnJournalStateDto>(line);
+            if (dto?.UsnJournalId is null || dto.LowestValidUsn is null || dto.NextUsn is null)
+            {
+                throw new InvalidDataException("Journal state is missing one or more required fields.");
+            }
+
+            return new UsnJournalState(
+                dto.UsnJournalId.GetValueOrDefault(),
+                dto.LowestValidUsn.GetValueOrDefault(),
+                dto.NextUsn.GetValueOrDefault());
+        }
+        catch (Exception exception) when (exception is JsonException or InvalidDataException)
+        {
+            throw new InvalidDataException("Invalid elevated indexer journal state output.", exception);
+        }
+    }
+
+    private static async IAsyncEnumerable<UsnJournalChange> ParseJournalChangesFileIfExistsAsync(
+        string path,
+        [EnumeratorCancellation] CancellationToken cancellationToken)
+    {
+        if (!File.Exists(path))
+        {
+            yield break;
+        }
+
+        using var stream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read, bufferSize: 64 * 1024, useAsync: true);
+        using var reader = new StreamReader(stream);
+        var lineNumber = 0;
+        while (await reader.ReadLineAsync(cancellationToken).ConfigureAwait(false) is { } line)
+        {
+            lineNumber++;
+            if (string.IsNullOrWhiteSpace(line))
+            {
+                continue;
+            }
+
+            yield return ParseJournalChange(line, lineNumber);
+        }
+    }
+
+    private static UsnJournalChange ParseJournalChange(string line, int lineNumber)
+    {
+        try
+        {
+            var dto = JsonSerializer.Deserialize<UsnJournalChangeDto>(line);
+            if (dto?.Kind is null)
+            {
+                throw new InvalidDataException("Journal change is missing kind.");
+            }
+
+            return dto.Kind switch
+            {
+                "upsert" => UsnJournalChange.Upsert(FileRecord.Create(
+                    dto.FullPath ?? throw new InvalidDataException("Upsert change is missing full path."),
+                    dto.IsDirectory ?? throw new InvalidDataException("Upsert change is missing directory flag."),
+                    dto.SizeBytes ?? throw new InvalidDataException("Upsert change is missing size."),
+                    dto.LastWriteTime ?? throw new InvalidDataException("Upsert change is missing last write time."))),
+                "delete" => UsnJournalChange.Delete(
+                    dto.FullPath ?? throw new InvalidDataException("Delete change is missing full path.")),
+                "fileRename" => UsnJournalChange.FileRename(
+                    dto.OldFullPath ?? throw new InvalidDataException("File rename change is missing old full path."),
+                    FileRecord.Create(
+                        dto.FullPath ?? throw new InvalidDataException("File rename change is missing full path."),
+                        dto.IsDirectory ?? throw new InvalidDataException("File rename change is missing directory flag."),
+                        dto.SizeBytes ?? throw new InvalidDataException("File rename change is missing size."),
+                        dto.LastWriteTime ?? throw new InvalidDataException("File rename change is missing last write time."))),
+                "directoryRenameOrMove" => UsnJournalChange.DirectoryRenameOrMove(),
+                _ => throw new InvalidDataException($"Unsupported journal change kind: {dto.Kind}.")
+            };
+        }
+        catch (Exception exception) when (exception is JsonException
+                                          or InvalidDataException
+                                          or ArgumentException
+                                          or ArgumentOutOfRangeException)
+        {
+            throw new InvalidDataException(
+                $"Invalid elevated indexer journal change output on line {lineNumber}.",
+                exception);
+        }
+    }
+
+    private static Func<HelperFileCommand, string, string, long, long, string, string, IElevatedIndexerProcess> WrapFileProcess(
+        Func<string, string, string, string, IElevatedIndexerProcess> createProcess)
+    {
+        return (_, helperPath, rootPath, _, _, outputPath, errorPath) =>
+            createProcess(helperPath, rootPath, outputPath, errorPath);
+    }
+
     private static IElevatedIndexerProcess CreateFileProcess(
+        HelperFileCommand command,
         string helperPath,
         string rootPath,
+        long startUsn,
+        long endUsn,
         string outputPath,
         string errorPath)
     {
         var process = new Process
         {
-            StartInfo = ElevatedIndexerProcessStartInfoFactory.CreateRedirectedFile(
-                helperPath,
-                rootPath,
-                outputPath,
-                errorPath)
+            StartInfo = command switch
+            {
+                HelperFileCommand.Scan => ElevatedIndexerProcessStartInfoFactory.CreateRedirectedFile(
+                    helperPath,
+                    rootPath,
+                    outputPath,
+                    errorPath),
+                HelperFileCommand.JournalState => ElevatedIndexerProcessStartInfoFactory.CreateRedirectedJournalStateFile(
+                    helperPath,
+                    rootPath,
+                    outputPath,
+                    errorPath),
+                HelperFileCommand.JournalChanges => ElevatedIndexerProcessStartInfoFactory.CreateRedirectedJournalChangesFile(
+                    helperPath,
+                    rootPath,
+                    startUsn,
+                    endUsn,
+                    outputPath,
+                    errorPath),
+                _ => throw new NotSupportedException($"Unsupported helper command: {command}.")
+            }
         };
 
         return new ElevatedIndexerProcess(process);
     }
 
     private static IElevatedIndexerProcess CreateElevatedProcess(
+        HelperFileCommand command,
         string helperPath,
         string rootPath,
+        long startUsn,
+        long endUsn,
         string outputPath,
         string errorPath)
     {
         var process = new Process
         {
-            StartInfo = ElevatedIndexerProcessStartInfoFactory.CreateUacFile(
-                helperPath,
-                rootPath,
-                outputPath,
-                errorPath)
+            StartInfo = command switch
+            {
+                HelperFileCommand.Scan => ElevatedIndexerProcessStartInfoFactory.CreateUacFile(
+                    helperPath,
+                    rootPath,
+                    outputPath,
+                    errorPath),
+                HelperFileCommand.JournalState => ElevatedIndexerProcessStartInfoFactory.CreateUacJournalStateFile(
+                    helperPath,
+                    rootPath,
+                    outputPath,
+                    errorPath),
+                HelperFileCommand.JournalChanges => ElevatedIndexerProcessStartInfoFactory.CreateUacJournalChangesFile(
+                    helperPath,
+                    rootPath,
+                    startUsn,
+                    endUsn,
+                    outputPath,
+                    errorPath),
+                _ => throw new NotSupportedException($"Unsupported helper command: {command}.")
+            }
         };
 
         return new ElevatedIndexerProcess(process);
@@ -650,10 +909,50 @@ public sealed class ElevatedIndexerClient : IElevatedIndexerClient
         UacFile
     }
 
+    private enum HelperFileCommand
+    {
+        Scan,
+        JournalState,
+        JournalChanges
+    }
+
     private sealed class ElevatedIndexerRecordDto
     {
         [JsonPropertyName("fullPath")]
         public string? FullPath { get; init; }
+
+        [JsonPropertyName("isDirectory")]
+        public bool? IsDirectory { get; init; }
+
+        [JsonPropertyName("sizeBytes")]
+        public long? SizeBytes { get; init; }
+
+        [JsonPropertyName("lastWriteTime")]
+        public DateTimeOffset? LastWriteTime { get; init; }
+    }
+
+    private sealed class UsnJournalStateDto
+    {
+        [JsonPropertyName("usnJournalId")]
+        public ulong? UsnJournalId { get; init; }
+
+        [JsonPropertyName("lowestValidUsn")]
+        public long? LowestValidUsn { get; init; }
+
+        [JsonPropertyName("nextUsn")]
+        public long? NextUsn { get; init; }
+    }
+
+    private sealed class UsnJournalChangeDto
+    {
+        [JsonPropertyName("kind")]
+        public string? Kind { get; init; }
+
+        [JsonPropertyName("fullPath")]
+        public string? FullPath { get; init; }
+
+        [JsonPropertyName("oldFullPath")]
+        public string? OldFullPath { get; init; }
 
         [JsonPropertyName("isDirectory")]
         public bool? IsDirectory { get; init; }

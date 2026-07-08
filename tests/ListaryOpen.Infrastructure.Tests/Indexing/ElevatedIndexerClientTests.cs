@@ -3,6 +3,7 @@ using System.Diagnostics;
 using System.Text;
 using ListaryOpen.Core.Indexing;
 using ListaryOpen.Infrastructure.Indexing;
+using ListaryOpen.Infrastructure.Indexing.Ntfs;
 
 namespace ListaryOpen.Infrastructure.Tests.Indexing;
 
@@ -439,6 +440,87 @@ public sealed class ElevatedIndexerClientTests
                     Assert.Equal(0, record.SizeBytes);
                     Assert.Equal(new DateTimeOffset(2026, 7, 3, 0, 1, 0, TimeSpan.Zero), record.LastWriteTime);
                 });
+        }
+        finally
+        {
+            Directory.Delete(tempDirectory, recursive: true);
+        }
+    }
+
+    [Fact]
+    public async Task QueryJournalStateAsyncParsesJsonStateFromHelperOutput()
+    {
+        var tempDirectory = Path.Combine(Path.GetTempPath(), "listary-open-" + Guid.NewGuid());
+        Directory.CreateDirectory(tempDirectory);
+
+        try
+        {
+            var helperPath = CreateUsableHelperBundle(tempDirectory);
+            var client = new ElevatedIndexerClient(
+                helperPath,
+                (_, _, outputPath, errorPath) => new FileWritingElevatedIndexerProcess(
+                    outputPath,
+                    errorPath,
+                    output: "{\"usnJournalId\":9,\"lowestValidUsn\":50,\"nextUsn\":200}",
+                    error: string.Empty,
+                    exitCode: 0));
+
+            var state = await client.QueryJournalStateAsync(new IndexRoot("C:\\Docs"), CancellationToken.None);
+
+            Assert.NotNull(state);
+            Assert.Equal(9ul, state!.UsnJournalId);
+            Assert.Equal(50, state.LowestValidUsn);
+            Assert.Equal(200, state.NextUsn);
+        }
+        finally
+        {
+            Directory.Delete(tempDirectory, recursive: true);
+        }
+    }
+
+    [Fact]
+    public async Task ReadJournalChangesAsyncParsesJsonChangesFromHelperOutput()
+    {
+        var tempDirectory = Path.Combine(Path.GetTempPath(), "listary-open-" + Guid.NewGuid());
+        Directory.CreateDirectory(tempDirectory);
+
+        try
+        {
+            var helperPath = CreateUsableHelperBundle(tempDirectory);
+            var output = string.Join(
+                Environment.NewLine,
+                "{\"kind\":\"delete\",\"fullPath\":\"C:\\\\Docs\\\\OldName.txt\"}",
+                "{\"kind\":\"upsert\",\"fullPath\":\"C:\\\\Docs\\\\NewName.txt\",\"isDirectory\":false,\"sizeBytes\":42,\"lastWriteTime\":\"2026-07-09T00:00:00+00:00\"}",
+                "{\"kind\":\"directoryRenameOrMove\"}");
+            var client = new ElevatedIndexerClient(
+                helperPath,
+                (_, _, outputPath, errorPath) => new FileWritingElevatedIndexerProcess(
+                    outputPath,
+                    errorPath,
+                    output,
+                    error: string.Empty,
+                    exitCode: 0));
+
+            var changes = new List<UsnJournalChange>();
+            await foreach (var change in client.ReadJournalChangesAsync(new IndexRoot("C:\\Docs"), 100, 200, CancellationToken.None))
+            {
+                changes.Add(change);
+            }
+
+            Assert.Collection(
+                changes,
+                change =>
+                {
+                    Assert.Equal(UsnJournalChangeKind.Delete, change.Kind);
+                    Assert.Equal("C:\\Docs\\OldName.txt", change.FullPath);
+                },
+                change =>
+                {
+                    Assert.Equal(UsnJournalChangeKind.Upsert, change.Kind);
+                    Assert.Equal("C:\\Docs\\NewName.txt", change.Record!.FullPath);
+                    Assert.Equal(42, change.Record.SizeBytes);
+                },
+                change => Assert.Equal(UsnJournalChangeKind.DirectoryRenameOrMove, change.Kind));
         }
         finally
         {

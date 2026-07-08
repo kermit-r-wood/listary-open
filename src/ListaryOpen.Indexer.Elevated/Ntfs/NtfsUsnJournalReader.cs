@@ -9,6 +9,27 @@ namespace ListaryOpen.Indexer.Elevated.Ntfs;
 
 public sealed class NtfsUsnJournalReader
 {
+    private const uint UsnReasonDataOverwrite = 0x0000_0001;
+    private const uint UsnReasonDataExtend = 0x0000_0002;
+    private const uint UsnReasonDataTruncation = 0x0000_0004;
+    private const uint UsnReasonNamedDataOverwrite = 0x0000_0010;
+    private const uint UsnReasonNamedDataExtend = 0x0000_0020;
+    private const uint UsnReasonNamedDataTruncation = 0x0000_0040;
+    private const uint UsnReasonFileCreate = 0x0000_0100;
+    private const uint UsnReasonFileDelete = 0x0000_0200;
+    private const uint UsnReasonBasicInfoChange = 0x0000_8000;
+    private const uint UsnReasonRenameOldName = 0x0000_1000;
+    private const uint UsnReasonRenameNewName = 0x0000_2000;
+    private const uint UsnReasonUpsertMask = UsnReasonDataOverwrite
+        | UsnReasonDataExtend
+        | UsnReasonDataTruncation
+        | UsnReasonNamedDataOverwrite
+        | UsnReasonNamedDataExtend
+        | UsnReasonNamedDataTruncation
+        | UsnReasonFileCreate
+        | UsnReasonBasicInfoChange
+        | UsnReasonRenameNewName;
+    private const uint UsnReasonDeleteMask = UsnReasonFileDelete | UsnReasonRenameOldName;
     private const int UsnOutputPrefixLength = sizeof(ulong);
     private const int UsnRecordV2HeaderLength = 60;
     private const int UsnBufferLength = 1024 * 1024;
@@ -88,6 +109,66 @@ public sealed class NtfsUsnJournalReader
             }
 
             return ((ulong)information.FileIndexHigh << 32) | information.FileIndexLow;
+        }
+        finally
+        {
+            NtfsNativeMethods.CloseHandle(handle);
+        }
+    }
+
+    public UsnJournalState ReadJournalState(string volumeRoot)
+    {
+        var scanRoot = NtfsScanRoot.Create(volumeRoot);
+        var handle = OpenVolume(scanRoot.VolumePath);
+
+        try
+        {
+            var journalData = QueryJournal(handle);
+            return new UsnJournalState(
+                journalData.UsnJournalId,
+                journalData.LowestValidUsn,
+                journalData.NextUsn);
+        }
+        finally
+        {
+            NtfsNativeMethods.CloseHandle(handle);
+        }
+    }
+
+    public async IAsyncEnumerable<UsnJournalChange> EnumerateChangesAsync(
+        string volumeRoot,
+        long startUsn,
+        long endUsn,
+        [EnumeratorCancellation] CancellationToken cancellationToken)
+    {
+        var scanRoot = NtfsScanRoot.Create(volumeRoot);
+        var handle = OpenVolume(scanRoot.VolumePath);
+
+        try
+        {
+            var journalData = QueryJournal(handle);
+            var volumeRootFileReferenceNumber = ReadFileReferenceNumber(scanRoot.VolumeRoot);
+            var directories = ReadDirectoryEntries(handle, journalData, cancellationToken);
+            var metadataReader = new NtfsFileMetadataReader();
+            var resolvedPaths = new Dictionary<ulong, string>();
+
+            foreach (var entry in EnumerateJournalEntries(handle, journalData, startUsn, endUsn, cancellationToken))
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                var change = CreateJournalChange(
+                    scanRoot,
+                    entry,
+                    directories,
+                    resolvedPaths,
+                    metadataReader,
+                    volumeRootFileReferenceNumber,
+                    cancellationToken);
+                if (change is not null)
+                {
+                    yield return change;
+                    await Task.Yield();
+                }
+            }
         }
         finally
         {
@@ -248,6 +329,61 @@ public sealed class NtfsUsnJournalReader
 
             readData.StartUsn = nextUsn;
         }
+    }
+
+    private static UsnJournalChange? CreateJournalChange(
+        NtfsScanRoot scanRoot,
+        NtfsUsnEntry entry,
+        IReadOnlyDictionary<ulong, NtfsUsnEntry> directoriesByReferenceNumber,
+        IDictionary<ulong, string> resolvedPaths,
+        INtfsFileMetadataReader metadataReader,
+        ulong volumeRootFileReferenceNumber,
+        CancellationToken cancellationToken)
+    {
+        if (entry.IsDirectory && (HasAnyReason(entry, UsnReasonDeleteMask | UsnReasonRenameNewName)))
+        {
+            return UsnJournalChange.DirectoryRenameOrMove();
+        }
+
+        if (!NtfsUsnRecordProjector.TryResolvePath(
+                entry,
+                scanRoot.VolumeRoot,
+                directoriesByReferenceNumber,
+                resolvedPaths,
+                new HashSet<ulong>(),
+                volumeRootFileReferenceNumber,
+                out var fullPath))
+        {
+            return UsnJournalChange.DirectoryRenameOrMove();
+        }
+
+        if (!NtfsUsnRecordProjector.IsRequestedRootOrDescendant(fullPath, scanRoot.RequestedRoot))
+        {
+            return null;
+        }
+
+        if (HasAnyReason(entry, UsnReasonDeleteMask))
+        {
+            return UsnJournalChange.Delete(fullPath);
+        }
+
+        if (!HasAnyReason(entry, UsnReasonUpsertMask))
+        {
+            return null;
+        }
+
+        if (!metadataReader.TryRead(fullPath, entry.IsDirectory, cancellationToken, out var metadata))
+        {
+            return UsnJournalChange.DirectoryRenameOrMove();
+        }
+
+        return UsnJournalChange.Upsert(
+            FileRecord.Create(fullPath, entry.IsDirectory, metadata.SizeBytes, metadata.LastWriteTime));
+    }
+
+    private static bool HasAnyReason(NtfsUsnEntry entry, uint reasonMask)
+    {
+        return (entry.Reason & reasonMask) != 0;
     }
 
     private static NtfsNativeMethods.UsnJournalDataV0 QueryJournal(IntPtr handle)

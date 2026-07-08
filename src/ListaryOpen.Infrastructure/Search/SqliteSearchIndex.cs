@@ -942,7 +942,7 @@ public sealed class SqliteSearchIndex : ISearchIndex, IAsyncDisposable
     {
         var records = new Dictionary<string, FileRecord>(StringComparer.Ordinal);
         var candidateLimit = CreateCandidateLimit(query);
-        var useExpensiveFuzzy = NormalizeSearchText(query.NormalizedText).Length > 1;
+        var useExpensiveFuzzy = UsesExpensiveFuzzyCandidates(query);
 
         await AddExactCandidatesAsync(query, candidateLimit, records, cancellationToken).ConfigureAwait(false);
         cancellationToken.ThrowIfCancellationRequested();
@@ -966,6 +966,12 @@ public sealed class SqliteSearchIndex : ISearchIndex, IAsyncDisposable
             .Where(record => MatchesParsedFilters(query, record))
             .ToArray();
     }
+
+    internal static bool UsesExpensiveFuzzyCandidatesForTests(SearchQuery query)
+        => UsesExpensiveFuzzyCandidates(query);
+
+    private static bool UsesExpensiveFuzzyCandidates(SearchQuery query)
+        => NormalizeSearchText(query.NormalizedText).Length > 1;
 
     private async Task AddExactCandidatesAsync(
         SearchQuery query,

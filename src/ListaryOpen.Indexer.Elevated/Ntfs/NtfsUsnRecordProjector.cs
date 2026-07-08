@@ -137,7 +137,7 @@ internal static class NtfsUsnRecordProjector
         return false;
     }
 
-    private static bool TryResolvePath(
+    internal static bool TryResolvePath(
         NtfsUsnEntry entry,
         string volumeRoot,
         IReadOnlyDictionary<ulong, NtfsUsnEntry> entries,
@@ -275,7 +275,7 @@ internal static class NtfsUsnRecordProjector
         return !string.IsNullOrWhiteSpace(name) && name != ".";
     }
 
-    private static bool IsRequestedRootOrDescendant(string fullPath, string requestedRoot)
+    internal static bool IsRequestedRootOrDescendant(string fullPath, string requestedRoot)
     {
         var normalizedPath = NormalizePath(fullPath);
         var normalizedRequestedRoot = NormalizePath(requestedRoot);

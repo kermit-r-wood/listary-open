@@ -1,5 +1,7 @@
+using System.Diagnostics;
 using System.IO;
 using ListaryOpen.Core.Indexing;
+using ListaryOpen.Infrastructure.Indexing.Ntfs;
 using ListaryOpen.Infrastructure.Search;
 
 namespace ListaryOpen.Infrastructure.Indexing;
@@ -145,10 +147,21 @@ public sealed class IndexingCoordinator
 
         try
         {
+            var catchUp = await TryCatchUpNtfsRootAsync(
+                provider,
+                root,
+                indexGeneration,
+                cancellationToken).ConfigureAwait(false);
+            if (catchUp.CompletedWithoutFullScan)
+            {
+                return new IndexRootResult(catchUp.IndexedCount, HadFailure: false, WasCanceled: false);
+            }
+
             var count = await ScanAndUpsertAsync(provider, root, indexGeneration, cancellationToken).ConfigureAwait(false);
             if (count > 0)
             {
                 await _index.PruneStaleRecordsUnderRootAsync(root.Path, indexGeneration, cancellationToken).ConfigureAwait(false);
+                await SaveNtfsCheckpointAsync(provider, root, catchUp.JournalState, cancellationToken).ConfigureAwait(false);
                 return new IndexRootResult(count, HadFailure: false, WasCanceled: false);
             }
 
@@ -165,7 +178,7 @@ public sealed class IndexingCoordinator
         {
             if (IsElevatedIndexerLaunchCanceled(exception))
             {
-                RaiseStatus(IndexingRunState.Indexing, $"NTFS scan canceled for {root.Path}.", currentIndexedCount);
+                RaiseStatus(IndexingRunState.Canceled, $"NTFS scan canceled for {root.Path}.", currentIndexedCount);
                 return new IndexRootResult(0, HadFailure: false, WasCanceled: true);
             }
 
@@ -183,6 +196,133 @@ public sealed class IndexingCoordinator
             await _index.PruneStaleRecordsUnderRootAsync(root.Path, indexGeneration, cancellationToken).ConfigureAwait(false);
             return new IndexRootResult(fallbackCount, HadFailure: true, WasCanceled: false);
         }
+    }
+
+    private async Task<NtfsCatchUpResult> TryCatchUpNtfsRootAsync(
+        IIndexProvider provider,
+        IndexRoot root,
+        long indexGeneration,
+        CancellationToken cancellationToken)
+    {
+        if (provider is not INtfsJournalProvider journalProvider)
+        {
+            return NtfsCatchUpResult.NeedsFullScan(journalState: null);
+        }
+
+        UsnJournalState? journalState;
+        try
+        {
+            journalState = await journalProvider
+                .QueryJournalStateAsync(root, cancellationToken)
+                .ConfigureAwait(false);
+        }
+        catch (OperationCanceledException)
+        {
+            throw;
+        }
+        catch (Exception exception) when (IsElevatedIndexerLaunchCanceled(exception))
+        {
+            throw new IndexProviderScanException(
+                $"Provider {provider.Name} journal query was canceled for {root.Path}: {exception.Message}",
+                exception);
+        }
+        catch (Exception exception)
+        {
+            Trace.TraceWarning("NTFS journal query failed for '{0}': {1}", root.Path, exception.Message);
+            return NtfsCatchUpResult.NeedsFullScan(journalState: null);
+        }
+
+        if (journalState is null)
+        {
+            return NtfsCatchUpResult.NeedsFullScan(journalState: null);
+        }
+
+        var checkpoint = await _index
+            .ReadVolumeCheckpointAsync(root.Path, cancellationToken)
+            .ConfigureAwait(false);
+        var plan = UsnJournalCatchUpPlanner.Plan(
+            checkpoint,
+            journalState,
+            SqliteSearchIndex.CurrentIndexContentVersion);
+        if (plan.Action == UsnCatchUpAction.FullRescan)
+        {
+            return NtfsCatchUpResult.NeedsFullScan(journalState);
+        }
+
+        if (plan.Action == UsnCatchUpAction.None)
+        {
+            return NtfsCatchUpResult.Completed(indexedCount: 0, journalState);
+        }
+
+        UsnJournalApplyResult applyResult;
+        try
+        {
+            var nextCheckpoint = CreateCheckpoint(root, journalState, plan.EndUsn);
+            var changes = journalProvider.ReadJournalChangesAsync(root, plan.StartUsn, plan.EndUsn, cancellationToken);
+            applyResult = await UsnJournalChangeApplier
+                .ApplyAsync(_index, changes, nextCheckpoint, cancellationToken)
+                .ConfigureAwait(false);
+        }
+        catch (OperationCanceledException)
+        {
+            throw;
+        }
+        catch (Exception exception) when (IsElevatedIndexerLaunchCanceled(exception))
+        {
+            throw new IndexProviderScanException(
+                $"Provider {provider.Name} journal catch-up was canceled for {root.Path}: {exception.Message}",
+                exception);
+        }
+        catch (Exception exception)
+        {
+            Trace.TraceWarning("NTFS journal catch-up failed for '{0}': {1}", root.Path, exception.Message);
+            return NtfsCatchUpResult.NeedsFullScan(journalState);
+        }
+
+        if (applyResult.RequiresFullRescan)
+        {
+            return NtfsCatchUpResult.NeedsFullScan(journalState);
+        }
+
+        return NtfsCatchUpResult.Completed(applyResult.AppliedCount, journalState);
+    }
+
+    private async Task SaveNtfsCheckpointAsync(
+        IIndexProvider provider,
+        IndexRoot root,
+        UsnJournalState? journalState,
+        CancellationToken cancellationToken)
+    {
+        if (provider is not INtfsJournalProvider journalProvider)
+        {
+            return;
+        }
+
+        journalState ??= await journalProvider
+            .QueryJournalStateAsync(root, cancellationToken)
+            .ConfigureAwait(false);
+        if (journalState is null)
+        {
+            return;
+        }
+
+        await _index
+            .SaveVolumeCheckpointAsync(CreateCheckpoint(root, journalState, journalState.NextUsn), cancellationToken)
+            .ConfigureAwait(false);
+    }
+
+    private static UsnJournalCheckpoint CreateCheckpoint(
+        IndexRoot root,
+        UsnJournalState journalState,
+        long nextUsn)
+    {
+        return new UsnJournalCheckpoint(
+            root.Path,
+            NtfsIndexProvider.ProviderName,
+            journalState.UsnJournalId,
+            nextUsn,
+            SqliteSearchIndex.CurrentIndexContentVersion,
+            DateTimeOffset.UtcNow);
     }
 
     private async Task<int> ScanAndUpsertAsync(
@@ -351,4 +491,16 @@ public sealed class IndexingCoordinator
     }
 
     private sealed record IndexRootResult(int IndexedCount, bool HadFailure, bool WasCanceled);
+
+    private sealed record NtfsCatchUpResult(
+        bool CompletedWithoutFullScan,
+        int IndexedCount,
+        UsnJournalState? JournalState)
+    {
+        public static NtfsCatchUpResult Completed(int indexedCount, UsnJournalState journalState)
+            => new(CompletedWithoutFullScan: true, indexedCount, journalState);
+
+        public static NtfsCatchUpResult NeedsFullScan(UsnJournalState? journalState)
+            => new(CompletedWithoutFullScan: false, IndexedCount: 0, journalState);
+    }
 }

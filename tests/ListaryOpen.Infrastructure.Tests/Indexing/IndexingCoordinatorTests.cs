@@ -3,6 +3,7 @@ using System.Runtime.CompilerServices;
 using ListaryOpen.Core.Indexing;
 using ListaryOpen.Core.Search;
 using ListaryOpen.Infrastructure.Indexing;
+using ListaryOpen.Infrastructure.Indexing.Ntfs;
 using ListaryOpen.Infrastructure.Search;
 
 namespace ListaryOpen.Infrastructure.Tests.Indexing;
@@ -229,7 +230,9 @@ public sealed class IndexingCoordinatorTests
             await coordinator.IndexRootsAsync(new[] { new IndexRoot(rootPath) }, CancellationToken.None);
 
             Assert.Equal(0, fallbackProvider.ScanCount);
-            Assert.Contains(statuses, status => status.Message.Contains("canceled", StringComparison.OrdinalIgnoreCase));
+            Assert.Contains(statuses, status =>
+                status.State == IndexingRunState.Canceled
+                && status.Message.Contains("canceled", StringComparison.OrdinalIgnoreCase));
             Assert.Equal(IndexingRunState.Canceled, statuses[^1].State);
         }
         finally
@@ -270,7 +273,9 @@ public sealed class IndexingCoordinatorTests
             await coordinator.IndexRootsAsync(new[] { new IndexRoot(rootPath) }, CancellationToken.None);
 
             Assert.Equal(0, fallbackProvider.ScanCount);
-            Assert.Contains(statuses, status => status.Message.Contains("canceled", StringComparison.OrdinalIgnoreCase));
+            Assert.Contains(statuses, status =>
+                status.State == IndexingRunState.Canceled
+                && status.Message.Contains("canceled", StringComparison.OrdinalIgnoreCase));
             Assert.Equal(IndexingRunState.Canceled, statuses[^1].State);
         }
         finally
@@ -627,6 +632,192 @@ public sealed class IndexingCoordinatorTests
         }
     }
 
+    [Fact]
+    public async Task IndexRootsAsyncSkipsNtfsFullScanWhenCheckpointAlreadyReachedJournalTip()
+    {
+        var rootPath = CreateTempDirectory();
+        var dbPath = CreateTempDbPath();
+
+        try
+        {
+            await using var index = await SqliteSearchIndex.OpenAsync(dbPath, CancellationToken.None);
+            await index.SaveVolumeCheckpointAsync(
+                new UsnJournalCheckpoint(
+                    rootPath,
+                    NtfsIndexProvider.ProviderName,
+                    9,
+                    200,
+                    SqliteSearchIndex.CurrentIndexContentVersion,
+                    DateTimeOffset.UtcNow),
+                CancellationToken.None);
+            var provider = new JournalAwareNtfsProvider(
+                new UsnJournalState(9, LowestValidUsn: 100, NextUsn: 200));
+            var coordinator = new IndexingCoordinator(
+                index,
+                new VolumeIndexer(new IIndexProvider[] { provider }),
+                new FallbackIndexProvider(),
+                _ => new VolumeInfo(rootPath, NtfsIndexProvider.ProviderName, true));
+
+            await coordinator.IndexRootsAsync(new[] { new IndexRoot(rootPath) }, CancellationToken.None);
+
+            Assert.Equal(0, provider.ScanCount);
+        }
+        finally
+        {
+            DeleteDirectoryIfExists(rootPath);
+            DeleteFileIfExists(dbPath);
+        }
+    }
+
+    [Fact]
+    public async Task IndexRootsAsyncSavesNtfsCheckpointAfterSuccessfulFullScan()
+    {
+        var rootPath = CreateTempDirectory();
+        var dbPath = CreateTempDbPath();
+
+        try
+        {
+            var record = FileRecord.Create(
+                Path.Combine(rootPath, "IndexedAfterFullScan.txt"),
+                isDirectory: false,
+                sizeBytes: 1,
+                DateTimeOffset.UtcNow);
+            await using var index = await SqliteSearchIndex.OpenAsync(dbPath, CancellationToken.None);
+            var provider = new JournalAwareNtfsProvider(
+                new UsnJournalState(9, LowestValidUsn: 100, NextUsn: 200),
+                records: new[] { record });
+            var coordinator = new IndexingCoordinator(
+                index,
+                new VolumeIndexer(new IIndexProvider[] { provider }),
+                new FallbackIndexProvider(),
+                _ => new VolumeInfo(rootPath, NtfsIndexProvider.ProviderName, true));
+
+            await coordinator.IndexRootsAsync(new[] { new IndexRoot(rootPath) }, CancellationToken.None);
+
+            var checkpoint = await index.ReadVolumeCheckpointAsync(rootPath, CancellationToken.None);
+            Assert.NotNull(checkpoint);
+            Assert.Equal(9ul, checkpoint!.UsnJournalId);
+            Assert.Equal(200, checkpoint.NextUsn);
+            Assert.Equal(SqliteSearchIndex.CurrentIndexContentVersion, checkpoint.RulesVersion);
+            Assert.Equal(1, provider.ScanCount);
+        }
+        finally
+        {
+            DeleteDirectoryIfExists(rootPath);
+            DeleteFileIfExists(dbPath);
+        }
+    }
+
+    [Fact]
+    public async Task IndexRootsAsyncAppliesNtfsJournalChangesWhenCheckpointCanCatchUp()
+    {
+        var rootPath = CreateTempDirectory();
+        var dbPath = CreateTempDbPath();
+
+        try
+        {
+            var oldRecord = FileRecord.Create(
+                Path.Combine(rootPath, "OldName.txt"),
+                isDirectory: false,
+                sizeBytes: 1,
+                DateTimeOffset.UtcNow);
+            var newRecord = FileRecord.Create(
+                Path.Combine(rootPath, "NewName.txt"),
+                isDirectory: false,
+                sizeBytes: 2,
+                DateTimeOffset.UtcNow);
+
+            await using var index = await SqliteSearchIndex.OpenAsync(dbPath, CancellationToken.None);
+            await index.UpsertAsync(oldRecord, CancellationToken.None);
+            await index.SaveVolumeCheckpointAsync(
+                new UsnJournalCheckpoint(
+                    rootPath,
+                    NtfsIndexProvider.ProviderName,
+                    9,
+                    100,
+                    SqliteSearchIndex.CurrentIndexContentVersion,
+                    DateTimeOffset.UtcNow),
+                CancellationToken.None);
+            var provider = new JournalAwareNtfsProvider(
+                new UsnJournalState(9, LowestValidUsn: 50, NextUsn: 200),
+                changes: new[]
+                {
+                    UsnJournalChange.Delete(oldRecord.FullPath),
+                    UsnJournalChange.Upsert(newRecord)
+                });
+            var coordinator = new IndexingCoordinator(
+                index,
+                new VolumeIndexer(new IIndexProvider[] { provider }),
+                new FallbackIndexProvider(),
+                _ => new VolumeInfo(rootPath, NtfsIndexProvider.ProviderName, true));
+
+            await coordinator.IndexRootsAsync(new[] { new IndexRoot(rootPath) }, CancellationToken.None);
+
+            Assert.Equal(1, provider.ReadJournalChangesCount);
+            var oldResults = await index.SearchAsync(new SearchQuery("OldName", SearchMode.FilesAndFolders), CancellationToken.None);
+            var newResults = await index.SearchAsync(new SearchQuery("NewName", SearchMode.FilesAndFolders), CancellationToken.None);
+            var checkpoint = await index.ReadVolumeCheckpointAsync(rootPath, CancellationToken.None);
+            Assert.DoesNotContain(oldResults, result => result.Record.PathKey == oldRecord.PathKey);
+            Assert.Equal("NewName.txt", Assert.Single(newResults).Record.Name);
+            Assert.Equal(200, checkpoint!.NextUsn);
+            Assert.Equal(0, provider.ScanCount);
+        }
+        finally
+        {
+            DeleteDirectoryIfExists(rootPath);
+            DeleteFileIfExists(dbPath);
+        }
+    }
+
+    [Fact]
+    public async Task IndexRootsAsyncFullRescansWhenNtfsJournalChangeRequiresFullRescan()
+    {
+        var rootPath = CreateTempDirectory();
+        var dbPath = CreateTempDbPath();
+
+        try
+        {
+            var currentRecord = FileRecord.Create(
+                Path.Combine(rootPath, "CurrentAfterDirectoryRename.txt"),
+                isDirectory: false,
+                sizeBytes: 1,
+                DateTimeOffset.UtcNow);
+
+            await using var index = await SqliteSearchIndex.OpenAsync(dbPath, CancellationToken.None);
+            await index.SaveVolumeCheckpointAsync(
+                new UsnJournalCheckpoint(
+                    rootPath,
+                    NtfsIndexProvider.ProviderName,
+                    9,
+                    100,
+                    SqliteSearchIndex.CurrentIndexContentVersion,
+                    DateTimeOffset.UtcNow),
+                CancellationToken.None);
+            var provider = new JournalAwareNtfsProvider(
+                new UsnJournalState(9, LowestValidUsn: 50, NextUsn: 200),
+                records: new[] { currentRecord },
+                changes: new[] { UsnJournalChange.DirectoryRenameOrMove() });
+            var coordinator = new IndexingCoordinator(
+                index,
+                new VolumeIndexer(new IIndexProvider[] { provider }),
+                new FallbackIndexProvider(),
+                _ => new VolumeInfo(rootPath, NtfsIndexProvider.ProviderName, true));
+
+            await coordinator.IndexRootsAsync(new[] { new IndexRoot(rootPath) }, CancellationToken.None);
+
+            var results = await index.SearchAsync(new SearchQuery("CurrentAfterDirectoryRename", SearchMode.FilesAndFolders), CancellationToken.None);
+            var checkpoint = await index.ReadVolumeCheckpointAsync(rootPath, CancellationToken.None);
+            Assert.Equal("CurrentAfterDirectoryRename.txt", Assert.Single(results).Record.Name);
+            Assert.Equal(1, provider.ScanCount);
+            Assert.Equal(200, checkpoint!.NextUsn);
+        }
+        finally
+        {
+            DeleteDirectoryIfExists(rootPath);
+            DeleteFileIfExists(dbPath);
+        }
+    }
+
     private static string CreateUsableHelperBundle(string directory)
     {
         var helperPath = Path.Combine(directory, "ListaryOpen.Indexer.Elevated.exe");
@@ -748,6 +939,65 @@ public sealed class IndexingCoordinatorTests
         public IAsyncEnumerable<FileRecord> ScanAsync(IndexRoot root, CancellationToken cancellationToken)
         {
             return new AsynchronousSingleRecordEnumerable(_record, cancellationToken);
+        }
+    }
+
+    private sealed class JournalAwareNtfsProvider : IIndexProvider, INtfsJournalProvider
+    {
+        private readonly UsnJournalState? _journalState;
+        private readonly IReadOnlyList<FileRecord> _records;
+        private readonly IReadOnlyList<UsnJournalChange> _changes;
+
+        public JournalAwareNtfsProvider(
+            UsnJournalState? journalState,
+            IReadOnlyList<FileRecord>? records = null,
+            IReadOnlyList<UsnJournalChange>? changes = null)
+        {
+            _journalState = journalState;
+            _records = records ?? Array.Empty<FileRecord>();
+            _changes = changes ?? Array.Empty<UsnJournalChange>();
+        }
+
+        public int ScanCount { get; private set; }
+
+        public int ReadJournalChangesCount { get; private set; }
+
+        public string Name => NtfsIndexProvider.ProviderName;
+
+        public bool CanIndex(VolumeInfo volume) => volume.IsReady;
+
+        public async IAsyncEnumerable<FileRecord> ScanAsync(
+            IndexRoot root,
+            [EnumeratorCancellation] CancellationToken cancellationToken)
+        {
+            ScanCount++;
+            foreach (var record in _records)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                await Task.Yield();
+                yield return record;
+            }
+        }
+
+        public Task<UsnJournalState?> QueryJournalStateAsync(IndexRoot root, CancellationToken cancellationToken)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            return Task.FromResult(_journalState);
+        }
+
+        public async IAsyncEnumerable<UsnJournalChange> ReadJournalChangesAsync(
+            IndexRoot root,
+            long startUsn,
+            long endUsn,
+            [EnumeratorCancellation] CancellationToken cancellationToken)
+        {
+            ReadJournalChangesCount++;
+            foreach (var change in _changes)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                await Task.Yield();
+                yield return change;
+            }
         }
     }
 
