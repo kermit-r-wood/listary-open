@@ -176,8 +176,10 @@ public sealed class ElevatedIndexerProjectTests
         startInfo.ArgumentList.Add(projectPath);
         startInfo.ArgumentList.Add("--no-restore");
         startInfo.ArgumentList.Add("--nologo");
+        startInfo.ArgumentList.Add("-nr:false");
         startInfo.ArgumentList.Add("-p:BuildNativeHooks=false");
         startInfo.ArgumentList.Add("-p:BaseOutputPath=" + baseOutputPath);
+        startInfo.ArgumentList.Add("-p:UseSharedCompilation=false");
 
         using var process = Process.Start(startInfo);
         Assert.NotNull(process);
