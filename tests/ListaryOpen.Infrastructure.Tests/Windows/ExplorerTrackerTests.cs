@@ -310,6 +310,85 @@ public sealed class ExplorerTrackerTests
     }
 
     [Fact]
+    public void CompositeQuickSwitchWindowProviderSnapshotsStaticFallbackCandidates()
+    {
+        var fallback = Directory.CreateTempSubdirectory("listary-open-fallback-snapshot-");
+        var candidates = new List<QuickSwitchFolderCandidate>
+        {
+            new(fallback.FullName, "Explorer", IntPtr.Zero, false)
+        };
+
+        try
+        {
+            var composite = new CompositeQuickSwitchWindowProvider(
+                new IQuickSwitchWindowProvider[]
+                {
+                    new RecordingRefreshableQuickSwitchProvider(Array.Empty<QuickSwitchFolderCandidate>())
+                },
+                candidates);
+            candidates.Clear();
+
+            var candidate = Assert.Single(composite.GetFolderCandidates());
+
+            Assert.Equal(fallback.FullName, candidate.FolderPath);
+        }
+        finally
+        {
+            fallback.Delete(recursive: true);
+        }
+    }
+
+    [Fact]
+    public void CompositeQuickSwitchWindowProviderSkipsThrowingFallbackCandidates()
+    {
+        var composite = new CompositeQuickSwitchWindowProvider(
+            new IQuickSwitchWindowProvider[]
+            {
+                new RecordingRefreshableQuickSwitchProvider(Array.Empty<QuickSwitchFolderCandidate>())
+            },
+            () => throw new IOException("Fallback failed."));
+
+        Assert.Empty(composite.GetFolderCandidates());
+    }
+
+    [Fact]
+    public void CompositeQuickSwitchWindowProviderDoesNotLetRememberedExplorerFolderOutrankLiveProviders()
+    {
+        var remembered = Directory.CreateTempSubdirectory("listary-open-remembered-");
+        var liveFolder = Directory.CreateTempSubdirectory("listary-open-live-provider-");
+
+        try
+        {
+            var tracker = new ExplorerTracker(
+                () => IntPtr.Zero,
+                new RecordingExplorerShellWindowsProvider(Array.Empty<ExplorerShellWindow>()));
+            tracker.ObserveFolderForTests(remembered.FullName);
+            var composite = new CompositeQuickSwitchWindowProvider(
+                new IQuickSwitchWindowProvider[]
+                {
+                    tracker,
+                    new RecordingRefreshableQuickSwitchProvider(new[]
+                    {
+                        new QuickSwitchFolderCandidate(liveFolder.FullName, "Directory Opus", new IntPtr(1), false)
+                    })
+                },
+                new[]
+                {
+                    new QuickSwitchFolderCandidate(remembered.FullName, "Explorer", IntPtr.Zero, false)
+                });
+
+            var candidate = Assert.Single(composite.GetFolderCandidates());
+
+            Assert.Equal(liveFolder.FullName, candidate.FolderPath);
+        }
+        finally
+        {
+            remembered.Delete(recursive: true);
+            liveFolder.Delete(recursive: true);
+        }
+    }
+
+    [Fact]
     public void CompositeQuickSwitchWindowProviderSkipsThrowingProviders()
     {
         var folder = Directory.CreateTempSubdirectory("listary-open-safe-provider-");
@@ -399,21 +478,141 @@ public sealed class ExplorerTrackerTests
     }
 
     [Fact]
-    public void DirectoryOpusQuickSwitchProviderSkipsInfoReadWhenDirectoryOpusIsNotForeground()
+    public void DirectoryOpusQuickSwitchProviderReadsActiveListerWhenDirectoryOpusIsNotForeground()
     {
+        var folder = Directory.CreateTempSubdirectory("listary-open-dopus-background-");
         var read = false;
-        var provider = new DirectoryOpusQuickSwitchProvider(
-            () =>
+
+        try
+        {
+            var provider = new DirectoryOpusQuickSwitchProvider(
+                () =>
+                {
+                    read = true;
+                    return $"<path active_lister=\"1\" active_tab=\"1\">{folder.FullName}</path>";
+                },
+                foregroundProvider: () => false);
+
+            var candidate = Assert.Single(provider.GetFolderCandidates());
+
+            Assert.True(read);
+            Assert.Equal(folder.FullName, candidate.FolderPath);
+            Assert.Equal("Directory Opus", candidate.SourceName);
+            Assert.False(candidate.IsForeground);
+        }
+        finally
+        {
+            folder.Delete(recursive: true);
+        }
+    }
+
+    [Fact]
+    public void TotalCommanderQuickSwitchProviderParsesPanelPathText()
+    {
+        var folder = Directory.CreateTempSubdirectory("listary-open-tc-parse-");
+
+        try
+        {
+            var root = Path.GetPathRoot(Environment.SystemDirectory)!;
+            var lowerRoot = char.ToLowerInvariant(root[0]) + root[1..];
+
+            Assert.Equal(root, TotalCommanderQuickSwitchProvider.ParsePanelPathText(root + "*.*"));
+            Assert.Equal(root, TotalCommanderQuickSwitchProvider.ParsePanelPathText(lowerRoot + "*.*"));
+            Assert.Equal(root, TotalCommanderQuickSwitchProvider.ParsePanelPathText(lowerRoot + ">"));
+            Assert.Equal(
+                folder.FullName,
+                TotalCommanderQuickSwitchProvider.ParsePanelPathText(folder.FullName + Path.DirectorySeparatorChar + "*.*"));
+            Assert.Equal(
+                folder.FullName,
+                TotalCommanderQuickSwitchProvider.ParsePanelPathText(folder.FullName + Path.DirectorySeparatorChar + "*.*>"));
+            Assert.Null(TotalCommanderQuickSwitchProvider.ParsePanelPathText(folder.FullName + Path.DirectorySeparatorChar));
+        }
+        finally
+        {
+            folder.Delete(recursive: true);
+        }
+    }
+
+    [Fact]
+    public void TotalCommanderQuickSwitchProviderReturnsPanelPathsForegroundFirst()
+    {
+        var backgroundFolder = Directory.CreateTempSubdirectory("listary-open-tc-background-");
+        var foregroundFolder = Directory.CreateTempSubdirectory("listary-open-tc-foreground-");
+
+        try
+        {
+            var foregroundHandle = new IntPtr(200);
+            var provider = new TotalCommanderQuickSwitchProvider(() => new[]
             {
-                read = true;
-                return "<path active_lister=\"1\" active_tab=\"1\">C:\\Users</path>";
-            },
-            foregroundProvider: () => false);
+                new TotalCommanderWindowSnapshot(
+                    new IntPtr(100),
+                    new[] { backgroundFolder.FullName + Path.DirectorySeparatorChar + "*.*" },
+                    false),
+                new TotalCommanderWindowSnapshot(
+                    foregroundHandle,
+                    new[] { foregroundFolder.FullName + Path.DirectorySeparatorChar + "*.*" },
+                    true)
+            });
 
-        var candidates = provider.GetFolderCandidates();
+            var candidates = provider.GetFolderCandidates();
 
-        Assert.Empty(candidates);
-        Assert.False(read);
+            Assert.Equal(
+                new[] { foregroundFolder.FullName, backgroundFolder.FullName },
+                candidates.Select(candidate => candidate.FolderPath));
+            Assert.True(candidates[0].IsForeground);
+            Assert.Equal(foregroundHandle, candidates[0].WindowHandle);
+            Assert.Equal("Total Commander", candidates[0].SourceName);
+        }
+        finally
+        {
+            backgroundFolder.Delete(recursive: true);
+            foregroundFolder.Delete(recursive: true);
+        }
+    }
+
+    [Fact]
+    public void TotalCommanderQuickSwitchProviderPrefersActivePanelBeforeInactivePanel()
+    {
+        var inactiveFolder = Directory.CreateTempSubdirectory("listary-open-tc-inactive-");
+        var activeFolder = Directory.CreateTempSubdirectory("listary-open-tc-active-");
+
+        try
+        {
+            var foregroundHandle = new IntPtr(200);
+            var provider = new TotalCommanderQuickSwitchProvider(() => new[]
+            {
+                new TotalCommanderWindowSnapshot(
+                    foregroundHandle,
+                    new[]
+                    {
+                        inactiveFolder.FullName + Path.DirectorySeparatorChar + "*.*",
+                        activeFolder.FullName + Path.DirectorySeparatorChar + ">"
+                    },
+                    true)
+            });
+
+            var candidates = provider.GetFolderCandidates();
+
+            Assert.Equal(
+                new[] { activeFolder.FullName, inactiveFolder.FullName },
+                candidates.Select(candidate => candidate.FolderPath));
+        }
+        finally
+        {
+            inactiveFolder.Delete(recursive: true);
+            activeFolder.Delete(recursive: true);
+        }
+    }
+
+    [Theory]
+    [InlineData("")]
+    [InlineData("0 k / 0 k in 0 / 2 file(s), 0 / 12 dir(s)")]
+    [InlineData("[_none_]  2,589,780,744 k of 4,000,105,676 k free")]
+    [InlineData("ftp://example.com/*.*")]
+    [InlineData("C:\\Windows")]
+    public void TotalCommanderQuickSwitchProviderSkipsNonFilesystemPanelText(string text)
+    {
+        Assert.Null(TotalCommanderQuickSwitchProvider.ParsePanelPathText(text));
     }
 
     [Theory]

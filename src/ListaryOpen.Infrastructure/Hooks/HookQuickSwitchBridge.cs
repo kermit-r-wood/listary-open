@@ -122,13 +122,25 @@ public sealed class HookQuickSwitchBridge : IHookQuickSwitchBridge
     private async Task<HookActiveDialogResult> QueryActiveDialogAsync(CancellationToken cancellationToken)
     {
         HookActiveDialogResult? firstFailure = null;
+        HookActiveDialogResult? bestNoActiveDialog = null;
 
-        foreach (var client in _clients.Values)
+        foreach (var client in _clients)
         {
-            var result = await GetActiveDialogResultAsync(client, cancellationToken).ConfigureAwait(false);
+            var result = await GetActiveDialogResultAsync(client.Value, cancellationToken).ConfigureAwait(false);
             if (result.Dialog is not null)
             {
                 return result;
+            }
+
+            if (result.Status == HookJumpStatus.NoActiveDialog)
+            {
+                var noActiveDialog = WithArchitectureMessage(client.Key, result);
+                if (bestNoActiveDialog is null || IsGenericNoActiveDialogMessage(bestNoActiveDialog.Message))
+                {
+                    bestNoActiveDialog = noActiveDialog;
+                }
+
+                continue;
             }
 
             if (result.Status != HookJumpStatus.NoActiveDialog)
@@ -137,8 +149,23 @@ public sealed class HookQuickSwitchBridge : IHookQuickSwitchBridge
             }
         }
 
-        return firstFailure ?? HookActiveDialogResult.NoActiveDialog("No active hook-controlled dialog.");
+        return firstFailure ?? bestNoActiveDialog ?? HookActiveDialogResult.NoActiveDialog("No active hook-controlled dialog.");
     }
+
+    private static HookActiveDialogResult WithArchitectureMessage(
+        HookArchitecture architecture,
+        HookActiveDialogResult result)
+    {
+        var message = string.IsNullOrWhiteSpace(result.Message)
+            ? $"{architecture.ToFolderName()} hook host reported no active dialog."
+            : $"{architecture.ToFolderName()} hook host: {result.Message}";
+        return new HookActiveDialogResult(result.Status, message, result.Dialog);
+    }
+
+    private static bool IsGenericNoActiveDialogMessage(string message) =>
+        message.Contains("No active hook-controlled dialog", StringComparison.OrdinalIgnoreCase) ||
+        message.Contains("No supported foreground hook dialog", StringComparison.OrdinalIgnoreCase) ||
+        message.Contains("does not match", StringComparison.OrdinalIgnoreCase);
 
     private static async Task<HookActiveDialogResult> GetActiveDialogResultAsync(
         IHookIpcClient client,
@@ -393,7 +420,6 @@ public sealed class HookQuickSwitchBridge : IHookQuickSwitchBridge
                 else
                 {
                     _hostProcesses[HookArchitecture.X64] = process;
-                    _hostProcesses[HookArchitecture.X86] = process;
                 }
             }
 
@@ -417,6 +443,18 @@ public sealed class HookQuickSwitchBridge : IHookQuickSwitchBridge
                         "x86 hook host launch was abandoned."));
             }
 
+            var x86Status = await TryCreateHealthyExistingHostStatusAsync(
+                    HookArchitecture.X86,
+                    x86Snapshot,
+                    cancellationToken)
+                .ConfigureAwait(false)
+                ?? new HookArchitectureStatus(
+                    HookArchitecture.X86,
+                    true,
+                    false,
+                    true,
+                    "x86 hook host launch requested by x64 hook host, but health was not confirmed.");
+
             return new HookQuickSwitchStatus(
                 true,
                 new HookArchitectureStatus(
@@ -425,12 +463,7 @@ public sealed class HookQuickSwitchBridge : IHookQuickSwitchBridge
                     true,
                     true,
                     "x64 hook host started."),
-                new HookArchitectureStatus(
-                    HookArchitecture.X86,
-                    true,
-                    true,
-                    true,
-                    "x86 hook host launch requested by x64 hook host."));
+                x86Status);
         }
         catch (Exception exception) when (exception is not OperationCanceledException)
         {

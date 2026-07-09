@@ -8,7 +8,7 @@ namespace ListaryOpen.Infrastructure.Windows;
 public sealed class CompositeQuickSwitchWindowProvider : IRefreshableQuickSwitchWindowProvider
 {
     private readonly IReadOnlyList<IQuickSwitchWindowProvider> _providers;
-    private readonly IReadOnlyList<QuickSwitchFolderCandidate> _fallbackCandidates;
+    private readonly Func<IReadOnlyList<QuickSwitchFolderCandidate>> _fallbackCandidatesProvider;
 
     public CompositeQuickSwitchWindowProvider(IReadOnlyList<IQuickSwitchWindowProvider> providers)
         : this(providers, Array.Empty<QuickSwitchFolderCandidate>())
@@ -22,7 +22,18 @@ public sealed class CompositeQuickSwitchWindowProvider : IRefreshableQuickSwitch
         ArgumentNullException.ThrowIfNull(providers);
         ArgumentNullException.ThrowIfNull(fallbackCandidates);
         _providers = providers.Where(provider => provider is not null).ToArray();
-        _fallbackCandidates = fallbackCandidates.Where(candidate => candidate is not null).ToArray();
+        var fallbackSnapshot = fallbackCandidates.Where(candidate => candidate is not null).ToArray();
+        _fallbackCandidatesProvider = () => fallbackSnapshot;
+    }
+
+    public CompositeQuickSwitchWindowProvider(
+        IReadOnlyList<IQuickSwitchWindowProvider> providers,
+        Func<IReadOnlyList<QuickSwitchFolderCandidate>> fallbackCandidatesProvider)
+    {
+        ArgumentNullException.ThrowIfNull(providers);
+        ArgumentNullException.ThrowIfNull(fallbackCandidatesProvider);
+        _providers = providers.Where(provider => provider is not null).ToArray();
+        _fallbackCandidatesProvider = fallbackCandidatesProvider;
     }
 
     public void Refresh()
@@ -66,7 +77,19 @@ public sealed class CompositeQuickSwitchWindowProvider : IRefreshableQuickSwitch
 
         if (candidates.Count == 0)
         {
-            foreach (var candidate in _fallbackCandidates)
+            IReadOnlyList<QuickSwitchFolderCandidate>? fallbackCandidates;
+            try
+            {
+                fallbackCandidates = _fallbackCandidatesProvider();
+            }
+            catch (Exception exception) when (IsExpectedProviderException(exception))
+            {
+                Trace.TraceError(exception.ToString());
+                fallbackCandidates = Array.Empty<QuickSwitchFolderCandidate>();
+            }
+
+            foreach (var candidate in fallbackCandidates?.Where(candidate => candidate is not null)
+                                      ?? Array.Empty<QuickSwitchFolderCandidate>())
             {
                 AddCandidate(candidates, candidateIndexesByFolderPath, candidate);
             }

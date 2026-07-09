@@ -101,6 +101,21 @@ public sealed class AppDialogHotkeyTests
     }
 
     [Fact]
+    public void CreateDefaultQuickSwitchWindowProviderIncludesThirdPartyFileManagers()
+    {
+        var composite = ListaryOpen.App.App.CreateDefaultQuickSwitchWindowProvider(new ExplorerTracker());
+        var providers = composite
+            .GetType()
+            .GetField("_providers", System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic)!
+            .GetValue(composite) as IReadOnlyList<IQuickSwitchWindowProvider>;
+
+        Assert.NotNull(providers);
+        Assert.Equal(
+            new[] { "ExplorerTracker", "DirectoryOpusQuickSwitchProvider", "TotalCommanderQuickSwitchProvider" },
+            providers!.Select(provider => provider.GetType().Name));
+    }
+
+    [Fact]
     public void ObserveAndGetExistingTrackedFolderRefreshesExplorerTrackerBeforeReadingLastFolder()
     {
         var staleFolder = Directory.CreateTempSubdirectory("listary-open-stale-");
@@ -157,6 +172,37 @@ public sealed class AppDialogHotkeyTests
         {
             firstFolder.Delete(recursive: true);
             secondFolder.Delete(recursive: true);
+        }
+    }
+
+    [Fact]
+    public async Task TryJumpToFirstQuickSwitchFolderAsyncSkipsMissingCandidates()
+    {
+        var missingFolder = Path.Combine(Path.GetTempPath(), "listary-open-missing-" + Guid.NewGuid());
+        var existingFolder = Directory.CreateTempSubdirectory("listary-open-existing-jump-");
+        var jumpedFolders = new List<string>();
+
+        try
+        {
+            var result = await ListaryOpen.App.App.TryJumpToFirstQuickSwitchFolderAsync(
+                new[]
+                {
+                    new QuickSwitchFolderCandidate(missingFolder, "Explorer", new IntPtr(1), true),
+                    new QuickSwitchFolderCandidate(existingFolder.FullName, "Directory Opus", new IntPtr(2), false)
+                },
+                (folderPath, _) =>
+                {
+                    jumpedFolders.Add(folderPath);
+                    return Task.FromResult(new DialogJumpResult(DialogJumpStatus.Success, "Dialog folder changed."));
+                },
+                CancellationToken.None);
+
+            Assert.True(result);
+            Assert.Equal(new[] { existingFolder.FullName }, jumpedFolders);
+        }
+        finally
+        {
+            existingFolder.Delete(recursive: true);
         }
     }
 

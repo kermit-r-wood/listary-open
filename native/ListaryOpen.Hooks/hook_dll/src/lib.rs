@@ -14,6 +14,7 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
 const ADDRESS_BAR_EDIT_CONTROL_ID: i32 = 41477;
 const FILE_NAME_EDIT_CONTROL_ID: i32 = 1148;
 const VK_RETURN_KEY: WPARAM = 0x0D;
+const BFFM_SETSELECTIONW: u32 = 0x0400 + 103;
 
 #[no_mangle]
 pub unsafe extern "system" fn ListaryOpenHookProc(
@@ -75,6 +76,16 @@ fn title_contains_supported_dialog_keyword(title: &str) -> bool {
 
 fn has_address_control(hwnd: HWND) -> bool {
     find_navigation_edit_control(hwnd).is_some()
+}
+
+fn dialog_without_navigation_edit_can_jump(class_name: &str, title: &str) -> bool {
+    class_name == DIALOG_CLASS && title.trim().eq_ignore_ascii_case("Browse For Folder")
+}
+
+fn window_without_navigation_edit_can_jump(hwnd: HWND) -> bool {
+    class_name(hwnd).as_deref().is_some_and(|class_name| {
+        dialog_without_navigation_edit_can_jump(class_name, &window_text(hwnd))
+    })
 }
 
 #[derive(Clone, Copy)]
@@ -379,7 +390,7 @@ fn decode_jump_copydata_payload(dw_data: usize, bytes: &[u8]) -> Option<JumpComm
 
 fn navigate_dialog_to_folder(hwnd: HWND, folder_path: &str) -> JumpAckStatus {
     let Some(path_edit) = find_navigation_edit_control(hwnd) else {
-        return JumpAckStatus::UnsupportedDialog;
+        return navigate_browse_for_folder_dialog_to_folder(hwnd, folder_path);
     };
 
     let wide_path = to_wide_null(folder_path);
@@ -391,6 +402,24 @@ fn navigate_dialog_to_folder(hwnd: HWND, folder_path: &str) -> JumpAckStatus {
     unsafe {
         SendMessageW(path_edit, WM_KEYDOWN, VK_RETURN_KEY, 0);
         SendMessageW(path_edit, WM_KEYUP, VK_RETURN_KEY, 0);
+    }
+
+    JumpAckStatus::Success
+}
+
+fn navigate_browse_for_folder_dialog_to_folder(hwnd: HWND, folder_path: &str) -> JumpAckStatus {
+    if !window_without_navigation_edit_can_jump(hwnd) {
+        return JumpAckStatus::UnsupportedDialog;
+    }
+
+    let wide_path = to_wide_null(folder_path);
+    unsafe {
+        SendMessageW(
+            hwnd,
+            BFFM_SETSELECTIONW,
+            TRUE as WPARAM,
+            wide_path.as_ptr() as LPARAM,
+        );
     }
 
     JumpAckStatus::Success
@@ -624,6 +653,19 @@ mod tests {
         ]);
 
         assert_eq!(Some(address_edit), selected);
+    }
+
+    #[test]
+    fn standard_dialog_without_navigation_edit_requires_browse_for_folder_shape() {
+        assert!(dialog_without_navigation_edit_can_jump(
+            "#32770",
+            "Browse For Folder"
+        ));
+        assert!(!dialog_without_navigation_edit_can_jump("#32770", "Open"));
+        assert!(!dialog_without_navigation_edit_can_jump(
+            "GHOST_WindowClass",
+            "Blender File View"
+        ));
     }
 
     #[test]

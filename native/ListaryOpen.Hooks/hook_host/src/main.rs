@@ -546,6 +546,64 @@ fn has_address_control(hwnd: HWND) -> bool {
     find_navigation_edit_control(hwnd).is_some()
 }
 
+fn dialog_without_navigation_edit_can_jump(class_name: &str, title: &str) -> bool {
+    class_name == DIALOG_CLASS && title.trim().eq_ignore_ascii_case("Browse For Folder")
+}
+
+fn window_without_navigation_edit_can_jump(hwnd: HWND) -> bool {
+    class_name(hwnd).as_deref().is_some_and(|class_name| {
+        dialog_without_navigation_edit_can_jump(class_name, &window_text(hwnd))
+    })
+}
+
+fn unsupported_foreground_window_message() -> Option<String> {
+    let foreground = unsafe { GetForegroundWindow() };
+    if foreground.is_null() {
+        return None;
+    }
+
+    let root = unsafe { GetAncestor(foreground, GA_ROOT) };
+    let hwnd = if root.is_null() { foreground } else { root };
+    let class_name = class_name(hwnd)?;
+    let title = window_text(hwnd);
+    let mut process_id = 0u32;
+    let thread_id = unsafe { GetWindowThreadProcessId(hwnd, &mut process_id) };
+    if thread_id == 0 || process_id == 0 {
+        return None;
+    }
+
+    unsupported_custom_file_browser_message(&process_name(process_id), &class_name, &title)
+}
+
+fn unsupported_custom_file_browser_message(
+    process_name: &str,
+    class_name: &str,
+    title: &str,
+) -> Option<String> {
+    if !is_blender_custom_file_browser(process_name, class_name, title) {
+        return None;
+    }
+
+    Some(format!(
+        "Foreground window is Blender custom file browser ({}/{}/{}), not a standard Win32 file dialog.",
+        process_name.trim(),
+        class_name.trim(),
+        title.trim()
+    ))
+}
+
+fn is_blender_custom_file_browser(process_name: &str, class_name: &str, title: &str) -> bool {
+    let process_name = process_name
+        .trim()
+        .strip_suffix(".exe")
+        .or_else(|| process_name.trim().strip_suffix(".EXE"))
+        .unwrap_or_else(|| process_name.trim());
+
+    process_name.eq_ignore_ascii_case("blender")
+        && class_name.trim() == "GHOST_WindowClass"
+        && title.trim().eq_ignore_ascii_case("Blender File View")
+}
+
 #[derive(Clone, Copy)]
 struct AddressControlCandidate<'a> {
     hwnd: HWND,
@@ -701,6 +759,7 @@ fn should_hook_observed_dialog(
         && is_supported_dialog_shape(class_name, title, has_address_control)
 }
 
+#[cfg(test)]
 fn should_report_active_dialog<C>(
     host_architecture: &str,
     dialog_architecture: &str,
@@ -893,8 +952,7 @@ fn response_for_request(request: &str) -> String {
     }
 
     match envelope.message_type.as_str() {
-        "GetActiveDialog" => active_dialog_response()
-            .unwrap_or_else(|| command_reply("NoActiveDialog", "No active hook dialog.")),
+        "GetActiveDialog" => active_dialog_response(),
         "JumpDialogToFolder" => {
             let payload = serde_json::from_value::<JumpCommandPayload>(envelope.payload);
             match payload {
@@ -907,17 +965,26 @@ fn response_for_request(request: &str) -> String {
     }
 }
 
-fn active_dialog_response() -> Option<String> {
-    let hwnd = resolve_active_dialog_window()?;
-    let dialog = observed_dialog(hwnd)?;
-    if !should_report_active_dialog(
-        host_architecture(),
-        dialog.architecture,
-        dialog.process_id,
-        dialog.thread_id,
-        is_hook_thread_confirmed,
-    ) {
-        return None;
+fn active_dialog_response() -> String {
+    let Some(hwnd) = resolve_active_dialog_window() else {
+        if let Some(message) = unsupported_foreground_window_message() {
+            return command_reply("NoActiveDialog", &message);
+        }
+
+        return command_reply("NoActiveDialog", "No supported foreground hook dialog.");
+    };
+
+    let Some(dialog) = observed_dialog(hwnd) else {
+        return command_reply(
+            "NoActiveDialog",
+            "Active foreground dialog could not be observed.",
+        );
+    };
+
+    if let Some(message) =
+        active_dialog_report_failure(host_architecture(), &dialog, is_hook_thread_confirmed)
+    {
+        return command_reply("NoActiveDialog", &message);
     }
 
     let payload = ActiveDialogPayload {
@@ -937,10 +1004,33 @@ fn active_dialog_response() -> Option<String> {
         payload,
     };
 
-    Some(
-        serde_json::to_string(&envelope)
-            .expect("hook IPC active dialog serialization should not fail"),
-    )
+    serde_json::to_string(&envelope).expect("hook IPC active dialog serialization should not fail")
+}
+
+fn active_dialog_report_failure<C>(
+    host_architecture: &str,
+    dialog: &ObservedDialog,
+    is_thread_hook_confirmed: C,
+) -> Option<String>
+where
+    C: Fn(HookThreadKey) -> bool,
+{
+    if !dialog.architecture.eq_ignore_ascii_case(host_architecture) {
+        return Some(format!(
+            "Active dialog architecture {} does not match {} hook host.",
+            dialog.architecture, host_architecture
+        ));
+    }
+
+    let thread = HookThreadKey::new(dialog.process_id, dialog.thread_id);
+    if !is_thread_hook_confirmed(thread) {
+        return Some(format!(
+            "Target dialog hook has not been installed yet for process {} thread {}.",
+            dialog.process_id, dialog.thread_id
+        ));
+    }
+
+    None
 }
 
 fn jump_dialog_to_folder(payload: JumpCommandPayload) -> String {
@@ -972,7 +1062,9 @@ fn jump_dialog_to_folder(payload: JumpCommandPayload) -> String {
         );
     }
 
-    if find_navigation_edit_control(hwnd).is_none() {
+    if find_navigation_edit_control(hwnd).is_none()
+        && !window_without_navigation_edit_can_jump(hwnd)
+    {
         return command_reply(
             "UnsupportedDialog",
             "Dialog does not expose a supported path edit control.",
@@ -1040,7 +1132,9 @@ fn jump_dialog_to_folder(payload: JumpCommandPayload) -> String {
         return command_reply(status, message);
     }
 
-    if find_navigation_edit_control(hwnd).is_none() {
+    if find_navigation_edit_control(hwnd).is_none()
+        && !window_without_navigation_edit_can_jump(hwnd)
+    {
         return command_reply(
             "UnsupportedDialog",
             "Dialog path edit control disappeared after jump command was acknowledged.",
@@ -2133,6 +2227,45 @@ mod tests {
     }
 
     #[test]
+    fn active_dialog_report_failure_explains_gate_that_failed() {
+        let dialog = ObservedDialog {
+            dialog_id: "100:200".to_string(),
+            window_handle: 200usize as HWND,
+            process_id: 100,
+            thread_id: 42,
+            process_name: "Code.exe".to_string(),
+            class_name: "#32770".to_string(),
+            title: "Open Folder".to_string(),
+            architecture: "x86",
+        };
+
+        assert_eq!(
+            Some("Active dialog architecture x86 does not match x64 hook host.".to_string()),
+            active_dialog_report_failure("x64", &dialog, |_| true)
+        );
+
+        let dialog = ObservedDialog {
+            architecture: "x64",
+            ..dialog
+        };
+
+        assert_eq!(
+            Some(
+                "Target dialog hook has not been installed yet for process 100 thread 42."
+                    .to_string()
+            ),
+            active_dialog_report_failure("x64", &dialog, |_| false)
+        );
+
+        assert_eq!(
+            None,
+            active_dialog_report_failure("x64", &dialog, |thread| {
+                thread == HookThreadKey::new(100, 42)
+            })
+        );
+    }
+
+    #[test]
     fn jump_target_ready_requires_active_target_and_confirmed_hook() {
         let target = 0x1234usize as HWND;
         let other = 0x5678usize as HWND;
@@ -2275,6 +2408,40 @@ mod tests {
         ]);
 
         assert_eq!(Some(address_edit), selected);
+    }
+
+    #[test]
+    fn standard_dialog_without_navigation_edit_requires_browse_for_folder_shape() {
+        assert!(dialog_without_navigation_edit_can_jump(
+            "#32770",
+            "Browse For Folder"
+        ));
+        assert!(!dialog_without_navigation_edit_can_jump("#32770", "Open"));
+        assert!(!dialog_without_navigation_edit_can_jump(
+            "GHOST_WindowClass",
+            "Blender File View"
+        ));
+    }
+
+    #[test]
+    fn custom_file_browser_message_identifies_blender_file_view() {
+        let message = unsupported_custom_file_browser_message(
+            "blender.exe",
+            "GHOST_WindowClass",
+            "Blender File View",
+        );
+
+        assert_eq!(
+            Some(
+                "Foreground window is Blender custom file browser (blender.exe/GHOST_WindowClass/Blender File View), not a standard Win32 file dialog."
+                    .to_string()
+            ),
+            message
+        );
+        assert_eq!(
+            None,
+            unsupported_custom_file_browser_message("blender.exe", "#32770", "Open")
+        );
     }
 
     #[test]

@@ -28,11 +28,14 @@ public sealed class DialogBridgeHookTests
         }
     }
 
-    [Fact]
-    public async Task JumpToFolderFallsBackWhenHookHasNoActiveDialog()
+    [Theory]
+    [InlineData(HookJumpStatus.NoActiveDialog)]
+    [InlineData(HookJumpStatus.HostUnavailable)]
+    [InlineData(HookJumpStatus.Timeout)]
+    public async Task JumpToFolderReportsDegradedFallbackWhenHookCannotProvideNativeJump(HookJumpStatus hookStatus)
     {
         var folder = Directory.CreateTempSubdirectory("listary-open-hook-fallback-");
-        var hook = new FakeHookBridge(new HookJumpResult(HookJumpStatus.NoActiveDialog, "No active hook dialog."));
+        var hook = new FakeHookBridge(new HookJumpResult(hookStatus, "Hook could not provide a native jump."));
         var fallback = new FakeDialogAutomation(DialogProbeResult.StandardDialog());
         var bridge = new DialogBridge(fallback, hook);
 
@@ -41,6 +44,9 @@ public sealed class DialogBridgeHookTests
             var result = await bridge.JumpToFolderAsync(folder.FullName, CancellationToken.None);
 
             Assert.Equal(DialogJumpStatus.Success, result.Status);
+            Assert.True(result.IsDegradedSuccess);
+            Assert.Contains("fallback", result.Message, StringComparison.OrdinalIgnoreCase);
+            Assert.Contains(hookStatus.ToString(), result.Message, StringComparison.Ordinal);
             Assert.Equal(1, hook.JumpCount);
             Assert.Equal(1, fallback.ProbeCallCount);
         }

@@ -73,18 +73,6 @@ public sealed class ExplorerTracker : IRefreshableQuickSwitchWindowProvider
             }
 
             var rememberedFolderPath = NormalizeExistingFolderPath(_lastFolder);
-            if (candidates.Count == 0 && rememberedFolderPath is not null)
-            {
-                return new[]
-                {
-                    new QuickSwitchFolderCandidate(
-                        rememberedFolderPath,
-                        "Explorer",
-                        IntPtr.Zero,
-                        false)
-                };
-            }
-
             return candidates
                 .OrderByDescending(candidate => candidate.IsForeground)
                 .ThenByDescending(candidate => IsRememberedFolderCandidate(candidate, rememberedFolderPath))
@@ -92,17 +80,7 @@ public sealed class ExplorerTracker : IRefreshableQuickSwitchWindowProvider
         }
         catch (Exception exception) when (IsExpectedExplorerObservationException(exception))
         {
-            var rememberedFolderPath = NormalizeExistingFolderPath(_lastFolder);
-            return rememberedFolderPath is null
-                ? Array.Empty<QuickSwitchFolderCandidate>()
-                : new[]
-                {
-                    new QuickSwitchFolderCandidate(
-                        rememberedFolderPath,
-                        "Explorer",
-                        IntPtr.Zero,
-                        false)
-                };
+            return Array.Empty<QuickSwitchFolderCandidate>();
         }
     }
 

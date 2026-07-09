@@ -14,9 +14,15 @@ public sealed class HookQuickSwitchBridgeTests
         hookFiles.CreateHostAndDll(HookArchitecture.X64);
         hookFiles.CreateHostAndDll(HookArchitecture.X86);
         var processFactory = new RecordingHookHostProcessFactory(startResult: new Process());
+        var x86HealthClient = new SequenceHealthProbeHookClient(
+            new HookJumpResult(HookJumpStatus.HostUnavailable, "No host."),
+            HookJumpResult.Success("Hook host healthy."));
         var bridge = new HookQuickSwitchBridge(
             HookQuickSwitchStatus.Disabled(),
-            CreateEmptyClients(),
+            new Dictionary<HookArchitecture, IHookIpcClient>
+            {
+                [HookArchitecture.X86] = x86HealthClient
+            },
             hookFiles.Paths,
             processFactory);
         var statuses = new List<HookQuickSwitchStatus>();
@@ -47,6 +53,26 @@ public sealed class HookQuickSwitchBridgeTests
                 hookFiles.ForArchitecture(HookArchitecture.X86).HookDllPath
             },
             start.StartInfo.ArgumentList);
+    }
+
+    [Fact]
+    public async Task EnableDoesNotMarkLaunchedX86HostRunningWithoutHealthProof()
+    {
+        using var hookFiles = HookFileFixture.Create();
+        hookFiles.CreateHostAndDll(HookArchitecture.X64);
+        hookFiles.CreateHostAndDll(HookArchitecture.X86);
+        var processFactory = new RecordingHookHostProcessFactory(startResult: new Process());
+        var bridge = new HookQuickSwitchBridge(
+            HookQuickSwitchStatus.Disabled(),
+            CreateEmptyClients(),
+            hookFiles.Paths,
+            processFactory);
+
+        await bridge.EnableAsync(CancellationToken.None);
+
+        Assert.True(bridge.Status.X64.HostRunning);
+        Assert.False(bridge.Status.X86.HostRunning);
+        Assert.Contains("health was not confirmed", bridge.Status.X86.Message, StringComparison.OrdinalIgnoreCase);
     }
 
     [Fact]
@@ -95,9 +121,10 @@ public sealed class HookQuickSwitchBridgeTests
         processFactory.Release();
         await Task.WhenAll(firstEnable, secondEnable).WaitAsync(TimeSpan.FromSeconds(2));
 
-        var start = Assert.Single(processFactory.Starts);
-        Assert.Equal("listary-open-hook-x64", start.StartInfo.ArgumentList[1]);
-        Assert.Contains("--launch-pipe", start.StartInfo.ArgumentList);
+        Assert.Equal(2, processFactory.Starts.Count);
+        Assert.Equal("listary-open-hook-x64", processFactory.Starts[0].StartInfo.ArgumentList[1]);
+        Assert.Contains("--launch-pipe", processFactory.Starts[0].StartInfo.ArgumentList);
+        Assert.Equal("listary-open-hook-x86", processFactory.Starts[1].StartInfo.ArgumentList[1]);
     }
 
     [Fact]
@@ -216,7 +243,7 @@ public sealed class HookQuickSwitchBridgeTests
     }
 
     [Fact]
-    public async Task EnableDoesNotStartDuplicateTrackedHostProcesses()
+    public async Task EnableRetriesX86HostWhenChildLaunchHealthWasNotConfirmed()
     {
         using var hookFiles = HookFileFixture.Create();
         hookFiles.CreateHostAndDll(HookArchitecture.X64);
@@ -231,7 +258,8 @@ public sealed class HookQuickSwitchBridgeTests
         await bridge.EnableAsync(CancellationToken.None);
         await bridge.EnableAsync(CancellationToken.None);
 
-        Assert.Single(processFactory.Starts);
+        Assert.Equal(2, processFactory.Starts.Count);
+        Assert.Equal("listary-open-hook-x86", processFactory.Starts[1].StartInfo.ArgumentList[1]);
     }
 
     [Fact]
@@ -342,6 +370,47 @@ public sealed class HookQuickSwitchBridgeTests
     }
 
     [Fact]
+    public async Task JumpPreservesSpecificNoActiveDialogDiagnostics()
+    {
+        var bridge = new HookQuickSwitchBridge(
+            HookQuickSwitchStatus.Disabled(),
+            new Dictionary<HookArchitecture, IHookIpcClient>
+            {
+                [HookArchitecture.X64] = new ActiveDialogResultHookClient(
+                    HookActiveDialogResult.NoActiveDialog("No supported foreground hook dialog.")),
+                [HookArchitecture.X86] = new ActiveDialogResultHookClient(
+                    HookActiveDialogResult.NoActiveDialog("Target dialog hook has not been installed yet for process 10 thread 20."))
+            });
+
+        var result = await bridge.JumpActiveDialogToFolderAsync("C:\\Users\\paulx", CancellationToken.None);
+
+        Assert.Equal(HookJumpStatus.NoActiveDialog, result.Status);
+        Assert.Contains("x86 hook host", result.Message, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains("Target dialog hook has not been installed yet", result.Message, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public async Task JumpPrefersTargetArchitecturePendingDiagnosticOverMismatch()
+    {
+        var bridge = new HookQuickSwitchBridge(
+            HookQuickSwitchStatus.Disabled(),
+            new Dictionary<HookArchitecture, IHookIpcClient>
+            {
+                [HookArchitecture.X64] = new ActiveDialogResultHookClient(
+                    HookActiveDialogResult.NoActiveDialog("Active dialog architecture x86 does not match x64 hook host.")),
+                [HookArchitecture.X86] = new ActiveDialogResultHookClient(
+                    HookActiveDialogResult.NoActiveDialog("Target dialog hook has not been installed yet for process 10 thread 20."))
+            });
+
+        var result = await bridge.JumpActiveDialogToFolderAsync("C:\\Users\\paulx", CancellationToken.None);
+
+        Assert.Equal(HookJumpStatus.NoActiveDialog, result.Status);
+        Assert.Contains("x86 hook host", result.Message, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains("Target dialog hook has not been installed yet", result.Message, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain("does not match", result.Message, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
     public async Task JumpUsesSnapshotOfClientDictionary()
     {
         var dialog = new HookDialogContext(
@@ -437,6 +506,46 @@ public sealed class HookQuickSwitchBridgeTests
 
         public Task<HookJumpResult> ProbeHealthAsync(CancellationToken cancellationToken) =>
             Task.FromResult(_healthResult);
+    }
+
+    private sealed class SequenceHealthProbeHookClient : IHookIpcClient, IHookHealthProbeClient
+    {
+        private readonly Queue<HookJumpResult> _healthResults;
+
+        public SequenceHealthProbeHookClient(params HookJumpResult[] healthResults)
+        {
+            _healthResults = new Queue<HookJumpResult>(healthResults);
+        }
+
+        public Task<HookDialogContext?> GetActiveDialogAsync(CancellationToken cancellationToken) =>
+            Task.FromResult<HookDialogContext?>(null);
+
+        public Task<HookJumpResult> JumpDialogToFolderAsync(string dialogId, string folderPath, CancellationToken cancellationToken) =>
+            Task.FromResult(new HookJumpResult(HookJumpStatus.NoActiveDialog, "No dialog."));
+
+        public Task<HookJumpResult> ProbeHealthAsync(CancellationToken cancellationToken) =>
+            Task.FromResult(_healthResults.Count == 0
+                ? new HookJumpResult(HookJumpStatus.HostUnavailable, "No host.")
+                : _healthResults.Dequeue());
+    }
+
+    private sealed class ActiveDialogResultHookClient : IHookIpcClient, IHookActiveDialogQueryClient
+    {
+        private readonly HookActiveDialogResult _result;
+
+        public ActiveDialogResultHookClient(HookActiveDialogResult result)
+        {
+            _result = result;
+        }
+
+        public Task<HookDialogContext?> GetActiveDialogAsync(CancellationToken cancellationToken) =>
+            Task.FromResult(_result.Dialog);
+
+        public Task<HookActiveDialogResult> GetActiveDialogResultAsync(CancellationToken cancellationToken) =>
+            Task.FromResult(_result);
+
+        public Task<HookJumpResult> JumpDialogToFolderAsync(string dialogId, string folderPath, CancellationToken cancellationToken) =>
+            Task.FromResult(new HookJumpResult(HookJumpStatus.NoActiveDialog, "No dialog."));
     }
 
     private sealed class BlockingHealthProbeHookClient : IHookIpcClient, IHookHealthProbeClient

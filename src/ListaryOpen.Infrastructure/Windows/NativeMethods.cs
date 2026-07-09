@@ -150,6 +150,16 @@ internal static partial class NativeMethods
     [DllImport("user32.dll", SetLastError = true)]
     internal static extern uint SendInput(uint nInputs, Input[] pInputs, int cbSize);
 
+    [DllImport("user32.dll", EntryPoint = "SendMessageTimeoutW", SetLastError = true, CharSet = CharSet.Unicode)]
+    internal static extern IntPtr SendMessageTimeout(
+        IntPtr hWnd,
+        uint msg,
+        UIntPtr wParam,
+        [Out] char[] lParam,
+        uint flags,
+        uint timeout,
+        out UIntPtr result);
+
     [LibraryImport("user32.dll")]
     [return: MarshalAs(UnmanagedType.Bool)]
     internal static partial bool SetForegroundWindow(IntPtr hWnd);

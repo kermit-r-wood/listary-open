@@ -29,9 +29,7 @@ public sealed class DirectoryOpusQuickSwitchProvider : IQuickSwitchWindowProvide
         try
         {
             var isForeground = _foregroundProvider();
-            return isForeground
-                ? ParseInfoPaths(_infoReader(), directoryOpusIsForeground: true)
-                : Array.Empty<QuickSwitchFolderCandidate>();
+            return ParseInfoPaths(_infoReader(), directoryOpusIsForeground: isForeground);
         }
         catch (Exception exception) when (exception is IOException
                                           or InvalidOperationException

@@ -1,5 +1,16 @@
 param(
-    [string[]]$ProcessNames = @("Antigravity", "notepad++", "chrome", "firefox", "MobaXterm"),
+    [string[]]$ProcessNames = @(
+        "Antigravity",
+        "notepad++",
+        "chrome",
+        "msedge",
+        "firefox",
+        "Code",
+        "MobaXterm",
+        "mspaint",
+        "wordpad",
+        "powershell_ise",
+        "vlc"),
     [string]$ModuleName = "ListaryOpen.Hook.dll",
     [string]$ExpectedHooksRoot = (Join-Path $PSScriptRoot "..\src\ListaryOpen.App\bin\Debug\net8.0-windows\hooks"),
     [switch]$AllowSubset,

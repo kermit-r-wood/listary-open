@@ -194,11 +194,7 @@ public partial class App : Application
         _settingsViewModel.UpdateHookQuickSwitchStatus(_hookQuickSwitchBridge.Status);
         var settingsWindow = new MainWindow(_settingsViewModel);
         _explorerTracker = new ExplorerTracker();
-        _quickSwitchWindowProvider = new CompositeQuickSwitchWindowProvider(new IQuickSwitchWindowProvider[]
-        {
-            _explorerTracker,
-            new DirectoryOpusQuickSwitchProvider()
-        });
+        _quickSwitchWindowProvider = CreateDefaultQuickSwitchWindowProvider(_explorerTracker);
         _explorerObservationScheduler = StartPeriodicExplorerObservation(
             _explorerTracker,
             () => new DispatcherExplorerObservationTimer());
@@ -291,6 +287,20 @@ public partial class App : Application
     internal static bool ShouldShowSettingsOnStartup(bool hasBlockingStartupMessage)
     {
         return hasBlockingStartupMessage;
+    }
+
+    internal static IQuickSwitchWindowProvider CreateDefaultQuickSwitchWindowProvider(ExplorerTracker explorerTracker)
+    {
+        ArgumentNullException.ThrowIfNull(explorerTracker);
+
+        return new CompositeQuickSwitchWindowProvider(
+            new IQuickSwitchWindowProvider[]
+            {
+                explorerTracker,
+                new DirectoryOpusQuickSwitchProvider(),
+                new TotalCommanderQuickSwitchProvider()
+            },
+            () => CreateExplorerFallbackCandidates(explorerTracker));
     }
 
     internal static void StartHookQuickSwitchEnablementOnStartup(
@@ -732,6 +742,22 @@ public partial class App : Application
             : Array.Empty<QuickSwitchFolderCandidate>();
     }
 
+    private static IReadOnlyList<QuickSwitchFolderCandidate> CreateExplorerFallbackCandidates(
+        ExplorerTracker explorerTracker)
+    {
+        var lastFolder = explorerTracker.LastFolder;
+        return !string.IsNullOrWhiteSpace(lastFolder) && Directory.Exists(lastFolder)
+            ? new[]
+            {
+                new QuickSwitchFolderCandidate(
+                    lastFolder,
+                    "Explorer",
+                    IntPtr.Zero,
+                    false)
+            }
+            : Array.Empty<QuickSwitchFolderCandidate>();
+    }
+
     internal static string? ObserveAndGetExistingTrackedFolder(ExplorerTracker? explorerTracker)
     {
         var candidateFolder = ObserveQuickSwitchFolderCandidates(explorerTracker)
@@ -771,8 +797,11 @@ public partial class App : Application
         ArgumentNullException.ThrowIfNull(dialogFolderActivation);
         ArgumentNullException.ThrowIfNull(reportDialogJumpResult);
 
-        var folderPath = candidates.FirstOrDefault()?.FolderPath;
-        if (string.IsNullOrWhiteSpace(folderPath) || !Directory.Exists(folderPath))
+        var folderPath = candidates
+            .FirstOrDefault(candidate => !string.IsNullOrWhiteSpace(candidate.FolderPath) &&
+                                         Directory.Exists(candidate.FolderPath))
+            ?.FolderPath;
+        if (string.IsNullOrWhiteSpace(folderPath))
         {
             return false;
         }
