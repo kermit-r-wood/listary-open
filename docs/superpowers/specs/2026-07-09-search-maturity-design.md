@@ -2,237 +2,343 @@
 
 ## Goal
 
-Improve ListaryOpen search maturity toward an Everything-like experience without trying to clone Everything in one pass.
+Move ListaryOpen search closer to an Everything-like local file search experience without attempting full Everything parity in one cycle.
 
-The first implementation should make the index harder to corrupt or drift, keep search responsive under large indexes, and expose a small set of high-value query filters. Full Everything parity is a later goal.
+The priority is index trustworthiness first, query responsiveness second, and richer syntax third. A search result that is briefly stale is acceptable. Silently deleting valid records because a scan or journal catch-up was partial is not acceptable.
 
-## Confirmed Requirements
+## Requirements
 
 - Keep the current product shape: tray-first, keyboard-first, WPF app, SQLite-backed local index.
-- Preserve the existing NTFS elevated helper and fallback provider architecture.
-- Prioritize index correctness over instant update latency. A stale result is better than deleting valid records because a scan was partial.
-- Use the smallest useful query syntax first: extension, file/folder mode, path text, quoted phrase, and exclusion.
-- Avoid new dependencies for the P0 work.
-- Do not implement ReFS parity, full Boolean grammar, regex, HTTP/ETP/FTP servers, SDK, or IPC as part of this spec.
+- Preserve the existing elevated NTFS helper plus fallback provider architecture.
+- Treat USN Journal support as a correctness system, not just a speed feature.
+- Make every prune, checkpoint advance, and full-rescan decision explicit and testable.
+- Stabilize the existing query syntax V1 before adding larger Everything-compatible syntax.
+- Add local diagnostics before adding heavier search infrastructure.
+- Avoid new dependencies for the stabilization work.
 
-## Current State
+## Non-Goals
 
-ListaryOpen already has useful search foundations:
+- Exact Everything search language compatibility.
+- Content indexing, OCR, or archive indexing.
+- Regex, wildcard grammar, full Boolean groups, macros, bookmarks, search history, size/date/attribute filters.
+- ReFS fast indexing, `USN_RECORD_V3`, mounted-volume maturity, or volume GUID path parity.
+- Persistent real-time watcher service.
+- Network location live monitoring.
+- HTTP/ETP/FTP servers, public SDK, or IPC.
+- FTS5, n-gram tables, multiple SQLite read connections, or WAL changes before measurement proves they are needed.
 
-- `NtfsUsnJournalReader` opens NTFS volumes and enumerates records with `FSCTL_ENUM_USN_DATA`.
-- `NtfsUsnRecordProjector` resolves records into paths with default exclusions.
-- `ElevatedIndexerClient` launches the helper and imports JSONL output incrementally.
-- `IndexingCoordinator` batches records into `SqliteSearchIndex`.
-- `SqliteSearchIndex` supports name/path matching, fuzzy matching, usage ranking, pinyin search text, and generation-based prune.
-- `FallbackIndexProvider` recursively scans non-NTFS and unavailable NTFS paths.
+## Review Inputs
 
-The important gap is that this is still "fast full scan plus SQLite rebuild", not an Everything-style persistent USN Journal index.
+This spec incorporates three independent review angles:
 
-## Current Problems
+- NTFS correctness: checkpoint scope, full-scan prune boundaries, ambiguous USN events, and volume identity.
+- Query behavior: existing parser semantics, filter-only searches, candidate-window limits, ranking, and UI mode contracts.
+- Product sequencing: phase size, rollback, diagnostics, and explicit out-of-scope parity work.
+
+The main conclusion is that P0 is correctly scoped, but P1 must be split. Checkpoint/planner work is not the same as robust real catch-up. Query syntax V1 already exists in code and should now be stabilized, documented, and measured.
+
+## Current Code Baseline
+
+ListaryOpen already has more than a basic recursive search:
+
+- `NtfsUsnJournalReader` uses `FSCTL_ENUM_USN_DATA` for NTFS full scans and now reuses one queried journal state as the full-scan high watermark.
+- `NtfsIndexProvider` rejects mapped network drives even when they report `NTFS`.
+- `IndexingCoordinator` only prunes after apparently successful scans and attempts NTFS journal catch-up before falling back to a full scan.
+- `SqliteSearchIndex` stores file records, usage records, generation metadata, and USN checkpoints.
+- `SqliteSearchIndex.ApplyUsnJournalChangesAsync` applies journal changes and checkpoint advancement in one SQLite transaction.
+- `ParsedSearchQuery` already supports bare terms, quoted phrases, `ext:`, `path:`, `!term`, `!ext:`, `file:`, and `folder:`.
+- `SqliteSearchIndex.SearchAsync` releases the connection gate before final .NET ranking.
+- Fallback indexing handles non-NTFS roots and unavailable NTFS paths.
+
+The remaining gap is not "add USN" from zero. The gap is making the existing USN and query work robust enough that the index does not drift, the UI behavior is predictable, and future syntax/performance work has measurements.
+
+## Current Risks
 
 ### Index Correctness
 
-- NTFS full scan uses two `FSCTL_ENUM_USN_DATA` passes that each query journal state independently. If the filesystem changes between passes, the directory map and record stream may not share one snapshot boundary.
-- Records whose paths cannot be resolved are skipped. If the scan otherwise completes, generation prune may delete old records that still exist.
-- There is no persisted per-volume checkpoint for `UsnJournalId`, `LowestValidUsn`, or `NextUsn`.
-- There is no `FSCTL_READ_USN_JOURNAL` catch-up path for create/delete/rename/modify events.
-- Rename and move are treated as delete plus insert after the next full scan because identity is currently path-based.
+- Checkpoints are effectively per indexed root, but the type/table still call the key `volume_root`. The spec and code should make this explicit. A true per-volume checkpoint is unsafe unless one coordinator applies a journal range to every indexed root on that volume before advancing it.
+- A full NTFS scan bounded at `HighUsn` can miss files changed after that watermark. Pruning immediately after the scan can delete records that should survive unless catch-up from `HighUsn` succeeds first.
+- `checkpoint.NextUsn > current.NextUsn` should be treated as a corrupt or stale checkpoint and force full rescan/reset. It must not be treated as "no work."
+- Busy volumes can advance `NextUsn` while catch-up is reading. Requiring the queried `NextUsn` to remain exactly equal to the requested end can cause repeated full rescans.
+- Root path is not a stable volume identity. Drive-letter reassignment, mounted volumes, and volume GUID paths can reuse a checkpoint for the wrong filesystem if identity is only path text.
+- Path-only delete/rename handling is acceptable for V1, but ambiguous USN sequences must preserve old records and schedule full rescan.
 
-### Query Performance And Syntax
+### Query Behavior And Performance
 
-- `SearchQuery` only models raw text, mode, and limit.
-- SQLite candidate collection runs several overlapping passes: exact, fuzzy, usage, combined, and fallback.
-- The main matching conditions are leading-wildcard `LIKE` patterns and ordered fuzzy `LIKE` patterns, so normal SQLite indexes provide little help.
-- `listary_rank_score` runs as a SQLite UDF during ordering and can become expensive for short queries.
-- `SearchAsync` holds the single connection gate while reading candidates, reading usage, and ranking.
-- There is no user-visible syntax for extension, path, negation, quoted phrase, size/date, attributes, regex, or macros.
+- Query syntax V1 exists, but unsupported Everything-style syntax does not have a documented contract.
+- Most SQLite filters still use leading-wildcard `LIKE`, suffix `LIKE`, or `lower(name) LIKE`. Current B-tree indexes help little for those predicates.
+- SQLite candidate queries still hold the single connection gate while they run.
+- `listary_rank_score` still runs inside SQLite for fuzzy and combined-score candidate passes, then final ranking is recomputed in .NET.
+- Cancellation is checked between candidate passes, but a long SQLite pass is not interruptible at fine granularity.
+- Filter-only queries such as `folder:`, `ext:pdf`, and `!ext:tmp` need deterministic first-page behavior and should avoid expensive fuzzy/UDF passes.
+- Dialog Jump and Quick Switch are folder-oriented UI modes. Their behavior for a user-entered `file:` token must be intentional and tested.
 
 ### Volumes And Permissions
 
-- Local NTFS drive-letter paths prefer `NtfsIndexProvider` when the helper is available.
-- ReFS, FAT, exFAT, UNC, and ordinary folders fall back to recursive enumeration.
-- Mapped network drives may be misclassified if only drive format is considered.
-- Fallback scanning swallows many file system errors. If a root-level permission or offline failure produces partial output, prune can remove good old records.
-- Extended paths, mounted volumes, and volume GUID paths are not first-class.
+- ReFS, FAT, exFAT, UNC, offline network roots, and permission-limited roots are fallback-only.
+- Root-level fallback failure must not look like a successful empty scan.
+- Child-level access failures can be skipped, but the status should say the run was permission-limited.
+- UAC cancellation should be reported as canceled and must not trigger fallback prune.
 
 ## Design
 
-### Phase P0: Prevent Drift And Keep Search Responsive
+### Phase P0: Stabilize The Existing Baseline
 
-P0 is the smallest useful hardening pass.
+P0 is a hardening pass over behavior that already exists or is close.
 
-#### Fixed NTFS Scan Watermark
+#### Checkpoint Scope
 
-`NtfsUsnJournalReader` should query the journal once at the start of a full scan and reuse the same `NextUsn` as `HighUsn` for both enumeration passes.
+Rename the conceptual checkpoint key from "volume checkpoint" to "root journal checkpoint" unless a real per-volume manager is introduced.
 
-This does not create a true snapshot, but it removes the current avoidable mismatch where the directory pass and record pass can use different upper bounds.
+Required behavior:
 
-#### Safe Prune Contract
+- A checkpoint belongs to one indexed root path plus the journal identity it was observed on.
+- Two indexed roots on the same NTFS volume must not cause either root to skip the other's journal range.
+- If a future per-volume manager is added, it must apply one journal range to every indexed root on that volume before advancing the shared checkpoint.
 
-Indexing should only prune stale records when the provider reports a complete scan.
+The table name can remain for migration simplicity, but code, comments, and tests should describe the actual root-scoped semantics.
 
-The minimal implementation can keep the current `IAsyncEnumerable<FileRecord>` shape and treat unexpected provider exceptions as incomplete. For fallback root-level enumeration failures, return failure to `IndexingCoordinator` instead of silently yielding zero or partial records.
+#### Checkpoint Safety Guards
 
-Provider behavior:
+Catch-up planning must force full rescan when:
 
-- Complete scan: upsert records, then prune records under the root for the current generation.
-- Incomplete scan: upsert any records already flushed if they are valid, but do not prune the root.
-- UAC canceled: do not fallback to a slow full scan and do not prune.
-- Root offline or inaccessible: mark status failed and keep old records.
+- checkpoint is missing.
+- `UsnJournalId` changed.
+- rules/content version changed.
+- checkpoint `NextUsn` is lower than `LowestValidUsn`.
+- checkpoint `NextUsn` is greater than current `NextUsn`.
+- checkpoint volume identity does not match the current root.
 
-#### Network Drive Classification
+Checkpoint advancement remains transactional with applied changes. Failed catch-up preserves old records and falls back to full scan without pruning partial output.
 
-Volume resolution should classify `DriveType.Network` as network before considering the file system name. A mapped `Z:\` drive that reports `NTFS` should use fallback folder indexing, not the NTFS volume helper.
+#### Full-Scan Prune Boundary
 
-UNC paths should continue to use fallback.
+A full NTFS scan records its starting journal state and `HighUsn`.
 
-#### Query Gate And Short Query Guard
+Before pruning stale records under the root, one of these must be true:
 
-`SqliteSearchIndex.SearchAsync` should hold `_connectionGate` only while accessing SQLite. Candidate records and usage records can be copied out, then `ResultRanker.Rank` can run after releasing the gate.
+- catch-up from full-scan `HighUsn` to the current journal point has been applied successfully, or
+- the system deliberately skips prune and reports that prune was skipped because the post-scan catch-up was incomplete.
 
-Search should check cancellation between candidate passes.
+This prevents files created, renamed, or modified after the scan watermark from being removed by generation prune.
 
-For one-character queries, skip expensive fuzzy UDF candidate passes and rely on exact/prefix/usage candidates. This preserves responsiveness for ordinary typing and avoids scanning the whole index on the first keystroke.
+#### Ambiguous USN Policy
 
-### Phase P1: Minimal USN Catch-Up And Useful Query Syntax
+The V1 journal applier should only apply changes it can resolve confidently:
 
-P1 adds real incremental correctness, but keeps the rename model simple.
+- create or modify: upsert current path metadata when the path is resolvable and under the indexed root.
+- delete: delete only when the path is known for that indexed root.
+- file rename: delete old path and upsert new path only when both sides are unambiguous.
+- directory rename/move, unresolved parent, hard-link ambiguity, coalesced rename, move in/out of root, transient create-delete, or metadata-read failure: preserve old records and schedule full rescan.
 
-#### Volume Checkpoint
+Ambiguous does not mean "empty success."
 
-Persist a per-volume checkpoint:
+#### Busy-Volume Catch-Up
 
-- volume root
-- file system kind
-- `UsnJournalId`
-- last applied `NextUsn`
-- index rules/content version
-- last successful full scan time
+Reading a journal range should target the planned `[StartUsn, EndUsn)` range. If the live journal advances beyond `EndUsn` while reading, the read may still succeed for the planned range. A full rescan is required only when the range is unavailable, the journal identity changes, records are unsupported/malformed, or the read cannot prove it reached `EndUsn`.
 
-The simplest storage is a new SQLite table. `index_metadata` is too flat once there are multiple volumes and roots.
+#### Query Syntax V1 Contract
 
-Checkpoint advancement rule:
+V1 syntax is:
 
-- Start from the previous checkpoint.
-- Read changes and apply them in a transaction.
-- Advance checkpoint only after all upserts/deletes and any required prune/dirty marking commit.
-
-#### USN Catch-Up
-
-On startup or after a full scan, query the current journal.
-
-- If `UsnJournalId` changed, do a full rescan.
-- If checkpoint `NextUsn` is lower than `LowestValidUsn`, do a full rescan.
-- Otherwise, read from checkpoint `NextUsn` to current `NextUsn` with `FSCTL_READ_USN_JOURNAL`.
-
-Apply simple deltas:
-
-- create or modify: upsert the current path metadata if resolvable and under an indexed root.
-- delete: delete the path if the path is known.
-- file rename: delete old path and upsert new path.
-- directory rename or move: mark the affected indexed root dirty and schedule a full rescan.
-
-Directory subtree diffs are deliberately deferred.
-
-#### Query Syntax V1
-
-Add a small parsed query model:
-
-- bare terms: existing fuzzy/name/path behavior.
-- quoted phrase: exact phrase in name/path search text.
+- bare terms: existing name/path fuzzy behavior.
+- quoted phrase: phrase filter in path/search text.
 - `ext:pdf`: extension filter without leading dot.
-- `file:` and `folder:`: type filters.
+- `file:`: files only.
+- `folder:`: folders only.
 - `path:src`: require path text.
-- `!term` or `!ext:tmp`: exclusion.
+- `!term` and `!ext:tmp`: exclusion filters.
 
-Parsing should be simple and deterministic. No Boolean groups, OR, macros, regex, or date/size filters in this phase.
+Unsupported Everything-style syntax has defined behavior:
 
-SQLite can apply cheap filters first, then feed candidates to the existing ranker.
+- `*.pdf`, `regex:foo`, `size:>1mb`, date filters, attribute filters, Boolean groups, and macros are treated as ordinary literal terms unless a later parser version explicitly claims them.
+- They must not silently behave like partial Everything syntax.
 
-### Phase P2: Larger Parity Work
+Filter-only searches must:
 
-P2 should wait for measurements and user pressure.
+- return a deterministic first page.
+- respect `SearchQuery.Limit`.
+- avoid fuzzy/UDF candidate passes when there is no useful positive ranking text.
 
-- ReFS USN support and `USN_RECORD_V3`.
-- File reference number side table for identity across rename/move.
-- Multiple read connections plus WAL for better foreground search isolation.
-- FTS5 or a small n-gram/prefix table for real prefiltering.
-- Full query grammar: OR, grouping, wildcards, regex, size/date/attribute filters, macros, bookmarks, search history.
-- Per-volume manager with offline retention policy.
-- HTTP/ETP/FTP server, SDK, and IPC.
+#### UI Mode Contract
+
+Dialog Jump and Quick Switch remain folder-targeting experiences.
+
+In those modes:
+
+- `folder:` is allowed and keeps folder-only results.
+- `file:` must not surface file results in a folder-only jump flow.
+- The UI should either ignore `file:` for these modes with a status message or return no results with a clear status. The chosen behavior must be covered by tests.
+
+Normal search can honor `file:` as files only.
+
+#### Diagnostics
+
+Add lightweight local diagnostics before larger search architecture work:
+
+- query elapsed p50/p95/max.
+- candidate count per pass.
+- final ranking time.
+- SQLite connection-gate wait time.
+- whether expensive fuzzy/UDF passes ran.
+- index run result, indexed count, prune count, and prune-skipped count.
+- catch-up action and reason.
+- USN events read, applied, skipped, and full-rescan reason.
+- database row count and file size.
+
+Diagnostics can be trace/log output first. No UI is required for P0.
+
+### Phase P1a: Root Journal Checkpoint Hardening
+
+P1a finishes the USN catch-up foundation without promising Everything-grade real-time updates.
+
+Required work:
+
+- Persist root-scoped checkpoints with root path, filesystem kind, journal id, next USN, rules version, last successful full scan time, and enough volume identity to avoid drive-letter reuse.
+- Add corrupt-checkpoint handling.
+- Add tests for two indexed roots on the same NTFS volume.
+- Add tests for checkpoint reset on journal id change, rules version change, low-watermark gap, future `NextUsn`, and volume identity mismatch.
+- Ensure catch-up failure never advances the checkpoint and never prunes partial output.
+
+Acceptance:
+
+- A create/delete sequence under root A does not cause root B on the same volume to skip its own changes.
+- Invalid checkpoint data causes a full rescan path and preserves existing records until a complete replacement is available.
+
+### Phase P1b: Real Catch-Up Integration
+
+P1b makes journal catch-up a dependable incremental update path.
+
+Required work:
+
+- Read planned USN ranges with `FSCTL_READ_USN_JOURNAL`.
+- Apply simple file create, modify, delete, and unambiguous file rename.
+- Detect directory-affecting or unresolved events and schedule root full rescan.
+- Apply post-full-scan catch-up before prune, or skip prune if catch-up is incomplete.
+- Advance checkpoints only after SQLite changes commit.
+- Keep full rescan available as the conservative fallback for every uncertain case.
+
+Acceptance:
+
+- Local NTFS root create, modify, delete, and file rename update the index without a full root scan.
+- Directory rename or move preserves old records, marks the root dirty, and completes a full rescan before prune.
+- A file created after full-scan `HighUsn` but before prune is not removed from the index.
+- Journal reset, unsupported record version, malformed helper output, and unreadable journal range all preserve existing records and request full rescan.
+
+### Phase P1c: Query Syntax Stabilization
+
+P1c locks down the current V1 parser and SQLite behavior.
+
+Required work:
+
+- Document syntax in user-facing docs.
+- Add parser and SQLite tests for all V1 tokens.
+- Add tests for unsupported syntax as literal text.
+- Add tests for filter-only queries.
+- Add candidate-window tests for path, phrase, and exclusion filters. Either prove a valid later result can still surface or explicitly accept the bounded-window limitation.
+- Add ranking contract tests: exact name match beats path/pinyin without usage; usage and recency boosts can reorder results only within capped, stable limits.
+- Decide and test `file:` behavior in Dialog Jump and Quick Switch.
+
+Performance follow-up:
+
+- If `ext:` or name filtering is slow in diagnostics, add narrow `extension` and `name_lower` columns.
+- Do not add FTS/ngram/WAL before the diagnostics show the current candidate path is the bottleneck.
 
 ## Data Model
 
 ### Files
 
-Keep the current `files` table for P0.
+Keep the current `files` table for stabilization.
 
-P1 may add cheap filter columns if needed:
+Optional future columns, only after measurement:
 
 - `extension`
 - `name_lower`
+- `volume_identity`
+- file reference number side table for rename/move identity
 
-Do not add these until query syntax work needs them. SQLite can initially derive extension from `name` or use a narrow migration if performance requires it.
+### Root Journal Checkpoints
 
-### Volume Checkpoints
-
-P1 adds:
+The existing table can be migrated or reinterpreted, but the model should be:
 
 ```sql
-create table if not exists volume_checkpoints(
-    volume_root text not null primary key,
+create table if not exists root_journal_checkpoints(
+    root_path text not null primary key,
     file_system_name text not null,
-    usn_journal_id text,
-    next_usn text,
+    volume_identity text,
+    usn_journal_id text not null,
+    next_usn text not null,
     rules_version integer not null,
-    last_full_scan_at text
+    last_full_scan_at text not null
 );
 ```
 
-USN values are stored as invariant-culture decimal text so unsigned journal identifiers do not depend on SQLite signed integer range. Code parses them to the native numeric type before comparison.
+USN values are stored as invariant-culture decimal text so unsigned journal identifiers do not depend on SQLite signed integer range. Code parses them to native numeric types before comparison.
 
 ## Error Handling
 
-- Unsupported USN record versions should fail the NTFS provider for that run. They must not look like a successful empty scan.
-- Malformed helper output should mark NTFS failed and avoid prune. Fallback is only safe before any partial NTFS output has been accepted for that root.
-- Root-level fallback access failures should mark the run failed and preserve old records.
-- Child-level inaccessible directories can still be skipped, but the status should mention permission-limited indexing.
-- Network offline should preserve old records and report offline, not root missing.
-- UAC cancellation should be reported as canceled and should not trigger fallback or prune.
+- Unsupported USN record versions fail the NTFS provider for that run. They must not look like a successful empty scan.
+- Malformed helper output marks NTFS failed and avoids prune.
+- Fallback is safe only before any partial NTFS output has been accepted for that root.
+- Root-level fallback access failures mark the run failed and preserve old records.
+- Child-level inaccessible directories can be skipped, but the run status should mention permission-limited indexing.
+- Network offline preserves old records and reports offline, not root missing.
+- UAC cancellation reports canceled and does not trigger fallback or prune.
+- Corrupt checkpoint data forces full rescan/reset and preserves old records until a complete scan succeeds.
 
 ## Verification
 
 Automated tests:
 
-- NTFS fixed watermark: fake journal returns different current `NextUsn` values; both enum passes use the same initial `HighUsn`.
-- Incomplete scan does not prune: provider yields one record then fails; old records under the root remain.
-- Fallback root failure does not prune: root-level unauthorized/offline failure preserves old records and reports failed status.
-- Network drive classification: `DriveType.Network` plus `DriveFormat = NTFS` selects fallback.
-- Short query guard: one-character query does not call the expensive fuzzy UDF path.
-- Query syntax V1: `ext:pdf invoice !archive`, `folder: report`, `path:src "search panel"` each returns the expected SQLite result set.
-- USN checkpoint: normal catch-up advances checkpoint only after commit; journal reset or `LowestValidUsn` gap schedules full rescan.
-- Rename handling: file rename removes old path and adds new path; directory rename marks root dirty.
+- Two roots on the same NTFS volume maintain independent root-scoped checkpoints.
+- `checkpoint.NextUsn > journal.NextUsn` forces full rescan/reset.
+- Volume identity mismatch does not reuse an old checkpoint.
+- Full-scan `HighUsn` to prune boundary is protected by catch-up or prune skip.
+- Busy-volume catch-up can read a planned range even if the live `NextUsn` advances beyond the planned end.
+- Ambiguous directory rename/move schedules full rescan and preserves old records.
+- Incomplete scan does not prune.
+- Fallback root failure does not prune.
+- Network drive classification selects fallback even when format reports `NTFS`.
+- Filter-only searches are deterministic and skip expensive fuzzy/UDF passes.
+- Unsupported syntax is treated as literal text.
+- Query syntax V1 filters return expected result sets.
+- Dialog Jump and Quick Switch have explicit `file:` behavior tests.
 
 Manual checks:
 
-- Local NTFS root with creates, deletes, file rename, and directory rename.
+- Local NTFS root with create, modify, delete, file rename, and directory rename.
+- Two indexed roots on the same NTFS volume.
 - exFAT or FAT USB root.
 - UNC share online and offline.
 - Mapped network drive while running elevated and non-elevated.
 - Root containing an inaccessible child directory.
-
-## Out Of Scope
-
-- Exact Everything search language compatibility.
-- ReFS fast indexing.
-- Persistent real-time watcher service.
-- Network location live monitoring.
-- Public SDK or remote search server.
-- UI for editing advanced syntax, exclusions, bookmarks, or macros.
+- Large-index short queries and filter-only queries with diagnostics enabled.
 
 ## Rollout
 
-1. Ship P0 as a correctness and responsiveness hardening pass.
-2. Measure large-index search latency and indexing status behavior.
-3. Ship P1 USN catch-up and Query Syntax V1 behind the existing indexing/search paths.
-4. Revisit P2 only after P0/P1 show real bottlenecks.
+1. Ship P0 stabilization and diagnostics.
+2. Review diagnostics on a large local index before adding heavier search structures.
+3. Ship P1a root checkpoint hardening.
+4. Ship P1b real USN catch-up integration.
+5. Ship P1c query syntax stabilization and docs.
+6. Revisit P2 parity only after P0/P1 metrics show the next bottleneck.
+
+## Rollback And Recovery
+
+- Schema/rules version bumps may rebuild `files`, but should preserve `usage`.
+- Missing, invalid, corrupt, or mismatched checkpoints force full rescan and preserve old records until a complete scan succeeds.
+- Catch-up failures must not advance checkpoints.
+- Partial full scans must not prune.
+- If a new syntax parser version misbehaves, unsupported tokens should continue to behave as literals rather than returning broad accidental matches.
+
+## P2 Parking Lot
+
+P2 is explicitly measurement-driven:
+
+- ReFS USN support and `USN_RECORD_V3`.
+- File reference number side table for identity across rename/move.
+- Multiple read connections plus WAL for foreground search isolation.
+- FTS5 or n-gram/prefix table for scalable filtering.
+- Full query grammar: OR, grouping, wildcards, regex, size/date/attribute filters, macros, bookmarks, search history.
+- Per-volume manager with offline retention policy.
+- HTTP/ETP/FTP server, SDK, and IPC.
