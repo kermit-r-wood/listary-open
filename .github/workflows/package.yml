@@ -1,0 +1,108 @@
+name: Package
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+    tags:
+      - "v*"
+
+jobs:
+  package:
+    name: Build Windows package
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v5
+        with:
+          global-json-file: global.json
+
+      - name: Setup MSYS2 MinGW toolchains
+        uses: msys2/setup-msys2@v2
+        with:
+          update: true
+          install: >-
+            mingw-w64-clang-x86_64-clang
+            mingw-w64-clang-i686-clang
+
+      - name: Setup Rust targets
+        shell: pwsh
+        run: |
+          rustup target add x86_64-pc-windows-gnullvm
+          rustup target add i686-pc-windows-gnullvm
+
+      - name: Configure Rust linkers
+        shell: pwsh
+        run: |
+          $cargoConfig = Join-Path $env:GITHUB_WORKSPACE "native/ListaryOpen.Hooks/.cargo/config.toml"
+          @"
+          [build]
+          target-dir = "target"
+
+          [target.x86_64-pc-windows-gnullvm]
+          linker = "C:/msys64/clang64/bin/x86_64-w64-mingw32-clang.exe"
+
+          [target.i686-pc-windows-gnullvm]
+          linker = "C:/msys64/clang32/bin/i686-w64-mingw32-clang.exe"
+          "@ | Set-Content -Path $cargoConfig -Encoding utf8
+
+      - name: Restore
+        shell: pwsh
+        run: dotnet restore ListaryOpen.sln
+
+      - name: Test
+        shell: pwsh
+        run: dotnet test ListaryOpen.sln -c Release --no-restore --nologo -p:BuildNativeHooks=false
+
+      - name: Publish app with native hooks
+        shell: pwsh
+        run: |
+          dotnet publish src\ListaryOpen.App\ListaryOpen.App.csproj `
+            -c Release `
+            -r win-x64 `
+            --self-contained false `
+            --no-restore `
+            -p:BuildNativeHooks=true `
+            -p:NativeHooksX64RuntimeDll=C:\msys64\clang64\bin\libunwind.dll `
+            -p:NativeHooksX86RuntimeDll=C:\msys64\clang32\bin\libunwind.dll `
+            -o artifacts\ListaryOpen
+
+      - name: Verify package contents
+        shell: pwsh
+        run: |
+          $required = @(
+            "artifacts\ListaryOpen\ListaryOpen.App.exe",
+            "artifacts\ListaryOpen\ListaryOpen.Indexer.Elevated.exe",
+            "artifacts\ListaryOpen\hooks\x64\ListaryOpen.HookHost.exe",
+            "artifacts\ListaryOpen\hooks\x64\ListaryOpen.Hook.dll",
+            "artifacts\ListaryOpen\hooks\x64\libunwind.dll",
+            "artifacts\ListaryOpen\hooks\x86\ListaryOpen.HookHost.exe",
+            "artifacts\ListaryOpen\hooks\x86\ListaryOpen.Hook.dll",
+            "artifacts\ListaryOpen\hooks\x86\libunwind.dll"
+          )
+
+          foreach ($path in $required) {
+            if (-not (Test-Path $path)) {
+              throw "Required package file is missing: $path"
+            }
+          }
+
+      - name: Create zip package
+        shell: pwsh
+        run: |
+          Compress-Archive `
+            -Path artifacts\ListaryOpen\* `
+            -DestinationPath artifacts\ListaryOpen-win-x64.zip `
+            -Force
+
+      - name: Upload package artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: ListaryOpen-win-x64
+          path: artifacts/ListaryOpen-win-x64.zip
+          if-no-files-found: error

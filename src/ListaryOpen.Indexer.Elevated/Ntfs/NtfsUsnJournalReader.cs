@@ -233,7 +233,7 @@ public sealed class NtfsUsnJournalReader
         long endUsn)
     {
         return journalData.UsnJournalId != expectedUsnJournalId
-            || journalData.NextUsn != endUsn;
+            || journalData.NextUsn < endUsn;
     }
 
     private static IEnumerable<NtfsUsnEntry> EnumerateEntries(

@@ -6,12 +6,14 @@ using System.Xml.Linq;
 
 namespace ListaryOpen.Infrastructure.Windows;
 
-public sealed class DirectoryOpusQuickSwitchProvider : IQuickSwitchWindowProvider
+public sealed class DirectoryOpusQuickSwitchProvider : IRefreshableQuickSwitchWindowProvider
 {
     private const string SourceName = "Directory Opus";
     private static readonly TimeSpan InfoTimeout = TimeSpan.FromSeconds(1);
     private readonly Func<string?> _infoReader;
     private readonly Func<bool> _foregroundProvider;
+    private IReadOnlyList<QuickSwitchFolderCandidate> _cachedCandidates = Array.Empty<QuickSwitchFolderCandidate>();
+    private int _refreshInProgress;
 
     public DirectoryOpusQuickSwitchProvider()
         : this(ReadDirectoryOpusInfo, IsDirectoryOpusForeground)
@@ -22,24 +24,44 @@ public sealed class DirectoryOpusQuickSwitchProvider : IQuickSwitchWindowProvide
     {
         _infoReader = infoReader ?? throw new ArgumentNullException(nameof(infoReader));
         _foregroundProvider = foregroundProvider ?? (() => false);
+        Refresh();
     }
 
     public IReadOnlyList<QuickSwitchFolderCandidate> GetFolderCandidates()
     {
-        try
+        var isForeground = _foregroundProvider();
+        return Volatile.Read(ref _cachedCandidates)
+            .Select(candidate => candidate with { IsForeground = isForeground && candidate.IsForeground })
+            .ToArray();
+    }
+
+    public void Refresh()
+    {
+        if (Interlocked.Exchange(ref _refreshInProgress, 1) != 0)
         {
-            var isForeground = _foregroundProvider();
-            return ParseInfoPaths(_infoReader(), directoryOpusIsForeground: isForeground);
+            return;
         }
-        catch (Exception exception) when (exception is IOException
-                                          or InvalidOperationException
-                                          or NotSupportedException
-                                          or Win32Exception
-                                          or UnauthorizedAccessException
-                                          or SecurityException)
+
+        _ = Task.Run(() =>
         {
-            return Array.Empty<QuickSwitchFolderCandidate>();
-        }
+            try
+            {
+                Volatile.Write(ref _cachedCandidates, ParseInfoPaths(_infoReader()));
+            }
+            catch (Exception exception) when (exception is IOException
+                                              or InvalidOperationException
+                                              or NotSupportedException
+                                              or Win32Exception
+                                              or UnauthorizedAccessException
+                                              or SecurityException)
+            {
+                Volatile.Write(ref _cachedCandidates, Array.Empty<QuickSwitchFolderCandidate>());
+            }
+            finally
+            {
+                Volatile.Write(ref _refreshInProgress, 0);
+            }
+        });
     }
 
     internal static IReadOnlyList<QuickSwitchFolderCandidate> ParseInfoPaths(

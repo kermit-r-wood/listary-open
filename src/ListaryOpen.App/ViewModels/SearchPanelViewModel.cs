@@ -20,7 +20,8 @@ public sealed class SearchPanelViewModel : INotifyPropertyChanged
     private readonly Func<string, bool> _folderExists;
     private readonly Func<string, DateTimeOffset> _getFolderLastWriteTime;
     private readonly ISearchResultActivationService _activationService;
-    private readonly Func<string, CancellationToken, Task<DialogJumpResult>> _dialogFolderActivation;
+    private readonly Func<string, CancellationToken, Task<DialogJumpResult>> _defaultDialogFolderActivation;
+    private Func<string, CancellationToken, Task<DialogJumpResult>> _dialogFolderActivation;
     private readonly TimeSpan _searchDelay;
     private readonly object _refreshCancellationGate = new();
     private int _refreshVersion;
@@ -82,7 +83,8 @@ public sealed class SearchPanelViewModel : INotifyPropertyChanged
         _folderExists = folderExists ?? throw new ArgumentNullException(nameof(folderExists));
         _getFolderLastWriteTime = getFolderLastWriteTime ?? throw new ArgumentNullException(nameof(getFolderLastWriteTime));
         _activationService = activationService ?? throw new ArgumentNullException(nameof(activationService));
-        _dialogFolderActivation = dialogFolderActivation ?? throw new ArgumentNullException(nameof(dialogFolderActivation));
+        _defaultDialogFolderActivation = dialogFolderActivation ?? throw new ArgumentNullException(nameof(dialogFolderActivation));
+        _dialogFolderActivation = _defaultDialogFolderActivation;
         _searchDelay = searchDelay ?? DefaultSearchDelay;
     }
 
@@ -160,6 +162,7 @@ public sealed class SearchPanelViewModel : INotifyPropertyChanged
 
     public Task ActivateFilesAndFoldersSearchAsync()
     {
+        _dialogFolderActivation = _defaultDialogFolderActivation;
         _searchMode = SearchMode.FilesAndFolders;
         _pinnedFolderPaths = Array.Empty<string>();
         StatusText = "Search files and folders.";
@@ -169,6 +172,7 @@ public sealed class SearchPanelViewModel : INotifyPropertyChanged
 
     public Task ActivateFolderSearchAsync(string? trackedFolder)
     {
+        _dialogFolderActivation = _defaultDialogFolderActivation;
         _searchMode = SearchMode.FoldersOnly;
         var normalizedFolder = TryNormalizeExistingFolder(trackedFolder);
         _pinnedFolderPaths = normalizedFolder is null
@@ -179,10 +183,17 @@ public sealed class SearchPanelViewModel : INotifyPropertyChanged
         return RefreshAsync();
     }
 
-    public Task ActivateQuickSwitchFolderSearchAsync(IReadOnlyList<QuickSwitchFolderCandidate> candidates)
+    public Task ActivateQuickSwitchFolderSearchAsync(IReadOnlyList<QuickSwitchFolderCandidate> candidates) =>
+        ActivateQuickSwitchFolderSearchAsync(candidates, _defaultDialogFolderActivation);
+
+    internal Task ActivateQuickSwitchFolderSearchAsync(
+        IReadOnlyList<QuickSwitchFolderCandidate> candidates,
+        Func<string, CancellationToken, Task<DialogJumpResult>> dialogFolderActivation)
     {
         ArgumentNullException.ThrowIfNull(candidates);
+        ArgumentNullException.ThrowIfNull(dialogFolderActivation);
 
+        _dialogFolderActivation = dialogFolderActivation;
         _searchMode = SearchMode.FoldersOnly;
         _pinnedFolderPaths = NormalizePinnedFolderPaths(candidates);
         SelectedResult = null;
@@ -216,6 +227,7 @@ public sealed class SearchPanelViewModel : INotifyPropertyChanged
         {
             await _activationService.OpenAsync(path);
             StatusText = $"Opened {path}";
+            await RecordUsageAsync(path);
         }
         catch (Exception exception) when (IsExpectedActivationException(exception))
         {
@@ -281,6 +293,43 @@ public sealed class SearchPanelViewModel : INotifyPropertyChanged
             : FormatDialogJumpFailure(result);
     }
 
+    private async Task RecordUsageAsync(string path)
+    {
+        try
+        {
+            await _index.RecordUsageAsync(path, CancellationToken.None);
+        }
+        catch (Exception exception)
+        {
+            Trace.TraceError(exception.ToString());
+        }
+    }
+
+    internal void MoveSelection(int delta)
+    {
+        if (delta == 0 || Results.Count == 0)
+        {
+            return;
+        }
+
+        var selectedIndex = -1;
+        for (var index = 0; index < Results.Count; index++)
+        {
+            if (Equals(Results[index], SelectedResult))
+            {
+                selectedIndex = index;
+                break;
+            }
+        }
+
+        if (selectedIndex < 0)
+        {
+            selectedIndex = delta > 0 ? -1 : Results.Count;
+        }
+
+        SelectedResult = Results[Math.Clamp(selectedIndex + delta, 0, Results.Count - 1)];
+    }
+
     private async Task RefreshAsync(bool delaySearch = false)
     {
         using var refreshCancellation = BeginRefreshCancellation();
@@ -315,6 +364,13 @@ public sealed class SearchPanelViewModel : INotifyPropertyChanged
                 return;
             }
 
+            var searchQuery = new SearchQuery(queryText, searchMode);
+            if (searchMode == SearchMode.FoldersOnly && searchQuery.Parsed.FileOnly)
+            {
+                StatusText = "File-only search is unavailable while selecting a folder.";
+                return;
+            }
+
             IReadOnlyList<SearchResult> results;
             try
             {
@@ -323,9 +379,7 @@ public sealed class SearchPanelViewModel : INotifyPropertyChanged
                     await Task.Delay(_searchDelay, cancellationToken);
                 }
 
-                results = await _index.SearchAsync(
-                    new SearchQuery(queryText, searchMode),
-                    cancellationToken);
+                results = await _index.SearchAsync(searchQuery, cancellationToken);
             }
             catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
             {

@@ -51,6 +51,51 @@ public sealed class DialogBridgeTests
     }
 
     [Fact]
+    public async Task JumpToFolderUsesCustomAdapterBeforeStandardAutomation()
+    {
+        var folder = Directory.CreateTempSubdirectory("listary-open-custom-adapter-");
+        var automation = new FakeDialogAutomation(DialogProbeResult.Unsupported("No standard dialog."));
+        var adapter = new FakeCustomDialogAdapter("Blender file browser", canHandle: true);
+        var bridge = new DialogBridge(
+            automation,
+            customAdapters: new ICustomDialogAdapter[] { adapter });
+
+        try
+        {
+            var result = await bridge.JumpToFolderAsync(folder.FullName, CancellationToken.None);
+
+            Assert.Equal(DialogJumpStatus.Success, result.Status);
+            Assert.Contains("Blender file browser", result.Message, StringComparison.Ordinal);
+            Assert.Equal(folder.FullName, adapter.LastFolder);
+            Assert.Equal(1, adapter.CanHandleCallCount);
+            Assert.Equal(1, adapter.SetFolderCallCount);
+            Assert.Equal(0, automation.ProbeCallCount);
+        }
+        finally
+        {
+            folder.Delete(recursive: true);
+        }
+    }
+
+    [Fact]
+    public async Task JumpToFolderSkipsCustomAdapterThatCannotHandleActiveWindow()
+    {
+        var automation = new FakeDialogAutomation(DialogProbeResult.Unsupported("No standard dialog."));
+        var adapter = new FakeCustomDialogAdapter("Blender file browser", canHandle: false);
+        var bridge = new DialogBridge(
+            automation,
+            customAdapters: new ICustomDialogAdapter[] { adapter });
+
+        var result = await bridge.JumpToFolderAsync("C:\\Docs", CancellationToken.None);
+
+        Assert.Equal(DialogJumpStatus.UnsupportedDialog, result.Status);
+        Assert.Equal("No standard dialog.", result.Message);
+        Assert.Equal(1, adapter.CanHandleCallCount);
+        Assert.Equal(0, adapter.SetFolderCallCount);
+        Assert.Equal(1, automation.ProbeCallCount);
+    }
+
+    [Fact]
     public async Task JumpToFolderReportsFailedAndSkipsAutomationForUnknownProbeStatus()
     {
         var automation = new FakeDialogAutomation(new DialogProbeResult((DialogProbeStatus)999, "Unknown dialog probe"));
@@ -133,6 +178,40 @@ public sealed class DialogBridgeTests
         Assert.Equal("folderPath", exception.ParamName);
         Assert.Equal(0, automation.ProbeCallCount);
         Assert.Equal(0, automation.SetFolderCallCount);
+    }
+}
+
+internal sealed class FakeCustomDialogAdapter : ICustomDialogAdapter
+{
+    private readonly bool _canHandle;
+    private readonly bool _setFolderResult;
+
+    public FakeCustomDialogAdapter(string name, bool canHandle, bool setFolderResult = true)
+    {
+        Name = name;
+        _canHandle = canHandle;
+        _setFolderResult = setFolderResult;
+    }
+
+    public string Name { get; }
+
+    public string? LastFolder { get; private set; }
+
+    public int CanHandleCallCount { get; private set; }
+
+    public int SetFolderCallCount { get; private set; }
+
+    public bool CanHandleActiveWindow()
+    {
+        CanHandleCallCount++;
+        return _canHandle;
+    }
+
+    public Task<bool> SetFolderAsync(string folderPath, CancellationToken cancellationToken)
+    {
+        SetFolderCallCount++;
+        LastFolder = folderPath;
+        return Task.FromResult(_setFolderResult);
     }
 }
 

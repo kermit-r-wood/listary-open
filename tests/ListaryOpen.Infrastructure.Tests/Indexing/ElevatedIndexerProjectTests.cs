@@ -103,6 +103,9 @@ public sealed class ElevatedIndexerProjectTests
         var projectXml = document.ToString(SaveOptions.DisableFormatting);
         var target = document.Descendants("Target").Single(element => (string?)element.Attribute("Name") == "BuildNativeHooks");
         var targetXml = target.ToString(SaveOptions.DisableFormatting);
+        var publishTarget = document.Descendants("Target").Single(element =>
+            (string?)element.Attribute("Name") == "CopyNativeHooksToPublishDirectory");
+        var publishTargetXml = publishTarget.ToString(SaveOptions.DisableFormatting);
 
         Assert.DoesNotContain(@"C:\Users\paulx", projectXml, StringComparison.OrdinalIgnoreCase);
         Assert.Contains("$(SCOOP)", projectXml, StringComparison.Ordinal);
@@ -137,6 +140,9 @@ public sealed class ElevatedIndexerProjectTests
         Assert.Contains(@"hooks\x86\ListaryOpen.Hook.dll", targetXml, StringComparison.Ordinal);
         Assert.Contains("libunwind.dll", targetXml, StringComparison.Ordinal);
         Assert.Contains("Error", targetXml, StringComparison.Ordinal);
+        Assert.Equal("Publish", (string?)publishTarget.Attribute("AfterTargets"));
+        Assert.Contains("$(OutDir)hooks\\**\\*", publishTargetXml, StringComparison.Ordinal);
+        Assert.Contains("$(PublishDir)hooks\\", publishTargetXml, StringComparison.Ordinal);
     }
 
     private static string FindRepositoryRoot()

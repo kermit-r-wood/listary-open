@@ -59,6 +59,25 @@ public sealed class HookHostProcessFactoryTests
     }
 
     [Fact]
+    public void CreateStartInfoIncludesParentAndSecretForBoundHost()
+    {
+        var factory = new HookHostProcessFactory();
+
+        var startInfo = factory.CreateStartInfo(
+            "C:\\Program Files\\ListaryOpen\\hooks\\x64\\ListaryOpen.HookHost.exe",
+            "listary-open-hook-x64-123-session",
+            "C:\\Program Files\\ListaryOpen\\hooks\\x64\\ListaryOpen.Hook.dll",
+            elevated: true,
+            parentProcessId: 123,
+            secret: "session-secret");
+
+        Assert.Contains("--parent-pid", startInfo.ArgumentList);
+        Assert.Contains("123", startInfo.ArgumentList);
+        Assert.Contains("--secret", startInfo.ArgumentList);
+        Assert.Contains("session-secret", startInfo.ArgumentList);
+    }
+
+    [Fact]
     public void CreateStartInfoCanAttachChildHostLaunchArguments()
     {
         var factory = new HookHostProcessFactory();

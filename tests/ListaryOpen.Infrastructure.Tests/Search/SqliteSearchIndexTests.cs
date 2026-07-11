@@ -257,6 +257,66 @@ public sealed class SqliteSearchIndexTests
     }
 
     [Fact]
+    public async Task SearchUsesFilterReasonForPureExtensionFilter()
+    {
+        var dbPath = CreateTempDbPath();
+
+        try
+        {
+            await using (var index = await SqliteSearchIndex.OpenAsync(dbPath, CancellationToken.None))
+            {
+                await index.UpsertManyAsync(new[]
+                {
+                    FileRecord.Create("C:\\Docs\\Alpha.pdf", false, 10, DateTimeOffset.UtcNow),
+                    FileRecord.Create("C:\\Docs\\Beta.txt", false, 10, DateTimeOffset.UtcNow)
+                }, CancellationToken.None);
+
+                var result = Assert.Single(await index.SearchAsync(
+                    new SearchQuery("ext:pdf", SearchMode.FilesAndFolders),
+                    CancellationToken.None));
+
+                Assert.Equal("Alpha.pdf", result.Record.Name);
+                Assert.Equal("filter", result.MatchReason);
+            }
+        }
+        finally
+        {
+            DeleteIfExists(dbPath);
+        }
+    }
+
+    [Fact]
+    public async Task SearchPureExtensionFilterRespectsLimitsAboveFallbackCandidateWindow()
+    {
+        var dbPath = CreateTempDbPath();
+
+        try
+        {
+            await using (var index = await SqliteSearchIndex.OpenAsync(dbPath, CancellationToken.None))
+            {
+                await index.UpsertManyAsync(
+                    Enumerable.Range(0, 250)
+                        .Select(index => FileRecord.Create(
+                            $"C:\\Docs\\Filtered-{index:D3}.pdf",
+                            false,
+                            10,
+                            DateTimeOffset.UtcNow)),
+                    CancellationToken.None);
+
+                var results = await index.SearchAsync(
+                    new SearchQuery("ext:pdf", SearchMode.FilesAndFolders, limit: 250),
+                    CancellationToken.None);
+
+                Assert.Equal(250, results.Count);
+            }
+        }
+        finally
+        {
+            DeleteIfExists(dbPath);
+        }
+    }
+
+    [Fact]
     public async Task SearchFolderFilterReturnsOnlyFolders()
     {
         var dbPath = CreateTempDbPath();
@@ -595,6 +655,38 @@ public sealed class SqliteSearchIndexTests
         {
             DeleteIfExists(dbPath);
             DeleteIfExists(legacyDbPath);
+        }
+    }
+
+    [Fact]
+    public async Task RecordUsageAsyncIncrementsOpenCountAndUpdatesTimestamp()
+    {
+        var dbPath = CreateTempDbPath();
+        var fullPath = "C:\\Docs\\Invoice.xlsx";
+        var before = DateTimeOffset.UtcNow;
+        DateTimeOffset after;
+
+        try
+        {
+            await using (var index = await SqliteSearchIndex.OpenAsync(dbPath, CancellationToken.None))
+            {
+                await index.RecordUsageAsync(fullPath, CancellationToken.None);
+                await index.RecordUsageAsync(fullPath, CancellationToken.None);
+                after = DateTimeOffset.UtcNow;
+            }
+
+            var usage = await ReadUsageRowAsync(dbPath, FileRecord.Create(
+                fullPath,
+                isDirectory: false,
+                sizeBytes: 0,
+                DateTimeOffset.UnixEpoch).PathKey);
+
+            Assert.Equal(2, usage.OpenCount);
+            Assert.InRange(usage.LastUsedAt, before, after);
+        }
+        finally
+        {
+            DeleteIfExists(dbPath);
         }
     }
 
@@ -1410,6 +1502,31 @@ public sealed class SqliteSearchIndexTests
 
         var result = await command.ExecuteScalarAsync();
         return Convert.ToInt64(result, CultureInfo.InvariantCulture);
+    }
+
+    private static async Task<(int OpenCount, DateTimeOffset LastUsedAt)> ReadUsageRowAsync(
+        string dbPath,
+        string pathKey)
+    {
+        var connectionString = new SqliteConnectionStringBuilder
+        {
+            DataSource = dbPath,
+            Pooling = false
+        }.ToString();
+
+        await using var connection = new SqliteConnection(connectionString);
+        await connection.OpenAsync();
+
+        using var command = connection.CreateCommand();
+        command.CommandText = "select open_count, last_used_at from usage where path_key = $path_key;";
+        command.Parameters.AddWithValue("$path_key", pathKey);
+
+        var reader = await command.ExecuteReaderAsync();
+        await using (reader.ConfigureAwait(false))
+        {
+            Assert.True(await reader.ReadAsync());
+            return (reader.GetInt32(0), DateTimeOffset.Parse(reader.GetString(1), CultureInfo.InvariantCulture));
+        }
     }
 
     private static IEnumerable<(string FullPath, int OpenCount, DateTimeOffset LastUsedAt)> CreateUnrelatedUsageRows(

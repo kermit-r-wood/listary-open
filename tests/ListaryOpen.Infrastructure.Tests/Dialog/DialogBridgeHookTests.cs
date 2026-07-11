@@ -153,6 +153,52 @@ public sealed class DialogBridgeHookTests
     }
 
     [Theory]
+    [InlineData(HookJumpStatus.Success, DialogJumpStatus.Success)]
+    [InlineData(HookJumpStatus.AccessDenied, DialogJumpStatus.PermissionLimited)]
+    [InlineData(HookJumpStatus.TargetGone, DialogJumpStatus.TargetGone)]
+    [InlineData(HookJumpStatus.UnsupportedDialog, DialogJumpStatus.UnsupportedDialog)]
+    [InlineData(HookJumpStatus.Failed, DialogJumpStatus.Failed)]
+    public async Task JumpToCapturedDialogMapsHookResultWithoutForegroundFallback(
+        HookJumpStatus hookStatus,
+        DialogJumpStatus expectedStatus)
+    {
+        var folder = Directory.CreateTempSubdirectory("listary-open-captured-hook-");
+        var hook = new FakeHookBridge(new HookJumpResult(hookStatus, "Captured hook result."));
+        var fallback = new FakeDialogAutomation(DialogProbeResult.StandardDialog());
+        var adapter = new FakeCustomDialogAdapter("Foreground adapter", canHandle: true);
+        var bridge = new DialogBridge(
+            fallback,
+            hook,
+            new ICustomDialogAdapter[] { adapter });
+        var dialog = new HookDialogContext(
+            "captured-dialog",
+            new IntPtr(100),
+            200,
+            300,
+            HookArchitecture.X64,
+            "notepad",
+            "#32770",
+            "Open",
+            DateTimeOffset.UtcNow);
+
+        try
+        {
+            var result = await bridge.JumpToFolderAsync(dialog, folder.FullName, CancellationToken.None);
+
+            Assert.Equal(expectedStatus, result.Status);
+            Assert.Equal("Captured hook result.", result.Message);
+            Assert.Equal(1, hook.CapturedJumpCount);
+            Assert.Equal(0, hook.ActiveJumpCount);
+            Assert.Equal(0, adapter.CanHandleCallCount);
+            Assert.Equal(0, fallback.ProbeCallCount);
+        }
+        finally
+        {
+            folder.Delete(recursive: true);
+        }
+    }
+
+    [Theory]
     [InlineData(HookJumpStatus.Failed)]
     [InlineData(HookJumpStatus.UnsupportedDialog)]
     public async Task JumpToFolderFallsBackWhenHookCannotJump(HookJumpStatus hookStatus)
@@ -214,7 +260,11 @@ public sealed class DialogBridgeHookTests
 
         public HookQuickSwitchStatus Status => HookQuickSwitchStatus.Disabled();
 
-        public int JumpCount { get; private set; }
+        public int JumpCount => ActiveJumpCount + CapturedJumpCount;
+
+        public int ActiveJumpCount { get; private set; }
+
+        public int CapturedJumpCount { get; private set; }
 
         public event EventHandler<HookQuickSwitchStatus>? StatusChanged
         {
@@ -226,9 +276,20 @@ public sealed class DialogBridgeHookTests
 
         public Task<HookDialogContext?> GetActiveDialogAsync(CancellationToken cancellationToken) => Task.FromResult<HookDialogContext?>(null);
 
+        public Task<HookJumpResult> JumpDialogToFolderAsync(
+            HookDialogContext dialog,
+            string folderPath,
+            CancellationToken cancellationToken)
+        {
+            CapturedJumpCount++;
+            return _exception is null
+                ? Task.FromResult(_jumpResult!)
+                : Task.FromException<HookJumpResult>(_exception);
+        }
+
         public Task<HookJumpResult> JumpActiveDialogToFolderAsync(string folderPath, CancellationToken cancellationToken)
         {
-            JumpCount++;
+            ActiveJumpCount++;
             return _exception is null
                 ? Task.FromResult(_jumpResult!)
                 : Task.FromException<HookJumpResult>(_exception);

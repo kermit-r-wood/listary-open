@@ -6,15 +6,16 @@ use listary_open_hook_common::{
 use windows_sys::Win32::Foundation::{BOOL, HWND, LPARAM, LRESULT, TRUE, WPARAM};
 use windows_sys::Win32::System::DataExchange::COPYDATASTRUCT;
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    CallNextHookEx, EnumChildWindows, GetClassNameW, GetDlgCtrlID, GetDlgItem,
-    GetWindowTextLengthW, GetWindowTextW, SendMessageW, CWPSTRUCT, WM_COPYDATA, WM_KEYDOWN,
-    WM_KEYUP, WM_SETTEXT,
+    CallNextHookEx, EnumChildWindows, GetClassNameW, GetDlgCtrlID, GetWindowTextLengthW,
+    GetWindowTextW, SendMessageW, CWPSTRUCT, WM_COPYDATA, WM_KEYDOWN, WM_KEYUP, WM_SETTEXT,
 };
 
 const ADDRESS_BAR_EDIT_CONTROL_ID: i32 = 41477;
-const FILE_NAME_EDIT_CONTROL_ID: i32 = 1148;
 const VK_RETURN_KEY: WPARAM = 0x0D;
 const BFFM_SETSELECTIONW: u32 = 0x0400 + 103;
+const BFFM_GETSELECTIONW: u32 = 0x0400 + 102;
+const CDM_GETFOLDERPATH: u32 = 0x0400 + 102;
+const FOLDER_PATH_BUFFER_LEN: usize = 32_768;
 
 #[no_mangle]
 pub unsafe extern "system" fn ListaryOpenHookProc(
@@ -102,16 +103,6 @@ where
     select_edit_control_by_id(candidates, ADDRESS_BAR_EDIT_CONTROL_ID)
 }
 
-fn select_navigation_edit_control<'a, I>(candidates: I) -> Option<HWND>
-where
-    I: IntoIterator<Item = AddressControlCandidate<'a>>,
-{
-    let candidates = candidates.into_iter().collect::<Vec<_>>();
-    select_edit_control_by_id(candidates.iter().copied(), ADDRESS_BAR_EDIT_CONTROL_ID).or_else(
-        || select_edit_control_by_id(candidates.iter().copied(), FILE_NAME_EDIT_CONTROL_ID),
-    )
-}
-
 fn select_edit_control_by_id<'a, I>(candidates: I, control_id: i32) -> Option<HWND>
 where
     I: IntoIterator<Item = AddressControlCandidate<'a>>,
@@ -129,7 +120,7 @@ struct AddressControlSearch {
 }
 
 fn find_navigation_edit_control(hwnd: HWND) -> Option<HWND> {
-    find_address_edit_control(hwnd).or_else(|| find_file_name_edit_control(hwnd))
+    find_address_edit_control(hwnd)
 }
 
 fn find_address_edit_control(hwnd: HWND) -> Option<HWND> {
@@ -177,59 +168,6 @@ unsafe extern "system" fn enum_address_edit_control_proc(hwnd: HWND, l_param: LP
     }
 
     TRUE
-}
-
-fn find_file_name_edit_control(hwnd: HWND) -> Option<HWND> {
-    let container = unsafe { GetDlgItem(hwnd, FILE_NAME_EDIT_CONTROL_ID) };
-    if container.is_null() {
-        return None;
-    }
-
-    if let Some(class_name) = class_name(container) {
-        let candidate = AddressControlCandidate {
-            hwnd: container,
-            control_id: FILE_NAME_EDIT_CONTROL_ID,
-            class_name: &class_name,
-        };
-        if let Some(file_name_edit) = select_navigation_edit_control([candidate]) {
-            return Some(file_name_edit);
-        }
-    }
-
-    let mut search = AddressControlSearch {
-        found_hwnd: std::ptr::null_mut(),
-    };
-    unsafe {
-        EnumChildWindows(
-            container,
-            Some(enum_file_name_edit_control_proc),
-            (&mut search as *mut AddressControlSearch) as LPARAM,
-        );
-    }
-
-    if search.found_hwnd.is_null() {
-        None
-    } else {
-        Some(search.found_hwnd)
-    }
-}
-
-unsafe extern "system" fn enum_file_name_edit_control_proc(hwnd: HWND, l_param: LPARAM) -> BOOL {
-    if l_param == 0 {
-        return TRUE;
-    }
-
-    let Some(class_name) = class_name(hwnd) else {
-        return TRUE;
-    };
-
-    if !class_name.eq_ignore_ascii_case("Edit") {
-        return TRUE;
-    }
-
-    let search = unsafe { &mut *(l_param as *mut AddressControlSearch) };
-    search.found_hwnd = hwnd;
-    0
 }
 
 fn class_name(hwnd: HWND) -> Option<String> {
@@ -404,7 +342,27 @@ fn navigate_dialog_to_folder(hwnd: HWND, folder_path: &str) -> JumpAckStatus {
         SendMessageW(path_edit, WM_KEYUP, VK_RETURN_KEY, 0);
     }
 
-    JumpAckStatus::Success
+    let current_folder = current_standard_dialog_folder(hwnd);
+    jump_status_for_verified_folder(current_folder.as_deref(), folder_path)
+}
+
+fn current_standard_dialog_folder(hwnd: HWND) -> Option<String> {
+    let mut folder_path = vec![0u16; FOLDER_PATH_BUFFER_LEN];
+    let result = unsafe {
+        SendMessageW(
+            hwnd,
+            CDM_GETFOLDERPATH,
+            folder_path.len(),
+            folder_path.as_mut_ptr() as LPARAM,
+        )
+    };
+    decode_dialog_folder_path(result, &folder_path)
+}
+
+fn decode_dialog_folder_path(result: LRESULT, folder_path: &[u16]) -> Option<String> {
+    (result > 0)
+        .then(|| wide_null_to_string(folder_path))
+        .filter(|path| !path.is_empty())
 }
 
 fn navigate_browse_for_folder_dialog_to_folder(hwnd: HWND, folder_path: &str) -> JumpAckStatus {
@@ -422,7 +380,52 @@ fn navigate_browse_for_folder_dialog_to_folder(hwnd: HWND, folder_path: &str) ->
         );
     }
 
-    JumpAckStatus::Success
+    let mut selected_path = vec![0u16; FOLDER_PATH_BUFFER_LEN];
+    let selected = unsafe {
+        SendMessageW(
+            hwnd,
+            BFFM_GETSELECTIONW,
+            0,
+            selected_path.as_mut_ptr() as LPARAM,
+        )
+    };
+    if selected == 0 {
+        return JumpAckStatus::Failed;
+    }
+
+    let selected_path = wide_null_to_string(&selected_path);
+    jump_status_for_verified_folder(Some(&selected_path), folder_path)
+}
+
+fn jump_status_for_verified_folder(
+    verified_current_folder: Option<&str>,
+    target_folder: &str,
+) -> JumpAckStatus {
+    if verified_current_folder
+        .is_some_and(|current_folder| folder_paths_match(current_folder, target_folder))
+    {
+        JumpAckStatus::Success
+    } else {
+        JumpAckStatus::Failed
+    }
+}
+
+fn folder_paths_match(current_path: &str, target_path: &str) -> bool {
+    let normalize = |path: &str| {
+        let path = path.trim().replace('/', "\\");
+        let path = path.trim_end_matches('\\');
+        (!path.is_empty()).then(|| path.to_ascii_lowercase())
+    };
+
+    normalize(current_path) == normalize(target_path)
+}
+
+fn wide_null_to_string(value: &[u16]) -> String {
+    let len = value
+        .iter()
+        .position(|unit| *unit == 0)
+        .unwrap_or(value.len());
+    String::from_utf16_lossy(&value[..len])
 }
 
 fn send_jump_ack(ack_hwnd: HWND, command_id: u64, status: JumpAckStatus) {
@@ -486,6 +489,35 @@ fn to_wide_null(value: &str) -> Vec<u16> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn folder_paths_match_ignores_case_separators_and_trailing_slashes() {
+        assert!(folder_paths_match(r"C:\Work\Project\", "c:/work/project"));
+        assert!(!folder_paths_match(r"C:\Work\Project", r"C:\Work\Other"));
+    }
+
+    #[test]
+    fn standard_dialog_ack_requires_a_verified_current_folder() {
+        assert_eq!(
+            JumpAckStatus::Failed,
+            jump_status_for_verified_folder(None, r"C:\Work\Project")
+        );
+        assert_eq!(
+            JumpAckStatus::Success,
+            jump_status_for_verified_folder(Some(r"c:/work/project/"), r"C:\Work\Project")
+        );
+    }
+
+    #[test]
+    fn standard_dialog_folder_query_decodes_only_successful_message_results() {
+        let path = to_wide_null(r"C:\Work\Project");
+
+        assert_eq!(
+            Some(r"C:\Work\Project".to_string()),
+            decode_dialog_folder_path(path.len() as LRESULT, &path)
+        );
+        assert_eq!(None, decode_dialog_folder_path(0, &path));
+    }
 
     #[test]
     fn decode_jump_payload_accepts_valid_magic_header_ack_command_and_terminated_path() {
@@ -622,16 +654,16 @@ mod tests {
     }
 
     #[test]
-    fn navigation_edit_selector_accepts_classic_file_name_edit_when_address_edit_is_missing() {
+    fn navigation_edit_selector_rejects_file_name_edit_when_address_edit_is_missing() {
         let file_name_edit = 301usize as HWND;
 
-        let selected = select_navigation_edit_control([AddressControlCandidate {
+        let selected = select_address_edit_control([AddressControlCandidate {
             hwnd: file_name_edit,
-            control_id: FILE_NAME_EDIT_CONTROL_ID,
+            control_id: 1148,
             class_name: "Edit",
         }]);
 
-        assert_eq!(Some(file_name_edit), selected);
+        assert_eq!(None, selected);
     }
 
     #[test]
@@ -639,10 +671,10 @@ mod tests {
         let file_name_edit = 401usize as HWND;
         let address_edit = 402usize as HWND;
 
-        let selected = select_navigation_edit_control([
+        let selected = select_address_edit_control([
             AddressControlCandidate {
                 hwnd: file_name_edit,
-                control_id: FILE_NAME_EDIT_CONTROL_ID,
+                control_id: 1148,
                 class_name: "Edit",
             },
             AddressControlCandidate {

@@ -41,7 +41,9 @@ public class HookHostProcessFactory
         string pipeName,
         string hookDllPath,
         bool elevated,
-        IEnumerable<HookHostLaunchRequest>? childHosts = null)
+        IEnumerable<HookHostLaunchRequest>? childHosts = null,
+        int? parentProcessId = null,
+        string? secret = null)
     {
         if (string.IsNullOrWhiteSpace(hostExePath))
         {
@@ -75,6 +77,14 @@ public class HookHostProcessFactory
         startInfo.ArgumentList.Add(pipeName);
         startInfo.ArgumentList.Add("--dll");
         startInfo.ArgumentList.Add(hookDllPath);
+
+        if (parentProcessId is not null && !string.IsNullOrWhiteSpace(secret))
+        {
+            startInfo.ArgumentList.Add("--parent-pid");
+            startInfo.ArgumentList.Add(parentProcessId.Value.ToString(System.Globalization.CultureInfo.InvariantCulture));
+            startInfo.ArgumentList.Add("--secret");
+            startInfo.ArgumentList.Add(secret);
+        }
 
         if (childHosts is not null)
         {

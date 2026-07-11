@@ -1,4 +1,7 @@
+using ListaryOpen.Core.Indexing;
+using ListaryOpen.Core.Search;
 using ListaryOpen.Infrastructure.Dialog;
+using ListaryOpen.Infrastructure.Hooks;
 using ListaryOpen.Infrastructure.Windows;
 
 namespace ListaryOpen.Infrastructure.Tests.App;
@@ -113,6 +116,15 @@ public sealed class AppDialogHotkeyTests
         Assert.Equal(
             new[] { "ExplorerTracker", "DirectoryOpusQuickSwitchProvider", "TotalCommanderQuickSwitchProvider" },
             providers!.Select(provider => provider.GetType().Name));
+    }
+
+    [Fact]
+    public void CreateDefaultCustomDialogAdaptersIncludesBlender()
+    {
+        var adapters = ListaryOpen.App.App.CreateDefaultCustomDialogAdapters();
+
+        var adapter = Assert.Single(adapters);
+        Assert.IsType<BlenderFileBrowserAdapter>(adapter);
     }
 
     [Fact]
@@ -307,6 +319,32 @@ public sealed class AppDialogHotkeyTests
     }
 
     [Fact]
+    public async Task RecordSuccessfulDialogUsageAsyncRecordsOnlySuccessfulJumpsAndKeepsSuccessOnWriteFailure()
+    {
+        var success = new DialogJumpResult(DialogJumpStatus.Success, "Dialog folder changed.");
+        var failure = new DialogJumpResult(DialogJumpStatus.Failed, "Dialog folder failed.");
+        var index = new RecordingUsageSearchIndex();
+
+        var successfulResult = await ListaryOpen.App.App.RecordSuccessfulDialogUsageAsync(
+            success,
+            "C:\\Docs",
+            index);
+        var failedResult = await ListaryOpen.App.App.RecordSuccessfulDialogUsageAsync(
+            failure,
+            "C:\\Failed",
+            index);
+        var writeFailureResult = await ListaryOpen.App.App.RecordSuccessfulDialogUsageAsync(
+            success,
+            "C:\\UsageFailure",
+            new RecordingUsageSearchIndex(new IOException("Usage failed.")));
+
+        Assert.Same(success, successfulResult);
+        Assert.Same(failure, failedResult);
+        Assert.Same(success, writeFailureResult);
+        Assert.Equal(new[] { "C:\\Docs" }, index.RecordedPaths);
+    }
+
+    [Fact]
     public async Task ActivateQuickSwitchFolderSearchWithDirectJumpStatusAsyncReportsFailureAfterActivationCompletes()
     {
         var events = new List<string>();
@@ -346,6 +384,76 @@ public sealed class AppDialogHotkeyTests
             events);
     }
 
+    [Fact]
+    public async Task DialogFolderActivationsKeepDirectFallbackAndCapturePanelTarget()
+    {
+        var dialog = CreateCapturedDialog();
+        var capturedDialogIds = new List<string>();
+        var activeCalls = 0;
+        var activations = ListaryOpen.App.App.CreateDialogFolderActivations(
+            dialog,
+            (_, _) =>
+            {
+                activeCalls++;
+                return Task.FromResult(new DialogJumpResult(DialogJumpStatus.Success, "Foreground fallback succeeded."));
+            },
+            (capturedDialog, _, _) =>
+            {
+                capturedDialogIds.Add(capturedDialog.DialogId);
+                return Task.FromResult(new DialogJumpResult(DialogJumpStatus.Success, "Panel jump succeeded."));
+            });
+
+        var directResult = await activations.Direct("C:\\Direct", CancellationToken.None);
+        var panelResult = await activations.Panel("C:\\Panel", CancellationToken.None);
+
+        Assert.Equal(DialogJumpStatus.Success, directResult.Status);
+        Assert.Equal(DialogJumpStatus.Success, panelResult.Status);
+        Assert.Equal(new[] { dialog.DialogId }, capturedDialogIds);
+        Assert.Equal(1, activeCalls);
+    }
+
+    [Fact]
+    public async Task DialogFolderActivationWithoutCapturedTargetUsesExistingPath()
+    {
+        var activeCalls = 0;
+        var activations = ListaryOpen.App.App.CreateDialogFolderActivations(
+            null,
+            (_, _) =>
+            {
+                activeCalls++;
+                return Task.FromResult(new DialogJumpResult(DialogJumpStatus.Success, "Existing path."));
+            },
+            (_, _, _) => throw new InvalidOperationException("Captured path must not run."));
+
+        var directResult = await activations.Direct("C:\\Direct", CancellationToken.None);
+        var panelResult = await activations.Panel("C:\\Panel", CancellationToken.None);
+
+        Assert.Equal(DialogJumpStatus.Success, directResult.Status);
+        Assert.Equal(DialogJumpStatus.Success, panelResult.Status);
+        Assert.Equal(2, activeCalls);
+    }
+
+    [Fact]
+    public async Task TryCaptureHookDialogReturnsNullWhenBridgeFails()
+    {
+        var result = await ListaryOpen.App.App.TryCaptureHookDialogAsync(
+            new ThrowingHookQuickSwitchBridge(),
+            CancellationToken.None);
+
+        Assert.Null(result);
+    }
+
+    private static HookDialogContext CreateCapturedDialog() => new(
+        "captured-dialog",
+        new IntPtr(100),
+        200,
+        300,
+        HookArchitecture.X64,
+        "notepad",
+        "#32770",
+        "Open",
+        DateTimeOffset.UtcNow);
+
     private sealed class RecordingExplorerShellWindowsProvider : IExplorerShellWindowsProvider
     {
         private readonly IReadOnlyList<ExplorerShellWindow> _windows;
@@ -367,5 +475,66 @@ public sealed class AppDialogHotkeyTests
         {
             return Array.Empty<QuickSwitchFolderCandidate>();
         }
+    }
+
+    private sealed class ThrowingHookQuickSwitchBridge : IHookQuickSwitchBridge
+    {
+        public HookQuickSwitchStatus Status => HookQuickSwitchStatus.Disabled();
+
+        public event EventHandler<HookQuickSwitchStatus>? StatusChanged
+        {
+            add { }
+            remove { }
+        }
+
+        public Task EnableAsync(CancellationToken cancellationToken) => Task.CompletedTask;
+
+        public Task<HookDialogContext?> GetActiveDialogAsync(CancellationToken cancellationToken) =>
+            Task.FromException<HookDialogContext?>(new InvalidOperationException("Capture failed."));
+
+        public Task<HookJumpResult> JumpDialogToFolderAsync(
+            HookDialogContext dialog,
+            string folderPath,
+            CancellationToken cancellationToken) =>
+            throw new NotSupportedException();
+
+        public Task<HookJumpResult> JumpActiveDialogToFolderAsync(
+            string folderPath,
+            CancellationToken cancellationToken) =>
+            throw new NotSupportedException();
+
+        public void Dispose()
+        {
+        }
+    }
+
+    private sealed class RecordingUsageSearchIndex : ISearchIndex
+    {
+        private readonly Exception? _exception;
+
+        public RecordingUsageSearchIndex(Exception? exception = null)
+        {
+            _exception = exception;
+        }
+
+        public List<string> RecordedPaths { get; } = new();
+
+        public Task UpsertAsync(FileRecord record, CancellationToken cancellationToken) => Task.CompletedTask;
+
+        public Task DeleteAsync(string fullPath, CancellationToken cancellationToken) => Task.CompletedTask;
+
+        public Task RecordUsageAsync(string fullPath, CancellationToken cancellationToken)
+        {
+            if (_exception is not null)
+            {
+                return Task.FromException(_exception);
+            }
+
+            RecordedPaths.Add(fullPath);
+            return Task.CompletedTask;
+        }
+
+        public Task<IReadOnlyList<SearchResult>> SearchAsync(SearchQuery query, CancellationToken cancellationToken) =>
+            Task.FromResult<IReadOnlyList<SearchResult>>(Array.Empty<SearchResult>());
     }
 }

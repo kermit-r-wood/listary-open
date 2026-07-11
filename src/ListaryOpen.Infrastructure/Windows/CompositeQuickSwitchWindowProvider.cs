@@ -9,6 +9,7 @@ public sealed class CompositeQuickSwitchWindowProvider : IRefreshableQuickSwitch
 {
     private readonly IReadOnlyList<IQuickSwitchWindowProvider> _providers;
     private readonly Func<IReadOnlyList<QuickSwitchFolderCandidate>> _fallbackCandidatesProvider;
+    private string? _lastForegroundSourceName;
 
     public CompositeQuickSwitchWindowProvider(IReadOnlyList<IQuickSwitchWindowProvider> providers)
         : this(providers, Array.Empty<QuickSwitchFolderCandidate>())
@@ -95,8 +96,17 @@ public sealed class CompositeQuickSwitchWindowProvider : IRefreshableQuickSwitch
             }
         }
 
+        var hasForegroundCandidate = candidates.Any(candidate => candidate.IsForeground);
+        if (hasForegroundCandidate)
+        {
+            _lastForegroundSourceName = candidates.First(candidate => candidate.IsForeground).SourceName;
+        }
+
         return candidates
             .OrderByDescending(candidate => candidate.IsForeground)
+            .ThenByDescending(candidate =>
+                !hasForegroundCandidate &&
+                string.Equals(candidate.SourceName, _lastForegroundSourceName, StringComparison.Ordinal))
             .ToArray();
     }
 

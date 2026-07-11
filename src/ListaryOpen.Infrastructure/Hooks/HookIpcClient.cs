@@ -28,8 +28,10 @@ public sealed class HookIpcClient : IHookIpcClient, IHookActiveDialogQueryClient
 
     private readonly string _pipeName;
     private readonly TimeSpan _connectTimeout;
+    private readonly int _clientProcessId;
+    private readonly string _secret;
 
-    public HookIpcClient(string pipeName, TimeSpan connectTimeout)
+    public HookIpcClient(string pipeName, TimeSpan connectTimeout, int? clientProcessId = null, string? secret = null)
     {
         if (string.IsNullOrWhiteSpace(pipeName))
         {
@@ -43,6 +45,8 @@ public sealed class HookIpcClient : IHookIpcClient, IHookActiveDialogQueryClient
 
         _pipeName = pipeName;
         _connectTimeout = connectTimeout;
+        _clientProcessId = clientProcessId ?? Environment.ProcessId;
+        _secret = secret ?? string.Empty;
     }
 
     public async Task<HookDialogContext?> GetActiveDialogAsync(CancellationToken cancellationToken)
@@ -159,7 +163,11 @@ public sealed class HookIpcClient : IHookIpcClient, IHookActiveDialogQueryClient
 
         try
         {
-            var request = HookIpcSerializer.Serialize(envelope);
+            var request = HookIpcSerializer.Serialize(envelope with
+            {
+                ClientProcessId = _clientProcessId,
+                Secret = _secret
+            });
 
             cancellationToken.ThrowIfCancellationRequested();
 

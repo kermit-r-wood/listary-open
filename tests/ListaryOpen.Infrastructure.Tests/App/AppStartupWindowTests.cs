@@ -81,6 +81,12 @@ public sealed class AppStartupWindowTests
         public Task<HookDialogContext?> GetActiveDialogAsync(CancellationToken cancellationToken) =>
             Task.FromResult<HookDialogContext?>(null);
 
+        public Task<HookJumpResult> JumpDialogToFolderAsync(
+            HookDialogContext dialog,
+            string folderPath,
+            CancellationToken cancellationToken) =>
+            Task.FromResult(new HookJumpResult(HookJumpStatus.NoActiveDialog, "No dialog."));
+
         public Task<HookJumpResult> JumpActiveDialogToFolderAsync(string folderPath, CancellationToken cancellationToken) =>
             Task.FromResult(new HookJumpResult(HookJumpStatus.NoActiveDialog, "No active dialog."));
 

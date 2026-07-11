@@ -3,7 +3,12 @@ using System.Text.Json.Serialization;
 
 namespace ListaryOpen.Infrastructure.Hooks;
 
-public sealed record HookIpcEnvelope(int Version, string MessageType, object Payload)
+public sealed record HookIpcEnvelope(
+    int Version,
+    string MessageType,
+    object Payload,
+    int ClientProcessId = 0,
+    string Secret = "")
 {
     public const int CurrentVersion = 1;
 
@@ -107,7 +112,16 @@ internal sealed class HookIpcEnvelopeJsonConverter : JsonConverter<HookIpcEnvelo
             _ => throw new InvalidOperationException($"Unknown hook IPC message type: {messageType}.")
         };
 
-        return new HookIpcEnvelope(version, messageType, payload);
+        var clientProcessId = root.TryGetProperty("clientProcessId", out var clientProcessIdElement)
+            && clientProcessIdElement.TryGetInt32(out var parsedClientProcessId)
+            ? parsedClientProcessId
+            : 0;
+        var secret = root.TryGetProperty("secret", out var secretElement)
+            && secretElement.ValueKind == JsonValueKind.String
+            ? secretElement.GetString() ?? string.Empty
+            : string.Empty;
+
+        return new HookIpcEnvelope(version, messageType, payload, clientProcessId, secret);
     }
 
     public override void Write(Utf8JsonWriter writer, HookIpcEnvelope value, JsonSerializerOptions options)
@@ -115,6 +129,8 @@ internal sealed class HookIpcEnvelopeJsonConverter : JsonConverter<HookIpcEnvelo
         writer.WriteStartObject();
         writer.WriteNumber("version", value.Version);
         writer.WriteString("messageType", value.MessageType);
+        writer.WriteNumber("clientProcessId", value.ClientProcessId);
+        writer.WriteString("secret", value.Secret);
         writer.WritePropertyName("payload");
         JsonSerializer.Serialize(writer, value.Payload, value.Payload.GetType(), options);
         writer.WriteEndObject();

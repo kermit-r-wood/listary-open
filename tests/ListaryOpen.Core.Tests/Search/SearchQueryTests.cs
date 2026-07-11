@@ -60,6 +60,17 @@ public sealed class SearchQueryTests
         Assert.Equal(new[] { "report" }, query.Parsed.Terms);
     }
 
+    [Theory]
+    [InlineData("ext:pdf")]
+    [InlineData("path:src")]
+    [InlineData("!ext:tmp")]
+    public void ParsedFilterOnlyQueryHasNoRankingText(string text)
+    {
+        var query = new SearchQuery(text, SearchMode.FilesAndFolders);
+
+        Assert.Equal(string.Empty, query.NormalizedText);
+    }
+
     [Fact]
     public void ParsedQueryTreatsBareFileAndFolderAsSearchTerms()
     {

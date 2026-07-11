@@ -10,7 +10,7 @@ public sealed class FallbackIndexProvider : IIndexProvider
     private static readonly EnumerationOptions EnumerationOptions = new()
     {
         AttributesToSkip = 0,
-        IgnoreInaccessible = true,
+        IgnoreInaccessible = false,
         RecurseSubdirectories = false
     };
 
@@ -59,7 +59,7 @@ public sealed class FallbackIndexProvider : IIndexProvider
                 normalizedRootPath,
                 StringComparison.OrdinalIgnoreCase);
 
-            foreach (var directory in EnumerateDirectories(current, cancellationToken, isRootEnumeration))
+            foreach (var directory in EnumerateDirectories(current, cancellationToken, failOnEnumerationFailure: true))
             {
                 cancellationToken.ThrowIfCancellationRequested();
                 if (_exclusionRules.ShouldExcludeDirectoryPath(directory))
@@ -77,7 +77,7 @@ public sealed class FallbackIndexProvider : IIndexProvider
                 await Task.Yield();
             }
 
-            foreach (var file in EnumerateFiles(current, cancellationToken, isRootEnumeration))
+            foreach (var file in EnumerateFiles(current, cancellationToken, failOnEnumerationFailure: true))
             {
                 cancellationToken.ThrowIfCancellationRequested();
 

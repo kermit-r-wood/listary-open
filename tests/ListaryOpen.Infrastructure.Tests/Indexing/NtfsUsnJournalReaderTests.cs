@@ -70,7 +70,7 @@ public sealed class NtfsUsnJournalReaderTests
     }
 
     [Fact]
-    public void JournalSnapshotHasAdvancedPastRequestedEndRequiresFullRescan()
+    public void JournalSnapshotHasAdvancedPastRequestedEndDoesNotRequireFullRescan()
     {
         var journal = new NtfsNativeMethods.UsnJournalDataV0
         {
@@ -79,7 +79,33 @@ public sealed class NtfsUsnJournalReaderTests
             NextUsn = 201
         };
 
+        Assert.False(NtfsUsnJournalReader.RequiresFullRescanForJournalSnapshot(journal, expectedUsnJournalId: 9, endUsn: 200));
+    }
+
+    [Fact]
+    public void JournalSnapshotBeforeRequestedEndRequiresFullRescan()
+    {
+        var journal = new NtfsNativeMethods.UsnJournalDataV0
+        {
+            UsnJournalId = 9,
+            LowestValidUsn = 50,
+            NextUsn = 199
+        };
+
         Assert.True(NtfsUsnJournalReader.RequiresFullRescanForJournalSnapshot(journal, expectedUsnJournalId: 9, endUsn: 200));
+    }
+
+    [Fact]
+    public void JournalSnapshotAtRequestedEndDoesNotRequireFullRescan()
+    {
+        var journal = new NtfsNativeMethods.UsnJournalDataV0
+        {
+            UsnJournalId = 9,
+            LowestValidUsn = 50,
+            NextUsn = 200
+        };
+
+        Assert.False(NtfsUsnJournalReader.RequiresFullRescanForJournalSnapshot(journal, expectedUsnJournalId: 9, endUsn: 200));
     }
 
     [Fact]

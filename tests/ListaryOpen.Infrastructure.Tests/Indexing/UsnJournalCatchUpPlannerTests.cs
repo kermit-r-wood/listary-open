@@ -74,4 +74,17 @@ public sealed class UsnJournalCatchUpPlannerTests
         Assert.Equal(200, plan.StartUsn);
         Assert.Equal(200, plan.EndUsn);
     }
+
+    [Fact]
+    public void PlanRequestsFullRescanWhenCheckpointIsAheadOfJournalTip()
+    {
+        var checkpoint = new UsnJournalCheckpoint("C:\\", "NTFS", 1, 201, 2, DateTimeOffset.UtcNow);
+        var journal = new UsnJournalState(1, LowestValidUsn: 50, NextUsn: 200);
+
+        var plan = UsnJournalCatchUpPlanner.Plan(checkpoint, journal, currentRulesVersion: 2);
+
+        Assert.Equal(UsnCatchUpAction.FullRescan, plan.Action);
+        Assert.Equal(0, plan.StartUsn);
+        Assert.Equal(200, plan.EndUsn);
+    }
 }

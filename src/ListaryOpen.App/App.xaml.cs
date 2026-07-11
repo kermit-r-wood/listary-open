@@ -1,6 +1,7 @@
 using ListaryOpen.App.Tray;
 using ListaryOpen.App.ViewModels;
 using ListaryOpen.Core.Indexing;
+using ListaryOpen.Core.Search;
 using ListaryOpen.Core.Settings;
 using ListaryOpen.Infrastructure.AppData;
 using ListaryOpen.Infrastructure.Dialog;
@@ -184,7 +185,10 @@ public partial class App : Application
         _dialogAutomation = new WindowsDialogAutomation();
         _hookQuickSwitchBridge = HookQuickSwitchBridgeFactory.CreateDefault();
         _hookQuickSwitchBridge.StatusChanged += OnHookQuickSwitchStatusChanged;
-        _dialogBridge = new DialogBridge(_dialogAutomation, _hookQuickSwitchBridge);
+        _dialogBridge = new DialogBridge(
+            _dialogAutomation,
+            _hookQuickSwitchBridge,
+            CreateDefaultCustomDialogAdapters());
 
         _settingsViewModel = new SettingsViewModel(
             AppSettings.Defaults(),
@@ -301,6 +305,14 @@ public partial class App : Application
                 new TotalCommanderQuickSwitchProvider()
             },
             () => CreateExplorerFallbackCandidates(explorerTracker));
+    }
+
+    internal static IReadOnlyList<ICustomDialogAdapter> CreateDefaultCustomDialogAdapters()
+    {
+        return new ICustomDialogAdapter[]
+        {
+            new BlenderFileBrowserAdapter()
+        };
     }
 
     internal static void StartHookQuickSwitchEnablementOnStartup(
@@ -679,11 +691,18 @@ public partial class App : Application
 
     private async Task HandleDialogHotkeyAsync()
     {
+        var capturedDialog = await TryCaptureHookDialogAsync(
+            _hookQuickSwitchBridge,
+            CancellationToken.None);
+        var dialogFolderActivations = CreateDialogFolderActivations(
+            capturedDialog,
+            JumpDialogToFolderAsync,
+            JumpDialogToFolderAsync);
         var candidates = ObserveQuickSwitchFolderCandidates(_quickSwitchWindowProvider);
         DialogJumpResult? directJumpResult = null;
         if (await TryJumpToFirstQuickSwitchFolderAsync(
                 candidates,
-                JumpDialogToFolderAsync,
+                dialogFolderActivations.Direct,
                 result => directJumpResult = result,
                 CancellationToken.None))
         {
@@ -703,9 +722,52 @@ public partial class App : Application
             directJumpResult,
             folderCandidates => _searchPanel is null
                 ? Task.CompletedTask
-                : _searchPanel.ActivateQuickSwitchFolderSearchAsync(folderCandidates),
+                : _searchPanel.ActivateQuickSwitchFolderSearchAsync(
+                    folderCandidates,
+                    dialogFolderActivations.Panel),
             result => _searchPanel?.ReportDialogJumpResult(result),
             message => _trayController?.ShowStatus(message));
+    }
+
+    internal static async Task<HookDialogContext?> TryCaptureHookDialogAsync(
+        IHookQuickSwitchBridge? hookBridge,
+        CancellationToken cancellationToken)
+    {
+        if (hookBridge is null)
+        {
+            return null;
+        }
+
+        try
+        {
+            return await hookBridge.GetActiveDialogAsync(cancellationToken).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            throw;
+        }
+        catch (Exception exception)
+        {
+            Trace.TraceError(exception.ToString());
+            return null;
+        }
+    }
+
+    internal static (
+        Func<string, CancellationToken, Task<DialogJumpResult>> Direct,
+        Func<string, CancellationToken, Task<DialogJumpResult>> Panel) CreateDialogFolderActivations(
+        HookDialogContext? capturedDialog,
+        Func<string, CancellationToken, Task<DialogJumpResult>> activeDialogActivation,
+        Func<HookDialogContext, string, CancellationToken, Task<DialogJumpResult>> capturedDialogActivation)
+    {
+        ArgumentNullException.ThrowIfNull(activeDialogActivation);
+        ArgumentNullException.ThrowIfNull(capturedDialogActivation);
+
+        var panelActivation = capturedDialog is null
+            ? activeDialogActivation
+            : (folderPath, cancellationToken) =>
+                capturedDialogActivation(capturedDialog, folderPath, cancellationToken);
+        return (activeDialogActivation, panelActivation);
     }
 
     internal static IReadOnlyList<QuickSwitchFolderCandidate> ObserveQuickSwitchFolderCandidates(
@@ -863,12 +925,53 @@ public partial class App : Application
         reportPanelStatus(result);
     }
 
-    private Task<DialogJumpResult> JumpDialogToFolderAsync(string folderPath, CancellationToken cancellationToken)
+    private async Task<DialogJumpResult> JumpDialogToFolderAsync(string folderPath, CancellationToken cancellationToken)
     {
         var dialogBridge = _dialogBridge;
-        return dialogBridge is null
+        var result = await (dialogBridge is null
             ? Task.FromResult(new DialogJumpResult(DialogJumpStatus.Failed, "Dialog integration is not available."))
-            : dialogBridge.JumpToFolderAsync(folderPath, cancellationToken);
+            : dialogBridge.JumpToFolderAsync(folderPath, cancellationToken)).ConfigureAwait(false);
+        return await RecordSuccessfulDialogUsageAsync(
+            result,
+            folderPath,
+            _searchIndex).ConfigureAwait(false);
+    }
+
+    private async Task<DialogJumpResult> JumpDialogToFolderAsync(
+        HookDialogContext dialog,
+        string folderPath,
+        CancellationToken cancellationToken)
+    {
+        var dialogBridge = _dialogBridge;
+        var result = await (dialogBridge is null
+            ? Task.FromResult(new DialogJumpResult(DialogJumpStatus.Failed, "Dialog integration is not available."))
+            : dialogBridge.JumpToFolderAsync(dialog, folderPath, cancellationToken)).ConfigureAwait(false);
+        return await RecordSuccessfulDialogUsageAsync(
+            result,
+            folderPath,
+            _searchIndex).ConfigureAwait(false);
+    }
+
+    internal static async Task<DialogJumpResult> RecordSuccessfulDialogUsageAsync(
+        DialogJumpResult result,
+        string folderPath,
+        ISearchIndex? searchIndex)
+    {
+        ArgumentNullException.ThrowIfNull(result);
+
+        if (result.Status == DialogJumpStatus.Success && searchIndex is not null)
+        {
+            try
+            {
+                await searchIndex.RecordUsageAsync(folderPath, CancellationToken.None).ConfigureAwait(false);
+            }
+            catch (Exception exception)
+            {
+                Trace.TraceError(exception.ToString());
+            }
+        }
+
+        return result;
     }
 
     private static bool IsSearchHotkey(string name)

@@ -15,8 +15,9 @@ public sealed class SearchPanelViewModelTests
     {
         var result = CreateResult("C:\\Docs\\Invoice.xlsx", isDirectory: false);
         var activation = new RecordingActivationService();
+        var index = new RecordingSearchIndex(Array.Empty<SearchResult>());
         var viewModel = new SearchPanelViewModel(
-            new RecordingSearchIndex(Array.Empty<SearchResult>()),
+            index,
             activation)
         {
             SelectedResult = result
@@ -28,6 +29,7 @@ public sealed class SearchPanelViewModelTests
         Assert.Equal(new[] { result.Record.FullPath }, activation.OpenedPaths);
         Assert.Empty(activation.RevealedPaths);
         Assert.Empty(activation.CopiedPaths);
+        Assert.Equal(new[] { result.Record.FullPath }, index.RecordedUsagePaths);
         Assert.Contains(result.Record.FullPath, viewModel.StatusText);
     }
 
@@ -36,8 +38,9 @@ public sealed class SearchPanelViewModelTests
     {
         var result = CreateResult("C:\\Docs\\Invoice.xlsx", isDirectory: false);
         var activation = new RecordingActivationService();
+        var index = new RecordingSearchIndex(Array.Empty<SearchResult>());
         var viewModel = new SearchPanelViewModel(
-            new RecordingSearchIndex(Array.Empty<SearchResult>()),
+            index,
             activation)
         {
             SelectedResult = result
@@ -49,6 +52,7 @@ public sealed class SearchPanelViewModelTests
         Assert.Equal(new[] { result.Record.FullPath }, activation.RevealedPaths);
         Assert.Empty(activation.OpenedPaths);
         Assert.Empty(activation.CopiedPaths);
+        Assert.Empty(index.RecordedUsagePaths);
         Assert.Contains(result.Record.FullPath, viewModel.StatusText);
     }
 
@@ -57,8 +61,9 @@ public sealed class SearchPanelViewModelTests
     {
         var result = CreateResult("C:\\Docs\\Invoice.xlsx", isDirectory: false);
         var activation = new RecordingActivationService();
+        var index = new RecordingSearchIndex(Array.Empty<SearchResult>());
         var viewModel = new SearchPanelViewModel(
-            new RecordingSearchIndex(Array.Empty<SearchResult>()),
+            index,
             activation)
         {
             SelectedResult = result
@@ -70,6 +75,45 @@ public sealed class SearchPanelViewModelTests
         Assert.Equal(new[] { result.Record.FullPath }, activation.CopiedPaths);
         Assert.Empty(activation.OpenedPaths);
         Assert.Empty(activation.RevealedPaths);
+        Assert.Empty(index.RecordedUsagePaths);
+        Assert.Contains(result.Record.FullPath, viewModel.StatusText);
+    }
+
+    [Fact]
+    public async Task ActivateSelectedAsyncDoesNotRecordUsageWhenOpenFails()
+    {
+        var result = CreateResult("C:\\Docs\\Invoice.xlsx", isDirectory: false);
+        var index = new RecordingSearchIndex(Array.Empty<SearchResult>());
+        var viewModel = new SearchPanelViewModel(
+            index,
+            new RecordingActivationService(new IOException("Open failed.")))
+        {
+            SelectedResult = result
+        };
+        viewModel.Results.Add(result);
+
+        await viewModel.ActivateSelectedAsync();
+
+        Assert.Empty(index.RecordedUsagePaths);
+        Assert.Contains("Could not open", viewModel.StatusText, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public async Task UsageWriteFailureDoesNotReplaceSuccessfulOpenStatus()
+    {
+        var result = CreateResult("C:\\Docs\\Invoice.xlsx", isDirectory: false);
+        var index = new RecordingSearchIndex(
+            Array.Empty<SearchResult>(),
+            usageException: new IOException("Usage failed."));
+        var viewModel = new SearchPanelViewModel(index, new RecordingActivationService())
+        {
+            SelectedResult = result
+        };
+        viewModel.Results.Add(result);
+
+        await viewModel.ActivateSelectedAsync();
+
+        Assert.Contains("Opened", viewModel.StatusText, StringComparison.OrdinalIgnoreCase);
         Assert.Contains(result.Record.FullPath, viewModel.StatusText);
     }
 
@@ -604,6 +648,69 @@ public sealed class SearchPanelViewModelTests
                 !method.IsGenericMethod &&
                 method.GetParameters() is [{ ParameterType: var parameterType }] &&
                 parameterType == typeof(IReadOnlyList<QuickSwitchFolderCandidate>));
+        Assert.Contains(
+            typeof(SearchPanel).GetMethods(
+                System.Reflection.BindingFlags.Instance |
+                System.Reflection.BindingFlags.NonPublic),
+            method =>
+                method.Name == nameof(SearchPanel.ActivateQuickSwitchFolderSearchAsync) &&
+                method.GetParameters() is
+                [
+                    { ParameterType: var candidatesType },
+                    { ParameterType: var activationType }
+                ] &&
+                candidatesType == typeof(IReadOnlyList<QuickSwitchFolderCandidate>) &&
+                activationType == typeof(Func<string, CancellationToken, Task<DialogJumpResult>>));
+    }
+
+    [Fact]
+    public async Task FolderSearchSkipsFileOnlyQueryAndKeepsPinnedFolders()
+    {
+        var now = DateTimeOffset.UtcNow;
+        var pinnedFolder = "C:\\Projects\\Alpha";
+        var index = new RecordingSearchIndex(new[] { CreateResult("C:\\Docs\\Report.txt", isDirectory: false) });
+        var viewModel = new SearchPanelViewModel(
+            index,
+            NormalizeTestFolder,
+            _ => true,
+            _ => now,
+            new RecordingActivationService(),
+            DialogJumpNotConfiguredAsync,
+            TimeSpan.Zero);
+
+        await viewModel.ActivateQuickSwitchFolderSearchAsync(new[] { CreateCandidate(pinnedFolder) });
+        viewModel.QueryText = "file: report";
+
+        await WaitUntilAsync(() => viewModel.StatusText.Contains("File-only", StringComparison.OrdinalIgnoreCase));
+
+        Assert.Empty(index.ObservedQueries);
+        var result = Assert.Single(viewModel.Results);
+        Assert.Equal(pinnedFolder, result.Record.FullPath);
+    }
+
+    [Fact]
+    public void MoveSelectionMovesWithinResultsAndClampsAtBothEnds()
+    {
+        var first = CreateResult("C:\\Docs\\Alpha.txt", isDirectory: false);
+        var second = CreateResult("C:\\Docs\\Beta.txt", isDirectory: false);
+        var third = CreateResult("C:\\Docs\\Gamma.txt", isDirectory: false);
+        var viewModel = new SearchPanelViewModel(new RecordingSearchIndex(Array.Empty<SearchResult>()));
+        viewModel.Results.Add(first);
+        viewModel.Results.Add(second);
+        viewModel.Results.Add(third);
+
+        viewModel.MoveSelection(1);
+        Assert.Equal(first, viewModel.SelectedResult);
+
+        viewModel.MoveSelection(10);
+        Assert.Equal(third, viewModel.SelectedResult);
+
+        viewModel.MoveSelection(-10);
+        Assert.Equal(first, viewModel.SelectedResult);
+
+        var emptyViewModel = new SearchPanelViewModel(new RecordingSearchIndex(Array.Empty<SearchResult>()));
+        emptyViewModel.MoveSelection(1);
+        Assert.Null(emptyViewModel.SelectedResult);
     }
 
     [Fact]
@@ -707,6 +814,38 @@ public sealed class SearchPanelViewModelTests
 
         Assert.Equal("Quick Switch", viewModel.ModeDisplayText);
         Assert.Equal("Quick switch to folder", viewModel.QueryPlaceholderText);
+    }
+
+    [Fact]
+    public async Task QuickSwitchActivationUsesSessionDialogDelegateAndFolderModeRestoresDefault()
+    {
+        var result = CreateResult("C:\\Docs\\Invoices", isDirectory: true);
+        var defaultActivation = new RecordingDialogFolderActivation(
+            new DialogJumpResult(DialogJumpStatus.Success, "Default dialog changed."));
+        var sessionActivation = new RecordingDialogFolderActivation(
+            new DialogJumpResult(DialogJumpStatus.Success, "Captured dialog changed."));
+        var viewModel = new SearchPanelViewModel(
+            new RecordingSearchIndex(Array.Empty<SearchResult>()),
+            new RecordingActivationService(),
+            defaultActivation.ActivateAsync);
+
+        await viewModel.ActivateQuickSwitchFolderSearchAsync(
+            Array.Empty<QuickSwitchFolderCandidate>(),
+            sessionActivation.ActivateAsync);
+        viewModel.Results.Add(result);
+        viewModel.SelectedResult = result;
+        await viewModel.ActivateSelectedAsync();
+
+        Assert.Equal(new[] { result.Record.FullPath }, sessionActivation.Paths);
+        Assert.Empty(defaultActivation.Paths);
+
+        await viewModel.ActivateFolderSearchAsync(null);
+        viewModel.Results.Add(result);
+        viewModel.SelectedResult = result;
+        await viewModel.ActivateSelectedAsync();
+
+        Assert.Equal(new[] { result.Record.FullPath }, defaultActivation.Paths);
+        Assert.Single(sessionActivation.Paths);
     }
 
     [Fact]
@@ -817,6 +956,13 @@ public sealed class SearchPanelViewModelTests
 
     private sealed class RecordingActivationService : ISearchResultActivationService
     {
+        private readonly Exception? _openException;
+
+        public RecordingActivationService(Exception? openException = null)
+        {
+            _openException = openException;
+        }
+
         public List<string> OpenedPaths { get; } = new();
 
         public List<string> RevealedPaths { get; } = new();
@@ -826,7 +972,9 @@ public sealed class SearchPanelViewModelTests
         public Task OpenAsync(string path)
         {
             OpenedPaths.Add(path);
-            return Task.CompletedTask;
+            return _openException is null
+                ? Task.CompletedTask
+                : Task.FromException(_openException);
         }
 
         public Task RevealAsync(string path, bool isDirectory)
@@ -870,11 +1018,15 @@ public sealed class SearchPanelViewModelTests
         private IReadOnlyList<SearchResult> _results;
         private readonly List<SearchQuery> _queries = new();
         private TaskCompletionSource _searchObserved = CreateCompletionSource();
+        private readonly Exception? _usageException;
 
-        public RecordingSearchIndex(IReadOnlyList<SearchResult> results)
+        public RecordingSearchIndex(IReadOnlyList<SearchResult> results, Exception? usageException = null)
         {
             _results = results;
+            _usageException = usageException;
         }
+
+        public List<string> RecordedUsagePaths { get; } = new();
 
         public IReadOnlyList<SearchQuery> ObservedQueries
         {
@@ -894,6 +1046,17 @@ public sealed class SearchPanelViewModelTests
 
         public Task DeleteAsync(string fullPath, CancellationToken cancellationToken)
         {
+            return Task.CompletedTask;
+        }
+
+        public Task RecordUsageAsync(string fullPath, CancellationToken cancellationToken)
+        {
+            if (_usageException is not null)
+            {
+                return Task.FromException(_usageException);
+            }
+
+            RecordedUsagePaths.Add(fullPath);
             return Task.CompletedTask;
         }
 
@@ -974,6 +1137,8 @@ public sealed class SearchPanelViewModelTests
         {
             return Task.CompletedTask;
         }
+
+        public Task RecordUsageAsync(string fullPath, CancellationToken cancellationToken) => Task.CompletedTask;
 
         public Task<IReadOnlyList<SearchResult>> SearchAsync(SearchQuery query, CancellationToken cancellationToken)
         {
@@ -1058,6 +1223,8 @@ public sealed class SearchPanelViewModelTests
         {
             return Task.CompletedTask;
         }
+
+        public Task RecordUsageAsync(string fullPath, CancellationToken cancellationToken) => Task.CompletedTask;
 
         public Task<IReadOnlyList<SearchResult>> SearchAsync(SearchQuery query, CancellationToken cancellationToken)
         {

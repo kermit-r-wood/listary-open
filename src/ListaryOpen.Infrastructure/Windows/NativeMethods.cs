@@ -140,6 +140,12 @@ internal static partial class NativeMethods
     [LibraryImport("user32.dll", EntryPoint = "GetClassNameW", StringMarshalling = StringMarshalling.Utf16)]
     internal static partial int GetClassName(IntPtr hWnd, char[] className, int maxCount);
 
+    [LibraryImport("user32.dll", EntryPoint = "GetWindowTextLengthW", SetLastError = true)]
+    internal static partial int GetWindowTextLength(IntPtr hWnd);
+
+    [LibraryImport("user32.dll", EntryPoint = "GetWindowTextW", StringMarshalling = StringMarshalling.Utf16, SetLastError = true)]
+    internal static partial int GetWindowText(IntPtr hWnd, char[] text, int maxCount);
+
     [LibraryImport("user32.dll")]
     internal static partial int GetDlgCtrlID(IntPtr hWnd);
 

@@ -55,6 +55,14 @@ public partial class SearchPanel : Window
         ShowAndFocusQuery();
     }
 
+    internal async Task ActivateQuickSwitchFolderSearchAsync(
+        IReadOnlyList<QuickSwitchFolderCandidate> candidates,
+        Func<string, CancellationToken, Task<DialogJumpResult>> dialogFolderActivation)
+    {
+        await ViewModel.ActivateQuickSwitchFolderSearchAsync(candidates, dialogFolderActivation);
+        ShowAndFocusQuery();
+    }
+
     public void ReportDialogJumpResult(DialogJumpResult result)
     {
         ViewModel.ReportDialogJumpResult(result);
@@ -90,10 +98,23 @@ public partial class SearchPanel : Window
             return;
         }
 
-        if (GetPreviewKeyAction(e.Key) == SearchPanelPreviewKeyAction.HidePanel)
+        var action = GetPreviewKeyAction(e.Key);
+        if (action == SearchPanelPreviewKeyAction.HidePanel)
         {
             e.Handled = true;
             Close();
+            return;
+        }
+
+        if (action is SearchPanelPreviewKeyAction.MoveSelectionUp or SearchPanelPreviewKeyAction.MoveSelectionDown)
+        {
+            e.Handled = true;
+            ViewModel.MoveSelection(action == SearchPanelPreviewKeyAction.MoveSelectionUp ? -1 : 1);
+            if (ViewModel.SelectedResult is not null)
+            {
+                ResultsList.ScrollIntoView(ViewModel.SelectedResult);
+            }
+
             return;
         }
 
@@ -140,9 +161,13 @@ public partial class SearchPanel : Window
 
     internal static SearchPanelPreviewKeyAction GetPreviewKeyAction(Key key)
     {
-        return key == Key.Escape
-            ? SearchPanelPreviewKeyAction.HidePanel
-            : SearchPanelPreviewKeyAction.None;
+        return key switch
+        {
+            Key.Escape => SearchPanelPreviewKeyAction.HidePanel,
+            Key.Up => SearchPanelPreviewKeyAction.MoveSelectionUp,
+            Key.Down => SearchPanelPreviewKeyAction.MoveSelectionDown,
+            _ => SearchPanelPreviewKeyAction.None
+        };
     }
 
     internal static async Task RunInteractionAsync(
@@ -192,6 +217,11 @@ public partial class SearchPanel : Window
             return Task.CompletedTask;
         }
 
+        public Task RecordUsageAsync(string fullPath, CancellationToken cancellationToken)
+        {
+            return Task.CompletedTask;
+        }
+
         public Task<IReadOnlyList<SearchResult>> SearchAsync(SearchQuery query, CancellationToken cancellationToken)
         {
             return Task.FromResult<IReadOnlyList<SearchResult>>(Array.Empty<SearchResult>());
@@ -202,5 +232,7 @@ public partial class SearchPanel : Window
 internal enum SearchPanelPreviewKeyAction
 {
     None,
-    HidePanel
+    HidePanel,
+    MoveSelectionUp,
+    MoveSelectionDown
 }

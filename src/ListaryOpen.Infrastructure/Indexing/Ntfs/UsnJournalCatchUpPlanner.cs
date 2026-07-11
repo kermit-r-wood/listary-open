@@ -21,7 +21,8 @@ public static class UsnJournalCatchUpPlanner
         if (checkpoint is null
             || checkpoint.UsnJournalId != journal.UsnJournalId
             || checkpoint.RulesVersion != currentRulesVersion
-            || checkpoint.NextUsn < journal.LowestValidUsn)
+            || checkpoint.NextUsn < journal.LowestValidUsn
+            || checkpoint.NextUsn > journal.NextUsn)
         {
             return new UsnCatchUpPlan(UsnCatchUpAction.FullRescan, 0, journal.NextUsn);
         }

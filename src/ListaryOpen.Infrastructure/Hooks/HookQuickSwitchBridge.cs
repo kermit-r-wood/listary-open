@@ -10,6 +10,7 @@ public sealed class HookQuickSwitchBridge : IHookQuickSwitchBridge
     private readonly IReadOnlyDictionary<HookArchitecture, IHookIpcClient> _clients;
     private readonly HookHostPaths? _hostPaths;
     private readonly HookHostProcessFactory _processFactory;
+    private readonly HookHostSession? _session;
     private readonly SemaphoreSlim _enableGate = new(1, 1);
     private readonly object _hostProcessGate = new();
     private readonly Dictionary<HookArchitecture, Process> _hostProcesses = new();
@@ -26,7 +27,8 @@ public sealed class HookQuickSwitchBridge : IHookQuickSwitchBridge
         HookQuickSwitchStatus initialStatus,
         IReadOnlyDictionary<HookArchitecture, IHookIpcClient> clients,
         HookHostPaths? hostPaths,
-        HookHostProcessFactory? processFactory)
+        HookHostProcessFactory? processFactory,
+        HookHostSession? session = null)
     {
         ArgumentNullException.ThrowIfNull(initialStatus);
         ArgumentNullException.ThrowIfNull(clients);
@@ -42,6 +44,7 @@ public sealed class HookQuickSwitchBridge : IHookQuickSwitchBridge
         _clients = clients.ToDictionary(client => client.Key, client => client.Value);
         _hostPaths = hostPaths;
         _processFactory = processFactory ?? new HookHostProcessFactory();
+        _session = session;
     }
 
     public HookQuickSwitchStatus Status { get; private set; }
@@ -90,16 +93,23 @@ public sealed class HookQuickSwitchBridge : IHookQuickSwitchBridge
 
     public async Task<HookDialogContext?> GetActiveDialogAsync(CancellationToken cancellationToken)
     {
+        cancellationToken.ThrowIfCancellationRequested();
+        if (!Status.Enabled)
+        {
+            return null;
+        }
+
         var result = await QueryActiveDialogAsync(cancellationToken).ConfigureAwait(false);
         return result.Dialog;
     }
 
     public async Task<HookJumpResult> JumpActiveDialogToFolderAsync(string folderPath, CancellationToken cancellationToken)
     {
-        ArgumentNullException.ThrowIfNull(folderPath);
-        if (string.IsNullOrWhiteSpace(folderPath))
+        ValidateFolderPath(folderPath);
+        cancellationToken.ThrowIfCancellationRequested();
+        if (!Status.Enabled)
         {
-            throw new ArgumentException("Folder path cannot be empty.", nameof(folderPath));
+            return HookDisabledResult();
         }
 
         var activeDialogResult = await QueryActiveDialogAsync(cancellationToken).ConfigureAwait(false);
@@ -111,12 +121,31 @@ public sealed class HookQuickSwitchBridge : IHookQuickSwitchBridge
                 : new HookJumpResult(activeDialogResult.Status, activeDialogResult.Message);
         }
 
-        if (!_clients.TryGetValue(dialog.Architecture, out var client))
+        return await JumpDialogToFolderAsync(dialog, folderPath, cancellationToken).ConfigureAwait(false);
+    }
+
+    public Task<HookJumpResult> JumpDialogToFolderAsync(
+        HookDialogContext dialog,
+        string folderPath,
+        CancellationToken cancellationToken)
+    {
+        ArgumentNullException.ThrowIfNull(dialog);
+        ValidateFolderPath(folderPath);
+        cancellationToken.ThrowIfCancellationRequested();
+        if (!Status.Enabled)
         {
-            return new HookJumpResult(HookJumpStatus.HostUnavailable, $"{dialog.Architecture} hook host is not available.");
+            return Task.FromResult(HookDisabledResult());
         }
 
-        return await client.JumpDialogToFolderAsync(dialog.DialogId, folderPath, cancellationToken).ConfigureAwait(false);
+        if (!_clients.TryGetValue(dialog.Architecture, out var client))
+        {
+            return Task.FromResult(
+                new HookJumpResult(
+                    HookJumpStatus.HostUnavailable,
+                    $"{dialog.Architecture} hook host is not available."));
+        }
+
+        return client.JumpDialogToFolderAsync(dialog.DialogId, folderPath, cancellationToken);
     }
 
     private async Task<HookActiveDialogResult> QueryActiveDialogAsync(CancellationToken cancellationToken)
@@ -229,12 +258,15 @@ public sealed class HookQuickSwitchBridge : IHookQuickSwitchBridge
 
         if (TryGetRunningTrackedProcess(architecture, out _))
         {
-            return new HookArchitectureStatus(
-                architecture,
-                true,
-                true,
-                snapshot.HookDllExists,
-                $"{architectureName} hook host is already running.");
+            return await TryCreateHealthyExistingHostStatusAsync(
+                    architecture,
+                    snapshot,
+                    cancellationToken)
+                .ConfigureAwait(false)
+                ?? CreateHealthUnconfirmedStatus(
+                    architecture,
+                    snapshot.HookDllExists,
+                    $"{architectureName} hook host is running, but health was not confirmed.");
         }
 
         var healthyStatus = await TryCreateHealthyExistingHostStatusAsync(
@@ -269,7 +301,9 @@ public sealed class HookQuickSwitchBridge : IHookQuickSwitchBridge
                 paths.HostExePath,
                 GetPipeName(architecture),
                 paths.HookDllPath,
-                elevated: true);
+                elevated: true,
+                parentProcessId: _session?.ParentProcessId,
+                secret: _session?.Secret);
             var process = _processFactory.Start(startInfo);
             if (process is null)
             {
@@ -306,12 +340,15 @@ public sealed class HookQuickSwitchBridge : IHookQuickSwitchBridge
                     $"{architectureName} hook host start was abandoned.");
             }
 
-            return new HookArchitectureStatus(
-                architecture,
-                true,
-                true,
-                true,
-                $"{architectureName} hook host started.");
+            return await TryCreateHealthyExistingHostStatusAsync(
+                    architecture,
+                    snapshot,
+                    cancellationToken)
+                .ConfigureAwait(false)
+                ?? CreateHealthUnconfirmedStatus(
+                    architecture,
+                    hookDllPresent: true,
+                    $"{architectureName} hook host started, but health was not confirmed.");
         }
         catch (Exception exception) when (exception is not OperationCanceledException)
         {
@@ -390,7 +427,9 @@ public sealed class HookQuickSwitchBridge : IHookQuickSwitchBridge
                         x86Paths.HostExePath,
                         GetPipeName(HookArchitecture.X86),
                         x86Paths.HookDllPath)
-                });
+                },
+                _session?.ParentProcessId,
+                _session?.Secret);
             var process = _processFactory.Start(startInfo);
             if (process is null)
             {
@@ -443,26 +482,28 @@ public sealed class HookQuickSwitchBridge : IHookQuickSwitchBridge
                         "x86 hook host launch was abandoned."));
             }
 
+            var x64Status = await TryCreateHealthyExistingHostStatusAsync(
+                    HookArchitecture.X64,
+                    x64Snapshot,
+                    cancellationToken)
+                .ConfigureAwait(false)
+                ?? CreateHealthUnconfirmedStatus(
+                    HookArchitecture.X64,
+                    hookDllPresent: true,
+                    "x64 hook host started, but health was not confirmed.");
             var x86Status = await TryCreateHealthyExistingHostStatusAsync(
                     HookArchitecture.X86,
                     x86Snapshot,
                     cancellationToken)
                 .ConfigureAwait(false)
-                ?? new HookArchitectureStatus(
+                ?? CreateHealthUnconfirmedStatus(
                     HookArchitecture.X86,
-                    true,
-                    false,
-                    true,
+                    hookDllPresent: true,
                     "x86 hook host launch requested by x64 hook host, but health was not confirmed.");
 
             return new HookQuickSwitchStatus(
                 true,
-                new HookArchitectureStatus(
-                    HookArchitecture.X64,
-                    true,
-                    true,
-                    true,
-                    "x64 hook host started."),
+                x64Status,
                 x86Status);
         }
         catch (Exception exception) when (exception is not OperationCanceledException)
@@ -545,6 +586,12 @@ public sealed class HookQuickSwitchBridge : IHookQuickSwitchBridge
             $"{architectureName} unavailable: {string.Join(" and ", missingParts)}.");
     }
 
+    private static HookArchitectureStatus CreateHealthUnconfirmedStatus(
+        HookArchitecture architecture,
+        bool hookDllPresent,
+        string message) =>
+        new(architecture, true, false, hookDllPresent, message);
+
     private bool TryGetRunningTrackedProcess(HookArchitecture architecture, out Process? process)
     {
         lock (_hostProcessGate)
@@ -582,11 +629,23 @@ public sealed class HookQuickSwitchBridge : IHookQuickSwitchBridge
         }
     }
 
-    private static string GetPipeName(HookArchitecture architecture) =>
+    private static void ValidateFolderPath(string folderPath)
+    {
+        ArgumentNullException.ThrowIfNull(folderPath);
+        if (string.IsNullOrWhiteSpace(folderPath))
+        {
+            throw new ArgumentException("Folder path cannot be empty.", nameof(folderPath));
+        }
+    }
+
+    private static HookJumpResult HookDisabledResult() =>
+        new(HookJumpStatus.HostUnavailable, "Hook quick switch is disabled.");
+
+    private string GetPipeName(HookArchitecture architecture) =>
         architecture switch
         {
-            HookArchitecture.X64 => X64PipeName,
-            HookArchitecture.X86 => X86PipeName,
+            HookArchitecture.X64 => _session?.X64PipeName ?? X64PipeName,
+            HookArchitecture.X86 => _session?.X86PipeName ?? X86PipeName,
             _ => throw new ArgumentOutOfRangeException(nameof(architecture), architecture, null)
         };
 }

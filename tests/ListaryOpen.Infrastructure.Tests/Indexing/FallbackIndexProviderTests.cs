@@ -162,18 +162,17 @@ public sealed class FallbackIndexProviderTests
     }
 
     [Fact]
-    public void ChildEnumerationFailureIsSkippedAfterProbeSucceeds()
+    public void ChildEnumerationFailureIsFatalInsteadOfBeingReportedAsACompleteScan()
     {
         static IEnumerable<string> ThrowAccessDenied()
         {
             throw new UnauthorizedAccessException("child is inaccessible");
         }
 
-        var entries = FallbackIndexProvider
-            .EnumerateEntriesForTests(ThrowAccessDenied, CancellationToken.None, failOnEnumerationFailure: false)
-            .ToList();
-
-        Assert.Empty(entries);
+        Assert.Throws<IOException>(() =>
+            FallbackIndexProvider
+                .EnumerateEntriesForTests(ThrowAccessDenied, CancellationToken.None, failOnEnumerationFailure: true)
+                .ToList());
     }
 
     [Theory]

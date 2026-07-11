@@ -283,6 +283,45 @@ public sealed class ExplorerTrackerTests
     }
 
     [Fact]
+    public void CompositeQuickSwitchWindowProviderPrefersMostRecentlyForegroundSourceWhenNoneIsForeground()
+    {
+        var explorerFolder = Directory.CreateTempSubdirectory("listary-open-explorer-");
+        var directoryOpusFolder = Directory.CreateTempSubdirectory("listary-open-dopus-");
+
+        try
+        {
+            var explorerProvider = new RecordingRefreshableQuickSwitchProvider(new[]
+            {
+                new QuickSwitchFolderCandidate(explorerFolder.FullName, "Explorer", new IntPtr(1), false)
+            });
+            var directoryOpusProvider = new RecordingRefreshableQuickSwitchProvider(new[]
+            {
+                new QuickSwitchFolderCandidate(directoryOpusFolder.FullName, "Directory Opus", new IntPtr(2), true)
+            });
+            var composite = new CompositeQuickSwitchWindowProvider(new IQuickSwitchWindowProvider[]
+            {
+                explorerProvider,
+                directoryOpusProvider
+            });
+
+            _ = composite.GetFolderCandidates();
+            directoryOpusProvider.Candidates = new[]
+            {
+                new QuickSwitchFolderCandidate(directoryOpusFolder.FullName, "Directory Opus", new IntPtr(2), false)
+            };
+
+            var candidates = composite.GetFolderCandidates();
+
+            Assert.Equal(directoryOpusFolder.FullName, candidates[0].FolderPath);
+        }
+        finally
+        {
+            explorerFolder.Delete(recursive: true);
+            directoryOpusFolder.Delete(recursive: true);
+        }
+    }
+
+    [Fact]
     public void CompositeQuickSwitchWindowProviderKeepsFallbackCandidatesWhenProvidersReturnNoFolders()
     {
         var fallback = Directory.CreateTempSubdirectory("listary-open-fallback-");
@@ -493,6 +532,7 @@ public sealed class ExplorerTrackerTests
                 },
                 foregroundProvider: () => false);
 
+            Assert.True(SpinWait.SpinUntil(() => provider.GetFolderCandidates().Count == 1, TimeSpan.FromSeconds(1)));
             var candidate = Assert.Single(provider.GetFolderCandidates());
 
             Assert.True(read);
@@ -502,6 +542,41 @@ public sealed class ExplorerTrackerTests
         }
         finally
         {
+            folder.Delete(recursive: true);
+        }
+    }
+
+    [Fact]
+    public void DirectoryOpusQuickSwitchProviderReturnsCachedSnapshotWhileInfoReadIsInFlight()
+    {
+        var folder = Directory.CreateTempSubdirectory("listary-open-dopus-cache-");
+        using var started = new ManualResetEventSlim();
+        using var release = new ManualResetEventSlim();
+
+        try
+        {
+            var provider = new DirectoryOpusQuickSwitchProvider(
+                () =>
+                {
+                    started.Set();
+                    release.Wait();
+                    return $"<path active_lister=\"1\" active_tab=\"1\">{folder.FullName}</path>";
+                },
+                foregroundProvider: () => true);
+            var refresh = typeof(DirectoryOpusQuickSwitchProvider).GetMethod(nameof(IRefreshableQuickSwitchWindowProvider.Refresh));
+
+            Assert.NotNull(refresh);
+            refresh!.Invoke(provider, null);
+            Assert.True(started.Wait(TimeSpan.FromSeconds(1)));
+
+            Assert.Empty(provider.GetFolderCandidates());
+
+            release.Set();
+            Assert.True(SpinWait.SpinUntil(() => provider.GetFolderCandidates().Count == 1, TimeSpan.FromSeconds(1)));
+        }
+        finally
+        {
+            release.Set();
             folder.Delete(recursive: true);
         }
     }
@@ -660,12 +735,12 @@ public sealed class ExplorerTrackerTests
 
     private sealed class RecordingRefreshableQuickSwitchProvider : IRefreshableQuickSwitchWindowProvider
     {
-        private readonly IReadOnlyList<QuickSwitchFolderCandidate> _candidates;
-
         public RecordingRefreshableQuickSwitchProvider(IReadOnlyList<QuickSwitchFolderCandidate> candidates)
         {
-            _candidates = candidates;
+            Candidates = candidates;
         }
+
+        public IReadOnlyList<QuickSwitchFolderCandidate> Candidates { get; set; }
 
         public bool Refreshed { get; private set; }
 
@@ -676,7 +751,7 @@ public sealed class ExplorerTrackerTests
 
         public IReadOnlyList<QuickSwitchFolderCandidate> GetFolderCandidates()
         {
-            return _candidates;
+            return Candidates;
         }
     }
 

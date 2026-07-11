@@ -10,5 +10,10 @@ public interface IHookQuickSwitchBridge : IDisposable
 
     Task<HookDialogContext?> GetActiveDialogAsync(CancellationToken cancellationToken);
 
+    Task<HookJumpResult> JumpDialogToFolderAsync(
+        HookDialogContext dialog,
+        string folderPath,
+        CancellationToken cancellationToken);
+
     Task<HookJumpResult> JumpActiveDialogToFolderAsync(string folderPath, CancellationToken cancellationToken);
 }

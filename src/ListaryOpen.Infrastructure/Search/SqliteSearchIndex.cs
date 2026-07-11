@@ -328,13 +328,49 @@ public sealed class SqliteSearchIndex : ISearchIndex, IAsyncDisposable
         }
     }
 
+    public async Task RecordUsageAsync(string fullPath, CancellationToken cancellationToken)
+    {
+        var normalizedFullPath = NormalizeFullPath(fullPath);
+        var pathKey = normalizedFullPath.ToUpperInvariant();
+
+        await _connectionGate.WaitAsync(cancellationToken).ConfigureAwait(false);
+        try
+        {
+            ThrowIfDisposed();
+
+            using var command = _connection.CreateCommand();
+            command.CommandText = """
+                insert into usage(full_path, path_key, open_count, last_used_at)
+                values ($full_path, $path_key, 1, $last_used_at)
+                on conflict(path_key) do update set
+                    full_path = excluded.full_path,
+                    open_count = usage.open_count + 1,
+                    last_used_at = excluded.last_used_at;
+                """;
+            command.Parameters.AddWithValue("$full_path", normalizedFullPath);
+            command.Parameters.AddWithValue("$path_key", pathKey);
+            command.Parameters.AddWithValue("$last_used_at", FormatDateTime(DateTimeOffset.UtcNow));
+
+            await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+        }
+        finally
+        {
+            _connectionGate.Release();
+        }
+    }
+
     internal async Task ApplyUsnJournalChangesAsync(
         IEnumerable<UsnJournalIndexChange> changes,
         UsnJournalCheckpoint checkpoint,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        long indexGeneration = DefaultIndexGeneration)
     {
         ArgumentNullException.ThrowIfNull(changes);
         ArgumentNullException.ThrowIfNull(checkpoint);
+        if (indexGeneration < DefaultIndexGeneration)
+        {
+            throw new ArgumentOutOfRangeException(nameof(indexGeneration));
+        }
 
         var materializedChanges = changes.ToArray();
 
@@ -353,7 +389,7 @@ public sealed class SqliteSearchIndex : ISearchIndex, IAsyncDisposable
                         case UsnJournalIndexChangeKind.Upsert:
                             await ExecuteUpsertAsync(
                                 change.Record!,
-                                DefaultIndexGeneration,
+                                indexGeneration,
                                 transaction,
                                 cancellationToken).ConfigureAwait(false);
                             break;
@@ -401,7 +437,9 @@ public sealed class SqliteSearchIndex : ISearchIndex, IAsyncDisposable
             ThrowIfDisposed();
 
             candidates = await ReadCandidatesAsync(query, cancellationToken).ConfigureAwait(false);
-            usage = await ReadUsageAsync(candidates.Select(record => record.PathKey), cancellationToken).ConfigureAwait(false);
+            usage = string.IsNullOrWhiteSpace(query.NormalizedText)
+                ? Array.Empty<UsageRecord>()
+                : await ReadUsageAsync(candidates.Select(record => record.PathKey), cancellationToken).ConfigureAwait(false);
         }
         finally
         {
@@ -941,6 +979,14 @@ public sealed class SqliteSearchIndex : ISearchIndex, IAsyncDisposable
     private async Task<IReadOnlyList<FileRecord>> ReadCandidatesAsync(SearchQuery query, CancellationToken cancellationToken)
     {
         var records = new Dictionary<string, FileRecord>(StringComparer.Ordinal);
+        if (string.IsNullOrWhiteSpace(query.NormalizedText))
+        {
+            await AddFallbackCandidatesAsync(query, query.Limit, records, cancellationToken).ConfigureAwait(false);
+            return records.Values
+                .Where(record => MatchesParsedFilters(query, record))
+                .ToArray();
+        }
+
         var candidateLimit = CreateCandidateLimit(query);
         var useExpensiveFuzzy = UsesExpensiveFuzzyCandidates(query);
 
@@ -960,7 +1006,7 @@ public sealed class SqliteSearchIndex : ISearchIndex, IAsyncDisposable
         }
 
         cancellationToken.ThrowIfCancellationRequested();
-        await AddFallbackCandidatesAsync(query, records, cancellationToken).ConfigureAwait(false);
+        await AddFallbackCandidatesAsync(query, FallbackCandidateLimit, records, cancellationToken).ConfigureAwait(false);
 
         return records.Values
             .Where(record => MatchesParsedFilters(query, record))
@@ -1135,6 +1181,7 @@ public sealed class SqliteSearchIndex : ISearchIndex, IAsyncDisposable
 
     private async Task AddFallbackCandidatesAsync(
         SearchQuery query,
+        int candidateLimit,
         IDictionary<string, FileRecord> records,
         CancellationToken cancellationToken)
     {
@@ -1153,7 +1200,7 @@ public sealed class SqliteSearchIndex : ISearchIndex, IAsyncDisposable
                 full_path
             limit $limit;
             """;
-        command.Parameters.AddWithValue("$limit", FallbackCandidateLimit);
+        command.Parameters.AddWithValue("$limit", candidateLimit);
 
         await AddRecordsAsync(command, records, cancellationToken).ConfigureAwait(false);
     }
@@ -1407,6 +1454,9 @@ public sealed class SqliteSearchIndex : ISearchIndex, IAsyncDisposable
     }
 
     private static string CreatePathKey(string fullPath)
+        => NormalizeFullPath(fullPath).ToUpperInvariant();
+
+    private static string NormalizeFullPath(string fullPath)
     {
         if (string.IsNullOrWhiteSpace(fullPath))
         {
@@ -1421,8 +1471,7 @@ public sealed class SqliteSearchIndex : ISearchIndex, IAsyncDisposable
 
         try
         {
-            var normalized = Path.TrimEndingDirectorySeparator(Path.GetFullPath(trimmed));
-            return normalized.ToUpperInvariant();
+            return Path.TrimEndingDirectorySeparator(Path.GetFullPath(trimmed));
         }
         catch (Exception ex) when (ex is ArgumentException or NotSupportedException or PathTooLongException)
         {

@@ -6,6 +6,22 @@ namespace ListaryOpen.Infrastructure.Tests.Hooks;
 public sealed class HookIpcMessagesTests
 {
     [Fact]
+    public void SerializerIncludesClientBindingFields()
+    {
+        var command = new HookIpcEnvelope(
+            HookIpcEnvelope.CurrentVersion,
+            "HealthProbe",
+            new HookHealthProbe(),
+            123,
+            "session-secret");
+
+        var json = HookIpcSerializer.Serialize(command);
+
+        Assert.Contains("\"clientProcessId\":123", json, StringComparison.Ordinal);
+        Assert.Contains("\"secret\":\"session-secret\"", json, StringComparison.Ordinal);
+    }
+
+    [Fact]
     public void JumpCommandRoundTripsWithVersionAndFolder()
     {
         var command = HookIpcEnvelope.Command(

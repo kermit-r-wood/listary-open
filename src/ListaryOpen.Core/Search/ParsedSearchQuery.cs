@@ -16,18 +16,9 @@ public sealed record ParsedSearchQuery(
     {
         get
         {
-            var parts = Phrases
+            return string.Join(' ', Phrases
                 .Concat(Terms)
-                .DefaultIfEmpty()
-                .Where(part => !string.IsNullOrWhiteSpace(part))
-                .ToArray();
-            if (parts.Length > 0)
-            {
-                return string.Join(' ', parts);
-            }
-
-            var fallbackParts = PathTerms.Concat(Extensions).ToArray();
-            return string.Join(' ', fallbackParts);
+                .Where(part => !string.IsNullOrWhiteSpace(part)));
         }
     }
 

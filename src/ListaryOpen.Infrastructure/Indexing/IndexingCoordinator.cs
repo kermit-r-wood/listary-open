@@ -59,6 +59,7 @@ public sealed class IndexingCoordinator
         var indexedCount = 0;
         var hadFailures = false;
         var hadCancellations = false;
+        var retainedStaleRecords = false;
         long? indexGeneration = null;
         RaiseStatus(IndexingRunState.Indexing, "Indexing started.", indexedCount);
 
@@ -86,6 +87,7 @@ public sealed class IndexingCoordinator
                 indexedCount += result.IndexedCount;
                 hadFailures |= result.HadFailure;
                 hadCancellations |= result.WasCanceled;
+                retainedStaleRecords |= result.RetainedStaleRecords;
             }
             catch (OperationCanceledException)
             {
@@ -107,7 +109,9 @@ public sealed class IndexingCoordinator
             ? "Indexing completed with errors."
             : hadCancellations
                 ? "Indexing canceled."
-                : "Indexing completed.";
+                : retainedStaleRecords
+                    ? "Indexing completed; stale records retained because pruning was skipped."
+                    : "Indexing completed.";
 
         RaiseStatus(
             finalState,
@@ -145,6 +149,7 @@ public sealed class IndexingCoordinator
             return new IndexRootResult(count, HadFailure: false, WasCanceled: false);
         }
 
+        UsnJournalState? preScanJournalState = null;
         try
         {
             var catchUp = await TryCatchUpNtfsRootAsync(
@@ -152,6 +157,7 @@ public sealed class IndexingCoordinator
                 root,
                 indexGeneration,
                 cancellationToken).ConfigureAwait(false);
+            preScanJournalState = catchUp.JournalState;
             if (catchUp.CompletedWithoutFullScan)
             {
                 return new IndexRootResult(catchUp.IndexedCount, HadFailure: false, WasCanceled: false);
@@ -160,15 +166,41 @@ public sealed class IndexingCoordinator
             var count = await ScanAndUpsertAsync(provider, root, indexGeneration, cancellationToken).ConfigureAwait(false);
             if (count > 0)
             {
+                var postScanJournalState = await TryApplyPostScanNtfsChangesAsync(
+                    provider,
+                    root,
+                    preScanJournalState,
+                    indexGeneration,
+                    cancellationToken).ConfigureAwait(false);
+                if (postScanJournalState is null)
+                {
+                    RaiseStatus(
+                        IndexingRunState.Indexing,
+                        $"NTFS prune skipped for {root.Path}: scan completeness could not be verified.",
+                        currentIndexedCount + count);
+                    return new IndexRootResult(
+                        count,
+                        HadFailure: false,
+                        WasCanceled: false,
+                        RetainedStaleRecords: true);
+                }
+
                 await _index.PruneStaleRecordsUnderRootAsync(root.Path, indexGeneration, cancellationToken).ConfigureAwait(false);
-                await SaveNtfsCheckpointAsync(root, catchUp.JournalState, cancellationToken).ConfigureAwait(false);
+                await SaveNtfsCheckpointAsync(root, postScanJournalState, cancellationToken).ConfigureAwait(false);
                 return new IndexRootResult(count, HadFailure: false, WasCanceled: false);
             }
 
             RaiseStatus(IndexingRunState.Indexing, $"NTFS returned no records; using fallback for {root.Path}.", currentIndexedCount);
             var fallbackCount = await ScanAndUpsertAsync(_fallbackProvider, root, indexGeneration, cancellationToken).ConfigureAwait(false);
-            await _index.PruneStaleRecordsUnderRootAsync(root.Path, indexGeneration, cancellationToken).ConfigureAwait(false);
-            return new IndexRootResult(fallbackCount, HadFailure: false, WasCanceled: false);
+            RaiseStatus(
+                IndexingRunState.Indexing,
+                $"NTFS prune skipped for {root.Path}: recovery scan has no journal completeness proof.",
+                currentIndexedCount + fallbackCount);
+            return new IndexRootResult(
+                fallbackCount,
+                HadFailure: false,
+                WasCanceled: false,
+                RetainedStaleRecords: true);
         }
         catch (OperationCanceledException)
         {
@@ -193,8 +225,15 @@ public sealed class IndexingCoordinator
 
             RaiseStatus(IndexingRunState.Failed, $"NTFS scan failed for {root.Path}; using fallback. {exception.Message}", currentIndexedCount);
             var fallbackCount = await ScanAndUpsertAsync(_fallbackProvider, root, indexGeneration, cancellationToken).ConfigureAwait(false);
-            await _index.PruneStaleRecordsUnderRootAsync(root.Path, indexGeneration, cancellationToken).ConfigureAwait(false);
-            return new IndexRootResult(fallbackCount, HadFailure: true, WasCanceled: false);
+            RaiseStatus(
+                IndexingRunState.Indexing,
+                $"NTFS prune skipped for {root.Path}: recovery scan has no journal completeness proof.",
+                currentIndexedCount + fallbackCount);
+            return new IndexRootResult(
+                fallbackCount,
+                HadFailure: true,
+                WasCanceled: false,
+                RetainedStaleRecords: true);
         }
     }
 
@@ -305,6 +344,61 @@ public sealed class IndexingCoordinator
         await _index
             .SaveVolumeCheckpointAsync(CreateCheckpoint(root, journalState, journalState.NextUsn), cancellationToken)
             .ConfigureAwait(false);
+    }
+
+    private async Task<UsnJournalState?> TryApplyPostScanNtfsChangesAsync(
+        IIndexProvider provider,
+        IndexRoot root,
+        UsnJournalState? preScanJournalState,
+        long indexGeneration,
+        CancellationToken cancellationToken)
+    {
+        if (provider is not INtfsJournalProvider journalProvider || preScanJournalState is null)
+        {
+            return null;
+        }
+
+        try
+        {
+            var postScanJournalState = await journalProvider
+                .QueryJournalStateAsync(root, cancellationToken)
+                .ConfigureAwait(false);
+            if (postScanJournalState is null
+                || postScanJournalState.UsnJournalId != preScanJournalState.UsnJournalId
+                || postScanJournalState.NextUsn < preScanJournalState.NextUsn)
+            {
+                return null;
+            }
+
+            if (postScanJournalState.NextUsn == preScanJournalState.NextUsn)
+            {
+                return postScanJournalState;
+            }
+
+            var changes = journalProvider.ReadJournalChangesAsync(
+                root,
+                postScanJournalState.UsnJournalId,
+                preScanJournalState.NextUsn,
+                postScanJournalState.NextUsn,
+                cancellationToken);
+            var result = await UsnJournalChangeApplier.ApplyAsync(
+                    _index,
+                    changes,
+                    CreateCheckpoint(root, postScanJournalState, postScanJournalState.NextUsn),
+                    cancellationToken,
+                    indexGeneration)
+                .ConfigureAwait(false);
+            return result.RequiresFullRescan ? null : postScanJournalState;
+        }
+        catch (OperationCanceledException)
+        {
+            throw;
+        }
+        catch (Exception exception)
+        {
+            Trace.TraceWarning("NTFS post-scan journal catch-up failed for '{0}': {1}", root.Path, exception.Message);
+            return null;
+        }
     }
 
     private static UsnJournalCheckpoint CreateCheckpoint(
@@ -486,7 +580,11 @@ public sealed class IndexingCoordinator
         public bool PartialRecordsAccepted { get; }
     }
 
-    private sealed record IndexRootResult(int IndexedCount, bool HadFailure, bool WasCanceled);
+    private sealed record IndexRootResult(
+        int IndexedCount,
+        bool HadFailure,
+        bool WasCanceled,
+        bool RetainedStaleRecords = false);
 
     private sealed record NtfsCatchUpResult(
         bool CompletedWithoutFullScan,

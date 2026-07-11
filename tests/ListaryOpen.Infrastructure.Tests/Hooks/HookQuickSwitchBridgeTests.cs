@@ -14,6 +14,9 @@ public sealed class HookQuickSwitchBridgeTests
         hookFiles.CreateHostAndDll(HookArchitecture.X64);
         hookFiles.CreateHostAndDll(HookArchitecture.X86);
         var processFactory = new RecordingHookHostProcessFactory(startResult: new Process());
+        var x64HealthClient = new SequenceHealthProbeHookClient(
+            new HookJumpResult(HookJumpStatus.HostUnavailable, "No host."),
+            HookJumpResult.Success("Hook host healthy."));
         var x86HealthClient = new SequenceHealthProbeHookClient(
             new HookJumpResult(HookJumpStatus.HostUnavailable, "No host."),
             HookJumpResult.Success("Hook host healthy."));
@@ -21,6 +24,7 @@ public sealed class HookQuickSwitchBridgeTests
             HookQuickSwitchStatus.Disabled(),
             new Dictionary<HookArchitecture, IHookIpcClient>
             {
+                [HookArchitecture.X64] = x64HealthClient,
                 [HookArchitecture.X86] = x86HealthClient
             },
             hookFiles.Paths,
@@ -36,6 +40,8 @@ public sealed class HookQuickSwitchBridgeTests
         Assert.True(bridge.Status.X64.HookDllPresent);
         Assert.True(bridge.Status.X86.HostRunning);
         Assert.True(bridge.Status.X86.HookDllPresent);
+        Assert.Equal(2, x64HealthClient.ProbeCount);
+        Assert.Equal(2, x86HealthClient.ProbeCount);
         var start = Assert.Single(processFactory.Starts);
         Assert.Equal(hookFiles.ForArchitecture(HookArchitecture.X64).HostExePath, start.StartInfo.FileName);
         Assert.Equal(
@@ -56,7 +62,7 @@ public sealed class HookQuickSwitchBridgeTests
     }
 
     [Fact]
-    public async Task EnableDoesNotMarkLaunchedX86HostRunningWithoutHealthProof()
+    public async Task EnableDoesNotMarkLaunchedHostsRunningWithoutHealthProof()
     {
         using var hookFiles = HookFileFixture.Create();
         hookFiles.CreateHostAndDll(HookArchitecture.X64);
@@ -70,7 +76,8 @@ public sealed class HookQuickSwitchBridgeTests
 
         await bridge.EnableAsync(CancellationToken.None);
 
-        Assert.True(bridge.Status.X64.HostRunning);
+        Assert.False(bridge.Status.X64.HostRunning);
+        Assert.Contains("health was not confirmed", bridge.Status.X64.Message, StringComparison.OrdinalIgnoreCase);
         Assert.False(bridge.Status.X86.HostRunning);
         Assert.Contains("health was not confirmed", bridge.Status.X86.Message, StringComparison.OrdinalIgnoreCase);
     }
@@ -295,7 +302,7 @@ public sealed class HookQuickSwitchBridgeTests
             DateTimeOffset.UtcNow);
         var client = new RecordingHookClient(dialog, HookJumpResult.Success("Jumped."));
         var bridge = new HookQuickSwitchBridge(
-            HookQuickSwitchStatus.Disabled(),
+            EnabledStatus(),
             new Dictionary<HookArchitecture, IHookIpcClient>
             {
                 [HookArchitecture.X64] = new RecordingHookClient(null, new HookJumpResult(HookJumpStatus.NoActiveDialog, "No dialog.")),
@@ -310,10 +317,46 @@ public sealed class HookQuickSwitchBridgeTests
     }
 
     [Fact]
+    public async Task JumpToCapturedDialogUsesTargetArchitectureWithoutQueryingActiveDialogs()
+    {
+        var dialog = new HookDialogContext(
+            "dlg-captured",
+            new IntPtr(100),
+            200,
+            300,
+            HookArchitecture.X86,
+            "MobaXterm",
+            "#32770",
+            "Choose which file(s) to upload...",
+            DateTimeOffset.UtcNow);
+        var x64Client = new RecordingHookClient(null, new HookJumpResult(HookJumpStatus.NoActiveDialog, "No dialog."));
+        var x86Client = new RecordingHookClient(null, HookJumpResult.Success("Jumped."));
+        var bridge = new HookQuickSwitchBridge(
+            EnabledStatus(),
+            new Dictionary<HookArchitecture, IHookIpcClient>
+            {
+                [HookArchitecture.X64] = x64Client,
+                [HookArchitecture.X86] = x86Client
+            });
+
+        var result = await bridge.JumpDialogToFolderAsync(
+            dialog,
+            "C:\\Users\\paulx",
+            CancellationToken.None);
+
+        Assert.Equal(HookJumpStatus.Success, result.Status);
+        Assert.Equal(0, x64Client.ActiveDialogQueryCount);
+        Assert.Equal(0, x86Client.ActiveDialogQueryCount);
+        Assert.Null(x64Client.LastDialogId);
+        Assert.Equal("dlg-captured", x86Client.LastDialogId);
+        Assert.Equal("C:\\Users\\paulx", x86Client.LastFolderPath);
+    }
+
+    [Fact]
     public async Task JumpReturnsNoActiveDialogWhenNoClientHasDialog()
     {
         var bridge = new HookQuickSwitchBridge(
-            HookQuickSwitchStatus.Disabled(),
+            EnabledStatus(),
             new Dictionary<HookArchitecture, IHookIpcClient>
             {
                 [HookArchitecture.X64] = new RecordingHookClient(null, new HookJumpResult(HookJumpStatus.NoActiveDialog, "No dialog.")),
@@ -330,7 +373,7 @@ public sealed class HookQuickSwitchBridgeTests
     {
         var client = new HookIpcClient("listary-open-missing-active-" + Guid.NewGuid(), TimeSpan.FromMilliseconds(50));
         var bridge = new HookQuickSwitchBridge(
-            HookQuickSwitchStatus.Disabled(),
+            EnabledStatus(),
             new Dictionary<HookArchitecture, IHookIpcClient>
             {
                 [HookArchitecture.X64] = client
@@ -350,7 +393,7 @@ public sealed class HookQuickSwitchBridgeTests
         var serverTask = ServeWithoutReplyOnceAsync(pipeName, serverCancellation.Token);
         var client = new HookIpcClient(pipeName, TimeSpan.FromMilliseconds(100));
         var bridge = new HookQuickSwitchBridge(
-            HookQuickSwitchStatus.Disabled(),
+            EnabledStatus(),
             new Dictionary<HookArchitecture, IHookIpcClient>
             {
                 [HookArchitecture.X64] = client
@@ -373,7 +416,7 @@ public sealed class HookQuickSwitchBridgeTests
     public async Task JumpPreservesSpecificNoActiveDialogDiagnostics()
     {
         var bridge = new HookQuickSwitchBridge(
-            HookQuickSwitchStatus.Disabled(),
+            EnabledStatus(),
             new Dictionary<HookArchitecture, IHookIpcClient>
             {
                 [HookArchitecture.X64] = new ActiveDialogResultHookClient(
@@ -393,7 +436,7 @@ public sealed class HookQuickSwitchBridgeTests
     public async Task JumpPrefersTargetArchitecturePendingDiagnosticOverMismatch()
     {
         var bridge = new HookQuickSwitchBridge(
-            HookQuickSwitchStatus.Disabled(),
+            EnabledStatus(),
             new Dictionary<HookArchitecture, IHookIpcClient>
             {
                 [HookArchitecture.X64] = new ActiveDialogResultHookClient(
@@ -429,7 +472,7 @@ public sealed class HookQuickSwitchBridgeTests
             [HookArchitecture.X64] = new RecordingHookClient(null, new HookJumpResult(HookJumpStatus.NoActiveDialog, "No dialog.")),
             [HookArchitecture.X86] = originalClient
         };
-        var bridge = new HookQuickSwitchBridge(HookQuickSwitchStatus.Disabled(), clients);
+        var bridge = new HookQuickSwitchBridge(EnabledStatus(), clients);
 
         clients[HookArchitecture.X86] = new RecordingHookClient(null, new HookJumpResult(HookJumpStatus.NoActiveDialog, "No dialog."));
         clients.Remove(HookArchitecture.X64);
@@ -438,6 +481,41 @@ public sealed class HookQuickSwitchBridgeTests
 
         Assert.Equal(HookJumpStatus.Success, result.Status);
         Assert.Equal("dlg-2", originalClient.LastDialogId);
+    }
+
+    [Fact]
+    public async Task DisabledBridgeDoesNotQueryOrJumpHookClients()
+    {
+        var dialog = new HookDialogContext(
+            "disabled-dialog",
+            new IntPtr(101),
+            201,
+            301,
+            HookArchitecture.X64,
+            "notepad",
+            "#32770",
+            "Open",
+            DateTimeOffset.UtcNow);
+        var client = new RecordingHookClient(dialog, HookJumpResult.Success("Jumped."));
+        var bridge = new HookQuickSwitchBridge(
+            HookQuickSwitchStatus.Disabled(),
+            new Dictionary<HookArchitecture, IHookIpcClient>
+            {
+                [HookArchitecture.X64] = client
+            });
+
+        var activeDialog = await bridge.GetActiveDialogAsync(CancellationToken.None);
+        var activeJump = await bridge.JumpActiveDialogToFolderAsync("C:\\Users\\paulx", CancellationToken.None);
+        var capturedJump = await bridge.JumpDialogToFolderAsync(
+            dialog,
+            "C:\\Users\\paulx",
+            CancellationToken.None);
+
+        Assert.Null(activeDialog);
+        Assert.Equal(HookJumpStatus.HostUnavailable, activeJump.Status);
+        Assert.Equal(HookJumpStatus.HostUnavailable, capturedJump.Status);
+        Assert.Equal(0, client.ActiveDialogQueryCount);
+        Assert.Null(client.LastDialogId);
     }
 
     [Fact]
@@ -478,8 +556,13 @@ public sealed class HookQuickSwitchBridgeTests
 
         public string? LastFolderPath { get; private set; }
 
-        public Task<HookDialogContext?> GetActiveDialogAsync(CancellationToken cancellationToken) =>
-            Task.FromResult(_activeDialog);
+        public int ActiveDialogQueryCount { get; private set; }
+
+        public Task<HookDialogContext?> GetActiveDialogAsync(CancellationToken cancellationToken)
+        {
+            ActiveDialogQueryCount++;
+            return Task.FromResult(_activeDialog);
+        }
 
         public Task<HookJumpResult> JumpDialogToFolderAsync(string dialogId, string folderPath, CancellationToken cancellationToken)
         {
@@ -488,6 +571,11 @@ public sealed class HookQuickSwitchBridgeTests
             return Task.FromResult(_jumpResult);
         }
     }
+
+    private static HookQuickSwitchStatus EnabledStatus() => new(
+        true,
+        new HookArchitectureStatus(HookArchitecture.X64, true, true, true, "x64 healthy"),
+        new HookArchitectureStatus(HookArchitecture.X86, true, true, true, "x86 healthy"));
 
     private sealed class HealthProbeHookClient : IHookIpcClient, IHookHealthProbeClient
     {
@@ -517,16 +605,21 @@ public sealed class HookQuickSwitchBridgeTests
             _healthResults = new Queue<HookJumpResult>(healthResults);
         }
 
+        public int ProbeCount { get; private set; }
+
         public Task<HookDialogContext?> GetActiveDialogAsync(CancellationToken cancellationToken) =>
             Task.FromResult<HookDialogContext?>(null);
 
         public Task<HookJumpResult> JumpDialogToFolderAsync(string dialogId, string folderPath, CancellationToken cancellationToken) =>
             Task.FromResult(new HookJumpResult(HookJumpStatus.NoActiveDialog, "No dialog."));
 
-        public Task<HookJumpResult> ProbeHealthAsync(CancellationToken cancellationToken) =>
-            Task.FromResult(_healthResults.Count == 0
+        public Task<HookJumpResult> ProbeHealthAsync(CancellationToken cancellationToken)
+        {
+            ProbeCount++;
+            return Task.FromResult(_healthResults.Count == 0
                 ? new HookJumpResult(HookJumpStatus.HostUnavailable, "No host.")
                 : _healthResults.Dequeue());
+        }
     }
 
     private sealed class ActiveDialogResultHookClient : IHookIpcClient, IHookActiveDialogQueryClient

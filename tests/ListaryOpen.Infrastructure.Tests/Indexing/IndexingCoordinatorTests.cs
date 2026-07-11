@@ -709,7 +709,57 @@ public sealed class IndexingCoordinatorTests
     }
 
     [Fact]
-    public async Task IndexRootsAsyncDoesNotSaveNtfsCheckpointAfterFullScanWithoutPreScanJournalState()
+    public async Task IndexRootsAsyncCatchesUpChangesWrittenDuringNtfsFullScanBeforePruning()
+    {
+        var rootPath = CreateTempDirectory();
+        var dbPath = CreateTempDbPath();
+
+        try
+        {
+            var scannedRecord = FileRecord.Create(
+                Path.Combine(rootPath, "ScannedBeforePostWatermark.txt"),
+                isDirectory: false,
+                sizeBytes: 1,
+                DateTimeOffset.UtcNow);
+            var changedRecord = FileRecord.Create(
+                Path.Combine(rootPath, "ChangedDuringFullScan.txt"),
+                isDirectory: false,
+                sizeBytes: 1,
+                DateTimeOffset.UtcNow);
+            await using var index = await SqliteSearchIndex.OpenAsync(dbPath, CancellationToken.None);
+            var provider = new JournalAwareNtfsProvider(
+                journalStates: new UsnJournalState?[]
+                {
+                    new(9, LowestValidUsn: 100, NextUsn: 200),
+                    new(9, LowestValidUsn: 100, NextUsn: 205)
+                },
+                records: new[] { scannedRecord },
+                changes: new[] { UsnJournalChange.Upsert(changedRecord) });
+            var coordinator = new IndexingCoordinator(
+                index,
+                new VolumeIndexer(new IIndexProvider[] { provider }),
+                new FallbackIndexProvider(),
+                _ => new VolumeInfo(rootPath, NtfsIndexProvider.ProviderName, true));
+
+            await coordinator.IndexRootsAsync(new[] { new IndexRoot(rootPath) }, CancellationToken.None);
+
+            var checkpoint = await index.ReadVolumeCheckpointAsync(rootPath, CancellationToken.None);
+            var results = await index.SearchAsync(
+                new SearchQuery("ChangedDuringFullScan", SearchMode.FilesAndFolders),
+                CancellationToken.None);
+            Assert.Equal(205, checkpoint!.NextUsn);
+            Assert.Contains(results, result => result.Record.PathKey == changedRecord.PathKey);
+            Assert.Equal(2, provider.QueryJournalStateCount);
+        }
+        finally
+        {
+            DeleteDirectoryIfExists(rootPath);
+            DeleteFileIfExists(dbPath);
+        }
+    }
+
+    [Fact]
+    public async Task IndexRootsAsyncDoesNotPruneOrSaveNtfsCheckpointAfterFullScanWithoutPreScanJournalState()
     {
         var rootPath = CreateTempDirectory();
         var dbPath = CreateTempDbPath();
@@ -721,7 +771,13 @@ public sealed class IndexingCoordinatorTests
                 isDirectory: false,
                 sizeBytes: 1,
                 DateTimeOffset.UtcNow);
+            var staleRecord = FileRecord.Create(
+                Path.Combine(rootPath, "PreservedWithoutJournalState.txt"),
+                isDirectory: false,
+                sizeBytes: 1,
+                DateTimeOffset.UtcNow);
             await using var index = await SqliteSearchIndex.OpenAsync(dbPath, CancellationToken.None);
+            await index.UpsertAsync(staleRecord, CancellationToken.None);
             var provider = new JournalAwareNtfsProvider(
                 journalStates: new UsnJournalState?[]
                 {
@@ -734,12 +790,206 @@ public sealed class IndexingCoordinatorTests
                 new VolumeIndexer(new IIndexProvider[] { provider }),
                 new FallbackIndexProvider(),
                 _ => new VolumeInfo(rootPath, NtfsIndexProvider.ProviderName, true));
+            var statuses = new List<IndexingStatus>();
+            coordinator.StatusChanged += (_, status) => statuses.Add(status);
 
             await coordinator.IndexRootsAsync(new[] { new IndexRoot(rootPath) }, CancellationToken.None);
 
             var checkpoint = await index.ReadVolumeCheckpointAsync(rootPath, CancellationToken.None);
+            var staleResults = await index.SearchAsync(
+                new SearchQuery("PreservedWithoutJournalState", SearchMode.FilesAndFolders),
+                CancellationToken.None);
             Assert.Null(checkpoint);
+            Assert.Contains(staleResults, result => result.Record.PathKey == staleRecord.PathKey);
             Assert.Equal(1, provider.QueryJournalStateCount);
+            Assert.Contains(statuses, status =>
+                status.Message.Contains("prune", StringComparison.OrdinalIgnoreCase)
+                && status.Message.Contains("completeness", StringComparison.OrdinalIgnoreCase));
+            Assert.Equal(IndexingRunState.Completed, statuses[^1].State);
+            Assert.Contains("stale records retained", statuses[^1].Message, StringComparison.OrdinalIgnoreCase);
+        }
+        finally
+        {
+            DeleteDirectoryIfExists(rootPath);
+            DeleteFileIfExists(dbPath);
+        }
+    }
+
+    [Fact]
+    public async Task IndexRootsAsyncDoesNotPruneAfterJournalQueryFailure()
+    {
+        var rootPath = CreateTempDirectory();
+        var dbPath = CreateTempDbPath();
+
+        try
+        {
+            var record = FileRecord.Create(
+                Path.Combine(rootPath, "IndexedAfterJournalQueryFailure.txt"),
+                isDirectory: false,
+                sizeBytes: 1,
+                DateTimeOffset.UtcNow);
+            var staleRecord = FileRecord.Create(
+                Path.Combine(rootPath, "PreservedAfterJournalQueryFailure.txt"),
+                isDirectory: false,
+                sizeBytes: 1,
+                DateTimeOffset.UtcNow);
+            await using var index = await SqliteSearchIndex.OpenAsync(dbPath, CancellationToken.None);
+            await index.UpsertAsync(staleRecord, CancellationToken.None);
+            var provider = new JournalAwareNtfsProvider(
+                journalState: null,
+                records: new[] { record },
+                journalQueryException: new IOException("Journal query failed."));
+            var coordinator = new IndexingCoordinator(
+                index,
+                new VolumeIndexer(new IIndexProvider[] { provider }),
+                new FallbackIndexProvider(),
+                _ => new VolumeInfo(rootPath, NtfsIndexProvider.ProviderName, true));
+
+            await coordinator.IndexRootsAsync(new[] { new IndexRoot(rootPath) }, CancellationToken.None);
+
+            var staleResults = await index.SearchAsync(
+                new SearchQuery("PreservedAfterJournalQueryFailure", SearchMode.FilesAndFolders),
+                CancellationToken.None);
+            var checkpoint = await index.ReadVolumeCheckpointAsync(rootPath, CancellationToken.None);
+            Assert.Contains(staleResults, result => result.Record.PathKey == staleRecord.PathKey);
+            Assert.Null(checkpoint);
+        }
+        finally
+        {
+            DeleteDirectoryIfExists(rootPath);
+            DeleteFileIfExists(dbPath);
+        }
+    }
+
+    [Fact]
+    public async Task IndexRootsAsyncDoesNotPruneFallbackAfterEmptyNtfsScanWithoutPreScanJournalState()
+    {
+        var rootPath = CreateTempDirectory();
+        var dbPath = CreateTempDbPath();
+
+        try
+        {
+            var fallbackRecord = FileRecord.Create(
+                Path.Combine(rootPath, "IndexedByFallback.txt"),
+                isDirectory: false,
+                sizeBytes: 1,
+                DateTimeOffset.UtcNow);
+            var staleRecord = FileRecord.Create(
+                Path.Combine(rootPath, "PreservedAfterFallback.txt"),
+                isDirectory: false,
+                sizeBytes: 1,
+                DateTimeOffset.UtcNow);
+            await using var index = await SqliteSearchIndex.OpenAsync(dbPath, CancellationToken.None);
+            await index.UpsertAsync(staleRecord, CancellationToken.None);
+            var provider = new JournalAwareNtfsProvider(journalState: null);
+            var coordinator = new IndexingCoordinator(
+                index,
+                new VolumeIndexer(new IIndexProvider[] { provider }),
+                new AsynchronousSingleRecordProvider(fallbackRecord),
+                _ => new VolumeInfo(rootPath, NtfsIndexProvider.ProviderName, true));
+            var statuses = new List<IndexingStatus>();
+            coordinator.StatusChanged += (_, status) => statuses.Add(status);
+
+            await coordinator.IndexRootsAsync(new[] { new IndexRoot(rootPath) }, CancellationToken.None);
+
+            var fallbackResults = await index.SearchAsync(
+                new SearchQuery("IndexedByFallback", SearchMode.FilesAndFolders),
+                CancellationToken.None);
+            var staleResults = await index.SearchAsync(
+                new SearchQuery("PreservedAfterFallback", SearchMode.FilesAndFolders),
+                CancellationToken.None);
+            var checkpoint = await index.ReadVolumeCheckpointAsync(rootPath, CancellationToken.None);
+            Assert.Contains(fallbackResults, result => result.Record.PathKey == fallbackRecord.PathKey);
+            Assert.Contains(staleResults, result => result.Record.PathKey == staleRecord.PathKey);
+            Assert.Null(checkpoint);
+            Assert.Equal(IndexingRunState.Completed, statuses[^1].State);
+            Assert.Contains("stale records retained", statuses[^1].Message, StringComparison.OrdinalIgnoreCase);
+        }
+        finally
+        {
+            DeleteDirectoryIfExists(rootPath);
+            DeleteFileIfExists(dbPath);
+        }
+    }
+
+    [Fact]
+    public async Task IndexRootsAsyncDoesNotPruneFallbackAfterEmptyNtfsScanWithPreScanJournalState()
+    {
+        var rootPath = CreateTempDirectory();
+        var dbPath = CreateTempDbPath();
+
+        try
+        {
+            var fallbackRecord = FileRecord.Create(
+                Path.Combine(rootPath, "IndexedByProvenanceLimitedFallback.txt"),
+                isDirectory: false,
+                sizeBytes: 1,
+                DateTimeOffset.UtcNow);
+            var staleRecord = FileRecord.Create(
+                Path.Combine(rootPath, "PreservedAfterProvenanceLimitedFallback.txt"),
+                isDirectory: false,
+                sizeBytes: 1,
+                DateTimeOffset.UtcNow);
+            await using var index = await SqliteSearchIndex.OpenAsync(dbPath, CancellationToken.None);
+            await index.UpsertAsync(staleRecord, CancellationToken.None);
+            var provider = new JournalAwareNtfsProvider(new UsnJournalState(9, 100, 200));
+            var coordinator = new IndexingCoordinator(
+                index,
+                new VolumeIndexer(new IIndexProvider[] { provider }),
+                new AsynchronousSingleRecordProvider(fallbackRecord),
+                _ => new VolumeInfo(rootPath, NtfsIndexProvider.ProviderName, true));
+
+            await coordinator.IndexRootsAsync(new[] { new IndexRoot(rootPath) }, CancellationToken.None);
+
+            var staleResults = await index.SearchAsync(
+                new SearchQuery("PreservedAfterProvenanceLimitedFallback", SearchMode.FilesAndFolders),
+                CancellationToken.None);
+            Assert.Contains(staleResults, result => result.Record.PathKey == staleRecord.PathKey);
+        }
+        finally
+        {
+            DeleteDirectoryIfExists(rootPath);
+            DeleteFileIfExists(dbPath);
+        }
+    }
+
+    [Fact]
+    public async Task IndexRootsAsyncDoesNotPruneFallbackAfterNtfsFailureWithoutPreScanJournalState()
+    {
+        var rootPath = CreateTempDirectory();
+        var dbPath = CreateTempDbPath();
+
+        try
+        {
+            var fallbackRecord = FileRecord.Create(
+                Path.Combine(rootPath, "IndexedAfterNtfsFailure.txt"),
+                isDirectory: false,
+                sizeBytes: 1,
+                DateTimeOffset.UtcNow);
+            var staleRecord = FileRecord.Create(
+                Path.Combine(rootPath, "PreservedAfterNtfsFailure.txt"),
+                isDirectory: false,
+                sizeBytes: 1,
+                DateTimeOffset.UtcNow);
+            await using var index = await SqliteSearchIndex.OpenAsync(dbPath, CancellationToken.None);
+            await index.UpsertAsync(staleRecord, CancellationToken.None);
+            var provider = new JournalAwareNtfsProvider(
+                journalState: null,
+                scanException: new IOException("NTFS scan failed."));
+            var coordinator = new IndexingCoordinator(
+                index,
+                new VolumeIndexer(new IIndexProvider[] { provider }),
+                new AsynchronousSingleRecordProvider(fallbackRecord),
+                _ => new VolumeInfo(rootPath, NtfsIndexProvider.ProviderName, true));
+
+            await coordinator.IndexRootsAsync(new[] { new IndexRoot(rootPath) }, CancellationToken.None);
+
+            var staleResults = await index.SearchAsync(
+                new SearchQuery("PreservedAfterNtfsFailure", SearchMode.FilesAndFolders),
+                CancellationToken.None);
+            var checkpoint = await index.ReadVolumeCheckpointAsync(rootPath, CancellationToken.None);
+            Assert.Contains(staleResults, result => result.Record.PathKey == staleRecord.PathKey);
+            Assert.Null(checkpoint);
         }
         finally
         {
@@ -989,27 +1239,37 @@ public sealed class IndexingCoordinatorTests
         private readonly Queue<UsnJournalState?> _journalStates;
         private readonly IReadOnlyList<FileRecord> _records;
         private readonly IReadOnlyList<UsnJournalChange> _changes;
+        private readonly Exception? _scanException;
+        private readonly Exception? _journalQueryException;
 
         public JournalAwareNtfsProvider(
             UsnJournalState? journalState,
             IReadOnlyList<FileRecord>? records = null,
-            IReadOnlyList<UsnJournalChange>? changes = null)
+            IReadOnlyList<UsnJournalChange>? changes = null,
+            Exception? scanException = null,
+            Exception? journalQueryException = null)
             : this(
                 new[] { journalState },
                 records,
-                changes)
+                changes,
+                scanException,
+                journalQueryException)
         {
         }
 
         public JournalAwareNtfsProvider(
             IEnumerable<UsnJournalState?> journalStates,
             IReadOnlyList<FileRecord>? records = null,
-            IReadOnlyList<UsnJournalChange>? changes = null)
+            IReadOnlyList<UsnJournalChange>? changes = null,
+            Exception? scanException = null,
+            Exception? journalQueryException = null)
         {
             _journalStates = new Queue<UsnJournalState?>(journalStates);
             _journalState = _journalStates.Count > 0 ? _journalStates.Peek() : null;
             _records = records ?? Array.Empty<FileRecord>();
             _changes = changes ?? Array.Empty<UsnJournalChange>();
+            _scanException = scanException;
+            _journalQueryException = journalQueryException;
         }
 
         public int ScanCount { get; private set; }
@@ -1035,12 +1295,22 @@ public sealed class IndexingCoordinatorTests
                 await Task.Yield();
                 yield return record;
             }
+
+            if (_scanException is not null)
+            {
+                await Task.FromException(_scanException);
+            }
         }
 
         public Task<UsnJournalState?> QueryJournalStateAsync(IndexRoot root, CancellationToken cancellationToken)
         {
             cancellationToken.ThrowIfCancellationRequested();
             QueryJournalStateCount++;
+            if (_journalQueryException is not null)
+            {
+                return Task.FromException<UsnJournalState?>(_journalQueryException);
+            }
+
             return Task.FromResult(_journalStates.Count > 0 ? _journalStates.Dequeue() : _journalState);
         }
 

@@ -91,7 +91,8 @@ public static class UsnJournalChangeApplier
         SqliteSearchIndex index,
         IAsyncEnumerable<UsnJournalChange> changes,
         UsnJournalCheckpoint nextCheckpoint,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        long indexGeneration = 0)
     {
         ArgumentNullException.ThrowIfNull(index);
         ArgumentNullException.ThrowIfNull(changes);
@@ -138,7 +139,7 @@ public static class UsnJournalChangeApplier
         }
 
         await index
-            .ApplyUsnJournalChangesAsync(indexChanges, nextCheckpoint, cancellationToken)
+            .ApplyUsnJournalChangesAsync(indexChanges, nextCheckpoint, cancellationToken, indexGeneration)
             .ConfigureAwait(false);
 
         return new UsnJournalApplyResult(

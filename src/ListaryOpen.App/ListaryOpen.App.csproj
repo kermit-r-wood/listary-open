@@ -116,4 +116,17 @@
           SkipUnchangedFiles="true" />
   </Target>
 
+  <Target Name="CopyNativeHooksToPublishDirectory"
+          AfterTargets="Publish"
+          Condition="'$(BuildNativeHooks)' == 'true' And '$(PublishDir)' != ''">
+    <ItemGroup>
+      <NativeHookPublishFiles Include="$(OutDir)hooks\**\*" />
+    </ItemGroup>
+    <Error Condition="'@(NativeHookPublishFiles)' == ''"
+           Text="Native hook build output was not found under $(OutDir)hooks." />
+    <Copy SourceFiles="@(NativeHookPublishFiles)"
+          DestinationFiles="@(NativeHookPublishFiles->'$(PublishDir)hooks\%(RecursiveDir)%(Filename)%(Extension)')"
+          SkipUnchangedFiles="true" />
+  </Target>
+
 </Project>

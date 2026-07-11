@@ -12,7 +12,7 @@ use std::ffi::c_void;
 use std::io;
 use std::process::{Child, Command};
 use std::ptr::{null, null_mut};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 use std::sync::{mpsc, Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -34,26 +34,26 @@ use windows_sys::Win32::Storage::FileSystem::{
 use windows_sys::Win32::System::DataExchange::COPYDATASTRUCT;
 use windows_sys::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress, LoadLibraryW};
 use windows_sys::Win32::System::Pipes::{
-    ConnectNamedPipe, CreateNamedPipeW, DisconnectNamedPipe, PIPE_READMODE_BYTE, PIPE_TYPE_BYTE,
-    PIPE_UNLIMITED_INSTANCES, PIPE_WAIT,
+    ConnectNamedPipe, CreateNamedPipeW, DisconnectNamedPipe, GetNamedPipeClientProcessId,
+    PIPE_READMODE_BYTE, PIPE_TYPE_BYTE, PIPE_UNLIMITED_INSTANCES, PIPE_WAIT,
 };
 use windows_sys::Win32::System::SystemInformation::{
     IMAGE_FILE_MACHINE_AMD64, IMAGE_FILE_MACHINE_ARM64, IMAGE_FILE_MACHINE_I386,
     IMAGE_FILE_MACHINE_UNKNOWN,
 };
 use windows_sys::Win32::System::Threading::{
-    GetCurrentProcess, IsWow64Process2, OpenProcess, OpenProcessToken, QueryFullProcessImageNameW,
-    PROCESS_QUERY_LIMITED_INFORMATION,
+    GetCurrentProcess, GetExitCodeProcess, IsWow64Process2, OpenProcess, OpenProcessToken,
+    QueryFullProcessImageNameW, PROCESS_QUERY_LIMITED_INFORMATION,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     ChangeWindowMessageFilterEx, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW,
-    EnumChildWindows, EnumWindows, GetAncestor, GetClassNameW, GetDlgCtrlID, GetDlgItem,
-    GetForegroundWindow, GetMessageW, GetWindowLongPtrW, GetWindowTextLengthW, GetWindowTextW,
-    GetWindowThreadProcessId, IsWindow, PeekMessageW, PostMessageW, PostQuitMessage,
-    RegisterClassW, SendMessageTimeoutW, SetWindowLongPtrW, SetWindowsHookExW, TranslateMessage,
-    UnhookWindowsHookEx, CHANGEFILTERSTRUCT, CREATESTRUCTW, GA_ROOT, GWLP_USERDATA, HHOOK,
-    HWND_MESSAGE, MSG, MSGFLT_ALLOW, PM_REMOVE, SMTO_ABORTIFHUNG, WH_CALLWNDPROC, WM_APP,
-    WM_COPYDATA, WM_DESTROY, WM_NCCREATE, WM_QUIT, WNDCLASSW,
+    EnumChildWindows, EnumWindows, GetAncestor, GetClassNameW, GetDlgCtrlID, GetForegroundWindow,
+    GetMessageW, GetWindowLongPtrW, GetWindowTextLengthW, GetWindowTextW, GetWindowThreadProcessId,
+    IsWindow, PeekMessageW, PostMessageW, PostQuitMessage, RegisterClassW, SendMessageTimeoutW,
+    SetWindowLongPtrW, SetWindowsHookExW, TranslateMessage, UnhookWindowsHookEx,
+    CHANGEFILTERSTRUCT, CREATESTRUCTW, GA_ROOT, GWLP_USERDATA, HHOOK, HWND_MESSAGE, MSG,
+    MSGFLT_ALLOW, PM_REMOVE, SMTO_ABORTIFHUNG, WH_CALLWNDPROC, WM_APP, WM_COPYDATA, WM_DESTROY,
+    WM_NCCREATE, WM_QUIT, WNDCLASSW,
 };
 
 const DEFAULT_PIPE_NAME: &str = pipe_name_for_pointer_width(usize::BITS);
@@ -62,18 +62,29 @@ const BUFFER_SIZE: usize = 64 * 1024;
 const HOOK_RESCAN_INTERVAL: Duration = Duration::from_millis(500);
 const HOOK_LOOP_SLEEP: Duration = Duration::from_millis(50);
 const ADDRESS_BAR_EDIT_CONTROL_ID: i32 = 41477;
-const FILE_NAME_EDIT_CONTROL_ID: i32 = 1148;
 const ACK_WINDOW_CLASS: &str = "ListaryOpenHookAckWindow";
 const ACK_STARTUP_ACCEPT_TIMEOUT: Duration = Duration::from_secs(2);
 const ACK_STARTUP_SHUTDOWN_GRACE: Duration = Duration::from_millis(100);
 const WM_LISTARY_ACK_CLOSE: u32 = WM_APP + 0x4C4F;
+const PIPE_REJECT_REMOTE_CLIENTS: u32 = 0x0000_0008;
+const STILL_ACTIVE: u32 = 259;
 
 static NEXT_COMMAND_ID: AtomicU64 = AtomicU64::new(1);
+static HOOK_RUNTIME_STATUS: AtomicU8 = AtomicU8::new(HookRuntimeStatus::Starting as u8);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum HookRuntimeStatus {
+    Starting = 0,
+    Ready = 1,
+    Failed = 2,
+}
 
 fn main() -> io::Result<()> {
+    let session = HostSession::from_args()?;
     let pipe_name = pipe_name_from_args();
     let pipe_path = format!(r"\\.\pipe\{}", pipe_name);
-    let _child_hosts = start_child_hosts(child_host_launches_from_args(env::args()));
+    let _child_hosts = start_child_hosts(child_host_launches_from_args(env::args()), &session);
+    start_parent_monitor(session.parent_process_id);
     start_hook_thread(arg_value("--dll"));
 
     println!("ListaryOpen hook host started on pipe '{}'.", pipe_name);
@@ -85,12 +96,68 @@ fn main() -> io::Result<()> {
             continue;
         }
 
+        let session = session.clone();
         thread::spawn(move || {
-            if let Err(error) = serve_connection(pipe) {
+            if let Err(error) = serve_connection(pipe, &session) {
                 eprintln!("Hook host connection failed: {error}");
             }
         });
     }
+}
+
+#[derive(Clone, Debug)]
+struct HostSession {
+    parent_process_id: u32,
+    secret: String,
+}
+
+impl HostSession {
+    fn from_args() -> io::Result<Self> {
+        let parent_process_id = arg_value("--parent-pid")
+            .and_then(|value| value.parse::<u32>().ok())
+            .filter(|value| *value != 0)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "missing --parent-pid"))?;
+        let secret = arg_value("--secret")
+            .filter(|value| !value.trim().is_empty())
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "missing --secret"))?;
+
+        Ok(Self {
+            parent_process_id,
+            secret,
+        })
+    }
+
+    fn accepts_client(
+        &self,
+        actual_client_process_id: u32,
+        claimed_client_process_id: u32,
+        secret: &str,
+    ) -> bool {
+        actual_client_process_id == self.parent_process_id
+            && claimed_client_process_id == self.parent_process_id
+            && secret == self.secret
+    }
+}
+
+fn start_parent_monitor(parent_process_id: u32) {
+    thread::spawn(move || loop {
+        if !parent_process_is_running(parent_process_id) {
+            std::process::exit(0);
+        }
+
+        thread::sleep(Duration::from_millis(500));
+    });
+}
+
+fn parent_process_is_running(parent_process_id: u32) -> bool {
+    let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, parent_process_id) };
+    if handle.is_null() {
+        return false;
+    }
+
+    let handle = OwnedHandle(handle);
+    let mut exit_code = 0u32;
+    unsafe { GetExitCodeProcess(handle.0, &mut exit_code) != 0 && exit_code == STILL_ACTIVE }
 }
 
 fn pipe_name_from_args() -> String {
@@ -169,7 +236,7 @@ where
     launches
 }
 
-fn start_child_hosts(launches: Vec<ChildHostLaunch>) -> Vec<Child> {
+fn start_child_hosts(launches: Vec<ChildHostLaunch>, session: &HostSession) -> Vec<Child> {
     let mut children = Vec::new();
     for launch in launches {
         match Command::new(&launch.host_exe_path)
@@ -177,6 +244,10 @@ fn start_child_hosts(launches: Vec<ChildHostLaunch>) -> Vec<Child> {
             .arg(&launch.pipe_name)
             .arg("--dll")
             .arg(&launch.dll_path)
+            .arg("--parent-pid")
+            .arg(session.parent_process_id.to_string())
+            .arg("--secret")
+            .arg(&session.secret)
             .spawn()
         {
             Ok(child) => children.push(child),
@@ -191,7 +262,9 @@ fn start_child_hosts(launches: Vec<ChildHostLaunch>) -> Vec<Child> {
 }
 
 fn start_hook_thread(dll_path: Option<String>) {
+    set_hook_runtime_status(HookRuntimeStatus::Starting);
     let Some(dll_path) = dll_path else {
+        set_hook_runtime_status(HookRuntimeStatus::Failed);
         eprintln!("Hook host started without --dll; health IPC will run without native hooks.");
         return;
     };
@@ -203,11 +276,26 @@ fn run_hook_thread(dll_path: &str) {
     match HookState::new(dll_path) {
         Ok(mut hook_state) => {
             hook_state.install_new_dialog_hooks();
+            set_hook_runtime_status(HookRuntimeStatus::Ready);
             hook_loop(hook_state);
+            set_hook_runtime_status(HookRuntimeStatus::Failed);
         }
         Err(error) => {
+            set_hook_runtime_status(HookRuntimeStatus::Failed);
             eprintln!("Hook host native hook setup failed: {error}");
         }
+    }
+}
+
+fn set_hook_runtime_status(status: HookRuntimeStatus) {
+    HOOK_RUNTIME_STATUS.store(status as u8, Ordering::Release);
+}
+
+fn hook_runtime_status() -> HookRuntimeStatus {
+    match HOOK_RUNTIME_STATUS.load(Ordering::Acquire) {
+        value if value == HookRuntimeStatus::Ready as u8 => HookRuntimeStatus::Ready,
+        value if value == HookRuntimeStatus::Failed as u8 => HookRuntimeStatus::Failed,
+        _ => HookRuntimeStatus::Starting,
     }
 }
 
@@ -618,16 +706,6 @@ where
     select_edit_control_by_id(candidates, ADDRESS_BAR_EDIT_CONTROL_ID)
 }
 
-fn select_navigation_edit_control<'a, I>(candidates: I) -> Option<HWND>
-where
-    I: IntoIterator<Item = AddressControlCandidate<'a>>,
-{
-    let candidates = candidates.into_iter().collect::<Vec<_>>();
-    select_edit_control_by_id(candidates.iter().copied(), ADDRESS_BAR_EDIT_CONTROL_ID).or_else(
-        || select_edit_control_by_id(candidates.iter().copied(), FILE_NAME_EDIT_CONTROL_ID),
-    )
-}
-
 fn select_edit_control_by_id<'a, I>(candidates: I, control_id: i32) -> Option<HWND>
 where
     I: IntoIterator<Item = AddressControlCandidate<'a>>,
@@ -645,7 +723,7 @@ struct AddressControlSearch {
 }
 
 fn find_navigation_edit_control(hwnd: HWND) -> Option<HWND> {
-    find_address_edit_control(hwnd).or_else(|| find_file_name_edit_control(hwnd))
+    find_address_edit_control(hwnd)
 }
 
 fn find_address_edit_control(hwnd: HWND) -> Option<HWND> {
@@ -693,59 +771,6 @@ unsafe extern "system" fn enum_address_edit_control_proc(hwnd: HWND, l_param: LP
     }
 
     TRUE
-}
-
-fn find_file_name_edit_control(hwnd: HWND) -> Option<HWND> {
-    let container = unsafe { GetDlgItem(hwnd, FILE_NAME_EDIT_CONTROL_ID) };
-    if container.is_null() {
-        return None;
-    }
-
-    if let Some(class_name) = class_name(container) {
-        let candidate = AddressControlCandidate {
-            hwnd: container,
-            control_id: FILE_NAME_EDIT_CONTROL_ID,
-            class_name: &class_name,
-        };
-        if let Some(file_name_edit) = select_navigation_edit_control([candidate]) {
-            return Some(file_name_edit);
-        }
-    }
-
-    let mut search = AddressControlSearch {
-        found_hwnd: null_mut(),
-    };
-    unsafe {
-        EnumChildWindows(
-            container,
-            Some(enum_file_name_edit_control_proc),
-            (&mut search as *mut AddressControlSearch) as LPARAM,
-        );
-    }
-
-    if search.found_hwnd.is_null() {
-        None
-    } else {
-        Some(search.found_hwnd)
-    }
-}
-
-unsafe extern "system" fn enum_file_name_edit_control_proc(hwnd: HWND, l_param: LPARAM) -> BOOL {
-    if l_param == 0 {
-        return TRUE;
-    }
-
-    let Some(class_name) = class_name(hwnd) else {
-        return TRUE;
-    };
-
-    if !class_name.eq_ignore_ascii_case("Edit") {
-        return TRUE;
-    }
-
-    let search = unsafe { &mut *(l_param as *mut AddressControlSearch) };
-    search.found_hwnd = hwnd;
-    0
 }
 
 fn should_hook_observed_dialog(
@@ -797,7 +822,7 @@ fn observed_dialog(hwnd: HWND) -> Option<ObservedDialog> {
     let architecture = process_architecture(process_id)?;
 
     Some(ObservedDialog {
-        dialog_id: dialog_id_for_window(process_id, hwnd),
+        dialog_id: dialog_id_for_window(process_id, thread_id, hwnd),
         window_handle: hwnd,
         thread_id,
         process_id,
@@ -808,9 +833,10 @@ fn observed_dialog(hwnd: HWND) -> Option<ObservedDialog> {
     })
 }
 
-fn serve_connection(pipe: NamedPipeHandle) -> io::Result<()> {
+fn serve_connection(pipe: NamedPipeHandle, session: &HostSession) -> io::Result<()> {
+    let client_process_id = named_pipe_client_process_id(pipe.raw())?;
     let response = match read_line(pipe.raw()) {
-        Ok(request) => response_for_request(&request),
+        Ok(request) => response_for_request(&request, session, client_process_id),
         Err(_) => command_reply("Failed", "Unknown command."),
     };
 
@@ -820,6 +846,16 @@ fn serve_connection(pipe: NamedPipeHandle) -> io::Result<()> {
     }
 
     result
+}
+
+fn named_pipe_client_process_id(handle: HANDLE) -> io::Result<u32> {
+    let mut process_id = 0u32;
+    let result = unsafe { GetNamedPipeClientProcessId(handle, &mut process_id) };
+    if result == 0 || process_id == 0 {
+        return Err(io::Error::last_os_error());
+    }
+
+    Ok(process_id)
 }
 
 fn connect_pipe(handle: HANDLE) -> io::Result<()> {
@@ -941,7 +977,7 @@ fn write_line(handle: HANDLE, line: &str) -> io::Result<()> {
     Ok(())
 }
 
-fn response_for_request(request: &str) -> String {
+fn response_for_request(request: &str, session: &HostSession, client_process_id: u32) -> String {
     let envelope = serde_json::from_str::<IncomingEnvelope>(request);
     let Ok(envelope) = envelope else {
         return command_reply("Failed", "Unknown command.");
@@ -949,6 +985,14 @@ fn response_for_request(request: &str) -> String {
 
     if envelope.version != IPC_VERSION {
         return command_reply("Failed", "Unsupported IPC version.");
+    }
+
+    if !session.accepts_client(
+        client_process_id,
+        envelope.client_process_id,
+        &envelope.secret,
+    ) {
+        return command_reply("Failed", "Unauthorized hook IPC client.");
     }
 
     match envelope.message_type.as_str() {
@@ -960,8 +1004,18 @@ fn response_for_request(request: &str) -> String {
                 Err(_) => command_reply("Failed", "Invalid jump command payload."),
             }
         }
-        "HealthProbe" => command_reply("Success", "Hook host healthy."),
+        "HealthProbe" => health_probe_reply(hook_runtime_status()),
         _ => command_reply("Failed", "Unknown command."),
+    }
+}
+
+fn health_probe_reply(status: HookRuntimeStatus) -> String {
+    match status {
+        HookRuntimeStatus::Starting => {
+            command_reply("HostUnavailable", "Native hook is still starting.")
+        }
+        HookRuntimeStatus::Ready => command_reply("Success", "Hook host healthy."),
+        HookRuntimeStatus::Failed => command_reply("Failed", "Native hook initialization failed."),
     }
 }
 
@@ -1038,7 +1092,8 @@ fn jump_dialog_to_folder(payload: JumpCommandPayload) -> String {
         return command_reply("Failed", "Invalid jump command payload.");
     }
 
-    let Some((expected_process_id, hwnd)) = parse_dialog_id(&payload.dialog_id) else {
+    let Some((expected_process_id, expected_thread_id, hwnd)) = parse_dialog_id(&payload.dialog_id)
+    else {
         return command_reply("Failed", "Invalid dialog id.");
     };
 
@@ -1048,7 +1103,14 @@ fn jump_dialog_to_folder(payload: JumpCommandPayload) -> String {
 
     let mut actual_process_id = 0u32;
     let thread_id = unsafe { GetWindowThreadProcessId(hwnd, &mut actual_process_id) };
-    if thread_id == 0 || actual_process_id != expected_process_id {
+    if thread_id == 0
+        || !target_window_identity_matches(
+            expected_process_id,
+            expected_thread_id,
+            actual_process_id,
+            thread_id,
+        )
+    {
         return command_reply(
             "TargetGone",
             "Dialog window no longer matches the requested target.",
@@ -1071,11 +1133,9 @@ fn jump_dialog_to_folder(payload: JumpCommandPayload) -> String {
         );
     }
 
-    if let Err(failure) = jump_target_ready(
-        hwnd,
+    if let Err(failure) = target_hook_ready(
         expected_process_id,
-        thread_id,
-        resolve_active_dialog_window(),
+        expected_thread_id,
         is_hook_thread_confirmed,
     ) {
         return command_reply(failure.status, failure.message);
@@ -1141,11 +1201,9 @@ fn jump_dialog_to_folder(payload: JumpCommandPayload) -> String {
         );
     }
 
-    if let Err(failure) = jump_target_ready(
-        hwnd,
+    if let Err(failure) = target_hook_ready(
         expected_process_id,
-        thread_id,
-        resolve_active_dialog_window(),
+        expected_thread_id,
         is_hook_thread_confirmed,
     ) {
         return command_reply(failure.status, failure.message);
@@ -1186,19 +1244,29 @@ where
     None
 }
 
-fn dialog_id_for_window(process_id: u32, hwnd: HWND) -> String {
-    format!("{process_id}:{}", hwnd as usize)
+fn dialog_id_for_window(process_id: u32, thread_id: u32, hwnd: HWND) -> String {
+    format!("{process_id}:{thread_id}:{}", hwnd as usize)
 }
 
-fn parse_dialog_id(dialog_id: &str) -> Option<(u32, HWND)> {
+fn parse_dialog_id(dialog_id: &str) -> Option<(u32, u32, HWND)> {
     let mut parts = dialog_id.split(':');
     let process_id = parts.next()?.parse::<u32>().ok()?;
+    let thread_id = parts.next()?.parse::<u32>().ok()?;
     let hwnd = parts.next()?.parse::<usize>().ok()? as HWND;
-    if parts.next().is_some() || process_id == 0 || hwnd.is_null() {
+    if parts.next().is_some() || process_id == 0 || thread_id == 0 || hwnd.is_null() {
         return None;
     }
 
-    Some((process_id, hwnd))
+    Some((process_id, thread_id, hwnd))
+}
+
+fn target_window_identity_matches(
+    expected_process_id: u32,
+    expected_thread_id: u32,
+    actual_process_id: u32,
+    actual_thread_id: u32,
+) -> bool {
+    expected_process_id == actual_process_id && expected_thread_id == actual_thread_id
 }
 
 fn build_jump_copydata_payload(ack_hwnd: HWND, command_id: u64, folder_path: &str) -> Vec<u8> {
@@ -1240,32 +1308,14 @@ struct CommandFailure {
     message: &'static str,
 }
 
-fn jump_target_ready<C>(
-    target_hwnd: HWND,
+fn target_hook_ready<C>(
     target_process_id: u32,
     target_thread_id: u32,
-    active_hwnd: Option<HWND>,
     is_thread_hook_confirmed: C,
 ) -> Result<(), CommandFailure>
 where
     C: Fn(HookThreadKey) -> bool,
 {
-    match active_hwnd {
-        Some(active_hwnd) if active_hwnd == target_hwnd => {}
-        Some(_) => {
-            return Err(CommandFailure {
-                status: "TargetGone",
-                message: "Dialog window is no longer the active foreground dialog.",
-            });
-        }
-        None => {
-            return Err(CommandFailure {
-                status: "NoActiveDialog",
-                message: "No active hook dialog.",
-            });
-        }
-    }
-
     if !is_thread_hook_confirmed(HookThreadKey::new(target_process_id, target_thread_id)) {
         return Err(CommandFailure {
             status: "NoActiveDialog",
@@ -1837,7 +1887,7 @@ impl NamedPipeHandle {
             CreateNamedPipeW(
                 pipe_path.as_ptr(),
                 PIPE_ACCESS_DUPLEX,
-                PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT,
+                PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT | PIPE_REJECT_REMOTE_CLIENTS,
                 PIPE_UNLIMITED_INSTANCES,
                 BUFFER_SIZE as u32,
                 BUFFER_SIZE as u32,
@@ -1998,6 +2048,8 @@ impl Drop for NamedPipeHandle {
 struct IncomingEnvelope {
     version: u32,
     message_type: String,
+    client_process_id: u32,
+    secret: String,
     payload: serde_json::Value,
 }
 
@@ -2052,6 +2104,37 @@ mod tests {
     use super::*;
 
     #[test]
+    fn host_session_accepts_only_its_parent_and_secret() {
+        let session = HostSession {
+            parent_process_id: 123,
+            secret: "session-secret".to_string(),
+        };
+
+        assert!(session.accepts_client(123, 123, "session-secret"));
+        assert!(!session.accepts_client(124, 123, "session-secret"));
+        assert!(!session.accepts_client(123, 124, "session-secret"));
+        assert!(!session.accepts_client(123, 123, "wrong-secret"));
+    }
+
+    #[test]
+    fn pipe_mode_rejects_remote_clients() {
+        assert_ne!(0, PIPE_REJECT_REMOTE_CLIENTS);
+    }
+
+    #[test]
+    fn response_for_request_rejects_unbound_client() {
+        let session = HostSession {
+            parent_process_id: 123,
+            secret: "session-secret".to_string(),
+        };
+        let request = r#"{"version":1,"messageType":"HealthProbe","clientProcessId":123,"secret":"session-secret","payload":{}}"#;
+
+        let response = response_for_request(request, &session, 124);
+
+        assert!(response.contains("Unauthorized hook IPC client."));
+    }
+
+    #[test]
     fn arg_value_from_returns_value_after_named_option() {
         let args = [
             "ListaryOpen.HookHost.exe",
@@ -2081,6 +2164,29 @@ mod tests {
         assert_eq!(
             None,
             arg_value_from(["host.exe", "--pipe", "pipe"], "--dll")
+        );
+    }
+
+    #[test]
+    fn health_probe_reply_reflects_native_hook_runtime_state() {
+        let status = |reply: String| {
+            serde_json::from_str::<serde_json::Value>(&reply).unwrap()["payload"]["status"]
+                .as_str()
+                .unwrap()
+                .to_string()
+        };
+
+        assert_eq!(
+            "HostUnavailable",
+            status(health_probe_reply(HookRuntimeStatus::Starting))
+        );
+        assert_eq!(
+            "Success",
+            status(health_probe_reply(HookRuntimeStatus::Ready))
+        );
+        assert_eq!(
+            "Failed",
+            status(health_probe_reply(HookRuntimeStatus::Failed))
         );
     }
 
@@ -2266,29 +2372,13 @@ mod tests {
     }
 
     #[test]
-    fn jump_target_ready_requires_active_target_and_confirmed_hook() {
-        let target = 0x1234usize as HWND;
-        let other = 0x5678usize as HWND;
-
+    fn captured_target_hook_ready_does_not_depend_on_foreground_window() {
         assert_eq!(
             Ok(()),
-            jump_target_ready(target, 100, 42, Some(target), |thread| {
-                thread == HookThreadKey::new(100, 42)
-            })
+            target_hook_ready(100, 42, |thread| { thread == HookThreadKey::new(100, 42) })
         );
 
-        let inactive = jump_target_ready(target, 100, 42, Some(other), |_| true).unwrap_err();
-        assert_eq!("TargetGone", inactive.status);
-        assert_eq!(
-            "Dialog window is no longer the active foreground dialog.",
-            inactive.message
-        );
-
-        let missing_active = jump_target_ready(target, 100, 42, None, |_| true).unwrap_err();
-        assert_eq!("NoActiveDialog", missing_active.status);
-        assert_eq!("No active hook dialog.", missing_active.message);
-
-        let unhooked = jump_target_ready(target, 100, 42, Some(target), |_| false).unwrap_err();
+        let unhooked = target_hook_ready(100, 42, |_| false).unwrap_err();
         assert_eq!("NoActiveDialog", unhooked.status);
         assert_eq!(
             "Target dialog hook has not been installed yet.",
@@ -2377,16 +2467,16 @@ mod tests {
     }
 
     #[test]
-    fn navigation_edit_selector_accepts_classic_file_name_edit_when_address_edit_is_missing() {
+    fn navigation_edit_selector_rejects_file_name_edit_when_address_edit_is_missing() {
         let file_name_edit = 301usize as HWND;
 
-        let selected = select_navigation_edit_control([AddressControlCandidate {
+        let selected = select_address_edit_control([AddressControlCandidate {
             hwnd: file_name_edit,
-            control_id: FILE_NAME_EDIT_CONTROL_ID,
+            control_id: 1148,
             class_name: "Edit",
         }]);
 
-        assert_eq!(Some(file_name_edit), selected);
+        assert_eq!(None, selected);
     }
 
     #[test]
@@ -2394,10 +2484,10 @@ mod tests {
         let file_name_edit = 401usize as HWND;
         let address_edit = 402usize as HWND;
 
-        let selected = select_navigation_edit_control([
+        let selected = select_address_edit_control([
             AddressControlCandidate {
                 hwnd: file_name_edit,
-                control_id: FILE_NAME_EDIT_CONTROL_ID,
+                control_id: 1148,
                 class_name: "Edit",
             },
             AddressControlCandidate {
@@ -2482,15 +2572,28 @@ mod tests {
     }
 
     #[test]
-    fn parse_dialog_id_requires_process_id_and_hwnd() {
+    fn dialog_id_includes_process_thread_and_hwnd() {
         assert_eq!(
-            Some((42, 123456usize as HWND)),
-            parse_dialog_id("42:123456")
+            "42:77:123456",
+            dialog_id_for_window(42, 77, 123456usize as HWND)
         );
+        assert_eq!(
+            Some((42, 77, 123456usize as HWND)),
+            parse_dialog_id("42:77:123456")
+        );
+        assert_eq!(None, parse_dialog_id("42:123456"));
         assert_eq!(None, parse_dialog_id("42"));
-        assert_eq!(None, parse_dialog_id("not-a-pid:123456"));
-        assert_eq!(None, parse_dialog_id("42:not-a-window"));
-        assert_eq!(None, parse_dialog_id("42:123456:extra"));
+        assert_eq!(None, parse_dialog_id("not-a-pid:77:123456"));
+        assert_eq!(None, parse_dialog_id("42:not-a-thread:123456"));
+        assert_eq!(None, parse_dialog_id("42:77:not-a-window"));
+        assert_eq!(None, parse_dialog_id("42:77:123456:extra"));
+    }
+
+    #[test]
+    fn captured_target_identity_rejects_a_different_thread() {
+        assert!(target_window_identity_matches(42, 77, 42, 77));
+        assert!(!target_window_identity_matches(42, 77, 42, 78));
+        assert!(!target_window_identity_matches(42, 77, 43, 77));
     }
 
     #[test]
