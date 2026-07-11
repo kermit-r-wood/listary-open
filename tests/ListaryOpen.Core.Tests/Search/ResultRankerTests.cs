@@ -7,6 +7,45 @@ namespace ListaryOpen.Core.Tests.Search;
 public sealed class ResultRankerTests
 {
     [Fact]
+    public void RankOrdersExactNameBeforePrefixBeforeSubstringBeforePath()
+    {
+        var now = new DateTimeOffset(2026, 7, 12, 0, 0, 0, TimeSpan.Zero);
+        var records = new[]
+        {
+            FileRecord.Create("C:\\Invoice\\unrelated.txt", false, 1, now),
+            FileRecord.Create("C:\\Docs\\OldInvoice.txt", false, 1, now),
+            FileRecord.Create("C:\\Docs\\InvoiceArchive.txt", false, 1, now),
+            FileRecord.Create("C:\\Docs\\Invoice", false, 1, now)
+        };
+
+        var ranked = ResultRanker.Rank(
+            new SearchQuery("invoice", SearchMode.FilesAndFolders),
+            records,
+            Array.Empty<UsageRecord>(),
+            Array.Empty<string>());
+
+        Assert.Equal(
+            new[] { "Invoice", "InvoiceArchive.txt", "OldInvoice.txt", "unrelated.txt" },
+            ranked.Select(result => result.Record.Name));
+    }
+
+    [Fact]
+    public void RankUsageCannotPromoteSubstringAboveExactName()
+    {
+        var now = DateTimeOffset.UtcNow;
+        var exact = FileRecord.Create("C:\\Docs\\Invoice", false, 1, now);
+        var substring = FileRecord.Create("C:\\Archive\\OldInvoiceBackup.txt", false, 1, now);
+
+        var ranked = ResultRanker.Rank(
+            new SearchQuery("invoice", SearchMode.FilesAndFolders),
+            [substring, exact],
+            [new UsageRecord(substring.FullPath, 100_000, now)],
+            Array.Empty<string>());
+
+        Assert.Equal(exact.FullPath, ranked[0].Record.FullPath);
+    }
+
+    [Fact]
     public void RankBoostsFrequentlyUsedRecord()
     {
         var now = new DateTimeOffset(2026, 7, 3, 1, 0, 0, TimeSpan.Zero);

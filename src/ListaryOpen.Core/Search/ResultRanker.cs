@@ -36,18 +36,24 @@ public static class ResultRanker
         return records
             .Where(record => (query.EffectiveMode == SearchMode.FilesAndFolders || record.IsDirectory)
                 && (!query.Parsed.FileOnly || !record.IsDirectory))
-            .Select(record => ScoreRecord(query, record, usage, pinned, now))
-            .Where(result => result.Score > 0)
-            .OrderByDescending(result => result.Score)
-            .ThenBy(result => result.Record.Name, StringComparer.OrdinalIgnoreCase)
-            .ThenBy(result => result.Record.Name, StringComparer.Ordinal)
-            .ThenBy(result => result.Record.FullPath, StringComparer.OrdinalIgnoreCase)
-            .ThenBy(result => result.Record.FullPath, StringComparer.Ordinal)
+            .Select(record => RankRecord(query, record, usage, pinned, now))
+            .Where(candidate => candidate.TextKey.IsMatch)
+            .OrderBy(candidate => candidate.TextKey.Tier)
+            .ThenByDescending(candidate => candidate.TextKey.Quality)
+            .ThenBy(candidate => candidate.TextKey.LengthDifference)
+            .ThenByDescending(candidate => candidate.IsPinned)
+            .ThenByDescending(candidate => candidate.OpenCount)
+            .ThenByDescending(candidate => candidate.Recency)
+            .ThenBy(candidate => candidate.Result.Record.Name, StringComparer.OrdinalIgnoreCase)
+            .ThenBy(candidate => candidate.Result.Record.Name, StringComparer.Ordinal)
+            .ThenBy(candidate => candidate.Result.Record.FullPath, StringComparer.OrdinalIgnoreCase)
+            .ThenBy(candidate => candidate.Result.Record.FullPath, StringComparer.Ordinal)
             .Take(query.Limit)
+            .Select(candidate => candidate.Result)
             .ToArray();
     }
 
-    private static SearchResult ScoreRecord(
+    private static RankedCandidate RankRecord(
         SearchQuery query,
         FileRecord record,
         IReadOnlyDictionary<string, UsageRecord> usage,
@@ -57,47 +63,60 @@ public static class ResultRanker
         var queryText = query.NormalizedText;
         if (string.IsNullOrWhiteSpace(queryText))
         {
-            return new SearchResult(record, 1, "filter");
+            return new RankedCandidate(
+                new SearchResult(record, 1, "filter"),
+                new TextMatchKey(0, 1, 0),
+                pinned.Contains(record.PathKey),
+                usage.TryGetValue(record.PathKey, out var filterUsage) ? filterUsage.OpenCount : 0,
+                usage.TryGetValue(record.PathKey, out filterUsage) ? RecencyBoost(filterUsage.LastUsedAt, now) : 0);
         }
 
-        var nameScore = FuzzyMatcher.Score(queryText, record.Name);
-        var pathScore = FuzzyMatcher.Score(queryText, record.FullPath) * 0.6;
-        var pinyinScore = PinyinMatcher.Score(queryText, record.Name) * 0.9;
+        var (textKey, reason) = CreateTextMatchKey(queryText, record);
+        usage.TryGetValue(record.PathKey, out var used);
+        var displayScore = textKey.IsMatch ? 10_000 - textKey.Tier * 1_000 + textKey.Quality : 0;
+        return new RankedCandidate(
+            new SearchResult(record, displayScore, reason),
+            textKey,
+            record.IsDirectory && pinned.Contains(record.PathKey),
+            used?.OpenCount ?? 0,
+            used is null ? 0 : RecencyBoost(used.LastUsedAt, now));
+    }
 
-        var score = nameScore;
-        var reason = "name";
-
-        if (pathScore > score)
+    private static (TextMatchKey Key, string Reason) CreateTextMatchKey(string queryText, FileRecord record)
+    {
+        var query = queryText.Trim().ToLowerInvariant();
+        var name = record.Name.Trim().ToLowerInvariant();
+        if (name == query)
         {
-            score = pathScore;
-            reason = "path";
+            return (new TextMatchKey(0, query.Length, 0), "exact-name");
         }
 
-        if (pinyinScore > score)
+        if (name.StartsWith(query, StringComparison.Ordinal))
         {
-            score = pinyinScore;
-            reason = "pinyin";
+            return (new TextMatchKey(1, query.Length, name.Length - query.Length), "name-prefix");
         }
 
-        if (score <= 0)
+        if (name.Contains(query, StringComparison.Ordinal))
         {
-            return new SearchResult(record, 0, reason);
+            return (new TextMatchKey(2, query.Length, name.Length - query.Length), "name-substring");
         }
 
-        if (usage.TryGetValue(record.PathKey, out var used))
+        var nameScore = FuzzyMatcher.Score(query, name);
+        if (nameScore > 0)
         {
-            score += Math.Min(50, used.OpenCount * 5);
-            score += RecencyBoost(used.LastUsedAt, now);
-            reason = "usage";
+            return (new TextMatchKey(3, nameScore, Math.Abs(name.Length - query.Length)), "name-fuzzy");
         }
 
-        if (record.IsDirectory && pinned.Contains(record.PathKey))
+        var pinyinScore = PinyinMatcher.Score(query, record.Name);
+        if (pinyinScore > 0)
         {
-            score += 40;
-            reason = "pinned";
+            return (new TextMatchKey(4, pinyinScore, Math.Abs(name.Length - query.Length)), "pinyin");
         }
 
-        return new SearchResult(record, score, reason);
+        var pathScore = FuzzyMatcher.Score(query, record.ParentPath);
+        return pathScore > 0
+            ? (new TextMatchKey(5, pathScore, Math.Abs(record.ParentPath.Length - query.Length)), "path")
+            : (TextMatchKey.NoMatch, "none");
     }
 
     private static double RecencyBoost(DateTimeOffset lastUsedAt, DateTimeOffset now)
@@ -111,4 +130,11 @@ public static class ResultRanker
         var normalized = Path.TrimEndingDirectorySeparator(Path.GetFullPath(path.Trim()));
         return normalized.ToUpperInvariant();
     }
+
+    private sealed record RankedCandidate(
+        SearchResult Result,
+        TextMatchKey TextKey,
+        bool IsPinned,
+        int OpenCount,
+        double Recency);
 }

@@ -13,7 +13,7 @@ namespace ListaryOpen.App.ViewModels;
 
 public sealed class SearchPanelViewModel : INotifyPropertyChanged
 {
-    private static readonly TimeSpan DefaultSearchDelay = TimeSpan.FromMilliseconds(400);
+    private static readonly TimeSpan DefaultSearchDelay = TimeSpan.FromMilliseconds(200);
 
     private readonly ISearchIndex _index;
     private readonly Func<string?, string?> _normalizeExistingFolder;
@@ -347,17 +347,11 @@ public sealed class SearchPanelViewModel : INotifyPropertyChanged
                 StringComparer.Ordinal);
             var hasQuery = !string.IsNullOrWhiteSpace(queryText);
 
-            if (hasQuery)
-            {
-                StatusText = "Searching...";
-            }
-
-            Results.Clear();
-            AddPinnedFolderResults(pinnedFolderResults);
-            UpdateSelectedResultAfterRefresh();
-
             if (!hasQuery)
             {
+                Results.Clear();
+                AddPinnedFolderResults(pinnedFolderResults);
+                UpdateSelectedResultAfterRefresh();
                 StatusText = searchMode == SearchMode.FoldersOnly
                     ? "Select a folder to jump the dialog."
                     : "Type to search.";
@@ -379,6 +373,7 @@ public sealed class SearchPanelViewModel : INotifyPropertyChanged
                     await Task.Delay(_searchDelay, cancellationToken);
                 }
 
+                StatusText = "Searching...";
                 results = await _index.SearchAsync(searchQuery, cancellationToken);
             }
             catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
@@ -391,9 +386,6 @@ public sealed class SearchPanelViewModel : INotifyPropertyChanged
 
                 if (version == _refreshVersion)
                 {
-                    Results.Clear();
-                    AddPinnedFolderResults(pinnedFolderResults);
-                    UpdateSelectedResultAfterRefresh();
                     StatusText = $"Search failed: {exception.Message}";
                 }
 

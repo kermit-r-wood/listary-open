@@ -315,7 +315,7 @@ public sealed class SearchPanelViewModelTests
     }
 
     [Fact]
-    public async Task RefreshClearsSelectionBeforeAwaitingDelayedSearchAndPreventsStaleActivation()
+    public async Task RefreshPreservesSelectionUntilDelayedSearchPublishesReplacement()
     {
         var stale = CreateResult("C:\\Docs\\OldInvoice.xlsx", isDirectory: false);
         var index = new BlockingSearchIndex();
@@ -327,19 +327,13 @@ public sealed class SearchPanelViewModelTests
         viewModel.QueryText = "new invoice";
         await index.WaitForSearchCountAsync(1);
 
-        Assert.Empty(viewModel.Results);
-        Assert.Null(viewModel.SelectedResult);
-
-        await viewModel.ActivateSelectedAsync();
-        await viewModel.RevealSelectedAsync();
-        viewModel.CopySelectedPath();
-
-        Assert.Empty(activation.OpenedPaths);
-        Assert.Empty(activation.RevealedPaths);
-        Assert.Empty(activation.CopiedPaths);
+        Assert.Equal(stale, Assert.Single(viewModel.Results));
+        Assert.Equal(stale, viewModel.SelectedResult);
 
         index.Complete(Array.Empty<SearchResult>());
         await WaitUntilAsync(() => viewModel.StatusText == "0 results.");
+        Assert.Empty(viewModel.Results);
+        Assert.Null(viewModel.SelectedResult);
     }
 
     [Fact]
@@ -370,19 +364,43 @@ public sealed class SearchPanelViewModelTests
     }
 
     [Fact]
-    public async Task QueryTextUsesLongerDefaultDelayBeforeSearching()
+    public async Task QueryTextSearchesAfterTwoHundredMillisecondDefaultDelay()
     {
         var index = new RecordingSearchIndex(Array.Empty<SearchResult>());
         var viewModel = new SearchPanelViewModel(index);
 
         viewModel.QueryText = "invoice";
 
-        await Task.Delay(TimeSpan.FromMilliseconds(250));
+        await Task.Delay(TimeSpan.FromMilliseconds(120));
         Assert.Empty(index.ObservedQueries);
 
-        await index.WaitForSearchCountAsync(1);
+        await Task.Delay(TimeSpan.FromMilliseconds(180));
         var query = Assert.Single(index.ObservedQueries);
         Assert.Equal("invoice", query.NormalizedText);
+    }
+
+    [Fact]
+    public async Task QueryTextPreservesCurrentResultsWhileWaitingForIdleDelay()
+    {
+        var existing = CreateResult("C:\\Docs\\Existing.txt", isDirectory: false);
+        var index = new RecordingSearchIndex(Array.Empty<SearchResult>());
+        var viewModel = new SearchPanelViewModel(
+            index,
+            NormalizeTestFolder,
+            _ => true,
+            _ => DateTimeOffset.UtcNow,
+            new RecordingActivationService(),
+            DialogJumpNotConfiguredAsync,
+            TimeSpan.FromSeconds(1));
+        viewModel.Results.Add(existing);
+        viewModel.SelectedResult = existing;
+
+        viewModel.QueryText = "replacement";
+        await Task.Delay(TimeSpan.FromMilliseconds(100));
+
+        Assert.Equal(existing, Assert.Single(viewModel.Results));
+        Assert.Equal(existing, viewModel.SelectedResult);
+        Assert.Empty(index.ObservedQueries);
     }
 
     [Fact]
