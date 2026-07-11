@@ -85,8 +85,9 @@ public sealed class AppIndexRootTests
 
         try
         {
-            WpfApp.EnableNtfsFastIndexing(client, () => reindexRequested = true);
+            var enabled = WpfApp.EnableNtfsFastIndexing(client, () => reindexRequested = true);
 
+            Assert.True(enabled);
             Assert.True(client.UacElevationEnabled);
             Assert.True(client.IsAvailable);
             Assert.True(reindexRequested);
@@ -95,6 +96,19 @@ public sealed class AppIndexRootTests
         {
             Directory.Delete(helperDirectory, recursive: true);
         }
+    }
+
+    [Fact]
+    public void EnableNtfsFastIndexingDoesNotReindexWithoutHelperBundle()
+    {
+        var client = new ElevatedIndexerClient(Path.Combine(Path.GetTempPath(), Guid.NewGuid() + ".exe"), () => false);
+        var reindexRequested = false;
+
+        var enabled = WpfApp.EnableNtfsFastIndexing(client, () => reindexRequested = true);
+
+        Assert.False(enabled);
+        Assert.False(client.IsAvailable);
+        Assert.False(reindexRequested);
     }
 
     [Fact]

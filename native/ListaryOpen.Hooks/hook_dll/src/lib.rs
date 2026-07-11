@@ -401,12 +401,12 @@ fn jump_status_for_verified_folder(
     verified_current_folder: Option<&str>,
     target_folder: &str,
 ) -> JumpAckStatus {
-    if verified_current_folder
-        .is_some_and(|current_folder| folder_paths_match(current_folder, target_folder))
-    {
-        JumpAckStatus::Success
-    } else {
-        JumpAckStatus::Failed
+    match verified_current_folder {
+        None => JumpAckStatus::Success,
+        Some(current_folder) if folder_paths_match(current_folder, target_folder) => {
+            JumpAckStatus::Success
+        }
+        Some(_) => JumpAckStatus::Failed,
     }
 }
 
@@ -497,10 +497,14 @@ mod tests {
     }
 
     #[test]
-    fn standard_dialog_ack_requires_a_verified_current_folder() {
+    fn standard_dialog_ack_allows_unsupported_readback_but_rejects_mismatch() {
+        assert_eq!(
+            JumpAckStatus::Success,
+            jump_status_for_verified_folder(None, r"C:\Work\Project")
+        );
         assert_eq!(
             JumpAckStatus::Failed,
-            jump_status_for_verified_folder(None, r"C:\Work\Project")
+            jump_status_for_verified_folder(Some(r"C:\Work\Other"), r"C:\Work\Project")
         );
         assert_eq!(
             JumpAckStatus::Success,

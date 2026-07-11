@@ -10,12 +10,13 @@ namespace ListaryOpen.App.ViewModels;
 public sealed class SettingsViewModel : INotifyPropertyChanged
 {
     private readonly Action _enableHookQuickSwitch;
-    private readonly Action _enableNtfsFastIndexing;
+    private readonly Func<bool> _enableNtfsFastIndexing;
     private bool _hookQuickSwitchEnableInProgress;
     private HookQuickSwitchStatus _hookQuickSwitchStatus = HookQuickSwitchStatus.Disabled();
     private IndexingRunState _indexingState = IndexingRunState.Idle;
     private string _indexingStatusText = "Indexing: idle";
     private bool _ntfsFastIndexingEnabled;
+    private bool _ntfsFastIndexingUnavailable;
 
     public SettingsViewModel()
         : this(AppSettings.Defaults())
@@ -27,19 +28,19 @@ public sealed class SettingsViewModel : INotifyPropertyChanged
     {
     }
 
-    public SettingsViewModel(AppSettings settings, Action? enableNtfsFastIndexing)
+    public SettingsViewModel(AppSettings settings, Func<bool>? enableNtfsFastIndexing)
         : this(settings, enableNtfsFastIndexing, null)
     {
     }
 
     public SettingsViewModel(
         AppSettings settings,
-        Action? enableNtfsFastIndexing,
+        Func<bool>? enableNtfsFastIndexing,
         Action? enableHookQuickSwitch,
         bool ntfsFastIndexingEnabled = false)
     {
         Settings = settings;
-        _enableNtfsFastIndexing = enableNtfsFastIndexing ?? (() => { });
+        _enableNtfsFastIndexing = enableNtfsFastIndexing ?? (() => false);
         _enableHookQuickSwitch = enableHookQuickSwitch ?? (() => { });
         _ntfsFastIndexingEnabled = ntfsFastIndexingEnabled;
         EnableNtfsFastIndexingCommand = new RelayCommand(
@@ -161,7 +162,9 @@ public sealed class SettingsViewModel : INotifyPropertyChanged
 
     public string NtfsFastIndexingStatusText => NtfsFastIndexingEnabled
         ? "NTFS fast indexing: enabled for this session"
-        : "NTFS fast indexing: disabled";
+        : _ntfsFastIndexingUnavailable
+            ? "NTFS fast indexing: unavailable (elevated helper bundle is missing)."
+            : "NTFS fast indexing: disabled";
 
     public event PropertyChangedEventHandler? PropertyChanged;
 
@@ -235,8 +238,14 @@ public sealed class SettingsViewModel : INotifyPropertyChanged
             return;
         }
 
-        _enableNtfsFastIndexing();
-        NtfsFastIndexingEnabled = true;
+        if (_enableNtfsFastIndexing())
+        {
+            NtfsFastIndexingEnabled = true;
+            return;
+        }
+
+        _ntfsFastIndexingUnavailable = true;
+        OnPropertyChanged(nameof(NtfsFastIndexingStatusText));
     }
 
     private bool IsHookQuickSwitchReady => _hookQuickSwitchStatus.Enabled

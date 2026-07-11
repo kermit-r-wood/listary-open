@@ -19,6 +19,7 @@ public sealed class HookQuickSwitchBridgeTests
             HookJumpResult.Success("Hook host healthy."));
         var x86HealthClient = new SequenceHealthProbeHookClient(
             new HookJumpResult(HookJumpStatus.HostUnavailable, "No host."),
+            new HookJumpResult(HookJumpStatus.HostUnavailable, "Host is starting."),
             HookJumpResult.Success("Hook host healthy."));
         var bridge = new HookQuickSwitchBridge(
             HookQuickSwitchStatus.Disabled(),
@@ -41,7 +42,7 @@ public sealed class HookQuickSwitchBridgeTests
         Assert.True(bridge.Status.X86.HostRunning);
         Assert.True(bridge.Status.X86.HookDllPresent);
         Assert.Equal(2, x64HealthClient.ProbeCount);
-        Assert.Equal(2, x86HealthClient.ProbeCount);
+        Assert.Equal(3, x86HealthClient.ProbeCount);
         var start = Assert.Single(processFactory.Starts);
         Assert.Equal(hookFiles.ForArchitecture(HookArchitecture.X64).HostExePath, start.StartInfo.FileName);
         Assert.Equal(

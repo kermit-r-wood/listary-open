@@ -364,12 +364,23 @@ public partial class App : Application
         return roots;
     }
 
-    internal static void EnableNtfsFastIndexing(ElevatedIndexerClient? client, Action requestReindex)
+    internal static bool EnableNtfsFastIndexing(ElevatedIndexerClient? client, Action requestReindex)
     {
         ArgumentNullException.ThrowIfNull(requestReindex);
 
-        client?.EnableUacElevation();
+        if (client is null)
+        {
+            return false;
+        }
+
+        client.EnableUacElevation();
+        if (!client.IsAvailable)
+        {
+            return false;
+        }
+
         requestReindex();
+        return true;
     }
 
     internal static bool EnableNtfsFastIndexingOnStartup(ElevatedIndexerClient? client)
@@ -422,9 +433,9 @@ public partial class App : Application
         StartBackgroundIndexing();
     }
 
-    private void EnableNtfsFastIndexing()
+    private bool EnableNtfsFastIndexing()
     {
-        EnableNtfsFastIndexing(
+        return EnableNtfsFastIndexing(
             _elevatedIndexerClient,
             () => StartBackgroundIndexing(cancelActive: true));
     }

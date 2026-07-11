@@ -33,7 +33,7 @@ public sealed class SettingsViewModelTests
     public void EnableNtfsFastIndexingCommandInvokesCallbackAndUpdatesState()
     {
         var enableCount = 0;
-        var viewModel = new SettingsViewModel(AppSettings.Defaults(), () => enableCount++);
+        var viewModel = new SettingsViewModel(AppSettings.Defaults(), () => { enableCount++; return true; });
         var changedProperties = new List<string?>();
         viewModel.PropertyChanged += (_, e) => changedProperties.Add(e.PropertyName);
 
@@ -46,6 +46,20 @@ public sealed class SettingsViewModelTests
         Assert.False(viewModel.EnableNtfsFastIndexingCommand.CanExecute(null));
         Assert.Contains(nameof(SettingsViewModel.NtfsFastIndexingEnabled), changedProperties);
         Assert.Contains(nameof(SettingsViewModel.NtfsFastIndexingStatusText), changedProperties);
+    }
+
+    [Fact]
+    public void EnableNtfsFastIndexingCommandStaysDisabledWhenHelperIsUnavailable()
+    {
+        var viewModel = new SettingsViewModel(AppSettings.Defaults(), () => false);
+
+        viewModel.EnableNtfsFastIndexingCommand.Execute(null);
+
+        Assert.False(viewModel.NtfsFastIndexingEnabled);
+        Assert.Equal(
+            "NTFS fast indexing: unavailable (elevated helper bundle is missing).",
+            viewModel.NtfsFastIndexingStatusText);
+        Assert.True(viewModel.EnableNtfsFastIndexingCommand.CanExecute(null));
     }
 
     [Fact]
@@ -86,7 +100,7 @@ public sealed class SettingsViewModelTests
     [Fact]
     public void EnableNtfsFastIndexingCommandUpdatesPresentationBadges()
     {
-        var viewModel = new SettingsViewModel(AppSettings.Defaults(), () => { });
+        var viewModel = new SettingsViewModel(AppSettings.Defaults(), () => true);
         var changedProperties = new List<string?>();
         viewModel.PropertyChanged += (_, e) => changedProperties.Add(e.PropertyName);
 
@@ -106,7 +120,7 @@ public sealed class SettingsViewModelTests
         var enableCount = 0;
         var viewModel = new SettingsViewModel(
             AppSettings.Defaults(),
-            () => enableCount++,
+            () => { enableCount++; return true; },
             enableHookQuickSwitch: null,
             ntfsFastIndexingEnabled: true);
 

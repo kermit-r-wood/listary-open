@@ -4,6 +4,8 @@ namespace ListaryOpen.Infrastructure.Hooks;
 
 public sealed class HookQuickSwitchBridge : IHookQuickSwitchBridge
 {
+    private static readonly TimeSpan HostStartupProbeInterval = TimeSpan.FromMilliseconds(50);
+    private static readonly TimeSpan HostStartupTimeout = TimeSpan.FromSeconds(2);
     public const string X64PipeName = "listary-open-hook-x64";
     public const string X86PipeName = "listary-open-hook-x86";
 
@@ -340,7 +342,7 @@ public sealed class HookQuickSwitchBridge : IHookQuickSwitchBridge
                     $"{architectureName} hook host start was abandoned.");
             }
 
-            return await TryCreateHealthyExistingHostStatusAsync(
+            return await WaitForHealthyHostStatusAsync(
                     architecture,
                     snapshot,
                     cancellationToken)
@@ -482,7 +484,7 @@ public sealed class HookQuickSwitchBridge : IHookQuickSwitchBridge
                         "x86 hook host launch was abandoned."));
             }
 
-            var x64Status = await TryCreateHealthyExistingHostStatusAsync(
+            var x64Status = await WaitForHealthyHostStatusAsync(
                     HookArchitecture.X64,
                     x64Snapshot,
                     cancellationToken)
@@ -491,7 +493,7 @@ public sealed class HookQuickSwitchBridge : IHookQuickSwitchBridge
                     HookArchitecture.X64,
                     hookDllPresent: true,
                     "x64 hook host started, but health was not confirmed.");
-            var x86Status = await TryCreateHealthyExistingHostStatusAsync(
+            var x86Status = await WaitForHealthyHostStatusAsync(
                     HookArchitecture.X86,
                     x86Snapshot,
                     cancellationToken)
@@ -562,6 +564,37 @@ public sealed class HookQuickSwitchBridge : IHookQuickSwitchBridge
         {
             return null;
         }
+    }
+
+    private async Task<HookArchitectureStatus?> WaitForHealthyHostStatusAsync(
+        HookArchitecture architecture,
+        HookArchitecturePathSnapshot snapshot,
+        CancellationToken cancellationToken)
+    {
+        if (!_clients.TryGetValue(architecture, out var client)
+            || client is not IHookHealthProbeClient)
+        {
+            return null;
+        }
+
+        var deadline = DateTime.UtcNow + HostStartupTimeout;
+        do
+        {
+            var status = await TryCreateHealthyExistingHostStatusAsync(
+                    architecture,
+                    snapshot,
+                    cancellationToken)
+                .ConfigureAwait(false);
+            if (status is not null)
+            {
+                return status;
+            }
+
+            await Task.Delay(HostStartupProbeInterval, cancellationToken).ConfigureAwait(false);
+        }
+        while (DateTime.UtcNow < deadline);
+
+        return null;
     }
 
     private static HookArchitectureStatus CreateUnavailableStatus(HookArchitecturePathSnapshot snapshot)
