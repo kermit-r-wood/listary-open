@@ -2,11 +2,14 @@
 
 Run date: 2026-07-04
 UI modernization verification date: 2026-07-06
+Search responsiveness verification date: 2026-07-12
 
 - [x] Run automated tests.
   - PASS: `dotnet test ListaryOpen.sln -c Release --no-restore` passed in the latest verification run.
   - PASS: `dotnet build ListaryOpen.sln -c Release --no-restore` completed with 0 warnings and 0 errors.
   - PASS: SQLite performance regressions are covered by large-index, bounded-candidate, usage-window, combined-ranking-window, folder-only, and fuzzy-prefilter tests.
+  - PASS: relevance tiers, 200 ms idle debounce, worker-thread search, stale-result rejection, batched UI publication, WAL, separate read/write connections, and FTS5 trigram retrieval are covered by automated tests.
+  - PASS: the 1,502,401-row real index returned ordinary substring results in 5-13 ms and exact-name results in 5-16 ms through `SqliteSearchIndex` after warmup.
   - PASS: Quick Switch multi-Explorer candidate ordering, remembered-folder fallback, app routing helper, and folder-mode pinning are covered by unit tests.
   - PASS: Browser upload file picker dialog resolution for Firefox/Chrome process cases is covered by `WindowsDialogAutomationTests`.
   - PASS: `dotnet test tests\ListaryOpen.Infrastructure.Tests\ListaryOpen.Infrastructure.Tests.csproj --no-restore --nologo --filter "FullyQualifiedName~ListaryOpen.Infrastructure.Tests.App" -p:UseAppHost=false -p:BaseOutputPath=.test-ui-app-final\` passed with 111 tests.
@@ -16,6 +19,8 @@ UI modernization verification date: 2026-07-06
   - Press Ctrl+Space and confirm the panel opens as a compact command palette.
   - Confirm the top mode label reads Search for normal file/folder search.
   - Type a known query and confirm result rows show name, parent path, file/folder badge, and match reason.
+  - Type continuously and confirm no search starts until input has been idle for about 200 ms and the current results do not disappear while typing.
+  - Confirm exact filename matches stay above prefixes, prefixes above substrings, and usage history cannot promote a weaker textual match.
   - Confirm long names and parent paths trim without overlapping badges.
   - Press Enter, Esc, Ctrl+Enter, and Ctrl+C and confirm existing behavior is unchanged.
   - NOT VERIFIED: requires interactive desktop focus and visual inspection; automated coverage is provided by `SearchPanelXamlTests`, `SearchPanelViewModelTests`, and `SearchPanelKeyboardTests`.

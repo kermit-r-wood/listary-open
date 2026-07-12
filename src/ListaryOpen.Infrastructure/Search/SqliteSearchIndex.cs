@@ -1187,7 +1187,9 @@ public sealed class SqliteSearchIndex : ISearchIndex, IAsyncDisposable
 
         await AddExactCandidatesAsync(query, candidateLimit, records, cancellationToken).ConfigureAwait(false);
         cancellationToken.ThrowIfCancellationRequested();
-        if (useExpensiveFuzzy)
+        var hasExactName = records.Values.Any(record =>
+            string.Equals(record.Name, query.NormalizedText, StringComparison.OrdinalIgnoreCase));
+        if (useExpensiveFuzzy && !hasExactName)
         {
             await AddFuzzyCandidatesAsync(query, candidateLimit, records, cancellationToken).ConfigureAwait(false);
         }
