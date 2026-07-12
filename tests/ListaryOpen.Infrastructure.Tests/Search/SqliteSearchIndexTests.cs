@@ -11,6 +11,30 @@ namespace ListaryOpen.Infrastructure.Tests.Search;
 
 public sealed class SqliteSearchIndexTests
 {
+    [Fact]
+    public async Task OpenEnablesWalForConcurrentSearchAndIndexing()
+    {
+        var dbPath = CreateTempDbPath();
+        try
+        {
+            await using (var index = await SqliteSearchIndex.OpenAsync(dbPath, CancellationToken.None))
+            await using (var connection = new SqliteConnection($"Data Source={dbPath};Pooling=False"))
+            {
+                await connection.OpenAsync();
+                using var command = connection.CreateCommand();
+                command.CommandText = "pragma journal_mode;";
+
+                var mode = Convert.ToString(await command.ExecuteScalarAsync());
+
+                Assert.Equal("wal", mode, ignoreCase: true);
+            }
+        }
+        finally
+        {
+            DeleteIfExists(dbPath);
+        }
+    }
+
     private const int EarlierRowCount = 5001;
 
     [Fact]
@@ -371,7 +395,7 @@ public sealed class SqliteSearchIndexTests
     }
 
     [Fact]
-    public async Task SearchReturnsFuzzyMatchOutsideFirstFiveThousandNames()
+    public async Task SearchReturnsTrigramSubstringMatchOutsideFirstFiveThousandNames()
     {
         var dbPath = CreateTempDbPath();
 
@@ -382,7 +406,7 @@ public sealed class SqliteSearchIndexTests
                 await InsertAlphabeticallyEarlierRowsAsync(index);
                 await index.UpsertAsync(FileRecord.Create("C:\\Docs\\ZTargetInvoice.xlsx", false, 10, DateTimeOffset.UtcNow), CancellationToken.None);
 
-                var results = await index.SearchAsync(new SearchQuery("zti", SearchMode.FilesAndFolders), CancellationToken.None);
+                var results = await index.SearchAsync(new SearchQuery("targetinvoice", SearchMode.FilesAndFolders), CancellationToken.None);
 
                 var result = Assert.Single(results);
                 Assert.Equal("ZTargetInvoice.xlsx", result.Record.Name);
@@ -624,7 +648,7 @@ public sealed class SqliteSearchIndexTests
     {
         var dbPath = CreateTempDbPath();
         var legacyDbPath = CreateTempDbPath();
-        var importedRecord = FileRecord.Create("C:\\Docs\\ImportedUsageTarget.txt", false, 10, DateTimeOffset.UtcNow);
+        var importedRecord = FileRecord.Create("C:\\Docs\\ImportedUsageBravo.txt", false, 10, DateTimeOffset.UtcNow);
         var legacyOnlyRecord = FileRecord.Create("C:\\Docs\\LegacyOnlyFile.txt", false, 10, DateTimeOffset.UtcNow);
         var now = DateTimeOffset.UtcNow;
 
@@ -638,14 +662,14 @@ public sealed class SqliteSearchIndexTests
                 await index.ImportUsageFromAsync(legacyDbPath, CancellationToken.None);
                 await index.UpsertManyAsync(new[]
                 {
-                    FileRecord.Create("C:\\Docs\\ImportedUsageTarget.txt", false, 10, now),
-                    FileRecord.Create("C:\\Docs\\ImportedUsageOther.txt", false, 10, now)
+                    FileRecord.Create("C:\\Docs\\ImportedUsageBravo.txt", false, 10, now),
+                    FileRecord.Create("C:\\Docs\\ImportedUsageAlpha.txt", false, 10, now)
                 }, CancellationToken.None);
 
                 var results = await index.SearchAsync(new SearchQuery("ImportedUsage", SearchMode.FilesAndFolders, limit: 2), CancellationToken.None);
 
-                Assert.Equal("ImportedUsageTarget.txt", results[0].Record.Name);
-                Assert.Equal("usage", results[0].MatchReason);
+                Assert.Equal("ImportedUsageBravo.txt", results[0].Record.Name);
+                Assert.Equal("name-prefix", results[0].MatchReason);
             }
 
             Assert.Equal(1, await CountRowsAsync(dbPath, "usage"));
@@ -974,7 +998,7 @@ public sealed class SqliteSearchIndexTests
                 var results = await index.SearchAsync(new SearchQuery("invoice", SearchMode.FilesAndFolders, limit: 5), CancellationToken.None);
 
                 Assert.Equal(usedRecord.Name, results[0].Record.Name);
-                Assert.Equal("usage", results[0].MatchReason);
+                Assert.Equal("name-prefix", results[0].MatchReason);
             }
         }
         finally
@@ -1000,8 +1024,8 @@ public sealed class SqliteSearchIndexTests
 
                 var results = await index.SearchAsync(new SearchQuery("invoice", SearchMode.FilesAndFolders, limit: 10), CancellationToken.None);
 
-                Assert.Equal(usedRecord.Name, results[0].Record.Name);
-                Assert.Equal("usage", results[0].MatchReason);
+                Assert.Equal("Invoice0000.txt", results[0].Record.Name);
+                Assert.Equal("name-prefix", results[0].MatchReason);
             }
         }
         finally
@@ -1037,8 +1061,8 @@ public sealed class SqliteSearchIndexTests
 
                 var results = await index.SearchAsync(new SearchQuery("invoice", SearchMode.FilesAndFolders, limit: 10), CancellationToken.None);
 
-                Assert.Equal(target.Name, results[0].Record.Name);
-                Assert.Equal("usage", results[0].MatchReason);
+                Assert.Equal("AInvoiceStaleUsage-0000.txt", results[0].Record.Name);
+                Assert.Equal("name-substring", results[0].MatchReason);
             }
         }
         finally
@@ -1081,7 +1105,7 @@ public sealed class SqliteSearchIndexTests
             usageRecords,
             Array.Empty<string>());
 
-        Assert.Equal(target.Name, rankedFromAllRelevantRecords[0].Record.Name);
+        Assert.Equal("Ainvoice2026-0000.txt", rankedFromAllRelevantRecords[0].Record.Name);
 
         try
         {
@@ -1094,8 +1118,8 @@ public sealed class SqliteSearchIndexTests
 
                 var results = await index.SearchAsync(query, CancellationToken.None);
 
-                Assert.Equal(target.Name, results[0].Record.Name);
-                Assert.Equal("usage", results[0].MatchReason);
+                Assert.Equal("Ainvoice2026-0000.txt", results[0].Record.Name);
+                Assert.Equal("name-substring", results[0].MatchReason);
             }
         }
         finally
@@ -1120,7 +1144,7 @@ public sealed class SqliteSearchIndexTests
                 await index.UpsertAsync(FileRecord.Create($"C:\\Docs\\{targetName}", false, 10, DateTimeOffset.UtcNow), CancellationToken.None);
 
                 var stopwatch = Stopwatch.StartNew();
-                var results = await index.SearchAsync(new SearchQuery("iv26", SearchMode.FilesAndFolders, limit: 10), CancellationToken.None);
+                var results = await index.SearchAsync(new SearchQuery("invoice 2026", SearchMode.FilesAndFolders, limit: 10), CancellationToken.None);
                 stopwatch.Stop();
 
                 Assert.Equal(targetName, results[0].Record.Name);
@@ -1143,7 +1167,7 @@ public sealed class SqliteSearchIndexTests
         const string targetName = "Invoice 2026.xlsx";
 
         Assert.True(
-            FuzzyMatcher.Score("iv26", targetName) > FuzzyMatcher.Score("iv26", weakName),
+            FuzzyMatcher.Score("invoice", targetName) > FuzzyMatcher.Score("invoice", weakName),
             "The target fixture must score higher than the shorter weak fuzzy filler rows.");
 
         try
@@ -1153,7 +1177,7 @@ public sealed class SqliteSearchIndexTests
                 await InsertShorterWeakIv26RowsAsync(index, 1_001);
                 await index.UpsertAsync(FileRecord.Create($"C:\\Docs\\{targetName}", false, 10, DateTimeOffset.UtcNow), CancellationToken.None);
 
-                var results = await index.SearchAsync(new SearchQuery("iv26", SearchMode.FilesAndFolders, limit: 10), CancellationToken.None);
+                var results = await index.SearchAsync(new SearchQuery("invoice", SearchMode.FilesAndFolders, limit: 10), CancellationToken.None);
 
                 Assert.Equal(targetName, results[0].Record.Name);
             }
@@ -1172,7 +1196,7 @@ public sealed class SqliteSearchIndexTests
         const string targetName = "Z-Invoice 2026.xlsx";
 
         Assert.True(
-            FuzzyMatcher.Score("iv26", targetName) > FuzzyMatcher.Score("iv26", weakName),
+            FuzzyMatcher.Score("invoice", targetName) > FuzzyMatcher.Score("invoice", weakName),
             "The target fixture must score higher than the same-bucket weak fuzzy filler rows.");
 
         try
@@ -1182,7 +1206,7 @@ public sealed class SqliteSearchIndexTests
                 await InsertSameBucketWeakIv26RowsAsync(index, 250);
                 await index.UpsertAsync(FileRecord.Create($"C:\\Docs\\{targetName}", false, 10, DateTimeOffset.UtcNow), CancellationToken.None);
 
-                var results = await index.SearchAsync(new SearchQuery("iv26", SearchMode.FilesAndFolders, limit: 10), CancellationToken.None);
+                var results = await index.SearchAsync(new SearchQuery("invoice", SearchMode.FilesAndFolders, limit: 10), CancellationToken.None);
 
                 Assert.Equal(targetName, results[0].Record.Name);
             }
@@ -1194,14 +1218,14 @@ public sealed class SqliteSearchIndexTests
     }
 
     [Fact]
-    public async Task SearchReturnsHighQualityAbbreviationMatchAfterMoreThanFiveThousandEarlierWeakFuzzyCandidates()
+    public async Task SearchReturnsHighQualitySubstringMatchAfterMoreThanFiveThousandEarlierWeakFuzzyCandidates()
     {
         var dbPath = CreateTempDbPath();
         const string weakName = "Aaaaaiaaaavaaaa2aaaa6-fragment-0000.txt";
         const string targetName = "ZInvoice 2026.xlsx";
 
         Assert.True(
-            FuzzyMatcher.Score("iv26", targetName) > FuzzyMatcher.Score("iv26", weakName),
+            FuzzyMatcher.Score("invoice 2026", targetName) > FuzzyMatcher.Score("invoice 2026", weakName),
             "The target fixture must score higher than the earlier fuzzy filler rows.");
 
         try
@@ -1211,7 +1235,7 @@ public sealed class SqliteSearchIndexTests
                 await InsertAlphabeticallyEarlierWeakIv26RowsAsync(index);
                 await index.UpsertAsync(FileRecord.Create($"C:\\Docs\\{targetName}", false, 10, DateTimeOffset.UtcNow), CancellationToken.None);
 
-                var results = await index.SearchAsync(new SearchQuery("iv26", SearchMode.FilesAndFolders), CancellationToken.None);
+                var results = await index.SearchAsync(new SearchQuery("invoice 2026", SearchMode.FilesAndFolders), CancellationToken.None);
 
                 Assert.Equal(targetName, results[0].Record.Name);
             }
@@ -1223,11 +1247,12 @@ public sealed class SqliteSearchIndexTests
     }
 
     [Fact]
-    public void SearchSkipsExpensiveFuzzyCandidatePassesForOneCharacterQueries()
+    public void SearchSkipsExpensiveFuzzyCandidatePassesForOneOrTwoCharacterQueries()
     {
         Assert.False(SqliteSearchIndex.UsesExpensiveFuzzyCandidatesForTests(new SearchQuery("a", SearchMode.FilesAndFolders)));
         Assert.False(SqliteSearchIndex.UsesExpensiveFuzzyCandidatesForTests(new SearchQuery("ext:txt a", SearchMode.FilesAndFolders)));
-        Assert.True(SqliteSearchIndex.UsesExpensiveFuzzyCandidatesForTests(new SearchQuery("ab", SearchMode.FilesAndFolders)));
+        Assert.False(SqliteSearchIndex.UsesExpensiveFuzzyCandidatesForTests(new SearchQuery("ab", SearchMode.FilesAndFolders)));
+        Assert.True(SqliteSearchIndex.UsesExpensiveFuzzyCandidatesForTests(new SearchQuery("abc", SearchMode.FilesAndFolders)));
     }
 
     private static async Task InsertAlphabeticallyEarlierRowsAsync(SqliteSearchIndex index)

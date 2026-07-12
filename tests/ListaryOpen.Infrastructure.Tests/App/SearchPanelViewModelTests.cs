@@ -404,6 +404,26 @@ public sealed class SearchPanelViewModelTests
     }
 
     [Fact]
+    public async Task QueryTextRunsSearchProviderAwayFromCallingThread()
+    {
+        var callingThreadId = Environment.CurrentManagedThreadId;
+        var index = new RecordingSearchIndex(Array.Empty<SearchResult>());
+        var viewModel = new SearchPanelViewModel(
+            index,
+            NormalizeTestFolder,
+            _ => true,
+            _ => DateTimeOffset.UtcNow,
+            new RecordingActivationService(),
+            DialogJumpNotConfiguredAsync,
+            TimeSpan.Zero);
+
+        viewModel.QueryText = "invoice";
+        await index.WaitForSearchCountAsync(1);
+
+        Assert.DoesNotContain(callingThreadId, index.SearchThreadIds);
+    }
+
+    [Fact]
     public async Task QueryTextCancelsPreviousSearchWhenNewQueryStarts()
     {
         var firstResult = CreateResult("C:\\Docs\\Invoice.xlsx", isDirectory: false);
@@ -1035,6 +1055,7 @@ public sealed class SearchPanelViewModelTests
         private readonly object _lock = new();
         private IReadOnlyList<SearchResult> _results;
         private readonly List<SearchQuery> _queries = new();
+        private readonly List<int> _searchThreadIds = new();
         private TaskCompletionSource _searchObserved = CreateCompletionSource();
         private readonly Exception? _usageException;
 
@@ -1045,6 +1066,17 @@ public sealed class SearchPanelViewModelTests
         }
 
         public List<string> RecordedUsagePaths { get; } = new();
+
+        public IReadOnlyList<int> SearchThreadIds
+        {
+            get
+            {
+                lock (_lock)
+                {
+                    return _searchThreadIds.ToArray();
+                }
+            }
+        }
 
         public IReadOnlyList<SearchQuery> ObservedQueries
         {
@@ -1083,6 +1115,7 @@ public sealed class SearchPanelViewModelTests
             lock (_lock)
             {
                 _queries.Add(query);
+                _searchThreadIds.Add(Environment.CurrentManagedThreadId);
                 _searchObserved.TrySetResult();
                 _searchObserved = CreateCompletionSource();
             }

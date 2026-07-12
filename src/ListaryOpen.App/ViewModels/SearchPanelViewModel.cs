@@ -90,7 +90,7 @@ public sealed class SearchPanelViewModel : INotifyPropertyChanged
 
     public event PropertyChangedEventHandler? PropertyChanged;
 
-    public ObservableCollection<SearchResult> Results { get; } = new();
+    public SearchResultCollection Results { get; } = new();
 
     public SearchResult? SelectedResult
     {
@@ -349,8 +349,7 @@ public sealed class SearchPanelViewModel : INotifyPropertyChanged
 
             if (!hasQuery)
             {
-                Results.Clear();
-                AddPinnedFolderResults(pinnedFolderResults);
+                Results.ReplaceAll(pinnedFolderResults);
                 UpdateSelectedResultAfterRefresh();
                 StatusText = searchMode == SearchMode.FoldersOnly
                     ? "Select a folder to jump the dialog."
@@ -374,7 +373,9 @@ public sealed class SearchPanelViewModel : INotifyPropertyChanged
                 }
 
                 StatusText = "Searching...";
-                results = await _index.SearchAsync(searchQuery, cancellationToken);
+                results = await Task.Run(
+                    () => _index.SearchAsync(searchQuery, cancellationToken),
+                    cancellationToken);
             }
             catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
             {
@@ -397,8 +398,7 @@ public sealed class SearchPanelViewModel : INotifyPropertyChanged
                 return;
             }
 
-            Results.Clear();
-            AddPinnedFolderResults(pinnedFolderResults);
+            var publishedResults = new List<SearchResult>(pinnedFolderResults);
             foreach (var result in results)
             {
                 if (searchMode == SearchMode.FoldersOnly && !result.Record.IsDirectory)
@@ -411,8 +411,10 @@ public sealed class SearchPanelViewModel : INotifyPropertyChanged
                     continue;
                 }
 
-                Results.Add(result);
+                publishedResults.Add(result);
             }
+
+            Results.ReplaceAll(publishedResults);
 
             UpdateSelectedResultAfterRefresh();
             StatusText = Results.Count == 1 ? "1 result." : $"{Results.Count} results.";
@@ -432,8 +434,9 @@ public sealed class SearchPanelViewModel : INotifyPropertyChanged
         {
             previousCancellation = _refreshCancellation;
             _refreshCancellation = cancellation;
-            previousCancellation?.Cancel();
         }
+
+        previousCancellation?.Cancel();
 
         return cancellation;
     }
@@ -490,14 +493,6 @@ public sealed class SearchPanelViewModel : INotifyPropertyChanged
         }
 
         return current;
-    }
-
-    private void AddPinnedFolderResults(IReadOnlyList<SearchResult> results)
-    {
-        foreach (var result in results)
-        {
-            Results.Add(result);
-        }
     }
 
     private IReadOnlyList<SearchResult> CreatePinnedFolderResults(IReadOnlyList<string> folderPaths)
