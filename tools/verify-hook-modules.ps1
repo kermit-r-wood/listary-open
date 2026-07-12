@@ -406,7 +406,7 @@ if ($results.Count -eq 0) {
     throw "No target processes found."
 }
 
-$results | Format-Table -AutoSize
+$results | Format-Table -AutoSize | Out-String -Width 4096 | Write-Output
 
 $missingRequiredTargets = $results | Where-Object { $_.Status -eq "RequiredTargetMissing" }
 if ($missingRequiredTargets) {

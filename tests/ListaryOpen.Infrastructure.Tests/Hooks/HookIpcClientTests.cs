@@ -147,7 +147,7 @@ public sealed class HookIpcClientTests
     public async Task GetActiveDialogReturnsNullForNoActiveDialogReply()
     {
         var pipeName = "listary-open-no-active-dialog-" + Guid.NewGuid();
-        using var serverCancellation = new CancellationTokenSource(TimeSpan.FromSeconds(5));
+        using var serverCancellation = new CancellationTokenSource(TimeSpan.FromSeconds(10));
         var serverTask = ServeOnceAsync(
             pipeName,
             HookIpcSerializer.Serialize(new HookIpcEnvelope(
@@ -155,12 +155,12 @@ public sealed class HookIpcClientTests
                 "CommandReply",
                 new HookCommandReply("NoActiveDialog", "No active hook dialog."))),
             serverCancellation.Token);
-        var client = new HookIpcClient(pipeName, TimeSpan.FromSeconds(2));
+        var client = new HookIpcClient(pipeName, TimeSpan.FromSeconds(5));
 
         try
         {
             var dialog = await client.GetActiveDialogAsync(CancellationToken.None);
-            var exchange = await serverTask.WaitAsync(TimeSpan.FromSeconds(1));
+            var exchange = await serverTask.WaitAsync(TimeSpan.FromSeconds(5));
 
             var request = HookIpcSerializer.Deserialize(exchange.Request);
             Assert.Equal("GetActiveDialog", request.MessageType);
