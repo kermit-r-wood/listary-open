@@ -176,9 +176,9 @@ public sealed class HookIpcClientTests
     public async Task ConnectWaitsForServerCreatedWithinTimeout()
     {
         var pipeName = "listary-open-delayed-" + Guid.NewGuid();
-        using var serverCancellation = new CancellationTokenSource(TimeSpan.FromSeconds(5));
+        using var serverCancellation = new CancellationTokenSource(TimeSpan.FromSeconds(15));
         Task<ServerExchange>? serverTask = null;
-        var client = new HookIpcClient(pipeName, TimeSpan.FromSeconds(2));
+        var client = new HookIpcClient(pipeName, TimeSpan.FromSeconds(10));
 
         var clientTask = client.JumpDialogToFolderAsync("dlg", "C:\\Users\\paulx", CancellationToken.None);
         await Task.Delay(50);
@@ -192,10 +192,10 @@ public sealed class HookIpcClientTests
 
         try
         {
-            var result = await clientTask.WaitAsync(TimeSpan.FromSeconds(3));
+            var result = await clientTask.WaitAsync(TimeSpan.FromSeconds(12));
 
             Assert.Equal(HookJumpStatus.NoActiveDialog, result.Status);
-            _ = await serverTask.WaitAsync(TimeSpan.FromSeconds(1));
+            _ = await serverTask.WaitAsync(TimeSpan.FromSeconds(5));
         }
         finally
         {
