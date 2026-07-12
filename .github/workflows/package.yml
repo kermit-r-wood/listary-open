@@ -22,13 +22,11 @@ jobs:
         with:
           global-json-file: global.json
 
-      - name: Setup MSYS2 MinGW toolchains
-        uses: msys2/setup-msys2@v2
-        with:
-          update: true
-          install: >-
-            mingw-w64-clang-x86_64-clang
-            mingw-w64-clang-i686-clang
+      - name: Setup LLVM-MinGW toolchains
+        shell: pwsh
+        run: |
+          Invoke-RestMethod -Uri https://get.scoop.sh | Invoke-Expression
+          scoop install mingw-mstorsjo-llvm-msvcrt
 
       - name: Setup Rust targets
         shell: pwsh
@@ -40,20 +38,22 @@ jobs:
         shell: pwsh
         run: |
           $cargoConfig = Join-Path $env:GITHUB_WORKSPACE "native/ListaryOpen.Hooks/.cargo/config.toml"
+          $mingwRoot = Join-Path $env:USERPROFILE "scoop/apps/mingw-mstorsjo-llvm-msvcrt/current"
+          $mingwBin = (Join-Path $mingwRoot "bin").Replace("\", "/")
           @"
           [build]
           target-dir = "target"
 
           [target.x86_64-pc-windows-gnullvm]
-          linker = "C:/msys64/clang64/bin/x86_64-w64-mingw32-clang.exe"
+          linker = "$mingwBin/x86_64-w64-mingw32-clang.exe"
 
           [target.i686-pc-windows-gnullvm]
-          linker = "C:/msys64/clang32/bin/i686-w64-mingw32-clang.exe"
+          linker = "$mingwBin/i686-w64-mingw32-clang.exe"
           "@ | Set-Content -Path $cargoConfig -Encoding utf8
 
       - name: Restore
         shell: pwsh
-        run: dotnet restore ListaryOpen.sln
+        run: dotnet restore ListaryOpen.sln -r win-x64
 
       - name: Test
         shell: pwsh
@@ -62,14 +62,13 @@ jobs:
       - name: Publish app with native hooks
         shell: pwsh
         run: |
+          Remove-Item artifacts\ListaryOpen -Recurse -Force -ErrorAction SilentlyContinue
           dotnet publish src\ListaryOpen.App\ListaryOpen.App.csproj `
             -c Release `
             -r win-x64 `
             --self-contained false `
             --no-restore `
             -p:BuildNativeHooks=true `
-            -p:NativeHooksX64RuntimeDll=C:\msys64\clang64\bin\libunwind.dll `
-            -p:NativeHooksX86RuntimeDll=C:\msys64\clang32\bin\libunwind.dll `
             -o artifacts\ListaryOpen
 
       - name: Verify package contents
