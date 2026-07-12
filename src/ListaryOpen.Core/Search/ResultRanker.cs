@@ -71,7 +71,7 @@ public static class ResultRanker
                 usage.TryGetValue(record.PathKey, out filterUsage) ? RecencyBoost(filterUsage.LastUsedAt, now) : 0);
         }
 
-        var (textKey, reason) = CreateTextMatchKey(queryText, record);
+        var (textKey, reason) = CreateTextMatchKey(query, record);
         usage.TryGetValue(record.PathKey, out var used);
         var displayScore = textKey.IsMatch ? 10_000 - textKey.Tier * 1_000 + textKey.Quality : 0;
         return new RankedCandidate(
@@ -82,7 +82,33 @@ public static class ResultRanker
             used is null ? 0 : RecencyBoost(used.LastUsedAt, now));
     }
 
-    private static (TextMatchKey Key, string Reason) CreateTextMatchKey(string queryText, FileRecord record)
+    private static (TextMatchKey Key, string Reason) CreateTextMatchKey(SearchQuery searchQuery, FileRecord record)
+    {
+        var matches = searchQuery.Parsed.Phrases
+            .Select(phrase => CreateTermMatchKey(phrase, record, allowFuzzy: false))
+            .Concat(searchQuery.Parsed.Terms.Select(term => CreateTermMatchKey(term, record, allowFuzzy: true)))
+            .ToArray();
+        if (matches.Length == 0 || matches.Any(match => !match.Key.IsMatch))
+        {
+            return (TextMatchKey.NoMatch, "none");
+        }
+
+        var worstMatch = matches
+            .OrderByDescending(match => match.Key.Tier)
+            .ThenBy(match => match.Key.Quality)
+            .First();
+        return (
+            new TextMatchKey(
+                matches.Max(match => match.Key.Tier),
+                matches.Sum(match => match.Key.Quality),
+                matches.Sum(match => match.Key.LengthDifference)),
+            worstMatch.Reason);
+    }
+
+    private static (TextMatchKey Key, string Reason) CreateTermMatchKey(
+        string queryText,
+        FileRecord record,
+        bool allowFuzzy)
     {
         var query = queryText.Trim().ToLowerInvariant();
         var name = record.Name.Trim().ToLowerInvariant();
@@ -101,19 +127,21 @@ public static class ResultRanker
             return (new TextMatchKey(2, query.Length, name.Length - query.Length), "name-substring");
         }
 
-        var nameScore = FuzzyMatcher.Score(query, name);
-        if (nameScore > 0)
+        var nameScore = allowFuzzy ? FuzzyMatcher.Score(query, name) : 0;
+        if (allowFuzzy && nameScore > 0)
         {
             return (new TextMatchKey(3, nameScore, Math.Abs(name.Length - query.Length)), "name-fuzzy");
         }
 
-        var pinyinScore = PinyinMatcher.Score(query, record.Name);
-        if (pinyinScore > 0)
+        var pinyinScore = allowFuzzy ? PinyinMatcher.Score(query, record.Name) : 0;
+        if (allowFuzzy && pinyinScore > 0)
         {
             return (new TextMatchKey(4, pinyinScore, Math.Abs(name.Length - query.Length)), "pinyin");
         }
 
-        var pathScore = FuzzyMatcher.Score(query, record.ParentPath);
+        var pathScore = allowFuzzy
+            ? FuzzyMatcher.Score(query, record.ParentPath)
+            : record.ParentPath.Contains(query, StringComparison.OrdinalIgnoreCase) ? query.Length : 0;
         return pathScore > 0
             ? (new TextMatchKey(5, pathScore, Math.Abs(record.ParentPath.Length - query.Length)), "path")
             : (TextMatchKey.NoMatch, "none");

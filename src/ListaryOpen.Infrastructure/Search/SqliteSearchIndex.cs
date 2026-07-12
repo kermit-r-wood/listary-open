@@ -1,6 +1,7 @@
 using System.Globalization;
 using System.IO;
 using System.Text;
+using System.Diagnostics;
 using ListaryOpen.Core.Indexing;
 using ListaryOpen.Core.Search;
 using ListaryOpen.Core.Usage;
@@ -717,6 +718,10 @@ public sealed class SqliteSearchIndex : ISearchIndex, IAsyncDisposable
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
         {
         }
+        catch (Exception exception)
+        {
+            Trace.TraceError("FTS index build failed: {0}", exception);
+        }
     }
 
     private static async Task<bool> HasColumnAsync(
@@ -1253,11 +1258,34 @@ public sealed class SqliteSearchIndex : ISearchIndex, IAsyncDisposable
             return;
         }
 
-        var matchQuery = CreateFtsMatchQuery(query);
-        if (string.IsNullOrWhiteSpace(matchQuery))
+        var termsQuery = CreateFtsMatchQuery(query);
+        if (string.IsNullOrWhiteSpace(termsQuery))
         {
             return;
         }
+
+        await AddFtsCandidatesAsync(
+            query,
+            $"name : ({termsQuery})",
+            candidateLimit,
+            records,
+            cancellationToken).ConfigureAwait(false);
+        cancellationToken.ThrowIfCancellationRequested();
+        await AddFtsCandidatesAsync(
+            query,
+            $"{{ parent_path search_text }} : ({termsQuery})",
+            candidateLimit,
+            records,
+            cancellationToken).ConfigureAwait(false);
+    }
+
+    private async Task AddFtsCandidatesAsync(
+        SearchQuery query,
+        string matchQuery,
+        int candidateLimit,
+        IDictionary<string, FileRecord> records,
+        CancellationToken cancellationToken)
+    {
 
         var directoryFilter = CreateDirectoryFilter(query, "files.");
 

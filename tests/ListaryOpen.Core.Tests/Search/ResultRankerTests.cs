@@ -46,6 +46,42 @@ public sealed class ResultRankerTests
     }
 
     [Fact]
+    public void RankMatchesMultipleTermsIndependentlyOfInputOrder()
+    {
+        var record = FileRecord.Create(
+            "C:\\Docs\\Invoice 2026.xlsx",
+            false,
+            1,
+            DateTimeOffset.UtcNow);
+
+        var ranked = ResultRanker.Rank(
+            new SearchQuery("2026 invoice", SearchMode.FilesAndFolders),
+            [record],
+            Array.Empty<UsageRecord>(),
+            Array.Empty<string>());
+
+        Assert.Equal(record, Assert.Single(ranked).Record);
+    }
+
+    [Fact]
+    public void RankRequiresQuotedPhraseToBeContiguous()
+    {
+        var record = FileRecord.Create(
+            "C:\\Docs\\Invoice Final 2026.xlsx",
+            false,
+            1,
+            DateTimeOffset.UtcNow);
+
+        var ranked = ResultRanker.Rank(
+            new SearchQuery("\"invoice 2026\"", SearchMode.FilesAndFolders),
+            [record],
+            Array.Empty<UsageRecord>(),
+            Array.Empty<string>());
+
+        Assert.Empty(ranked);
+    }
+
+    [Fact]
     public void RankBoostsFrequentlyUsedRecord()
     {
         var now = new DateTimeOffset(2026, 7, 3, 1, 0, 0, TimeSpan.Zero);
