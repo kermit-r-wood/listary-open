@@ -130,6 +130,23 @@ public sealed class NtfsUsnRecordProjectorTests
     }
 
     [Fact]
+    public void CreateFileRecordsSkipsUnresolvedNtfsMetadataInStrictMode()
+    {
+        var records = NtfsUsnRecordProjector
+            .CreateFileRecords(
+                "C:\\",
+                "C:\\Users\\paulx",
+                [new NtfsUsnEntry(0x0001_0000_0000_001B, 0x000B_0000_0000_000B, "$RmMetadata", IsDirectory: true)],
+                new StubMetadataReader(),
+                CancellationToken.None,
+                volumeRootFileReferenceNumber: 5,
+                failOnSkippedRecords: true)
+            .ToList();
+
+        Assert.Empty(records);
+    }
+
+    [Fact]
     public void CreateFileRecordsResolvesChildrenWhenVolumeRootRecordIsAbsent()
     {
         const ulong volumeRootFileReferenceNumber = 5;
@@ -157,6 +174,35 @@ public sealed class NtfsUsnRecordProjectorTests
             records,
             record => Assert.Equal("C:\\Users\\paulx", record.FullPath),
             record => Assert.Equal("C:\\Users\\paulx\\Invoice.txt", record.FullPath));
+    }
+
+    [Fact]
+    public void CreateFileRecordsResolvesParentWhenSequenceNumberDiffers()
+    {
+        const ulong parentRecord = 0x0001_0000_0000_001B;
+        const ulong parentReferenceFromChild = 0x0002_0000_0000_001B;
+        var metadata = new StubMetadataReader();
+        metadata.Add("C:\\Users", isDirectory: true, sizeBytes: 0, Timestamp);
+        metadata.Add("C:\\Users\\profile.txt", isDirectory: false, sizeBytes: 7, Timestamp);
+
+        var records = NtfsUsnRecordProjector
+            .CreateFileRecords(
+                "C:\\",
+                "C:\\Users",
+                [
+                    new NtfsUsnEntry(parentRecord, 5, "Users", IsDirectory: true),
+                    new NtfsUsnEntry(30, parentReferenceFromChild, "profile.txt", IsDirectory: false)
+                ],
+                metadata,
+                CancellationToken.None,
+                volumeRootFileReferenceNumber: 5,
+                failOnSkippedRecords: true)
+            .ToList();
+
+        Assert.Collection(
+            records,
+            record => Assert.Equal("C:\\Users", record.FullPath),
+            record => Assert.Equal("C:\\Users\\profile.txt", record.FullPath));
     }
 
     [Fact]

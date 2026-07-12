@@ -31,7 +31,7 @@ internal static class NtfsUsnRecordProjector
         var orderedEntries = entries.ToList();
         var directoriesByReferenceNumber = orderedEntries
             .Where(entry => entry.IsDirectory)
-            .GroupBy(entry => entry.FileReferenceNumber)
+            .GroupBy(entry => GetMftSegmentReferenceNumber(entry.FileReferenceNumber))
             .ToDictionary(group => group.Key, group => group.Last());
 
         foreach (var record in CreateFileRecordsFromDirectoryMap(
@@ -68,6 +68,9 @@ internal static class NtfsUsnRecordProjector
 
         var rules = exclusionRules ?? IndexExclusionRules.Default;
         var resolvedPaths = new Dictionary<ulong, string>();
+        var normalizedDirectories = directoriesByReferenceNumber.Values
+            .GroupBy(entry => GetMftSegmentReferenceNumber(entry.FileReferenceNumber))
+            .ToDictionary(group => group.Key, group => group.Last());
 
         foreach (var entry in entries)
         {
@@ -75,16 +78,17 @@ internal static class NtfsUsnRecordProjector
             if (!TryResolvePath(
                     entry,
                     volumeRoot,
-                    directoriesByReferenceNumber,
+                    normalizedDirectories,
                     resolvedPaths,
                     new HashSet<ulong>(),
                     volumeRootFileReferenceNumber,
                     out var fullPath))
             {
-                if (failOnSkippedRecords)
+                if (failOnSkippedRecords && !IsNtfsMetadataEntry(entry))
                 {
                     throw new InvalidDataException(
-                        $"NTFS record path could not be resolved for file reference {entry.FileReferenceNumber}.");
+                        $"NTFS record path could not be resolved for file reference {entry.FileReferenceNumber} " +
+                        $"(parent {entry.ParentFileReferenceNumber}, name '{entry.Name}', directory {entry.IsDirectory}).");
                 }
 
                 continue;
@@ -158,12 +162,13 @@ internal static class NtfsUsnRecordProjector
                 out fullPath);
         }
 
-        if (resolvedPaths.TryGetValue(entry.FileReferenceNumber, out fullPath!))
+        var entryReferenceNumber = GetMftSegmentReferenceNumber(entry.FileReferenceNumber);
+        if (resolvedPaths.TryGetValue(entryReferenceNumber, out fullPath!))
         {
             return true;
         }
 
-        if (!resolving.Add(entry.FileReferenceNumber))
+        if (!resolving.Add(entryReferenceNumber))
         {
             fullPath = string.Empty;
             return false;
@@ -174,7 +179,7 @@ internal static class NtfsUsnRecordProjector
             if (IsRootEntry(entry, volumeRootFileReferenceNumber))
             {
                 fullPath = volumeRoot;
-                resolvedPaths[entry.FileReferenceNumber] = fullPath;
+                resolvedPaths[entryReferenceNumber] = fullPath;
                 return true;
             }
 
@@ -182,11 +187,11 @@ internal static class NtfsUsnRecordProjector
                 && IsUsableChildName(entry.Name))
             {
                 fullPath = Path.Combine(volumeRoot, entry.Name);
-                resolvedPaths[entry.FileReferenceNumber] = fullPath;
+                resolvedPaths[entryReferenceNumber] = fullPath;
                 return true;
             }
 
-            if (!entries.TryGetValue(entry.ParentFileReferenceNumber, out var parent)
+            if (!entries.TryGetValue(GetMftSegmentReferenceNumber(entry.ParentFileReferenceNumber), out var parent)
                 || !TryResolvePath(
                     parent,
                     volumeRoot,
@@ -202,12 +207,12 @@ internal static class NtfsUsnRecordProjector
             }
 
             fullPath = Path.Combine(parentPath, entry.Name);
-            resolvedPaths[entry.FileReferenceNumber] = fullPath;
+            resolvedPaths[entryReferenceNumber] = fullPath;
             return true;
         }
         finally
         {
-            resolving.Remove(entry.FileReferenceNumber);
+            resolving.Remove(entryReferenceNumber);
         }
     }
 
@@ -232,7 +237,7 @@ internal static class NtfsUsnRecordProjector
             return true;
         }
 
-        if (!entries.TryGetValue(entry.ParentFileReferenceNumber, out var parent)
+        if (!entries.TryGetValue(GetMftSegmentReferenceNumber(entry.ParentFileReferenceNumber), out var parent)
             || !TryResolvePath(
                 parent,
                 volumeRoot,
@@ -264,15 +269,25 @@ internal static class NtfsUsnRecordProjector
 
     private static bool IsSameFileReference(ulong referenceNumber, ulong? expectedReferenceNumber)
     {
-        const ulong mftSegmentReferenceNumberMask = 0x0000_FFFF_FFFF_FFFF;
         return expectedReferenceNumber is { } expected
             && (referenceNumber == expected
-                || (referenceNumber & mftSegmentReferenceNumberMask) == (expected & mftSegmentReferenceNumberMask));
+                || GetMftSegmentReferenceNumber(referenceNumber) == GetMftSegmentReferenceNumber(expected));
+    }
+
+    private static ulong GetMftSegmentReferenceNumber(ulong fileReferenceNumber)
+    {
+        const ulong mftSegmentReferenceNumberMask = 0x0000_FFFF_FFFF_FFFF;
+        return fileReferenceNumber & mftSegmentReferenceNumberMask;
     }
 
     private static bool IsUsableChildName(string name)
     {
         return !string.IsNullOrWhiteSpace(name) && name != ".";
+    }
+
+    private static bool IsNtfsMetadataEntry(NtfsUsnEntry entry)
+    {
+        return entry.Name.StartsWith('$');
     }
 
     internal static bool IsRequestedRootOrDescendant(string fullPath, string requestedRoot)

@@ -57,6 +57,19 @@
           SkipUnchangedFiles="true" />
   </Target>
 
+  <Target Name="CopyElevatedIndexerBundleToPublishDirectory"
+          AfterTargets="Publish"
+          Condition="'$(PublishDir)' != ''">
+    <ItemGroup>
+      <ElevatedIndexerPublishFiles Include="$(OutDir)ListaryOpen.Indexer.Elevated.*" />
+    </ItemGroup>
+    <Error Condition="'@(ElevatedIndexerPublishFiles)' == ''"
+           Text="Elevated indexer bundle was not found under $(OutDir)." />
+    <Copy SourceFiles="@(ElevatedIndexerPublishFiles)"
+          DestinationFolder="$(PublishDir)"
+          SkipUnchangedFiles="true" />
+  </Target>
+
   <Target Name="BuildNativeHooks" AfterTargets="Build" Condition="'$(BuildNativeHooks)' == 'true'">
     <PropertyGroup>
       <NativeHooksX64OutputDir>$(OutDir)hooks\x64\</NativeHooksX64OutputDir>
