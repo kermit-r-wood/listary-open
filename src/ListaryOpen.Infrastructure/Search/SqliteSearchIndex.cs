@@ -704,6 +704,10 @@ public sealed class SqliteSearchIndex : ISearchIndex, IAsyncDisposable
                     transaction: null,
                     cancellationToken).ConfigureAwait(false);
                 _ftsReady = true;
+
+                using var checkpointCommand = _connection.CreateCommand();
+                checkpointCommand.CommandText = "pragma wal_checkpoint(truncate);";
+                await checkpointCommand.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
             }
             finally
             {
@@ -1215,14 +1219,14 @@ public sealed class SqliteSearchIndex : ISearchIndex, IAsyncDisposable
                 size_bytes,
                 last_write_time
             from files
-            where (
-                name = $query collate nocase
-                or name like $query_prefix escape '\' collate nocase
-            ){directoryFilter}{parsedFilter}
+            where name >= $query collate nocase
+              and name < $query_upper_bound collate nocase
+              {directoryFilter}{parsedFilter}
             order by
                 case
                     when name = $query then 0
-                    when name like $query_prefix escape '\' then 1
+                    when name >= $query collate nocase
+                     and name < $query_upper_bound collate nocase then 1
                     else 2
                 end,
                 length(name),
@@ -1232,7 +1236,7 @@ public sealed class SqliteSearchIndex : ISearchIndex, IAsyncDisposable
             limit $limit;
             """;
         command.Parameters.AddWithValue("$query", normalizedQuery);
-        command.Parameters.AddWithValue("$query_prefix", $"{EscapeLike(normalizedQuery)}%");
+        command.Parameters.AddWithValue("$query_upper_bound", normalizedQuery + '\uFFFF');
         command.Parameters.AddWithValue("$limit", candidateLimit);
 
         await AddRecordsAsync(command, records, cancellationToken).ConfigureAwait(false);
