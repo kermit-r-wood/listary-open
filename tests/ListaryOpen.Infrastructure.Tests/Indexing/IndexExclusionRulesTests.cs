@@ -23,9 +23,9 @@ public sealed class IndexExclusionRulesTests
     [InlineData(".next")]
     [InlineData(".nuxt")]
     [InlineData("target")]
-    public void DefaultRulesExcludeNoisyDirectoryNames(string directoryName)
+    public void DefaultRulesDoNotSilentlyExcludeDirectoryNames(string directoryName)
     {
-        Assert.True(IndexExclusionRules.Default.ShouldExcludeDirectoryName(directoryName));
+        Assert.False(IndexExclusionRules.Default.ShouldExcludeDirectoryName(directoryName));
     }
 
     [Fact]
@@ -37,6 +37,8 @@ public sealed class IndexExclusionRulesTests
     [Fact]
     public void ShouldExcludeDirectoryPathUsesLastPathSegment()
     {
-        Assert.True(IndexExclusionRules.Default.ShouldExcludeDirectoryPath(Path.Combine("C:\\Projects", "node_modules")));
+        var rules = new IndexExclusionRules(["node_modules"]);
+
+        Assert.True(rules.ShouldExcludeDirectoryPath(Path.Combine("C:\\Projects", "node_modules")));
     }
 }

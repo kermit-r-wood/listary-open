@@ -49,6 +49,7 @@ public sealed class FallbackIndexProvider : IIndexProvider
         var pending = new Stack<string>();
         pending.Push(root.Path);
         var normalizedRootPath = NormalizePath(root.Path);
+        var skippedInaccessibleLocation = false;
 
         while (pending.Count > 0)
         {
@@ -60,7 +61,11 @@ public sealed class FallbackIndexProvider : IIndexProvider
                 normalizedRootPath,
                 StringComparison.OrdinalIgnoreCase);
 
-            foreach (var directory in EnumerateDirectories(current, cancellationToken, failOnEnumerationFailure: true))
+            foreach (var directory in EnumerateDirectories(
+                         current,
+                         cancellationToken,
+                         failOnEnumerationFailure: isRootEnumeration,
+                         _ => skippedInaccessibleLocation = true))
             {
                 cancellationToken.ThrowIfCancellationRequested();
                 if (_exclusionRules.ShouldExcludeDirectoryPath(directory))
@@ -77,7 +82,11 @@ public sealed class FallbackIndexProvider : IIndexProvider
                 pending.Push(fullName);
             }
 
-            foreach (var file in EnumerateFiles(current, cancellationToken, failOnEnumerationFailure: true))
+            foreach (var file in EnumerateFiles(
+                         current,
+                         cancellationToken,
+                         failOnEnumerationFailure: isRootEnumeration,
+                         _ => skippedInaccessibleLocation = true))
             {
                 cancellationToken.ThrowIfCancellationRequested();
 
@@ -89,37 +98,48 @@ public sealed class FallbackIndexProvider : IIndexProvider
                 yield return record;
             }
         }
+
+        if (skippedInaccessibleLocation)
+        {
+            throw new IOException(
+                $"Index root could not be completely enumerated because one or more child locations were inaccessible: {root.Path}");
+        }
     }
 
     internal static IEnumerable<string> EnumerateEntriesForTests(
         Func<IEnumerable<string>> enumerate,
         CancellationToken cancellationToken,
-        bool failOnEnumerationFailure)
-        => EnumerateEntries(enumerate, cancellationToken, failOnEnumerationFailure);
+        bool failOnEnumerationFailure,
+        Action<Exception>? onEnumerationFailure = null)
+        => EnumerateEntries(enumerate, cancellationToken, failOnEnumerationFailure, onEnumerationFailure);
 
     private static IEnumerable<string> EnumerateDirectories(
         string path,
         CancellationToken cancellationToken,
-        bool failOnEnumerationFailure)
+        bool failOnEnumerationFailure,
+        Action<Exception>? onEnumerationFailure)
         => EnumerateEntries(
             () => Directory.EnumerateDirectories(
                 path,
                 "*",
                 failOnEnumerationFailure ? RootProbeEnumerationOptions : EnumerationOptions),
             cancellationToken,
-            failOnEnumerationFailure);
+            failOnEnumerationFailure,
+            onEnumerationFailure);
 
     private static IEnumerable<string> EnumerateFiles(
         string path,
         CancellationToken cancellationToken,
-        bool failOnEnumerationFailure)
+        bool failOnEnumerationFailure,
+        Action<Exception>? onEnumerationFailure)
         => EnumerateEntries(
             () => Directory.EnumerateFiles(
                 path,
                 "*",
                 failOnEnumerationFailure ? RootProbeEnumerationOptions : EnumerationOptions),
             cancellationToken,
-            failOnEnumerationFailure);
+            failOnEnumerationFailure,
+            onEnumerationFailure);
 
     private static void EnsureRootCanBeEnumerated(string path, CancellationToken cancellationToken)
     {
@@ -146,7 +166,8 @@ public sealed class FallbackIndexProvider : IIndexProvider
     private static IEnumerable<string> EnumerateEntries(
         Func<IEnumerable<string>> enumerate,
         CancellationToken cancellationToken,
-        bool failOnEnumerationFailure)
+        bool failOnEnumerationFailure,
+        Action<Exception>? onEnumerationFailure = null)
     {
         IEnumerator<string> enumerator;
         try
@@ -160,6 +181,7 @@ public sealed class FallbackIndexProvider : IIndexProvider
                 throw new IOException("Index root could not be enumerated.", exception);
             }
 
+            onEnumerationFailure?.Invoke(exception);
             yield break;
         }
 
@@ -186,6 +208,7 @@ public sealed class FallbackIndexProvider : IIndexProvider
                         throw new IOException("Index root could not be enumerated.", exception);
                     }
 
+                    onEnumerationFailure?.Invoke(exception);
                     yield break;
                 }
 

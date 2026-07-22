@@ -132,6 +132,31 @@ public sealed class SettingsViewModelTests
 
         Assert.NotEmpty(viewModel.Drives);
         Assert.All(viewModel.Drives, drive => Assert.True(drive.IsSelected));
+        Assert.DoesNotContain(
+            viewModel.Drives.Select(drive => drive.RootPath),
+            driveRoot => viewModel.IndexedRootsText
+                .Split(Environment.NewLine, StringSplitOptions.RemoveEmptyEntries)
+                .Contains(driveRoot, StringComparer.OrdinalIgnoreCase));
+    }
+
+    [Fact]
+    public void AdditionalFolderTextOmitsFoldersCoveredByASelectedDrive()
+    {
+        var selectedDrive = Assert.Single(
+            DriveInfo.GetDrives().Where(drive => drive.IsReady).Take(1));
+        var coveredFolder = Path.Combine(selectedDrive.Name, "Users", "Example");
+        var settings = AppSettings.Defaults().WithPreferences(
+            [selectedDrive.Name, coveredFolder],
+            [],
+            AppTheme.System,
+            IndexUpdateFrequency.StartupOnly,
+            AppSettings.Defaults().QuickMenuEntries,
+            true);
+
+        var viewModel = new SettingsViewModel(settings);
+
+        Assert.DoesNotContain(selectedDrive.Name, viewModel.IndexedRootsText, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain(coveredFolder, viewModel.IndexedRootsText, StringComparison.OrdinalIgnoreCase);
     }
 
     [Fact]

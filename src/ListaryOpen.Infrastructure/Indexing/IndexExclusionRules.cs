@@ -6,28 +6,6 @@ namespace ListaryOpen.Infrastructure.Indexing;
 
 public sealed class IndexExclusionRules
 {
-    private static readonly string[] DefaultDirectoryNames =
-    [
-        ".git",
-        ".svn",
-        ".hg",
-        "node_modules",
-        "bin",
-        "obj",
-        ".vs",
-        ".idea",
-        ".vscode",
-        "packages",
-        "dist",
-        "build",
-        ".cache",
-        "__pycache__",
-        ".pytest_cache",
-        ".next",
-        ".nuxt",
-        "target"
-    ];
-
     private readonly HashSet<string> _directoryNames;
 
     public IndexExclusionRules(IEnumerable<string> directoryNames)
@@ -40,7 +18,9 @@ public sealed class IndexExclusionRules
             .ToHashSet(StringComparer.OrdinalIgnoreCase);
     }
 
-    public static IndexExclusionRules Default { get; } = new(DefaultDirectoryNames);
+    // Full-disk indexing must not silently omit conventional development folders.
+    // User-visible exclusions are applied separately by ConfiguredIndexFilter.
+    public static IndexExclusionRules Default { get; } = new(Array.Empty<string>());
 
     public bool ShouldExcludeDirectoryName(string directoryName)
     {

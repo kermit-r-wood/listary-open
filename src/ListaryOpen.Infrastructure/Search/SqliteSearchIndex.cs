@@ -14,7 +14,7 @@ namespace ListaryOpen.Infrastructure.Search;
 public sealed class SqliteSearchIndex : ISearchIndex, IAsyncDisposable
 {
     internal const int CurrentSchemaVersion = 2;
-    internal const long CurrentIndexContentVersion = 2;
+    internal const long CurrentIndexContentVersion = 3;
 
     private const int FallbackCandidateLimit = 200;
     private const int CandidateLimitMultiplier = 20;

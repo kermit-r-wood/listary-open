@@ -228,7 +228,7 @@ public sealed class NtfsUsnRecordProjectorTests
                 ],
                 metadata,
                 CancellationToken.None,
-                exclusionRules: IndexExclusionRules.Default)
+                exclusionRules: new IndexExclusionRules(["node_modules"]))
             .ToList();
 
         Assert.Contains(records, record => record.FullPath.EndsWith("visible.txt", StringComparison.OrdinalIgnoreCase));

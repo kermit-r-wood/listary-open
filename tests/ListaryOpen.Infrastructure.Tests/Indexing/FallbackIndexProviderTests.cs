@@ -83,7 +83,7 @@ public sealed class FallbackIndexProviderTests
             var excluded = Directory.CreateDirectory(Path.Combine(root, "node_modules"));
             await File.WriteAllTextAsync(Path.Combine(excluded.FullName, "hidden.txt"), "hidden");
 
-            var provider = new FallbackIndexProvider();
+            var provider = new FallbackIndexProvider(new IndexExclusionRules(["node_modules"]));
             var records = new List<FileRecord>();
             await foreach (var record in provider.ScanAsync(new IndexRoot(root), CancellationToken.None))
             {
@@ -162,17 +162,24 @@ public sealed class FallbackIndexProviderTests
     }
 
     [Fact]
-    public void ChildEnumerationFailureIsFatalInsteadOfBeingReportedAsACompleteScan()
+    public void ChildEnumerationFailureSkipsThatLocationAndReportsIncompleteScan()
     {
         static IEnumerable<string> ThrowAccessDenied()
         {
             throw new UnauthorizedAccessException("child is inaccessible");
         }
 
-        Assert.Throws<IOException>(() =>
-            FallbackIndexProvider
-                .EnumerateEntriesForTests(ThrowAccessDenied, CancellationToken.None, failOnEnumerationFailure: true)
-                .ToList());
+        Exception? observedFailure = null;
+        var entries = FallbackIndexProvider
+            .EnumerateEntriesForTests(
+                ThrowAccessDenied,
+                CancellationToken.None,
+                failOnEnumerationFailure: false,
+                exception => observedFailure = exception)
+            .ToList();
+
+        Assert.Empty(entries);
+        Assert.IsType<UnauthorizedAccessException>(observedFailure);
     }
 
     [Theory]

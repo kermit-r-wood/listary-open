@@ -91,10 +91,16 @@ public sealed class SettingsViewModel : INotifyPropertyChanged
         _selectedLanguage = settings.Language;
         _selectedIndexFrequency = settings.IndexFrequency;
         _selectedSearchTransliteration = settings.SearchTransliteration;
-        _indexedRootsText = string.Join(Environment.NewLine, settings.IndexedRoots);
         _excludedPathsText = string.Join(Environment.NewLine, settings.ExcludedPaths);
         _checkForUpdates = settings.CheckForUpdates;
         Drives = new ObservableCollection<DriveOptionViewModel>(CreateDriveOptions(settings.IndexedRoots));
+        var selectedDriveRoots = Drives
+            .Where(drive => drive.IsSelected)
+            .Select(drive => drive.RootPath)
+            .ToArray();
+        _indexedRootsText = string.Join(
+            Environment.NewLine,
+            settings.IndexedRoots.Where(path => !IsCoveredBySelectedDrive(path, selectedDriveRoots)));
         MenuEntries = new ObservableCollection<QuickMenuEntryEditor>(settings.QuickMenuEntries.Select(entry => new QuickMenuEntryEditor(entry)));
         QuickLaunchEntries = new ObservableCollection<QuickLaunchEntryEditor>(settings.QuickLaunchEntries.Select(entry => new QuickLaunchEntryEditor(entry)));
         SelectedMenuEntry = MenuEntries.FirstOrDefault();
