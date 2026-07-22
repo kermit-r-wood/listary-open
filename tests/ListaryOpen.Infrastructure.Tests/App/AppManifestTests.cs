@@ -3,7 +3,7 @@ namespace ListaryOpen.Infrastructure.Tests.App;
 public sealed class AppManifestTests
 {
     [Fact]
-    public void DefaultAppManifestRequiresAdministrator()
+    public void DefaultAppManifestRequestsAdministratorOnceAtStartup()
     {
         var manifest = File.ReadAllText(GetRepositoryPath("src", "ListaryOpen.App", "app.manifest"));
 
@@ -26,7 +26,18 @@ public sealed class AppManifestTests
 
         Assert.Contains("ListaryOpenAppManifest", project);
         Assert.Contains("$(ListaryOpenAppManifest)", project);
-        Assert.Contains("app.manifest", project);
+        Assert.Contains(">app.manifest</ListaryOpenAppManifest>", project);
+    }
+
+    [Theory]
+    [InlineData("app.manifest")]
+    [InlineData("app.no-admin.manifest")]
+    public void AppManifestsEnablePerMonitorV2DpiAwareness(string manifestName)
+    {
+        var manifest = File.ReadAllText(GetRepositoryPath("src", "ListaryOpen.App", manifestName));
+
+        Assert.Contains(">true/pm</dpiAware>", manifest);
+        Assert.Contains(">PerMonitorV2,PerMonitor</dpiAwareness>", manifest);
     }
 
     private static string GetRepositoryPath(params string[] segments)

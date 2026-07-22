@@ -1,0 +1,100 @@
+<UserControl x:Class="ListaryOpen.App.FilePreviewPane"
+             xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+             xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+             xmlns:local="clr-namespace:ListaryOpen.App"
+             MinWidth="250">
+    <Border Padding="14"
+            Background="{DynamicResource Brush.Surface}"
+            BorderBrush="{DynamicResource Brush.Border}"
+            BorderThickness="1"
+            CornerRadius="10">
+        <Grid>
+            <Grid.RowDefinitions>
+                <RowDefinition Height="*" />
+                <RowDefinition Height="Auto" />
+            </Grid.RowDefinitions>
+
+            <Border Background="{DynamicResource Brush.SurfaceMuted}"
+                    BorderBrush="{DynamicResource Brush.Border}"
+                    BorderThickness="1"
+                    CornerRadius="8"
+                    ClipToBounds="True">
+                <Grid>
+                    <local:ShellPreviewHost x:Name="ShellHost" Visibility="Collapsed" />
+                    <Grid x:Name="ImagePreviewSurface"
+                          Margin="8"
+                          ClipToBounds="True"
+                          Visibility="Collapsed">
+                        <Image x:Name="PreviewImage"
+                               HorizontalAlignment="Center"
+                               VerticalAlignment="Center"
+                               Stretch="Uniform"
+                               RenderOptions.BitmapScalingMode="HighQuality" />
+                    </Grid>
+                    <TextBox x:Name="PreviewText"
+                             Padding="12"
+                             BorderThickness="0"
+                             Background="Transparent"
+                             Foreground="{DynamicResource Brush.TextPrimary}"
+                             FontFamily="Cascadia Mono, Consolas"
+                             FontSize="12"
+                             IsReadOnly="True"
+                             TextWrapping="NoWrap"
+                             HorizontalScrollBarVisibility="Auto"
+                             VerticalScrollBarVisibility="Auto"
+                             Visibility="Collapsed" />
+                    <StackPanel x:Name="EmptyPreview"
+                                Margin="20"
+                                HorizontalAlignment="Center"
+                                VerticalAlignment="Center">
+                        <Grid Width="64" Height="64" HorizontalAlignment="Center">
+                            <TextBlock HorizontalAlignment="Center"
+                                       VerticalAlignment="Center"
+                                       FontFamily="Segoe MDL2 Assets"
+                                       FontSize="42"
+                                       Foreground="{DynamicResource Brush.TextMuted}"
+                                       Text="&#xE7C3;" />
+                            <Image x:Name="PreviewIcon"
+                                   Width="48"
+                                   Height="48"
+                                   RenderOptions.BitmapScalingMode="HighQuality" />
+                        </Grid>
+                        <TextBlock x:Name="EmptyMessage"
+                                   Margin="0,12,0,0"
+                                   HorizontalAlignment="Center"
+                                   Foreground="{DynamicResource Brush.TextMuted}"
+                                   Text="Select a result to preview" />
+                    </StackPanel>
+                </Grid>
+            </Border>
+
+            <StackPanel Grid.Row="1" Margin="0,14,0,0">
+                <TextBlock x:Name="PreviewName"
+                           FontFamily="{StaticResource Font.Primary}"
+                           FontSize="16"
+                           FontWeight="SemiBold"
+                           Foreground="{DynamicResource Brush.TextPrimary}"
+                           TextTrimming="CharacterEllipsis" />
+                <TextBlock x:Name="PreviewPath"
+                           Margin="0,5,0,0"
+                           FontFamily="{StaticResource Font.Primary}"
+                           FontSize="11"
+                           Foreground="{DynamicResource Brush.TextMuted}"
+                           TextTrimming="CharacterEllipsis"
+                           ToolTip="{Binding Text, RelativeSource={RelativeSource Self}}" />
+                <Separator Margin="0,12" Background="{DynamicResource Brush.Border}" />
+                <Grid>
+                    <Grid.ColumnDefinitions>
+                        <ColumnDefinition Width="Auto" />
+                        <ColumnDefinition Width="*" />
+                    </Grid.ColumnDefinitions>
+                    <TextBlock Foreground="{DynamicResource Brush.TextMuted}" Text="Size:&#x0a;Created:&#x0a;Modified:" />
+                    <TextBlock x:Name="PreviewDetails"
+                               Grid.Column="1"
+                               Margin="14,0,0,0"
+                               Foreground="{DynamicResource Brush.TextPrimary}" />
+                </Grid>
+            </StackPanel>
+        </Grid>
+    </Border>
+</UserControl>

@@ -39,6 +39,7 @@ public sealed class NtfsUsnJournalReader
         string volumeRoot,
         [EnumeratorCancellation] CancellationToken cancellationToken)
     {
+        await Task.CompletedTask.ConfigureAwait(false);
         var scanRoot = NtfsScanRoot.Create(volumeRoot);
         var handle = OpenVolume(scanRoot.VolumePath);
 
@@ -58,7 +59,6 @@ public sealed class NtfsUsnJournalReader
                          failOnSkippedRecords: true))
             {
                 yield return record;
-                await Task.Yield();
             }
         }
         finally
@@ -143,6 +143,7 @@ public sealed class NtfsUsnJournalReader
         long endUsn,
         [EnumeratorCancellation] CancellationToken cancellationToken)
     {
+        await Task.CompletedTask.ConfigureAwait(false);
         var scanRoot = NtfsScanRoot.Create(volumeRoot);
         var handle = OpenVolume(scanRoot.VolumePath);
 
@@ -174,7 +175,6 @@ public sealed class NtfsUsnJournalReader
                 if (change is not null)
                 {
                     yield return change;
-                    await Task.Yield();
                 }
             }
         }

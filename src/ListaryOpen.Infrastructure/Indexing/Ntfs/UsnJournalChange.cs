@@ -75,7 +75,8 @@ public static class UsnJournalChangeApplier
         SqliteSearchIndex index,
         IEnumerable<UsnJournalChange> changes,
         UsnJournalCheckpoint nextCheckpoint,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        Func<FileRecord, bool>? recordFilter = null)
     {
         ArgumentNullException.ThrowIfNull(changes);
 
@@ -83,7 +84,8 @@ public static class UsnJournalChangeApplier
                 index,
                 ToAsyncEnumerable(changes, cancellationToken),
                 nextCheckpoint,
-                cancellationToken)
+                cancellationToken,
+                recordFilter: recordFilter)
             .ConfigureAwait(false);
     }
 
@@ -92,7 +94,8 @@ public static class UsnJournalChangeApplier
         IAsyncEnumerable<UsnJournalChange> changes,
         UsnJournalCheckpoint nextCheckpoint,
         CancellationToken cancellationToken,
-        long indexGeneration = 0)
+        long indexGeneration = 0,
+        Func<FileRecord, bool>? recordFilter = null)
     {
         ArgumentNullException.ThrowIfNull(index);
         ArgumentNullException.ThrowIfNull(changes);
@@ -113,12 +116,15 @@ public static class UsnJournalChangeApplier
         }
 
         var indexChanges = new List<UsnJournalIndexChange>();
+        recordFilter ??= _ => true;
         foreach (var change in materializedChanges)
         {
             switch (change.Kind)
             {
                 case UsnJournalChangeKind.Upsert:
-                    indexChanges.Add(UsnJournalIndexChange.Upsert(change.Record!));
+                    indexChanges.Add(recordFilter(change.Record!)
+                        ? UsnJournalIndexChange.Upsert(change.Record!)
+                        : UsnJournalIndexChange.Delete(change.Record!.FullPath));
                     break;
 
                 case UsnJournalChangeKind.Delete:
@@ -127,7 +133,10 @@ public static class UsnJournalChangeApplier
 
                 case UsnJournalChangeKind.FileRename:
                     indexChanges.Add(UsnJournalIndexChange.Delete(change.OldFullPath!));
-                    indexChanges.Add(UsnJournalIndexChange.Upsert(change.Record!));
+                    if (recordFilter(change.Record!))
+                    {
+                        indexChanges.Add(UsnJournalIndexChange.Upsert(change.Record!));
+                    }
                     break;
 
                 case UsnJournalChangeKind.DirectoryRenameOrMove:

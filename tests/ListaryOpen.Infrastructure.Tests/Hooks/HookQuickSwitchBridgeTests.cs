@@ -196,6 +196,40 @@ public sealed class HookQuickSwitchBridgeTests
     }
 
     [Fact]
+    public async Task DisposeRequestsGracefulShutdownBeforeWaitingForOwnedHostExit()
+    {
+        using var hookFiles = HookFileFixture.Create();
+        hookFiles.CreateHostAndDll(HookArchitecture.X64);
+        hookFiles.CreateHostAndDll(HookArchitecture.X86);
+        var x64Client = new ShutdownHealthHookClient(
+            new HookJumpResult(HookJumpStatus.HostUnavailable, "No host."),
+            HookJumpResult.Success("Hook host healthy."));
+        var x86Client = new ShutdownHealthHookClient(
+            new HookJumpResult(HookJumpStatus.HostUnavailable, "No host."),
+            HookJumpResult.Success("Hook host healthy."));
+        var processFactory = new ShutdownOrderingProcessFactory(
+            () => x64Client.ShutdownCount == 1 && x86Client.ShutdownCount == 1);
+        var bridge = new HookQuickSwitchBridge(
+            HookQuickSwitchStatus.Disabled(),
+            new Dictionary<HookArchitecture, IHookIpcClient>
+            {
+                [HookArchitecture.X64] = x64Client,
+                [HookArchitecture.X86] = x86Client
+            },
+            hookFiles.Paths,
+            processFactory);
+
+        await bridge.EnableAsync(CancellationToken.None);
+        bridge.Dispose();
+
+        Assert.Equal(1, x64Client.ShutdownCount);
+        Assert.Equal(1, x86Client.ShutdownCount);
+        Assert.True(processFactory.GracefulWaitCalled);
+        Assert.True(processFactory.ShutdownWasObservedBeforeWait);
+        Assert.False(processFactory.ImmediateTerminateCalled);
+    }
+
+    [Fact]
     public async Task EnableReportsMissingHostAndDllPerArchitecture()
     {
         using var hookFiles = HookFileFixture.Create();
@@ -623,6 +657,35 @@ public sealed class HookQuickSwitchBridgeTests
         }
     }
 
+    private sealed class ShutdownHealthHookClient : IHookIpcClient, IHookHealthProbeClient, IHookShutdownClient
+    {
+        private readonly Queue<HookJumpResult> _healthResults;
+
+        public ShutdownHealthHookClient(params HookJumpResult[] healthResults)
+        {
+            _healthResults = new Queue<HookJumpResult>(healthResults);
+        }
+
+        public int ShutdownCount { get; private set; }
+
+        public Task<HookDialogContext?> GetActiveDialogAsync(CancellationToken cancellationToken) =>
+            Task.FromResult<HookDialogContext?>(null);
+
+        public Task<HookJumpResult> JumpDialogToFolderAsync(string dialogId, string folderPath, CancellationToken cancellationToken) =>
+            Task.FromResult(new HookJumpResult(HookJumpStatus.NoActiveDialog, "No dialog."));
+
+        public Task<HookJumpResult> ProbeHealthAsync(CancellationToken cancellationToken) =>
+            Task.FromResult(_healthResults.Count == 0
+                ? HookJumpResult.Success("Hook host healthy.")
+                : _healthResults.Dequeue());
+
+        public Task<HookJumpResult> ShutdownAsync(CancellationToken cancellationToken)
+        {
+            ShutdownCount++;
+            return Task.FromResult(HookJumpResult.Success("Hook host graceful shutdown accepted."));
+        }
+    }
+
     private sealed class ActiveDialogResultHookClient : IHookIpcClient, IHookActiveDialogQueryClient
     {
         private readonly HookActiveDialogResult _result;
@@ -778,6 +841,35 @@ public sealed class HookQuickSwitchBridgeTests
     }
 
     private sealed record RecordedStart(ProcessStartInfo StartInfo);
+
+    private sealed class ShutdownOrderingProcessFactory : HookHostProcessFactory
+    {
+        private readonly Func<bool> _shutdownObserved;
+
+        public ShutdownOrderingProcessFactory(Func<bool> shutdownObserved)
+        {
+            _shutdownObserved = shutdownObserved;
+        }
+
+        public bool GracefulWaitCalled { get; private set; }
+
+        public bool ShutdownWasObservedBeforeWait { get; private set; }
+
+        public bool ImmediateTerminateCalled { get; private set; }
+
+        public override Process? Start(ProcessStartInfo startInfo) => new();
+
+        public override void WaitForGracefulExitOrTerminate(Process process)
+        {
+            GracefulWaitCalled = true;
+            ShutdownWasObservedBeforeWait = _shutdownObserved();
+        }
+
+        public override void Terminate(Process process)
+        {
+            ImmediateTerminateCalled = true;
+        }
+    }
 
     private sealed class BlockingHookHostProcessFactory : HookHostProcessFactory
     {

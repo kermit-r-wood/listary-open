@@ -1,8 +1,2 @@
 [build]
 target-dir = "target"
-
-[target.x86_64-pc-windows-gnullvm]
-linker = "C:/Users/paulx/scoop/apps/mingw-mstorsjo-llvm-msvcrt/22.1.8-20260616/bin/x86_64-w64-mingw32-clang.exe"
-
-[target.i686-pc-windows-gnullvm]
-linker = "C:/Users/paulx/scoop/apps/mingw-mstorsjo-llvm-msvcrt/22.1.8-20260616/bin/i686-w64-mingw32-clang.exe"

@@ -8,16 +8,23 @@ public sealed class ExplorerObservationSchedulerTests
     public void TickObservesExplorerFolder()
     {
         var observations = 0;
+        var observationApartment = ApartmentState.Unknown;
         var timer = new ManualExplorerObservationTimer();
         using var scheduler = new ListaryOpen.App.ExplorerObservationScheduler(
-            () => observations++,
+            () =>
+            {
+                observationApartment = Thread.CurrentThread.GetApartmentState();
+                observations++;
+            },
             TimeSpan.FromSeconds(1),
             () => timer);
 
         scheduler.Start();
+        Assert.True(SpinWait.SpinUntil(() => Volatile.Read(ref observations) == 1, TimeSpan.FromSeconds(1)));
+        Assert.Equal(ApartmentState.STA, observationApartment);
         timer.RaiseTick();
 
-        Assert.Equal(1, observations);
+        Assert.True(SpinWait.SpinUntil(() => Volatile.Read(ref observations) == 2, TimeSpan.FromSeconds(1)));
     }
 
     [Fact]
@@ -38,10 +45,43 @@ public sealed class ExplorerObservationSchedulerTests
             () => timer);
 
         scheduler.Start();
-        timer.RaiseTick();
+        Assert.True(SpinWait.SpinUntil(() => Volatile.Read(ref observations) == 1, TimeSpan.FromSeconds(1)));
         timer.RaiseTick();
 
-        Assert.Equal(2, observations);
+        Assert.True(SpinWait.SpinUntil(() => Volatile.Read(ref observations) == 2, TimeSpan.FromSeconds(1)));
+    }
+
+    [Fact]
+    public async Task RequestedObservationCompletesAfterFreshSnapshotIsPublished()
+    {
+        var folderA = Directory.CreateTempSubdirectory("listary-open-observe-a-");
+        var folderB = Directory.CreateTempSubdirectory("listary-open-observe-b-");
+        try
+        {
+            var window = new IntPtr(1234);
+            var provider = new MutableExplorerShellWindowsProvider(
+                new[] { new ExplorerShellWindow(window, folderA.FullName) });
+            var tracker = new ExplorerTracker(() => window, provider);
+            var timer = new ManualExplorerObservationTimer();
+            using var scheduler = new ListaryOpen.App.ExplorerObservationScheduler(
+                tracker.ObserveForegroundExplorerFolder,
+                TimeSpan.FromSeconds(2),
+                () => timer);
+            scheduler.Start();
+            await scheduler.RequestObservationAsync().WaitAsync(TimeSpan.FromSeconds(5));
+
+            provider.Windows = new[] { new ExplorerShellWindow(window, folderB.FullName) };
+            await scheduler.RequestObservationAsync().WaitAsync(TimeSpan.FromSeconds(5));
+
+            var candidate = Assert.Single(tracker.GetFolderCandidates());
+            Assert.Equal(folderB.FullName, candidate.FolderPath);
+            Assert.True(candidate.IsForeground);
+        }
+        finally
+        {
+            folderA.Delete(recursive: true);
+            folderB.Delete(recursive: true);
+        }
     }
 
     [Fact]
@@ -65,11 +105,13 @@ public sealed class ExplorerObservationSchedulerTests
                 () => timer);
 
             Assert.NotNull(scheduler);
-            Assert.Equal(TimeSpan.FromSeconds(2), timer.StartedInterval);
+            Assert.Equal(TimeSpan.FromSeconds(10), timer.StartedInterval);
 
             timer.RaiseTick();
 
-            Assert.Equal(folder.FullName, tracker.LastFolder);
+            Assert.True(SpinWait.SpinUntil(
+                () => string.Equals(folder.FullName, tracker.LastFolder, StringComparison.Ordinal),
+                TimeSpan.FromSeconds(1)));
         }
         finally
         {
@@ -116,5 +158,17 @@ public sealed class ExplorerObservationSchedulerTests
         {
             return _windows;
         }
+    }
+
+    private sealed class MutableExplorerShellWindowsProvider : IExplorerShellWindowsProvider
+    {
+        public MutableExplorerShellWindowsProvider(IReadOnlyList<ExplorerShellWindow> windows)
+        {
+            Windows = windows;
+        }
+
+        public IReadOnlyList<ExplorerShellWindow> Windows { get; set; }
+
+        public IEnumerable<ExplorerShellWindow> EnumerateWindows() => Windows;
     }
 }

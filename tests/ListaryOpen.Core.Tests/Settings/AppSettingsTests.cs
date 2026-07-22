@@ -9,12 +9,61 @@ public sealed class AppSettingsTests
     {
         var settings = AppSettings.Defaults();
 
-        Assert.Equal(new[] { Environment.GetFolderPath(Environment.SpecialFolder.UserProfile) }, settings.IndexedRoots);
+        var readyDriveRoots = DriveInfo.GetDrives()
+            .Where(drive => drive.IsReady)
+            .Select(drive => drive.Name)
+            .ToArray();
+        Assert.Equal(readyDriveRoots, settings.IndexedRoots);
+        Assert.NotEmpty(settings.IndexedRoots);
         Assert.Empty(settings.ExcludedPaths);
         Assert.Empty(settings.PinnedFolders);
         Assert.Equal("Ctrl+Space", settings.SearchHotkey);
         Assert.Equal("Ctrl+G", settings.DialogHotkey);
         Assert.True(settings.QuickSaveOpenEnabled);
+        Assert.Equal(AppTheme.System, settings.Theme);
+        Assert.Equal(IndexUpdateFrequency.StartupOnly, settings.IndexFrequency);
+        Assert.NotEmpty(settings.QuickMenuEntries);
+        Assert.True(settings.CheckForUpdates);
+        Assert.Equal(AppLanguage.System, settings.Language);
+    }
+
+    [Fact]
+    public void PreferenceUpdatePreservesAndCanChangeInterfaceLanguage()
+    {
+        var defaults = AppSettings.Defaults();
+        var chinese = defaults.WithPreferences(
+            defaults.IndexedRoots,
+            defaults.ExcludedPaths,
+            defaults.Theme,
+            defaults.IndexFrequency,
+            defaults.QuickMenuEntries,
+            defaults.CheckForUpdates,
+            language: AppLanguage.SimplifiedChinese);
+
+        Assert.Equal(AppLanguage.SimplifiedChinese, chinese.Language);
+        Assert.Equal(AppLanguage.SimplifiedChinese, chinese.WithHotkeys("Ctrl+F", "Ctrl+G").Language);
+    }
+
+    [Fact]
+    public void UpdateCheckPreferenceCanBeChangedWithoutChangingOtherSettings()
+    {
+        var settings = AppSettings.Defaults().WithPreferences(
+            AppSettings.Defaults().IndexedRoots,
+            ["*.tmp"],
+            AppTheme.Dark,
+            IndexUpdateFrequency.Hourly,
+            AppSettings.Defaults().QuickMenuEntries,
+            true,
+            language: AppLanguage.SimplifiedChinese);
+
+        var updated = settings.WithCheckForUpdates(false);
+
+        Assert.False(updated.CheckForUpdates);
+        Assert.Equal(settings.IndexedRoots, updated.IndexedRoots);
+        Assert.Equal(settings.ExcludedPaths, updated.ExcludedPaths);
+        Assert.Equal(settings.Theme, updated.Theme);
+        Assert.Equal(settings.IndexFrequency, updated.IndexFrequency);
+        Assert.Equal(settings.Language, updated.Language);
     }
 
     [Fact]

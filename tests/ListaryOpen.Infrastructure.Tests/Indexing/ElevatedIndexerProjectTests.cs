@@ -129,7 +129,8 @@ public sealed class ElevatedIndexerProjectTests
         Assert.Contains("<BuildNativeHooks", projectXml, StringComparison.Ordinal);
         Assert.Contains("x86_64-pc-windows-gnullvm", projectXml, StringComparison.Ordinal);
         Assert.Contains("i686-pc-windows-gnullvm", projectXml, StringComparison.Ordinal);
-        Assert.Contains("cargo build --locked", targetXml, StringComparison.Ordinal);
+        Assert.Contains("cargo build --release --locked", targetXml, StringComparison.Ordinal);
+        Assert.Contains(@"\release\listary_open_hook_host.exe", targetXml, StringComparison.Ordinal);
         Assert.Contains("-p listary_open_hook_host", targetXml, StringComparison.Ordinal);
         Assert.Contains("-p listary_open_hook", targetXml, StringComparison.Ordinal);
         Assert.Contains("--target $(NativeHooksX64Target)", targetXml, StringComparison.Ordinal);

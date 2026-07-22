@@ -22,7 +22,12 @@ public interface IHookHealthProbeClient
     Task<HookJumpResult> ProbeHealthAsync(CancellationToken cancellationToken);
 }
 
-public sealed class HookIpcClient : IHookIpcClient, IHookActiveDialogQueryClient, IHookHealthProbeClient, IDisposable
+public interface IHookShutdownClient
+{
+    Task<HookJumpResult> ShutdownAsync(CancellationToken cancellationToken);
+}
+
+public sealed class HookIpcClient : IHookIpcClient, IHookActiveDialogQueryClient, IHookHealthProbeClient, IHookShutdownClient, IDisposable
 {
     private static readonly UTF8Encoding PipeEncoding = new(encoderShouldEmitUTF8Identifier: false);
 
@@ -119,6 +124,9 @@ public sealed class HookIpcClient : IHookIpcClient, IHookActiveDialogQueryClient
 
     public Task<HookJumpResult> ProbeHealthAsync(CancellationToken cancellationToken) =>
         SendCommandAsync(HookIpcEnvelope.Command(new HookHealthProbe()), cancellationToken);
+
+    public Task<HookJumpResult> ShutdownAsync(CancellationToken cancellationToken) =>
+        SendCommandAsync(HookIpcEnvelope.Command(new HookShutdownCommand()), cancellationToken);
 
     public Task<HookJumpResult> JumpDialogToFolderAsync(string dialogId, string folderPath, CancellationToken cancellationToken)
     {
@@ -248,7 +256,9 @@ public sealed class HookIpcClient : IHookIpcClient, IHookActiveDialogQueryClient
                 activeDialog.ProcessName,
                 activeDialog.ClassName,
                 activeDialog.Title,
-                DateTimeOffset.UtcNow);
+                DateTimeOffset.UtcNow,
+                activeDialog.FirefoxFileDialogUtility,
+                activeDialog.PreloadConfirmedBeforeDialog);
         }
         catch (OverflowException)
         {

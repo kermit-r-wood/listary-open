@@ -6,6 +6,7 @@ public sealed class HookQuickSwitchBridge : IHookQuickSwitchBridge
 {
     private static readonly TimeSpan HostStartupProbeInterval = TimeSpan.FromMilliseconds(50);
     private static readonly TimeSpan HostStartupTimeout = TimeSpan.FromSeconds(2);
+    private static readonly TimeSpan HostShutdownTimeout = TimeSpan.FromSeconds(5);
     public const string X64PipeName = "listary-open-hook-x64";
     public const string X86PipeName = "listary-open-hook-x86";
 
@@ -228,6 +229,8 @@ public sealed class HookQuickSwitchBridge : IHookQuickSwitchBridge
             _hostProcesses.Clear();
         }
 
+        var gracefulShutdownAccepted = hostProcesses.Length > 0 && RequestGracefulHostShutdown();
+
         foreach (var client in _clients.Values.OfType<IDisposable>())
         {
             client.Dispose();
@@ -235,8 +238,48 @@ public sealed class HookQuickSwitchBridge : IHookQuickSwitchBridge
 
         foreach (var process in hostProcesses)
         {
+            if (gracefulShutdownAccepted)
+            {
+                _processFactory.WaitForGracefulExitOrTerminate(process);
+            }
+            else
+            {
+                _processFactory.Terminate(process);
+            }
+        }
+    }
+
+    private void GracefullyTerminateStartedProcess(Process process)
+    {
+        if (RequestGracefulHostShutdown())
+        {
+            _processFactory.WaitForGracefulExitOrTerminate(process);
+        }
+        else
+        {
             _processFactory.Terminate(process);
         }
+    }
+
+    private bool RequestGracefulHostShutdown()
+    {
+        using var cancellation = new CancellationTokenSource(HostShutdownTimeout);
+        var accepted = false;
+        foreach (var client in _clients.Values.OfType<IHookShutdownClient>().Distinct())
+        {
+            try
+            {
+                var result = client.ShutdownAsync(cancellation.Token).GetAwaiter().GetResult();
+                accepted |= result.Status == HookJumpStatus.Success;
+            }
+            catch (Exception exception) when (exception is OperationCanceledException
+                                               or System.IO.IOException
+                                               or InvalidOperationException)
+            {
+            }
+        }
+
+        return accepted;
     }
 
     private async Task<HookArchitectureStatus> EnableArchitectureAsync(
@@ -332,7 +375,7 @@ public sealed class HookQuickSwitchBridge : IHookQuickSwitchBridge
 
             if (terminateStartedProcess)
             {
-                _processFactory.Terminate(process);
+                GracefullyTerminateStartedProcess(process);
                 cancellationToken.ThrowIfCancellationRequested();
                 return new HookArchitectureStatus(
                     architecture,
@@ -466,7 +509,7 @@ public sealed class HookQuickSwitchBridge : IHookQuickSwitchBridge
 
             if (terminateStartedProcess)
             {
-                _processFactory.Terminate(process);
+                GracefullyTerminateStartedProcess(process);
                 cancellationToken.ThrowIfCancellationRequested();
                 return new HookQuickSwitchStatus(
                     true,

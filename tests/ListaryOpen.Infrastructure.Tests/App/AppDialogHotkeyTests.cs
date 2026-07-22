@@ -1,5 +1,6 @@
 using ListaryOpen.Core.Indexing;
 using ListaryOpen.Core.Search;
+using ListaryOpen.Core.Settings;
 using ListaryOpen.Infrastructure.Dialog;
 using ListaryOpen.Infrastructure.Hooks;
 using ListaryOpen.Infrastructure.Windows;
@@ -8,6 +9,17 @@ namespace ListaryOpen.Infrastructure.Tests.App;
 
 public sealed class AppDialogHotkeyTests
 {
+    [Theory]
+    [InlineData(IndexUpdateFrequency.StartupOnly, 0)]
+    [InlineData(IndexUpdateFrequency.Every15Minutes, 15)]
+    [InlineData(IndexUpdateFrequency.Hourly, 60)]
+    [InlineData(IndexUpdateFrequency.Every6Hours, 360)]
+    [InlineData(IndexUpdateFrequency.Daily, 1440)]
+    public void IndexFrequencyMapsToExpectedSchedule(IndexUpdateFrequency frequency, int minutes)
+    {
+        Assert.Equal(TimeSpan.FromMinutes(minutes), ListaryOpen.App.App.GetIndexInterval(frequency));
+    }
+
     [Fact]
     public void ObserveQuickSwitchFolderCandidatesReturnsMultipleExplorerFoldersForegroundFirst()
     {
@@ -26,6 +38,7 @@ public sealed class AppDialogHotkeyTests
                     new ExplorerShellWindow(foregroundHandle, foregroundFolder.FullName),
                     new ExplorerShellWindow(new IntPtr(3333), thirdFolder.FullName)
                 }));
+            tracker.ObserveForegroundExplorerFolder();
 
             var candidates = ListaryOpen.App.App.ObserveQuickSwitchFolderCandidates(tracker);
 
@@ -119,16 +132,22 @@ public sealed class AppDialogHotkeyTests
     }
 
     [Fact]
-    public void CreateDefaultCustomDialogAdaptersIncludesBlender()
+    public void CreateDefaultDialogJumpPluginsDoesNotShipAnUnverifiedInputSimulator()
     {
-        var adapters = ListaryOpen.App.App.CreateDefaultCustomDialogAdapters();
-
-        var adapter = Assert.Single(adapters);
-        Assert.IsType<BlenderFileBrowserAdapter>(adapter);
+        var root = Directory.CreateTempSubdirectory("listary-empty-plugins-");
+        try
+        {
+            var plugins = ListaryOpen.App.App.CreateDefaultDialogJumpPlugins(root.FullName);
+            Assert.Empty(plugins);
+        }
+        finally
+        {
+            root.Delete(recursive: true);
+        }
     }
 
     [Fact]
-    public void ObserveAndGetExistingTrackedFolderRefreshesExplorerTrackerBeforeReadingLastFolder()
+    public void ObserveAndGetExistingTrackedFolderUsesLatestExplorerSnapshotBeforeRememberedFolder()
     {
         var staleFolder = Directory.CreateTempSubdirectory("listary-open-stale-");
         var foregroundFolder = Directory.CreateTempSubdirectory("listary-open-foreground-");
@@ -143,6 +162,7 @@ public sealed class AppDialogHotkeyTests
                 }));
             var stalePath = staleFolder.FullName + Path.DirectorySeparatorChar;
             tracker.ObserveFolderForTests(stalePath);
+            tracker.ObserveForegroundExplorerFolder();
 
             var trackedFolder = ListaryOpen.App.App.ObserveAndGetExistingTrackedFolder(tracker);
 
@@ -223,20 +243,20 @@ public sealed class AppDialogHotkeyTests
     {
         var folder = Directory.CreateTempSubdirectory("listary-open-reported-jump-");
         var reportedResults = new List<DialogJumpResult>();
-        var fallbackMessage = "Dialog folder changed via fallback automation after hook Failed: Hook could not jump.";
+        var directHookMessage = "Dialog folder changed through the captured native hook.";
 
         try
         {
             var result = await ListaryOpen.App.App.TryJumpToFirstQuickSwitchFolderAsync(
                 new[] { new QuickSwitchFolderCandidate(folder.FullName, "Explorer", IntPtr.Zero, true) },
-                (_, _) => Task.FromResult(new DialogJumpResult(DialogJumpStatus.Success, fallbackMessage)),
+                (_, _) => Task.FromResult(new DialogJumpResult(DialogJumpStatus.Success, directHookMessage)),
                 reportedResults.Add,
                 CancellationToken.None);
 
             Assert.True(result);
             var reported = Assert.Single(reportedResults);
             Assert.Equal(DialogJumpStatus.Success, reported.Status);
-            Assert.Equal(fallbackMessage, reported.Message);
+            Assert.Equal(directHookMessage, reported.Message);
         }
         finally
         {
@@ -303,19 +323,20 @@ public sealed class AppDialogHotkeyTests
     }
 
     [Fact]
-    public void ReportDirectDialogJumpStatusShowsDegradedSuccessInTrayStatus()
+    public void ReportDirectDialogJumpStatusReportsNativeFailureInPanel()
     {
         var panelResults = new List<DialogJumpResult>();
         var trayMessages = new List<string>();
-        var message = "Dialog folder changed via fallback automation after hook Timeout: Hook host timed out.";
+        var message = "Native hook direct navigation timed out.";
 
         ListaryOpen.App.App.ReportDirectDialogJumpStatus(
-            new DialogJumpResult(DialogJumpStatus.Success, message, isDegradedSuccess: true),
+            new DialogJumpResult(DialogJumpStatus.Failed, message),
             panelResults.Add,
             trayMessages.Add);
 
-        Assert.Empty(panelResults);
-        Assert.Equal(new[] { message }, trayMessages);
+        var failure = Assert.Single(panelResults);
+        Assert.Equal(DialogJumpStatus.Failed, failure.Status);
+        Assert.Empty(trayMessages);
     }
 
     [Fact]
@@ -385,7 +406,7 @@ public sealed class AppDialogHotkeyTests
     }
 
     [Fact]
-    public async Task DialogFolderActivationsKeepDirectFallbackAndCapturePanelTarget()
+    public async Task DialogFolderActivationsUseCapturedTargetForDirectAndPanelJumps()
     {
         var dialog = CreateCapturedDialog();
         var capturedDialogIds = new List<string>();
@@ -408,8 +429,8 @@ public sealed class AppDialogHotkeyTests
 
         Assert.Equal(DialogJumpStatus.Success, directResult.Status);
         Assert.Equal(DialogJumpStatus.Success, panelResult.Status);
-        Assert.Equal(new[] { dialog.DialogId }, capturedDialogIds);
-        Assert.Equal(1, activeCalls);
+        Assert.Equal(new[] { dialog.DialogId, dialog.DialogId }, capturedDialogIds);
+        Assert.Equal(0, activeCalls);
     }
 
     [Fact]
@@ -441,6 +462,57 @@ public sealed class AppDialogHotkeyTests
             CancellationToken.None);
 
         Assert.Null(result);
+    }
+
+    [Theory]
+    [InlineData(true, true, true)]
+    [InlineData(true, false, false)]
+    [InlineData(false, true, false)]
+    public void DialogAttachmentSurvivesOnlyATransientProbeMissWithALiveAnchor(
+        bool isAttached,
+        bool anchorWindowAvailable,
+        bool expected)
+    {
+        Assert.Equal(
+            expected,
+            ListaryOpen.App.App.ShouldRetainDialogAttachmentOnProbeMiss(
+                isAttached,
+                anchorWindowAvailable));
+    }
+
+    [Theory]
+    [InlineData(true, false, true)]
+    [InlineData(true, true, false)]
+    [InlineData(false, false, false)]
+    public void DestroyedDialogAlwaysDetachesEvenWhileTheSearchBarIsActive(
+        bool isAttached,
+        bool anchorWindowAlive,
+        bool expected)
+    {
+        Assert.Equal(
+            expected,
+            ListaryOpen.App.App.ShouldDetachDialogAttachment(
+                isAttached,
+                anchorWindowAlive));
+    }
+
+    [Theory]
+    [InlineData(true, true, true, true)]
+    [InlineData(true, true, false, false)]
+    [InlineData(true, false, true, false)]
+    [InlineData(false, true, true, false)]
+    public void ActiveSearchBarSkipsProbeOnlyWhileItsDialogRemainsVisible(
+        bool isAttached,
+        bool barIsActive,
+        bool anchorWindowAvailable,
+        bool expected)
+    {
+        Assert.Equal(
+            expected,
+            ListaryOpen.App.App.ShouldSkipDialogProbeWhileBarActive(
+                isAttached,
+                barIsActive,
+                anchorWindowAvailable));
     }
 
     private static HookDialogContext CreateCapturedDialog() => new(

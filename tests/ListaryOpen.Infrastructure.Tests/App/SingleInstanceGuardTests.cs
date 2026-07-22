@@ -5,6 +5,12 @@ namespace ListaryOpen.Infrastructure.Tests.App;
 public sealed class SingleInstanceGuardTests
 {
     [Fact]
+    public void DuplicateInstanceStartupExitsWithoutAModalNotification()
+    {
+        Assert.False(ListaryOpen.App.App.ShouldShowDuplicateInstanceMessage);
+    }
+
+    [Fact]
     public void MutexNameIsStable()
     {
         Assert.Equal(@"Local\ListaryOpen.SingleInstance", SingleInstanceGuard.MutexName);

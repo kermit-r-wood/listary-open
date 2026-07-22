@@ -34,83 +34,17 @@ jobs:
           rustup target add x86_64-pc-windows-gnullvm
           rustup target add i686-pc-windows-gnullvm
 
-      - name: Configure Rust linkers
+      - name: Run automated acceptance and package
         shell: pwsh
-        run: |
-          $cargoConfig = Join-Path $env:GITHUB_WORKSPACE "native/ListaryOpen.Hooks/.cargo/config.toml"
-          $mingwRoot = Join-Path $env:USERPROFILE "scoop/apps/mingw-mstorsjo-llvm-msvcrt/current"
-          $mingwBin = (Join-Path $mingwRoot "bin").Replace("\", "/")
-          @"
-          [build]
-          target-dir = "target"
+        run: tools\Invoke-AutomatedAcceptance.ps1
 
-          [target.x86_64-pc-windows-gnullvm]
-          linker = "$mingwBin/x86_64-w64-mingw32-clang.exe"
-
-          [target.i686-pc-windows-gnullvm]
-          linker = "$mingwBin/i686-w64-mingw32-clang.exe"
-          "@ | Set-Content -Path $cargoConfig -Encoding utf8
-
-      - name: Restore
-        shell: pwsh
-        run: dotnet restore ListaryOpen.sln -r win-x64
-
-      - name: Test
-        shell: pwsh
-        run: |
-          $testOutput = dotnet test ListaryOpen.sln `
-            -c Release `
-            --no-restore `
-            --nologo `
-            -p:BuildNativeHooks=false 2>&1 | Tee-Object -Variable capturedOutput
-          $exitCode = $LASTEXITCODE
-
-          if ($exitCode -ne 0) {
-            $details = ($capturedOutput | Select-Object -Last 100) -join "`n"
-            $details = $details.Replace("%", "%25").Replace("`r", "%0D").Replace("`n", "%0A")
-            Write-Output "::error title=Test failure::$details"
-            exit $exitCode
-          }
-
-      - name: Publish app with native hooks
-        shell: pwsh
-        run: |
-          Remove-Item artifacts\ListaryOpen -Recurse -Force -ErrorAction SilentlyContinue
-          dotnet publish src\ListaryOpen.App\ListaryOpen.App.csproj `
-            -c Release `
-            -r win-x64 `
-            --self-contained false `
-            --no-restore `
-            -p:BuildNativeHooks=true `
-            -o artifacts\ListaryOpen
-
-      - name: Verify package contents
-        shell: pwsh
-        run: |
-          $required = @(
-            "artifacts\ListaryOpen\ListaryOpen.App.exe",
-            "artifacts\ListaryOpen\ListaryOpen.Indexer.Elevated.exe",
-            "artifacts\ListaryOpen\hooks\x64\ListaryOpen.HookHost.exe",
-            "artifacts\ListaryOpen\hooks\x64\ListaryOpen.Hook.dll",
-            "artifacts\ListaryOpen\hooks\x64\libunwind.dll",
-            "artifacts\ListaryOpen\hooks\x86\ListaryOpen.HookHost.exe",
-            "artifacts\ListaryOpen\hooks\x86\ListaryOpen.Hook.dll",
-            "artifacts\ListaryOpen\hooks\x86\libunwind.dll"
-          )
-
-          foreach ($path in $required) {
-            if (-not (Test-Path $path)) {
-              throw "Required package file is missing: $path"
-            }
-          }
-
-      - name: Create zip package
-        shell: pwsh
-        run: |
-          Compress-Archive `
-            -Path artifacts\ListaryOpen\* `
-            -DestinationPath artifacts\ListaryOpen-win-x64.zip `
-            -Force
+      - name: Upload acceptance evidence
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: ListaryOpen-acceptance-results
+          path: artifacts/acceptance-results
+          if-no-files-found: error
 
       - name: Upload package artifact
         uses: actions/upload-artifact@v7

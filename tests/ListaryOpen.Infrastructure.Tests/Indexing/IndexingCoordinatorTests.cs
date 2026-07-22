@@ -11,6 +11,92 @@ namespace ListaryOpen.Infrastructure.Tests.Indexing;
 public sealed class IndexingCoordinatorTests
 {
     [Fact]
+    public async Task IndexRootsAsyncReportsLiveCountAndCurrentRootWhileScanning()
+    {
+        var rootPath = CreateTempDirectory();
+        var dbPath = CreateTempDbPath();
+
+        try
+        {
+            await File.WriteAllTextAsync(Path.Combine(rootPath, "First.txt"), "first");
+            await File.WriteAllTextAsync(Path.Combine(rootPath, "Second.txt"), "second");
+            await using var index = await SqliteSearchIndex.OpenAsync(dbPath, CancellationToken.None);
+            var provider = new FallbackIndexProvider();
+            var coordinator = new IndexingCoordinator(
+                index,
+                new VolumeIndexer(new[] { provider }),
+                provider,
+                _ => new VolumeInfo(rootPath, "NTFS", true),
+                batchSize: 1);
+            var statuses = new List<IndexingStatus>();
+            coordinator.StatusChanged += (_, status) => statuses.Add(status);
+
+            await coordinator.IndexRootsAsync(new[] { new IndexRoot(rootPath) }, CancellationToken.None);
+
+            Assert.Contains(statuses, status =>
+                status.State == IndexingRunState.Indexing
+                && status.IndexedCount > 0
+                && status.CurrentRoot == rootPath
+                && status.CurrentRootNumber == 1
+                && status.TotalRoots == 1);
+            Assert.Contains(statuses, status =>
+                status.State == IndexingRunState.Indexing
+                && status.Message.StartsWith("Writing ", StringComparison.Ordinal));
+            Assert.Equal(2, statuses[^1].IndexedCount);
+            Assert.Equal(IndexingRunState.Completed, statuses[^1].State);
+        }
+        finally
+        {
+            DeleteDirectoryIfExists(rootPath);
+            DeleteFileIfExists(dbPath);
+        }
+    }
+
+    [Fact]
+    public async Task IndexRootsAsyncReportsCanceledInsteadOfLeavingIndexingActive()
+    {
+        var rootPath = CreateTempDirectory();
+        var dbPath = CreateTempDbPath();
+
+        try
+        {
+            await File.WriteAllTextAsync(Path.Combine(rootPath, "Cancel.txt"), "cancel");
+            await using var index = await SqliteSearchIndex.OpenAsync(dbPath, CancellationToken.None);
+            var provider = new FallbackIndexProvider();
+            var coordinator = new IndexingCoordinator(
+                index,
+                new VolumeIndexer(new[] { provider }),
+                provider,
+                _ => new VolumeInfo(rootPath, "NTFS", true));
+            using var cancellation = new CancellationTokenSource();
+            var statuses = new List<IndexingStatus>();
+            coordinator.StatusChanged += (_, status) =>
+            {
+                statuses.Add(status);
+                if (status.State == IndexingRunState.Indexing
+                    && status.Message.Contains("Scanning", StringComparison.Ordinal))
+                {
+                    cancellation.Cancel();
+                }
+            };
+
+            await Assert.ThrowsAnyAsync<OperationCanceledException>(() =>
+                coordinator.IndexRootsAsync(new[] { new IndexRoot(rootPath) }, cancellation.Token));
+
+            var finalStatus = statuses[^1];
+            Assert.Equal(IndexingRunState.Canceled, finalStatus.State);
+            Assert.Equal(rootPath, finalStatus.CurrentRoot);
+            Assert.Equal(1, finalStatus.CurrentRootNumber);
+            Assert.Equal(1, finalStatus.TotalRoots);
+        }
+        finally
+        {
+            DeleteDirectoryIfExists(rootPath);
+            DeleteFileIfExists(dbPath);
+        }
+    }
+
+    [Fact]
     public async Task IndexRootsAsyncFallsBackFromEmptyNtfsScanAndUpsertsFilesAndFolders()
     {
         var rootPath = CreateTempDirectory();
@@ -330,7 +416,7 @@ public sealed class IndexingCoordinatorTests
     }
 
     [Fact]
-    public async Task IndexRootsAsyncDoesNotPruneWhenProviderFailsAfterPartialOutput()
+    public async Task IndexRootsAsyncRecoversWithFallbackAndPrunesAfterNtfsPartialOutput()
     {
         var rootPath = CreateTempDirectory();
         var dbPath = CreateTempDbPath();
@@ -347,6 +433,7 @@ public sealed class IndexingCoordinatorTests
                 isDirectory: false,
                 sizeBytes: 1,
                 DateTimeOffset.UtcNow);
+            File.WriteAllText(currentRecord.FullPath, "current");
 
             await using var index = await SqliteSearchIndex.OpenAsync(dbPath, CancellationToken.None);
             await index.UpsertManyAsync(new[] { currentRecord, staleRecord }, CancellationToken.None);
@@ -365,7 +452,9 @@ public sealed class IndexingCoordinatorTests
             var staleResults = await index.SearchAsync(new SearchQuery("KeepBecauseScanIncomplete", SearchMode.FilesAndFolders), CancellationToken.None);
 
             Assert.Contains(currentResults, result => result.Record.PathKey == currentRecord.PathKey);
-            Assert.Contains(staleResults, result => result.Record.PathKey == staleRecord.PathKey);
+            Assert.DoesNotContain(staleResults, result => result.Record.PathKey == staleRecord.PathKey);
+            Assert.Contains(statuses, status =>
+                status.Message.Contains("restarting with fallback", StringComparison.OrdinalIgnoreCase));
             Assert.Equal(IndexingRunState.Failed, statuses[^1].State);
         }
         finally
@@ -913,38 +1002,40 @@ public sealed class IndexingCoordinatorTests
     }
 
     [Fact]
-    public async Task IndexRootsAsyncDoesNotPruneFallbackAfterEmptyNtfsScanWithPreScanJournalState()
+    public async Task IndexRootsAsyncPrunesAndSkipsFallbackAfterCompleteEmptyNtfsScan()
     {
         var rootPath = CreateTempDirectory();
         var dbPath = CreateTempDbPath();
 
         try
         {
-            var fallbackRecord = FileRecord.Create(
-                Path.Combine(rootPath, "IndexedByProvenanceLimitedFallback.txt"),
-                isDirectory: false,
-                sizeBytes: 1,
-                DateTimeOffset.UtcNow);
             var staleRecord = FileRecord.Create(
-                Path.Combine(rootPath, "PreservedAfterProvenanceLimitedFallback.txt"),
+                Path.Combine(rootPath, "RemovedFromCompleteEmptyRoot.txt"),
                 isDirectory: false,
                 sizeBytes: 1,
                 DateTimeOffset.UtcNow);
             await using var index = await SqliteSearchIndex.OpenAsync(dbPath, CancellationToken.None);
             await index.UpsertAsync(staleRecord, CancellationToken.None);
             var provider = new JournalAwareNtfsProvider(new UsnJournalState(9, 100, 200));
+            var fallbackProvider = new CountingFallbackProvider();
             var coordinator = new IndexingCoordinator(
                 index,
                 new VolumeIndexer(new IIndexProvider[] { provider }),
-                new AsynchronousSingleRecordProvider(fallbackRecord),
+                fallbackProvider,
                 _ => new VolumeInfo(rootPath, NtfsIndexProvider.ProviderName, true));
 
             await coordinator.IndexRootsAsync(new[] { new IndexRoot(rootPath) }, CancellationToken.None);
 
             var staleResults = await index.SearchAsync(
-                new SearchQuery("PreservedAfterProvenanceLimitedFallback", SearchMode.FilesAndFolders),
+                new SearchQuery("RemovedFromCompleteEmptyRoot", SearchMode.FilesAndFolders),
                 CancellationToken.None);
-            Assert.Contains(staleResults, result => result.Record.PathKey == staleRecord.PathKey);
+            var checkpoint = await index.ReadVolumeCheckpointAsync(rootPath, CancellationToken.None);
+            Assert.Empty(staleResults);
+            Assert.NotNull(checkpoint);
+            Assert.Equal(200, checkpoint!.NextUsn);
+            Assert.Equal(1, provider.ScanCount);
+            Assert.Equal(2, provider.QueryJournalStateCount);
+            Assert.Equal(0, fallbackProvider.ScanCount);
         }
         finally
         {

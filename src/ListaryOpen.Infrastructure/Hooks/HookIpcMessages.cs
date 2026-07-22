@@ -18,11 +18,16 @@ public sealed record HookIpcEnvelope(
     public static HookIpcEnvelope Command(HookHealthProbe probe) =>
         new(CurrentVersion, "HealthProbe", probe);
 
+    public static HookIpcEnvelope Command(HookShutdownCommand command) =>
+        new(CurrentVersion, "Shutdown", command);
+
     public static HookIpcEnvelope Command(HookActiveDialogQuery query) =>
         new(CurrentVersion, "GetActiveDialog", query);
 }
 
 public sealed record HookHealthProbe;
+
+public sealed record HookShutdownCommand;
 
 public sealed record HookActiveDialogQuery;
 
@@ -64,7 +69,9 @@ public sealed record HookActiveDialogEvent(
     string Architecture,
     string ProcessName,
     string ClassName,
-    string Title);
+    string Title,
+    bool FirefoxFileDialogUtility,
+    bool PreloadConfirmedBeforeDialog);
 
 public sealed record HookCommandReply(string Status, string Message);
 
@@ -105,6 +112,7 @@ internal sealed class HookIpcEnvelopeJsonConverter : JsonConverter<HookIpcEnvelo
         object payload = messageType switch
         {
             "HealthProbe" => new HookHealthProbe(),
+            "Shutdown" => new HookShutdownCommand(),
             "GetActiveDialog" => new HookActiveDialogQuery(),
             "JumpDialogToFolder" => ReadJumpCommand(payloadElement),
             "ActiveDialog" => ReadActiveDialogEvent(payloadElement),
@@ -190,6 +198,17 @@ internal sealed class HookIpcEnvelopeJsonConverter : JsonConverter<HookIpcEnvelo
         return value;
     }
 
+    private static bool GetRequiredBoolean(JsonElement root, string propertyName)
+    {
+        var property = GetRequiredProperty(root, propertyName);
+        return property.ValueKind switch
+        {
+            JsonValueKind.True => true,
+            JsonValueKind.False => false,
+            _ => throw InvalidMessage($"{propertyName} was invalid")
+        };
+    }
+
     private static string GetRequiredString(JsonElement root, string propertyName)
     {
         var property = GetRequiredProperty(root, propertyName);
@@ -222,7 +241,9 @@ internal sealed class HookIpcEnvelopeJsonConverter : JsonConverter<HookIpcEnvelo
             GetRequiredString(payload, "architecture"),
             GetRequiredString(payload, "processName"),
             GetRequiredString(payload, "className"),
-            GetRequiredString(payload, "title"));
+            GetRequiredString(payload, "title"),
+            GetRequiredBoolean(payload, "firefoxFileDialogUtility"),
+            GetRequiredBoolean(payload, "preloadConfirmedBeforeDialog"));
 
     private static HookCommandReply ReadCommandReply(JsonElement payload) =>
         new(

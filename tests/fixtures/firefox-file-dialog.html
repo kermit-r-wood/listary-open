@@ -1,0 +1,43 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>ListaryOpen Firefox file dialog fixture</title>
+  <style>
+    body {
+      margin: 0;
+      min-height: 100vh;
+      display: grid;
+      place-items: center;
+      font: 18px system-ui, sans-serif;
+      background: #f4f6f8;
+    }
+    #upload {
+      width: 360px;
+      height: 96px;
+      color: transparent;
+      opacity: 1;
+      pointer-events: auto;
+    }
+    #upload::file-selector-button {
+      min-width: 360px;
+      min-height: 96px;
+      border: 3px solid #5925dc;
+      border-radius: 12px;
+      color: #ffffff;
+      background: #6938ef;
+      font: 700 22px system-ui, sans-serif;
+      cursor: pointer;
+    }
+  </style>
+</head>
+<body>
+  <input id="upload" type="file" aria-label="Open Listary test file picker">
+  <script>
+    document.querySelector('#upload').addEventListener('change', event => {
+      const file = event.target.files[0];
+      document.title = file ? `SELECTED:${file.name}` : 'NO_SELECTION';
+    });
+  </script>
+</body>
+</html>

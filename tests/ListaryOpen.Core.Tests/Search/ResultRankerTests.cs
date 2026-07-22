@@ -7,6 +7,48 @@ namespace ListaryOpen.Core.Tests.Search;
 public sealed class ResultRankerTests
 {
     [Fact]
+    public void RankPlacesPreferredRootBeforeBetterGlobalTextMatch()
+    {
+        var now = DateTimeOffset.UtcNow;
+        var globalExact = FileRecord.Create("C:\\Elsewhere\\report", false, 1, now);
+        var currentSubstring = FileRecord.Create("C:\\Projects\\old-report.txt", false, 1, now);
+
+        var ranked = ResultRanker.Rank(
+            new SearchQuery(
+                "report",
+                SearchMode.FilesAndFolders,
+                preferredRoot: "C:\\Projects"),
+            [globalExact, currentSubstring],
+            Array.Empty<UsageRecord>(),
+            Array.Empty<string>());
+
+        Assert.Equal(currentSubstring.FullPath, ranked[0].Record.FullPath);
+    }
+
+    [Fact]
+    public void RankDoesNotBoostPreferredRootDescendantsAboveGlobalTextQuality()
+    {
+        var now = DateTimeOffset.UtcNow;
+        var globalExact = FileRecord.Create("C:\\Elsewhere\\report", false, 1, now);
+        var descendantSubstring = FileRecord.Create(
+            "C:\\Projects\\Nested\\old-report.txt",
+            false,
+            1,
+            now);
+
+        var ranked = ResultRanker.Rank(
+            new SearchQuery(
+                "report",
+                SearchMode.FilesAndFolders,
+                preferredRoot: "C:\\Projects"),
+            [descendantSubstring, globalExact],
+            Array.Empty<UsageRecord>(),
+            Array.Empty<string>());
+
+        Assert.Equal(globalExact.FullPath, ranked[0].Record.FullPath);
+    }
+
+    [Fact]
     public void RankOrdersExactNameBeforePrefixBeforeSubstringBeforePath()
     {
         var now = new DateTimeOffset(2026, 7, 12, 0, 0, 0, TimeSpan.Zero);
@@ -278,6 +320,66 @@ public sealed class ResultRankerTests
         Assert.Equal(originalPinned, pinned);
     }
 
+    [Fact]
+    public void RankStopsEnumeratingRecordsAfterCancellation()
+    {
+        using var cancellation = new CancellationTokenSource();
+        var enumeratedCount = 0;
+
+        Assert.Throws<OperationCanceledException>(() => ResultRanker.Rank(
+            new SearchQuery("invoice", SearchMode.FilesAndFolders),
+            CancelDuringEnumeration(cancellation, () => enumeratedCount++),
+            Array.Empty<UsageRecord>(),
+            Array.Empty<string>(),
+            cancellation.Token));
+
+        Assert.InRange(enumeratedCount, 8, 72);
+    }
+
+    [Fact]
+    public void RankChecksCancellationWhenAllRecordsAreFilteredOut()
+    {
+        using var cancellation = new CancellationTokenSource();
+        var enumeratedCount = 0;
+
+        Assert.Throws<OperationCanceledException>(() => ResultRanker.Rank(
+            new SearchQuery("invoice", SearchMode.FoldersOnly),
+            CancelDuringEnumeration(cancellation, () => enumeratedCount++),
+            Array.Empty<UsageRecord>(),
+            Array.Empty<string>(),
+            cancellation.Token));
+
+        Assert.InRange(enumeratedCount, 8, 72);
+    }
+
+    [Fact]
+    public void RankWithCancelableTokenPreservesNormalResults()
+    {
+        var now = new DateTimeOffset(2026, 7, 15, 0, 0, 0, TimeSpan.Zero);
+        var records = new[]
+        {
+            FileRecord.Create("C:\\Docs\\OldInvoice.txt", false, 1, now),
+            FileRecord.Create("C:\\Docs\\InvoiceArchive.txt", false, 1, now),
+            FileRecord.Create("C:\\Docs\\Invoice", false, 1, now)
+        };
+        var query = new SearchQuery("invoice", SearchMode.FilesAndFolders);
+        var expected = ResultRanker.Rank(
+            query,
+            records,
+            Array.Empty<UsageRecord>(),
+            Array.Empty<string>());
+        using var cancellation = new CancellationTokenSource();
+
+        var actual = ResultRanker.Rank(
+            query,
+            records,
+            Array.Empty<UsageRecord>(),
+            Array.Empty<string>(),
+            cancellation.Token);
+
+        Assert.Equal(expected, actual);
+    }
+
     private static IEnumerable<FileRecord> DelayBeforeSecond(IEnumerable<FileRecord> records)
     {
         var index = 0;
@@ -290,6 +392,26 @@ public sealed class ResultRankerTests
 
             index++;
             yield return record;
+        }
+    }
+
+    private static IEnumerable<FileRecord> CancelDuringEnumeration(
+        CancellationTokenSource cancellation,
+        Action onEnumerated)
+    {
+        for (var index = 0; index < 1_000; index++)
+        {
+            onEnumerated();
+            if (index == 7)
+            {
+                cancellation.Cancel();
+            }
+
+            yield return FileRecord.Create(
+                $"C:\\Docs\\Invoice-{index:D4}.txt",
+                false,
+                1,
+                DateTimeOffset.UnixEpoch);
         }
     }
 }

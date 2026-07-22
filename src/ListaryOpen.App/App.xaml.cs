@@ -9,8 +9,11 @@ using ListaryOpen.Infrastructure.Hooks;
 using ListaryOpen.Infrastructure.Indexing;
 using ListaryOpen.Infrastructure.Search;
 using ListaryOpen.Infrastructure.Windows;
+using System.ComponentModel;
 using System.Diagnostics;
 using System.IO;
+using System.Runtime.InteropServices;
+using System.Text;
 using System.Windows;
 using System.Windows.Threading;
 
@@ -18,32 +21,64 @@ namespace ListaryOpen.App;
 
 public partial class App : Application
 {
+    private static readonly TimeSpan IdleDialogProbeInterval = TimeSpan.FromSeconds(2);
+    private static readonly TimeSpan AttachedDialogProbeInterval = TimeSpan.FromMilliseconds(500);
     private readonly CancellationTokenSource _shutdownCancellation = new();
     private readonly IndexingRunCancellationManager _indexingCancellation = new();
     private readonly BackgroundIndexingTaskTracker _indexingTasks = new();
     private readonly SemaphoreSlim _indexingRunLock = new(1, 1);
 
     private DialogBridge? _dialogBridge;
+    private ContinuousIndexingService? _continuousIndexing;
     private ElevatedIndexerClient? _elevatedIndexerClient;
     private ExplorerObservationScheduler? _explorerObservationScheduler;
     private FallbackIndexProvider? _fallbackIndexProvider;
+    private GlobalTextInputService? _globalTextInputService;
     private IHookQuickSwitchBridge? _hookQuickSwitchBridge;
     private ExplorerTracker? _explorerTracker;
+    private ExplorerQuickMenu? _explorerQuickMenu;
     private HotkeyService? _hotkeyService;
     private IndexingCoordinator? _indexingCoordinator;
     private NtfsIndexProvider? _ntfsIndexProvider;
+    private PerformanceMetricsFileSink? _performanceMetricsFileSink;
     private IQuickSwitchWindowProvider? _quickSwitchWindowProvider;
+    private QuickSwitchBarWindow? _quickSwitchBar;
     private SearchPanel? _searchPanel;
+    private TaskManagerSearchWindow? _taskManagerSearchWindow;
     private SqliteSearchIndex? _searchIndex;
     private SettingsViewModel? _settingsViewModel;
     private SingleInstanceGuard? _singleInstanceGuard;
+    private E2eControlServer? _e2eControlServer;
+    private E2eControlOptions? _e2eControlOptions;
     private TrayController? _trayController;
     private VolumeIndexer? _volumeIndexer;
-    private WindowsDialogAutomation? _dialogAutomation;
+    private readonly AppSettingsStore _settingsStore = new();
+    private readonly GitHubUpdateChecker _updateChecker = new();
+    private AppSettings _activeSettings = AppSettings.Defaults();
+    private IReadOnlyList<string> _internalIndexExclusions = Array.Empty<string>();
+    private string? _settingsPath;
+    private DispatcherTimer? _dialogAttachmentTimer;
+    private DispatcherTimer? _foregroundObservationTimer;
+    private DispatcherTimer? _scheduledIndexTimer;
+    private bool _dialogAttachmentProbeRunning;
+    private string? _attachedDialogId;
+    private HookDialogContext? _lastE2eHookDialog;
+    private IntPtr _lastExplorerTypeSearchWindow;
+    private IntPtr _lastTaskManagerSearchWindow;
+    private readonly ExplorerTypeSearchNavigationCapture _explorerNavigationCapture = new();
+    private readonly object _globalTextInputQueueGate = new();
+    private readonly Queue<GlobalTextInputEventArgs> _globalTextInputQueue = new();
+    private readonly List<GlobalTextInputEventArgs> _pendingExplorerActivationInputs = new();
+    private bool _globalTextInputDrainScheduled;
+    private bool _explorerActivationRefreshPending;
+    private IntPtr _lastObservedForegroundWindow;
+    private IntPtr _activeDialogQuickSwitchInputWindow;
 
     internal static bool IsShuttingDown =>
         Current?.Dispatcher.HasShutdownStarted == true ||
         Current?.Dispatcher.HasShutdownFinished == true;
+
+    internal static bool ShouldShowDuplicateInstanceMessage => false;
 
     protected override async void OnStartup(StartupEventArgs e)
     {
@@ -51,14 +86,19 @@ public partial class App : Application
 
         try
         {
+            _e2eControlOptions = E2eControlOptions.TryParse(e.Args);
             _singleInstanceGuard = SingleInstanceGuard.TryAcquire();
             if (!_singleInstanceGuard.IsOwner)
             {
-                MessageBox.Show(
-                    "ListaryOpen is already running.",
-                    "ListaryOpen",
-                    MessageBoxButton.OK,
-                    MessageBoxImage.Information);
+                if (ShouldShowDuplicateInstanceMessage)
+                {
+                    MessageBox.Show(
+                        "ListaryOpen is already running.",
+                        "ListaryOpen",
+                        MessageBoxButton.OK,
+                        MessageBoxImage.Information);
+                }
+
                 Shutdown();
                 return;
             }
@@ -87,8 +127,10 @@ public partial class App : Application
 
     protected override void OnExit(ExitEventArgs e)
     {
+        _e2eControlServer?.Dispose();
         _indexingCancellation.CancelActive();
         _shutdownCancellation.Cancel();
+        _continuousIndexing?.Dispose();
 
         if (_indexingCoordinator is not null)
         {
@@ -103,6 +145,42 @@ public partial class App : Application
             _hotkeyService.Dispose();
         }
 
+        if (_globalTextInputService is not null)
+        {
+            _globalTextInputService.CaptureOverlayInput = false;
+            _globalTextInputService.DialogInputWindow = IntPtr.Zero;
+            _explorerNavigationCapture.Deactivate();
+            _globalTextInputService.TextInput -= OnGlobalTextInput;
+            _globalTextInputService.EscapePressed -= OnGlobalEscapePressed;
+            _globalTextInputService.PointerPressed -= OnGlobalPointerPressed;
+            _globalTextInputService.NavigationPressed -= OnGlobalNavigationPressed;
+            _globalTextInputService.ConfirmPressed -= OnGlobalConfirmPressed;
+            _globalTextInputService.EditCommandPressed -= OnGlobalEditCommandPressed;
+            _globalTextInputService.ResultShortcutPressed -= OnGlobalResultShortcutPressed;
+            _globalTextInputService.ExplorerMenuGesturePressed -= OnExplorerMenuGesturePressed;
+            _globalTextInputService.Dispose();
+        }
+
+        if (_searchPanel is not null)
+        {
+            _searchPanel.ExplorerSearchSessionEnded -= OnExplorerSearchSessionEnded;
+            _searchPanel.ResultContextMenuOpenStateChanged -= OnResultContextMenuOpenStateChanged;
+        }
+
+        if (_quickSwitchBar is not null)
+        {
+            _quickSwitchBar.AttachmentChanged -= OnQuickSwitchBarAttachmentChanged;
+            _quickSwitchBar.InputCaptureStateChanged -= OnQuickSwitchBarInputCaptureStateChanged;
+        }
+
+        Interlocked.Exchange(ref _activeDialogQuickSwitchInputWindow, IntPtr.Zero);
+
+        if (_taskManagerSearchWindow is not null)
+        {
+            _taskManagerSearchWindow.SearchSessionEnded -= OnTaskManagerSearchSessionEnded;
+            _taskManagerSearchWindow.Close();
+        }
+
         if (_hookQuickSwitchBridge is not null)
         {
             _hookQuickSwitchBridge.StatusChanged -= OnHookQuickSwitchStatusChanged;
@@ -110,7 +188,12 @@ public partial class App : Application
         }
 
         _explorerObservationScheduler?.Dispose();
+        StopForegroundObservationMonitoring();
+        _explorerQuickMenu?.CloseOpenMenu();
+        _scheduledIndexTimer?.Stop();
+        StopDialogAttachmentMonitoring();
         _trayController?.Dispose();
+        _performanceMetricsFileSink?.Dispose();
         DisposeSearchIndex();
         _indexingCancellation.Dispose();
         _singleInstanceGuard?.Dispose();
@@ -122,9 +205,15 @@ public partial class App : Application
     private async Task<bool> InitializeApplicationServicesAsync()
     {
         var appDataPaths = CreateAppDataPaths();
+        AppSettings settings;
         try
         {
             appDataPaths.EnsureDirectories();
+            _settingsPath = appDataPaths.SettingsPath;
+            settings = _settingsStore.Load(appDataPaths.SettingsPath);
+            PinyinMatcher.Configure(settings.SearchTransliteration);
+            _performanceMetricsFileSink = new PerformanceMetricsFileSink(
+                appDataPaths.PerformanceMetricsPath);
             _searchIndex = await SqliteSearchIndex.OpenAsync(appDataPaths.IndexDatabasePath, CancellationToken.None)
                 .ConfigureAwait(false);
             await ImportLegacyUsageIfAvailableAsync(_searchIndex, appDataPaths, CancellationToken.None)
@@ -137,7 +226,7 @@ public partial class App : Application
 
         return await InvokeOnDispatcherAsync(
                 Dispatcher,
-                () => InitializeApplicationServices(_searchIndex))
+                () => InitializeApplicationServices(_searchIndex, settings, appDataPaths))
             .ConfigureAwait(false);
     }
 
@@ -168,8 +257,16 @@ public partial class App : Application
         }
     }
 
-    private bool InitializeApplicationServices(SqliteSearchIndex searchIndex)
+    private bool InitializeApplicationServices(
+        SqliteSearchIndex searchIndex,
+        AppSettings settings,
+        AppDataPaths appDataPaths)
     {
+        _activeSettings = settings;
+        ThemeManager.Initialize();
+        ThemeManager.Apply(settings.Theme);
+        LocalizationManager.Initialize();
+        LocalizationManager.Apply(settings.Language);
         _fallbackIndexProvider = new FallbackIndexProvider();
         _elevatedIndexerClient = new ElevatedIndexerClient();
         var ntfsFastIndexingEnabled = EnableNtfsFastIndexingOnStartup(_elevatedIndexerClient);
@@ -179,22 +276,38 @@ public partial class App : Application
             _ntfsIndexProvider,
             _fallbackIndexProvider
         });
-        _indexingCoordinator = new IndexingCoordinator(searchIndex, _volumeIndexer, _fallbackIndexProvider);
+        _internalIndexExclusions = new[] { appDataPaths.DataDirectory };
+        _indexingCoordinator = new IndexingCoordinator(
+            searchIndex,
+            _volumeIndexer,
+            _fallbackIndexProvider,
+            recordFilter: record =>
+                ConfiguredIndexFilter.ShouldInclude(record, _activeSettings.ExcludedPaths) &&
+                !IsPathWithinAnyRoot(record.FullPath, _internalIndexExclusions));
         _indexingCoordinator.StatusChanged += OnIndexingStatusChanged;
+        _continuousIndexing = new ContinuousIndexingService(
+            searchIndex,
+            GetAllIndexRootPaths(settings),
+            settings.ExcludedPaths,
+            _internalIndexExclusions,
+            () => StartBackgroundIndexing());
+        _continuousIndexing.Start(baselineReady: false);
 
-        _dialogAutomation = new WindowsDialogAutomation();
         _hookQuickSwitchBridge = HookQuickSwitchBridgeFactory.CreateDefault();
         _hookQuickSwitchBridge.StatusChanged += OnHookQuickSwitchStatusChanged;
         _dialogBridge = new DialogBridge(
-            _dialogAutomation,
             _hookQuickSwitchBridge,
-            CreateDefaultCustomDialogAdapters());
+            CreateDefaultDialogJumpPlugins());
 
         _settingsViewModel = new SettingsViewModel(
-            AppSettings.Defaults(),
+            settings,
             EnableNtfsFastIndexing,
             EnableHookQuickSwitch,
-            ntfsFastIndexingEnabled);
+            ntfsFastIndexingEnabled,
+            ApplyHotkeys,
+            ApplySettings,
+            _updateChecker.CheckAsync,
+            ThemeManager.Apply);
         _settingsViewModel.UpdateHookQuickSwitchStatus(_hookQuickSwitchBridge.Status);
         var settingsWindow = new MainWindow(_settingsViewModel);
         _explorerTracker = new ExplorerTracker();
@@ -202,11 +315,22 @@ public partial class App : Application
         _explorerObservationScheduler = StartPeriodicExplorerObservation(
             _explorerTracker,
             () => new DispatcherExplorerObservationTimer());
-        _searchPanel = new SearchPanel(new SearchPanelViewModel(searchIndex, JumpDialogToFolderAsync));
+        StartForegroundObservationMonitoring();
+        _searchPanel = new SearchPanel(new SearchPanelViewModel(
+            searchIndex,
+            JumpDialogToFolderAsync,
+            () => _activeSettings.QuickLaunchEntries));
+        _searchPanel.ExplorerSearchSessionEnded += OnExplorerSearchSessionEnded;
+        _searchPanel.ResultContextMenuOpenStateChanged += OnResultContextMenuOpenStateChanged;
+        _quickSwitchBar = new QuickSwitchBarWindow(
+            new SearchPanelViewModel(searchIndex, JumpDialogToFolderAsync));
+        _quickSwitchBar.AttachmentChanged += OnQuickSwitchBarAttachmentChanged;
+        _quickSwitchBar.InputCaptureStateChanged += OnQuickSwitchBarInputCaptureStateChanged;
         _trayController = new TrayController(settingsWindow, RequestReindex);
         _hotkeyService = new HotkeyService();
         _hotkeyService.HotkeyPressed += OnHotkeyPressed;
-        var hotkeyStartupDecision = CreateHotkeyStartupDecision(_hotkeyService.RegisterDefaults());
+        var hotkeyStartupDecision = CreateHotkeyStartupDecision(
+            _hotkeyService.Register(settings.SearchHotkey, settings.DialogHotkey));
         if (hotkeyStartupDecision.Message is not null)
         {
             MessageBox.Show(
@@ -221,6 +345,8 @@ public partial class App : Application
             return false;
         }
 
+        StartGlobalTextInputCapture();
+
         MainWindow = settingsWindow;
         if (ShouldShowSettingsOnStartup(hasBlockingStartupMessage: false))
         {
@@ -228,8 +354,177 @@ public partial class App : Application
         }
 
         StartHookQuickSwitchEnablementOnStartup(_hookQuickSwitchBridge, EnableHookQuickSwitchAsync);
+        StartDialogAttachmentMonitoring();
+        ConfigureScheduledIndexing(settings.IndexFrequency);
+        _ = WarmSearchIndexAsync(searchIndex, _shutdownCancellation.Token);
         StartBackgroundIndexing();
+        if (settings.CheckForUpdates)
+        {
+            _settingsViewModel.CheckForUpdatesCommand.Execute(null);
+        }
+
+        StartE2eControlServer();
         return true;
+    }
+
+    private void StartE2eControlServer()
+    {
+        if (_e2eControlOptions is null)
+        {
+            return;
+        }
+
+        _e2eControlServer = new E2eControlServer(
+            _e2eControlOptions,
+            setInjectedInputPermission: allowed =>
+            {
+                var inputService = _globalTextInputService;
+                if (inputService is null)
+                {
+                    return false;
+                }
+
+                inputService.AcceptInjectedInputForTesting = allowed;
+                return inputService.AcceptInjectedInputForTesting == allowed;
+            },
+            requestShutdown: () => Dispatcher.BeginInvoke(new Action(() => Shutdown())),
+            getDialogPrecaptureProof: processId =>
+            {
+                var dialog = Volatile.Read(ref _lastE2eHookDialog);
+                return dialog is not null && dialog.ProcessId == processId
+                    ? new E2eDialogPrecaptureProof(
+                        dialog.ProcessId,
+                        dialog.FirefoxFileDialogUtility,
+                        dialog.PreloadConfirmedBeforeDialog)
+                    : null;
+            });
+        _e2eControlServer.Start();
+    }
+
+    private string? ApplySettings(AppSettings settings)
+    {
+        if (string.IsNullOrWhiteSpace(_settingsPath))
+        {
+            return "Settings path is unavailable.";
+        }
+
+        try
+        {
+            var indexingChanged = !_activeSettings.IndexedRoots.SequenceEqual(settings.IndexedRoots, StringComparer.OrdinalIgnoreCase) ||
+                !_activeSettings.ExcludedPaths.SequenceEqual(settings.ExcludedPaths, StringComparer.OrdinalIgnoreCase) ||
+                _activeSettings.SearchTransliteration != settings.SearchTransliteration;
+            _settingsStore.Save(_settingsPath, settings);
+            _activeSettings = settings;
+            PinyinMatcher.Configure(settings.SearchTransliteration);
+            if (indexingChanged)
+            {
+                _continuousIndexing?.PauseUntilBaselineReady();
+                _continuousIndexing?.Reconfigure(
+                    GetAllIndexRootPaths(settings),
+                    settings.ExcludedPaths,
+                    _internalIndexExclusions);
+            }
+            ThemeManager.Apply(settings.Theme);
+            LocalizationManager.Apply(settings.Language);
+            ConfigureScheduledIndexing(settings.IndexFrequency);
+            if (indexingChanged)
+            {
+                Dispatcher.BeginInvoke(new Action(() => StartBackgroundIndexing(cancelActive: true)));
+            }
+            return null;
+        }
+        catch (Exception exception) when (exception is IOException or UnauthorizedAccessException)
+        {
+            return $"Could not save settings: {exception.Message}";
+        }
+    }
+
+    private void ConfigureScheduledIndexing(IndexUpdateFrequency frequency)
+    {
+        if (_scheduledIndexTimer is not null)
+        {
+            _scheduledIndexTimer.Stop();
+            _scheduledIndexTimer = null;
+        }
+
+        var interval = GetIndexInterval(frequency);
+        if (interval == TimeSpan.Zero)
+        {
+            return;
+        }
+
+        _scheduledIndexTimer = new DispatcherTimer(DispatcherPriority.Background) { Interval = interval };
+        _scheduledIndexTimer.Tick += (_, _) => StartBackgroundIndexing();
+        _scheduledIndexTimer.Start();
+    }
+
+    internal static TimeSpan GetIndexInterval(IndexUpdateFrequency frequency) => frequency switch
+        {
+            IndexUpdateFrequency.Every15Minutes => TimeSpan.FromMinutes(15),
+            IndexUpdateFrequency.Hourly => TimeSpan.FromHours(1),
+            IndexUpdateFrequency.Every6Hours => TimeSpan.FromHours(6),
+            IndexUpdateFrequency.Daily => TimeSpan.FromDays(1),
+            _ => TimeSpan.Zero
+        };
+
+    internal static async Task WarmSearchIndexAsync(
+        ISearchIndex? searchIndex,
+        CancellationToken cancellationToken)
+    {
+        if (searchIndex is null)
+        {
+            return;
+        }
+
+        try
+        {
+            var warmupQuery = new SearchQuery(
+                "__listary_open_warmup__",
+                SearchMode.FilesAndFolders,
+                limit: 1);
+            await Task.Run(
+                    () => searchIndex.SearchAsync(warmupQuery, cancellationToken),
+                    cancellationToken)
+                .ConfigureAwait(false);
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+        }
+        catch (Exception exception)
+        {
+            Trace.TraceWarning("Search warmup failed: {0}", exception.Message);
+        }
+    }
+
+    private string? ApplyHotkeys(string searchHotkey, string dialogHotkey)
+    {
+        var service = _hotkeyService;
+        var settingsViewModel = _settingsViewModel;
+        if (service is null || settingsViewModel is null || string.IsNullOrWhiteSpace(_settingsPath))
+        {
+            return "Hotkey service is unavailable.";
+        }
+
+        var previous = settingsViewModel.Settings;
+        var result = service.Register(searchHotkey, dialogHotkey);
+        if (!result.AllRegistered)
+        {
+            service.Register(previous.SearchHotkey, previous.DialogHotkey);
+            var failed = string.Join(", ", result.FailedHotkeys.Select(item => item.Name));
+            return $"Could not register: {failed}. Check the format or conflicts.";
+        }
+
+        try
+        {
+            _settingsStore.Save(_settingsPath, previous.WithHotkeys(searchHotkey, dialogHotkey));
+            _activeSettings = previous.WithHotkeys(searchHotkey, dialogHotkey);
+            return null;
+        }
+        catch (Exception exception) when (exception is IOException or UnauthorizedAccessException)
+        {
+            service.Register(previous.SearchHotkey, previous.DialogHotkey);
+            return $"Could not save hotkeys: {exception.Message}";
+        }
     }
 
     internal static Task InvokeOnDispatcherAsync(Dispatcher dispatcher, Action action)
@@ -307,13 +602,9 @@ public partial class App : Application
             () => CreateExplorerFallbackCandidates(explorerTracker));
     }
 
-    internal static IReadOnlyList<ICustomDialogAdapter> CreateDefaultCustomDialogAdapters()
-    {
-        return new ICustomDialogAdapter[]
-        {
-            new BlenderFileBrowserAdapter()
-        };
-    }
+    internal static IReadOnlyList<IDialogJumpPlugin> CreateDefaultDialogJumpPlugins(
+        string? pluginRoot = null) =>
+        DialogPluginLoader.LoadFromRoot(pluginRoot ?? DialogPluginLoader.DefaultPluginRoot).Plugins;
 
     internal static void StartHookQuickSwitchEnablementOnStartup(
         IHookQuickSwitchBridge? bridge,
@@ -348,12 +639,12 @@ public partial class App : Application
     {
         ArgumentNullException.ThrowIfNull(rootPaths);
 
-        var roots = new List<IndexRoot>();
+        var candidates = new List<IndexRoot>();
         foreach (var rootPath in rootPaths)
         {
             try
             {
-                roots.Add(new IndexRoot(rootPath));
+                candidates.Add(new IndexRoot(rootPath));
             }
             catch (Exception exception) when (IsInvalidIndexRootException(exception))
             {
@@ -361,7 +652,64 @@ public partial class App : Application
             }
         }
 
+        var roots = new List<IndexRoot>();
+        foreach (var candidate in candidates
+                     .DistinctBy(root => root.Path, StringComparer.OrdinalIgnoreCase)
+                     .OrderBy(root => root.Path.Length))
+        {
+            if (!roots.Any(root => IsPathWithinAnyRoot(candidate.Path, new[] { root.Path })))
+            {
+                roots.Add(candidate);
+            }
+        }
+
         return roots;
+    }
+
+    internal static IReadOnlyList<string> GetAllIndexRootPaths(AppSettings settings)
+    {
+        ArgumentNullException.ThrowIfNull(settings);
+        return settings.IndexedRoots
+            .Concat(AppSettings.GetBuiltInShortcutRoots())
+            .Where(path => !string.IsNullOrWhiteSpace(path))
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToArray();
+    }
+
+    internal static bool IsPathWithinAnyRoot(string path, IReadOnlyList<string> roots)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(path);
+        ArgumentNullException.ThrowIfNull(roots);
+
+        string normalizedPath;
+        try
+        {
+            normalizedPath = Path.TrimEndingDirectorySeparator(Path.GetFullPath(path));
+        }
+        catch (Exception exception) when (IsInvalidIndexRootException(exception))
+        {
+            return false;
+        }
+
+        foreach (var root in roots)
+        {
+            try
+            {
+                var normalizedRoot = Path.TrimEndingDirectorySeparator(Path.GetFullPath(root));
+                if (string.Equals(normalizedPath, normalizedRoot, StringComparison.OrdinalIgnoreCase) ||
+                    normalizedPath.StartsWith(
+                        normalizedRoot + Path.DirectorySeparatorChar,
+                        StringComparison.OrdinalIgnoreCase))
+                {
+                    return true;
+                }
+            }
+            catch (Exception exception) when (IsInvalidIndexRootException(exception))
+            {
+            }
+        }
+
+        return false;
     }
 
     internal static bool EnableNtfsFastIndexing(ElevatedIndexerClient? client, Action requestReindex)
@@ -390,13 +738,11 @@ public partial class App : Application
             return false;
         }
 
-        if (!client.IsAvailable)
-        {
-            return false;
-        }
-
+        // IsAvailable depends on the launch mode. A non-elevated build can
+        // only become available after UAC mode is armed, so checking it first
+        // permanently forced the NTFS volume provider onto Fallback.
         client.EnableUacElevation();
-        return true;
+        return client.IsAvailable;
     }
 
     internal static ExplorerObservationScheduler? StartPeriodicExplorerObservation(
@@ -412,7 +758,7 @@ public partial class App : Application
 
         var scheduler = new ExplorerObservationScheduler(
             explorerTracker.ObserveForegroundExplorerFolder,
-            TimeSpan.FromSeconds(2),
+            TimeSpan.FromSeconds(10),
             timerFactory);
         scheduler.Start();
         return scheduler;
@@ -492,6 +838,8 @@ public partial class App : Application
         finally
         {
             _indexingCancellation.CompleteRun(runCancellation);
+            _continuousIndexing?.NotifyReconciliationCompleted();
+            _continuousIndexing?.MarkBaselineReady();
         }
     }
 
@@ -538,7 +886,7 @@ public partial class App : Application
             return;
         }
 
-        var rootPaths = _settingsViewModel?.Settings.IndexedRoots ?? AppSettings.Defaults().IndexedRoots;
+        var rootPaths = GetAllIndexRootPaths(_activeSettings);
         var roots = CreateIndexRoots(rootPaths);
         await coordinator.IndexRootsAsync(roots, cancellationToken).ConfigureAwait(false);
     }
@@ -670,15 +1018,766 @@ public partial class App : Application
         HandleHotkeyPressed(name);
     }
 
+    private void StartGlobalTextInputCapture()
+    {
+        try
+        {
+            _globalTextInputService = new GlobalTextInputService();
+            _globalTextInputService.TextInput += OnGlobalTextInput;
+            _globalTextInputService.EscapePressed += OnGlobalEscapePressed;
+            _globalTextInputService.PointerPressed += OnGlobalPointerPressed;
+            _globalTextInputService.NavigationPressed += OnGlobalNavigationPressed;
+            _globalTextInputService.ConfirmPressed += OnGlobalConfirmPressed;
+            _globalTextInputService.EditCommandPressed += OnGlobalEditCommandPressed;
+            _globalTextInputService.ResultShortcutPressed += OnGlobalResultShortcutPressed;
+            _globalTextInputService.ExplorerMenuGesturePressed += OnExplorerMenuGesturePressed;
+            _globalTextInputService.CaptureExplorerMenuInput = true;
+            _globalTextInputService.Start();
+        }
+        catch (Exception exception) when (exception is Win32Exception or InvalidOperationException)
+        {
+            Trace.TraceWarning("Explorer type-to-search is unavailable: {0}", exception.Message);
+            if (_globalTextInputService is not null)
+            {
+                _globalTextInputService.TextInput -= OnGlobalTextInput;
+                _globalTextInputService.EscapePressed -= OnGlobalEscapePressed;
+                _globalTextInputService.PointerPressed -= OnGlobalPointerPressed;
+                _globalTextInputService.NavigationPressed -= OnGlobalNavigationPressed;
+                _globalTextInputService.ConfirmPressed -= OnGlobalConfirmPressed;
+                _globalTextInputService.EditCommandPressed -= OnGlobalEditCommandPressed;
+                _globalTextInputService.ResultShortcutPressed -= OnGlobalResultShortcutPressed;
+                _globalTextInputService.ExplorerMenuGesturePressed -= OnExplorerMenuGesturePressed;
+                _globalTextInputService.Dispose();
+                _globalTextInputService = null;
+            }
+        }
+    }
+
+    private void OnGlobalTextInput(object? sender, GlobalTextInputEventArgs input)
+    {
+        if (IsShuttingDown)
+        {
+            return;
+        }
+
+        input.Handled = ShouldConsumeGlobalTextInput(input.Host);
+
+        var scheduleDrain = false;
+        lock (_globalTextInputQueueGate)
+        {
+            _globalTextInputQueue.Enqueue(input);
+            if (!_globalTextInputDrainScheduled)
+            {
+                _globalTextInputDrainScheduled = true;
+                scheduleDrain = true;
+            }
+        }
+
+        if (scheduleDrain)
+        {
+            Dispatcher.BeginInvoke(DispatcherPriority.Input, new Action(DrainGlobalTextInputQueue));
+        }
+    }
+
+    internal static bool ShouldConsumeGlobalTextInput(GlobalTextInputHost host) =>
+        host == GlobalTextInputHost.Dialog;
+
+    private void DrainGlobalTextInputQueue()
+    {
+        while (true)
+        {
+            List<GlobalTextInputEventArgs> inputs;
+            lock (_globalTextInputQueueGate)
+            {
+                if (_globalTextInputQueue.Count == 0)
+                {
+                    _globalTextInputDrainScheduled = false;
+                    return;
+                }
+
+                inputs = new List<GlobalTextInputEventArgs>(_globalTextInputQueue.Count);
+                while (_globalTextInputQueue.TryDequeue(out var input))
+                {
+                    inputs.Add(input);
+                }
+            }
+
+            foreach (var input in CoalesceGlobalTextInputs(inputs))
+            {
+                HandleGlobalTextInput(input);
+            }
+        }
+    }
+
+    internal static IReadOnlyList<GlobalTextInputEventArgs> CoalesceGlobalTextInputs(
+        IReadOnlyList<GlobalTextInputEventArgs> inputs)
+    {
+        ArgumentNullException.ThrowIfNull(inputs);
+        if (inputs.Count == 0)
+        {
+            return [];
+        }
+
+        var coalesced = new List<GlobalTextInputEventArgs>(inputs.Count);
+        var currentWindow = inputs[0].ForegroundWindow;
+        var currentControlClass = inputs[0].FocusedControlClass;
+        var currentHost = inputs[0].Host;
+        var currentText = new StringBuilder(inputs[0].Text);
+        for (var index = 1; index < inputs.Count; index++)
+        {
+            var input = inputs[index];
+            if (input.ForegroundWindow == currentWindow &&
+                input.Host == currentHost &&
+                string.Equals(input.FocusedControlClass, currentControlClass, StringComparison.Ordinal))
+            {
+                currentText.Append(input.Text);
+                continue;
+            }
+
+            coalesced.Add(new GlobalTextInputEventArgs(currentText.ToString(), currentWindow, currentControlClass, currentHost));
+            currentWindow = input.ForegroundWindow;
+            currentControlClass = input.FocusedControlClass;
+            currentHost = input.Host;
+            currentText.Clear();
+            currentText.Append(input.Text);
+        }
+
+        coalesced.Add(new GlobalTextInputEventArgs(currentText.ToString(), currentWindow, currentControlClass, currentHost));
+        return coalesced;
+    }
+
+    private void OnGlobalEscapePressed(object? sender, GlobalEscapeInputEventArgs input)
+    {
+        if (IsShuttingDown)
+        {
+            return;
+        }
+
+        var dialogInputWindow = TryCaptureDialogQuickSwitchInput(input.ForegroundWindow);
+        Dispatcher.BeginInvoke(new Action(() => HandleGlobalEscapePressed(input, dialogInputWindow)));
+    }
+
+    private void HandleGlobalEscapePressed(
+        GlobalEscapeInputEventArgs input,
+        IntPtr dialogInputWindow)
+    {
+        _explorerQuickMenu?.CloseOpenMenu();
+
+        if (dialogInputWindow != IntPtr.Zero)
+        {
+            _quickSwitchBar?.CollapseFromDialogInput(input.ForegroundWindow);
+            return;
+        }
+
+        var searchPanel = _searchPanel;
+        switch (GetOverlayEscapeTarget(
+                    _taskManagerSearchWindow?.IsTaskManagerSearchActive == true,
+                    searchPanel?.IsVisible == true && searchPanel.IsExplorerTypeSearchActive))
+        {
+            case OverlayEscapeTarget.TaskManager:
+                _taskManagerSearchWindow!.DismissSearch();
+                break;
+            case OverlayEscapeTarget.Explorer:
+                searchPanel!.DismissExplorerSearch();
+                break;
+        }
+    }
+
+    private void OnGlobalPointerPressed(object? sender, GlobalPointerInputEventArgs input)
+    {
+        if (IsShuttingDown)
+        {
+            return;
+        }
+
+        Dispatcher.BeginInvoke(new Action(() => HandleGlobalPointerPressed(input)));
+        if (ShouldCloseResultContextMenus(input.Button))
+        {
+            Dispatcher.BeginInvoke(
+                DispatcherPriority.ContextIdle,
+                new Action(() =>
+                {
+                    _searchPanel?.CloseResultContextMenu();
+                    _quickSwitchBar?.CloseResultContextMenu();
+                }));
+        }
+    }
+
+    private void OnExplorerMenuGesturePressed(object? sender, ExplorerMenuGestureInputEventArgs input)
+    {
+        if (IsShuttingDown)
+        {
+            return;
+        }
+
+        Dispatcher.BeginInvoke(new Action(() => _ = ShowExplorerQuickMenuAsync(input)));
+    }
+
+    private async Task ShowExplorerQuickMenuAsync(ExplorerMenuGestureInputEventArgs input)
+    {
+        if (!ExplorerQuickMenuHitTest.TryGetExplorerWindow(
+                input.ScreenX,
+                input.ScreenY,
+                out var explorerWindow) ||
+            !await Task.Run(() => ExplorerQuickMenuHitTest.IsExplorerItemsBackground(input.ScreenX, input.ScreenY)))
+        {
+            return;
+        }
+
+        try
+        {
+            if (_explorerObservationScheduler is not null)
+            {
+                await _explorerObservationScheduler.RequestObservationAsync();
+            }
+
+            var candidates = _explorerTracker?.GetFolderCandidates() ?? Array.Empty<QuickSwitchFolderCandidate>();
+            var current = candidates.FirstOrDefault(candidate => candidate.WindowHandle == explorerWindow);
+            if (current is null || string.IsNullOrWhiteSpace(current.FolderPath))
+            {
+                return;
+            }
+
+            if (_explorerQuickMenu is null)
+            {
+                _explorerQuickMenu = new ExplorerQuickMenu(
+                    ShowSettingsWindow,
+                    message => _trayController?.ShowStatus($"Quick menu: {message}"));
+                _explorerQuickMenu.OpenStateChanged += OnExplorerQuickMenuOpenStateChanged;
+            }
+            _explorerQuickMenu.Show(
+                current.FolderPath,
+                candidates,
+                _activeSettings.QuickMenuEntries,
+                input.ScreenX,
+                input.ScreenY,
+                explorerWindow);
+            RefreshOverlayInputCapture();
+        }
+        catch (Exception exception) when (exception is OperationCanceledException or InvalidOperationException)
+        {
+            Trace.TraceWarning("Could not show Explorer quick menu: {0}", exception.Message);
+        }
+    }
+
+    private void ShowSettingsWindow()
+    {
+        if (MainWindow is not Window settingsWindow)
+        {
+            return;
+        }
+
+        settingsWindow.Show();
+        settingsWindow.Activate();
+    }
+
+    private void HandleGlobalPointerPressed(GlobalPointerInputEventArgs input)
+    {
+        if (_explorerQuickMenu?.IsOpen == true &&
+            !_explorerQuickMenu.ContainsScreenPoint(input.ScreenX, input.ScreenY))
+        {
+            _explorerQuickMenu.CloseOpenMenu();
+        }
+
+        if (_taskManagerSearchWindow?.IsTaskManagerSearchActive == true &&
+            !_taskManagerSearchWindow.ContainsScreenPoint(input.ScreenX, input.ScreenY))
+        {
+            _taskManagerSearchWindow.DismissSearch();
+        }
+
+        if (_quickSwitchBar?.IsDialogSearchExpanded == true &&
+            !_quickSwitchBar.ContainsScreenPoint(input.ScreenX, input.ScreenY))
+        {
+            _quickSwitchBar.Collapse();
+        }
+
+        var searchPanel = _searchPanel;
+        var explorerSearchVisible = searchPanel?.IsVisible == true && searchPanel.IsExplorerTypeSearchActive;
+        var pointerInsidePanel = explorerSearchVisible &&
+            searchPanel!.ContainsScreenPoint(input.ScreenX, input.ScreenY);
+        if (!ShouldDismissExplorerTypeSearchForPointer(explorerSearchVisible, pointerInsidePanel))
+        {
+            return;
+        }
+
+        searchPanel!.DismissExplorerSearch();
+    }
+
+    private void OnGlobalNavigationPressed(object? sender, GlobalNavigationInputEventArgs input)
+    {
+        if (IsShuttingDown)
+        {
+            return;
+        }
+
+        var dialogInputWindow = TryCaptureDialogQuickSwitchInput(input.ForegroundWindow);
+        if (dialogInputWindow != IntPtr.Zero)
+        {
+            input.Handled = true;
+            Dispatcher.BeginInvoke(new Action(() =>
+                _quickSwitchBar?.MoveSelectionFromDialogInput(
+                    input.SelectionDelta,
+                    input.ForegroundWindow)));
+            return;
+        }
+
+        // The low-level hook needs its handled decision synchronously. The immutable
+        // session reference atomically couples the active state and Explorer window.
+        // The dispatched callback rejects work queued by an older overlay session.
+        var capturedSession = _explorerNavigationCapture.TryCapture(input);
+        if (capturedSession is null)
+        {
+            return;
+        }
+
+        Dispatcher.BeginInvoke(new Action(() =>
+        {
+            var currentPanel = _searchPanel;
+            if (_explorerNavigationCapture.IsCurrent(capturedSession) &&
+                _lastExplorerTypeSearchWindow == capturedSession.ExplorerWindow &&
+                currentPanel?.IsVisible == true &&
+                currentPanel.IsExplorerTypeSearchActive)
+            {
+                currentPanel.MoveSearchSelection(input.SelectionDelta);
+            }
+            else if (_explorerNavigationCapture.IsCurrent(capturedSession) &&
+                _lastTaskManagerSearchWindow == capturedSession.ExplorerWindow &&
+                _taskManagerSearchWindow?.IsTaskManagerSearchActive == true)
+            {
+                _taskManagerSearchWindow.MoveSelection(input.SelectionDelta);
+            }
+        }));
+    }
+
+    private void OnGlobalConfirmPressed(object? sender, GlobalConfirmInputEventArgs input)
+    {
+        if (IsShuttingDown)
+        {
+            return;
+        }
+
+        var dialogInputWindow = TryCaptureDialogQuickSwitchInput(input.ForegroundWindow);
+        if (dialogInputWindow == IntPtr.Zero)
+        {
+            return;
+        }
+
+        input.Handled = true;
+        Dispatcher.BeginInvoke(new Action(() =>
+            _quickSwitchBar?.ConfirmSelectionFromDialogInput(input.ForegroundWindow)));
+    }
+
+    private void OnGlobalEditCommandPressed(object? sender, GlobalEditCommandInputEventArgs input)
+    {
+        if (IsShuttingDown)
+        {
+            return;
+        }
+
+        var dialogInputWindow = TryCaptureDialogQuickSwitchInput(input.ForegroundWindow);
+        if (dialogInputWindow != IntPtr.Zero)
+        {
+            input.Handled = true;
+            Dispatcher.BeginInvoke(new Action(() =>
+                _quickSwitchBar?.ExecuteEditCommandFromDialogInput(
+                    input.Command,
+                    input.ForegroundWindow)));
+            return;
+        }
+
+        var capturedSession = _explorerNavigationCapture.TryCapture(input);
+        if (capturedSession is null)
+        {
+            return;
+        }
+
+        Dispatcher.BeginInvoke(new Action(() =>
+        {
+            var currentPanel = _searchPanel;
+            if (_explorerNavigationCapture.IsCurrent(capturedSession) &&
+                _lastExplorerTypeSearchWindow == capturedSession.ExplorerWindow &&
+                currentPanel?.IsVisible == true &&
+                currentPanel.IsExplorerTypeSearchActive)
+            {
+                currentPanel.ExecuteExplorerSearchEditCommand(input.Command);
+            }
+            else if (_explorerNavigationCapture.IsCurrent(capturedSession) &&
+                _lastTaskManagerSearchWindow == capturedSession.ExplorerWindow &&
+                _taskManagerSearchWindow?.IsTaskManagerSearchActive == true)
+            {
+                _taskManagerSearchWindow.ExecuteEditCommand(input.Command);
+            }
+        }));
+    }
+
+    private void OnGlobalResultShortcutPressed(object? sender, GlobalResultShortcutInputEventArgs input)
+    {
+        if (IsShuttingDown)
+        {
+            return;
+        }
+
+        var dialogInputWindow = TryCaptureDialogQuickSwitchInput(input.ForegroundWindow);
+        if (dialogInputWindow != IntPtr.Zero)
+        {
+            input.Handled = true;
+            Dispatcher.BeginInvoke(new Action(() =>
+                _quickSwitchBar?.ActivateResultShortcutFromDialogInput(
+                    input.ResultIndex,
+                    input.ForegroundWindow)));
+            return;
+        }
+
+        var capturedSession = _explorerNavigationCapture.TryCapture(input);
+        if (capturedSession is null)
+        {
+            return;
+        }
+
+        Dispatcher.BeginInvoke(new Action(() =>
+        {
+            var currentPanel = _searchPanel;
+            if (_explorerNavigationCapture.IsCurrent(capturedSession) &&
+                _lastExplorerTypeSearchWindow == capturedSession.ExplorerWindow &&
+                currentPanel?.IsVisible == true &&
+                currentPanel.IsExplorerTypeSearchActive)
+            {
+                _ = currentPanel.ActivateResultShortcutAsync(input.ResultIndex);
+            }
+            else if (_explorerNavigationCapture.IsCurrent(capturedSession) &&
+                _lastTaskManagerSearchWindow == capturedSession.ExplorerWindow &&
+                _taskManagerSearchWindow?.IsTaskManagerSearchActive == true)
+            {
+                _taskManagerSearchWindow.ActivateResultShortcut(input.ResultIndex);
+            }
+        }));
+    }
+
+    private void HandleGlobalTextInput(GlobalTextInputEventArgs input)
+    {
+        if (input.Host == GlobalTextInputHost.TaskManager)
+        {
+            HandleTaskManagerTextInput(input);
+            return;
+        }
+
+        if (input.Host == GlobalTextInputHost.Dialog)
+        {
+            _quickSwitchBar?.TryAppendDialogText(input.Text, input.ForegroundWindow);
+            return;
+        }
+
+        var searchPanel = _searchPanel;
+        if (ShouldAppendExplorerTypeSearchInput(
+                input,
+                _lastExplorerTypeSearchWindow,
+                searchPanel?.IsVisible == true && searchPanel.IsExplorerTypeSearchActive))
+        {
+            searchPanel!.AppendExplorerSearchText(input.Text);
+            return;
+        }
+
+        QueueExplorerActivationAfterRefresh(input);
+    }
+
+    private void HandleTaskManagerTextInput(GlobalTextInputEventArgs input)
+    {
+        if (string.IsNullOrWhiteSpace(input.Text) ||
+            GlobalTextInputService.IsTextEntryControlClass(input.FocusedControlClass) ||
+            TaskManagerAutomationService.IsNativeTextInputFocused(input.ForegroundWindow))
+        {
+            return;
+        }
+
+        if (_taskManagerSearchWindow?.IsTaskManagerSearchActive == true &&
+            input.ForegroundWindow == _lastTaskManagerSearchWindow)
+        {
+            _taskManagerSearchWindow.AppendText(input.Text);
+            return;
+        }
+
+        if (_searchPanel?.IsExplorerTypeSearchActive == true)
+        {
+            _searchPanel.DismissExplorerSearch();
+        }
+
+        _taskManagerSearchWindow ??= CreateTaskManagerSearchWindow();
+        _lastTaskManagerSearchWindow = input.ForegroundWindow;
+        _taskManagerSearchWindow.ActivateSearch(input.Text, input.ForegroundWindow);
+        _explorerNavigationCapture.Activate(input.ForegroundWindow);
+        RefreshOverlayInputCapture();
+    }
+
+    private TaskManagerSearchWindow CreateTaskManagerSearchWindow()
+    {
+        var window = new TaskManagerSearchWindow();
+        window.SearchSessionEnded += OnTaskManagerSearchSessionEnded;
+        return window;
+    }
+
+    private void OnTaskManagerSearchSessionEnded(object? sender, EventArgs e)
+    {
+        _explorerNavigationCapture.Deactivate();
+        _lastTaskManagerSearchWindow = IntPtr.Zero;
+        RefreshOverlayInputCapture();
+    }
+
+    private void QueueExplorerActivationAfterRefresh(GlobalTextInputEventArgs input)
+    {
+        _pendingExplorerActivationInputs.Add(input);
+        if (_explorerActivationRefreshPending)
+        {
+            return;
+        }
+
+        _explorerActivationRefreshPending = true;
+        var refreshTask = _explorerObservationScheduler?.RequestObservationAsync() ?? Task.CompletedTask;
+        _ = ReplayExplorerActivationInputsAsync(refreshTask);
+    }
+
+    private async Task ReplayExplorerActivationInputsAsync(Task refreshTask)
+    {
+        try
+        {
+            await refreshTask;
+        }
+        catch (OperationCanceledException)
+        {
+            _pendingExplorerActivationInputs.Clear();
+            _explorerActivationRefreshPending = false;
+            return;
+        }
+        catch (Exception exception) when (exception is not OperationCanceledException)
+        {
+            Trace.TraceWarning("Could not refresh Explorer before type-to-search: {0}", exception.Message);
+        }
+
+        if (IsShuttingDown)
+        {
+            _pendingExplorerActivationInputs.Clear();
+            _explorerActivationRefreshPending = false;
+            return;
+        }
+
+        var inputs = CoalesceGlobalTextInputs(_pendingExplorerActivationInputs.ToArray());
+        _pendingExplorerActivationInputs.Clear();
+        _explorerActivationRefreshPending = false;
+        foreach (var input in inputs)
+        {
+            ActivateOrAppendExplorerTypeSearchFromSnapshot(input);
+        }
+    }
+
+    private void ActivateOrAppendExplorerTypeSearchFromSnapshot(GlobalTextInputEventArgs input)
+    {
+        var searchPanel = _searchPanel;
+        if (ShouldAppendExplorerTypeSearchInput(
+                input,
+                _lastExplorerTypeSearchWindow,
+                searchPanel?.IsVisible == true && searchPanel.IsExplorerTypeSearchActive))
+        {
+            searchPanel!.AppendExplorerSearchText(input.Text);
+            return;
+        }
+
+        var request = TryCreateExplorerTypeSearchRequest(input, _explorerTracker);
+        if (request is not null)
+        {
+            if (searchPanel is null)
+            {
+                return;
+            }
+
+            if (_taskManagerSearchWindow?.IsTaskManagerSearchActive == true)
+            {
+                _taskManagerSearchWindow.DismissSearch();
+            }
+
+            _lastExplorerTypeSearchWindow = request.ExplorerWindow;
+            searchPanel.ActivateExplorerSearch(
+                request.InitialQuery,
+                request.CurrentFolder,
+                request.ExplorerWindow);
+            _explorerNavigationCapture.Activate(request.ExplorerWindow);
+            RefreshOverlayInputCapture();
+            return;
+        }
+    }
+
+    private void OnExplorerSearchSessionEnded(object? sender, EventArgs e)
+    {
+        _explorerNavigationCapture.Deactivate();
+        _lastExplorerTypeSearchWindow = IntPtr.Zero;
+        RefreshOverlayInputCapture();
+    }
+
+    private void OnExplorerQuickMenuOpenStateChanged(object? sender, EventArgs e) =>
+        RefreshOverlayInputCapture();
+
+    private void OnResultContextMenuOpenStateChanged(object? sender, EventArgs e) =>
+        RefreshOverlayInputCapture();
+
+    private void OnQuickSwitchBarAttachmentChanged(object? sender, EventArgs e) =>
+        RefreshOverlayInputCapture();
+
+    private void OnQuickSwitchBarInputCaptureStateChanged(object? sender, EventArgs e) =>
+        RefreshOverlayInputCapture();
+
+    private void RefreshOverlayInputCapture()
+    {
+        var dialogInputWindow = _quickSwitchBar?.IsDialogSearchExpanded == true
+            ? _quickSwitchBar.AnchorWindow
+            : IntPtr.Zero;
+        Interlocked.Exchange(ref _activeDialogQuickSwitchInputWindow, dialogInputWindow);
+        if (_globalTextInputService is not null)
+        {
+            _globalTextInputService.DialogInputWindow =
+                _quickSwitchBar?.IsAttached == true
+                    ? _quickSwitchBar.AnchorWindow
+                    : IntPtr.Zero;
+            _globalTextInputService.CaptureOverlayInput = ShouldCaptureOverlayInput(
+                dialogInputWindow != IntPtr.Zero,
+                _explorerQuickMenu?.IsOpen == true,
+                _taskManagerSearchWindow?.IsTaskManagerSearchActive == true,
+                _searchPanel?.IsResultContextMenuOpen == true,
+                _searchPanel?.IsVisible == true && _searchPanel.IsExplorerTypeSearchActive);
+        }
+    }
+
+    internal static bool ShouldCaptureOverlayInput(
+        bool dialogQuickSwitchExpanded,
+        bool explorerQuickMenuOpen,
+        bool taskManagerSearchActive,
+        bool resultContextMenuOpen,
+        bool explorerTypeSearchActive) =>
+        dialogQuickSwitchExpanded ||
+        explorerQuickMenuOpen ||
+        taskManagerSearchActive ||
+        resultContextMenuOpen ||
+        explorerTypeSearchActive;
+
+    private IntPtr TryCaptureDialogQuickSwitchInput(IntPtr foregroundWindow)
+    {
+        var dialogInputWindow = Interlocked.CompareExchange(
+            ref _activeDialogQuickSwitchInputWindow,
+            IntPtr.Zero,
+            IntPtr.Zero);
+        return ShouldHandleDialogQuickSwitchInput(
+                foregroundWindow,
+                dialogInputWindow,
+                _quickSwitchBar?.WindowHandle ?? IntPtr.Zero)
+            ? dialogInputWindow
+            : IntPtr.Zero;
+    }
+
+    internal static bool ShouldHandleDialogQuickSwitchInput(
+        IntPtr foregroundWindow,
+        IntPtr activeDialogInputWindow,
+        IntPtr quickSwitchWindow = default) =>
+        activeDialogInputWindow != IntPtr.Zero &&
+        ((quickSwitchWindow != IntPtr.Zero && foregroundWindow == quickSwitchWindow) ||
+            GlobalTextInputService.IsConfiguredDialogInputWindow(
+                foregroundWindow,
+                activeDialogInputWindow));
+
+    internal static bool ShouldAppendExplorerTypeSearchInput(
+        GlobalTextInputEventArgs input,
+        IntPtr activeExplorerWindow,
+        bool explorerSearchPanelVisible)
+    {
+        ArgumentNullException.ThrowIfNull(input);
+        return explorerSearchPanelVisible
+            && activeExplorerWindow != IntPtr.Zero
+            && input.ForegroundWindow == activeExplorerWindow
+            && !string.IsNullOrWhiteSpace(input.Text)
+            && !GlobalTextInputService.IsTextEntryControlClass(input.FocusedControlClass);
+    }
+
+    internal static bool ShouldDismissExplorerTypeSearch(
+        GlobalEscapeInputEventArgs input,
+        IntPtr activeExplorerWindow,
+        bool explorerSearchPanelVisible)
+    {
+        ArgumentNullException.ThrowIfNull(input);
+        return explorerSearchPanelVisible
+            && activeExplorerWindow != IntPtr.Zero
+            && input.ForegroundWindow == activeExplorerWindow
+            && !GlobalTextInputService.IsTextEntryControlClass(input.FocusedControlClass);
+    }
+
+    internal static bool ShouldDismissExplorerTypeSearchForPointer(
+        bool explorerSearchPanelVisible,
+        bool pointerInsidePanel) =>
+        explorerSearchPanelVisible && !pointerInsidePanel;
+
+    internal static bool ShouldCloseResultContextMenus(GlobalPointerButton button) =>
+        button != GlobalPointerButton.Right;
+
+    internal static OverlayEscapeTarget GetOverlayEscapeTarget(
+        bool taskManagerSearchActive,
+        bool explorerSearchActive) =>
+        taskManagerSearchActive
+            ? OverlayEscapeTarget.TaskManager
+            : explorerSearchActive
+                ? OverlayEscapeTarget.Explorer
+                : OverlayEscapeTarget.None;
+
+    internal static bool ShouldHandleExplorerTypeSearchNavigation(
+        GlobalNavigationInputEventArgs input,
+        IntPtr activeExplorerWindow,
+        bool explorerSearchPanelVisible)
+    {
+        ArgumentNullException.ThrowIfNull(input);
+        return explorerSearchPanelVisible
+            && activeExplorerWindow != IntPtr.Zero
+            && input.ForegroundWindow == activeExplorerWindow
+            && !GlobalTextInputService.IsTextEntryControlClass(input.FocusedControlClass);
+    }
+
+    internal static ExplorerTypeSearchRequest? TryCreateExplorerTypeSearchRequest(
+        GlobalTextInputEventArgs input,
+        IQuickSwitchWindowProvider? explorerWindowProvider)
+    {
+        ArgumentNullException.ThrowIfNull(input);
+        if (explorerWindowProvider is null
+            || string.IsNullOrWhiteSpace(input.Text)
+            || GlobalTextInputService.IsTextEntryControlClass(input.FocusedControlClass))
+        {
+            return null;
+        }
+
+        var provider = explorerWindowProvider;
+        var candidate = provider
+            .GetFolderCandidates()
+            .FirstOrDefault(item =>
+                item.IsForeground
+                && item.WindowHandle == input.ForegroundWindow
+                && !string.IsNullOrWhiteSpace(item.FolderPath));
+        return candidate is null
+            ? null
+            : new ExplorerTypeSearchRequest(input.Text, candidate.FolderPath, candidate.WindowHandle);
+    }
+
     private void HandleHotkeyPressed(string name)
     {
         if (IsSearchHotkey(name))
         {
+            if (_taskManagerSearchWindow?.IsTaskManagerSearchActive == true)
+            {
+                _taskManagerSearchWindow.DismissSearch();
+            }
             if (_searchPanel is not null)
             {
                 if (GetSearchHotkeyPanelAction(_searchPanel.IsVisible) == SearchHotkeyPanelAction.Hide)
                 {
-                    _searchPanel.Hide();
+                    if (_searchPanel.IsExplorerTypeSearchActive)
+                    {
+                        _searchPanel.DismissExplorerSearch();
+                    }
+                    else
+                    {
+                        _searchPanel.Hide();
+                    }
                 }
                 else
                 {
@@ -702,42 +1801,255 @@ public partial class App : Application
 
     private async Task HandleDialogHotkeyAsync()
     {
-        var capturedDialog = await TryCaptureHookDialogAsync(
-            _hookQuickSwitchBridge,
-            CancellationToken.None);
-        var dialogFolderActivations = CreateDialogFolderActivations(
-            capturedDialog,
-            JumpDialogToFolderAsync,
-            JumpDialogToFolderAsync);
-        var candidates = ObserveQuickSwitchFolderCandidates(_quickSwitchWindowProvider);
-        DialogJumpResult? directJumpResult = null;
-        if (await TryJumpToFirstQuickSwitchFolderAsync(
-                candidates,
-                dialogFolderActivations.Direct,
-                result => directJumpResult = result,
-                CancellationToken.None))
+        using var metrics = PerformanceMetrics.Begin("quick_switch.hotkey");
+        try
         {
-            if (directJumpResult is not null)
+            DialogAttachmentTarget? capturedDialog;
+            using (PerformanceMetrics.MeasureStage("hook.capture_dialog"))
             {
-                ReportDirectDialogJumpStatus(
-                    directJumpResult,
-                    result => _searchPanel?.ReportDialogJumpResult(result),
-                    message => _trayController?.ShowStatus(message));
+                capturedDialog = await TryCaptureDialogTargetAsync(CancellationToken.None);
             }
 
+            var dialogFolderActivations = CreateDialogFolderActivationsForTarget(capturedDialog);
+            IReadOnlyList<QuickSwitchFolderCandidate> candidates;
+            using (PerformanceMetrics.MeasureStage("quick_switch.collect_candidates"))
+            {
+                if (_explorerObservationScheduler is not null)
+                {
+                    await _explorerObservationScheduler.RequestObservationAsync();
+                }
+
+                candidates = ObserveQuickSwitchFolderCandidates(_quickSwitchWindowProvider);
+            }
+
+            PerformanceMetrics.SetCounter("candidate_count", candidates.Count);
+            DialogJumpResult? directJumpResult = null;
+            using (PerformanceMetrics.MeasureStage("quick_switch.direct_jump"))
+            {
+                var jumped = await TryJumpToFirstQuickSwitchFolderAsync(
+                    candidates,
+                    dialogFolderActivations.Direct,
+                    result => directJumpResult = result,
+                    CancellationToken.None);
+                if (jumped)
+                {
+                    if (directJumpResult is not null)
+                    {
+                        ReportDirectDialogJumpStatus(
+                            directJumpResult,
+                            result => _quickSwitchBar?.ReportDialogJumpResult(result),
+                            message => _trayController?.ShowStatus(message));
+                    }
+
+                    metrics.Complete("success", candidates.Count);
+                    return;
+                }
+            }
+
+            if (_quickSwitchBar?.IsAttached == true)
+            {
+                _quickSwitchBar.Expand();
+            }
+            else if (_quickSwitchBar is not null)
+            {
+                await _quickSwitchBar.AttachAsync(
+                    candidates,
+                    dialogFolderActivations.Panel,
+                    capturedDialog?.WindowHandle ?? IntPtr.Zero);
+                _quickSwitchBar.Expand();
+            }
+
+            metrics.Complete("no_direct_target", candidates.Count);
+        }
+        catch (Exception exception)
+        {
+            metrics.Complete("failed");
+            Trace.TraceError(exception.ToString());
+            _trayController?.ShowStatus($"Could not open Quick Switch: {exception.Message}");
+        }
+    }
+
+    private void StartDialogAttachmentMonitoring()
+    {
+        if (_dialogAttachmentTimer is not null)
+        {
             return;
         }
 
-        await ActivateQuickSwitchFolderSearchWithDirectJumpStatusAsync(
-            candidates,
-            directJumpResult,
-            folderCandidates => _searchPanel is null
-                ? Task.CompletedTask
-                : _searchPanel.ActivateQuickSwitchFolderSearchAsync(
-                    folderCandidates,
-                    dialogFolderActivations.Panel),
-            result => _searchPanel?.ReportDialogJumpResult(result),
-            message => _trayController?.ShowStatus(message));
+        _dialogAttachmentTimer = new DispatcherTimer(DispatcherPriority.Background)
+        {
+            Interval = IdleDialogProbeInterval
+        };
+        _dialogAttachmentTimer.Tick += OnDialogAttachmentTick;
+        _dialogAttachmentTimer.Start();
+    }
+
+    private void StartForegroundObservationMonitoring()
+    {
+        if (_foregroundObservationTimer is not null)
+        {
+            return;
+        }
+
+        _lastObservedForegroundWindow = GetForegroundWindow();
+        _foregroundObservationTimer = new DispatcherTimer(DispatcherPriority.Background)
+        {
+            Interval = TimeSpan.FromMilliseconds(150)
+        };
+        _foregroundObservationTimer.Tick += OnForegroundObservationTick;
+        _foregroundObservationTimer.Start();
+    }
+
+    private void StopForegroundObservationMonitoring()
+    {
+        if (_foregroundObservationTimer is null)
+        {
+            return;
+        }
+
+        _foregroundObservationTimer.Tick -= OnForegroundObservationTick;
+        _foregroundObservationTimer.Stop();
+        _foregroundObservationTimer = null;
+    }
+
+    private void OnForegroundObservationTick(object? sender, EventArgs e)
+    {
+        var foregroundWindow = GetForegroundWindow();
+        if (foregroundWindow == IntPtr.Zero || foregroundWindow == _lastObservedForegroundWindow)
+        {
+            return;
+        }
+
+        _lastObservedForegroundWindow = foregroundWindow;
+        _ = _explorerObservationScheduler?.RequestObservationAsync();
+    }
+
+    private void StopDialogAttachmentMonitoring()
+    {
+        if (_dialogAttachmentTimer is null)
+        {
+            return;
+        }
+
+        _dialogAttachmentTimer.Tick -= OnDialogAttachmentTick;
+        _dialogAttachmentTimer.Stop();
+        _dialogAttachmentTimer = null;
+    }
+
+    private async void OnDialogAttachmentTick(object? sender, EventArgs e)
+    {
+        if (_dialogAttachmentProbeRunning || IsShuttingDown)
+        {
+            return;
+        }
+
+        var bar = _quickSwitchBar;
+        if (ShouldDetachDialogAttachment(
+                bar?.IsAttached == true,
+                bar?.IsAnchorWindowAlive == true))
+        {
+            SetDialogProbeInterval(IdleDialogProbeInterval);
+            _attachedDialogId = null;
+            bar!.Detach();
+            return;
+        }
+
+        if (ShouldSkipDialogProbeWhileBarActive(
+                bar?.IsAttached == true,
+                bar?.IsActive == true,
+                bar?.IsAnchorWindowAvailable == true))
+        {
+            SetDialogProbeInterval(AttachedDialogProbeInterval);
+            bar!.Reposition();
+            return;
+        }
+
+        _dialogAttachmentProbeRunning = true;
+        try
+        {
+            var dialog = await TryCaptureDialogTargetAsync(_shutdownCancellation.Token);
+            if (dialog is null)
+            {
+                if (ShouldRetainDialogAttachmentOnProbeMiss(
+                        bar?.IsAttached == true,
+                        bar?.IsAnchorWindowAvailable == true))
+                {
+                    SetDialogProbeInterval(AttachedDialogProbeInterval);
+                    bar!.Reposition();
+                    return;
+                }
+
+                SetDialogProbeInterval(IdleDialogProbeInterval);
+                _attachedDialogId = null;
+                bar?.Detach();
+                return;
+            }
+
+            if (string.Equals(_attachedDialogId, dialog.Id, StringComparison.Ordinal) &&
+                bar?.IsAttached == true)
+            {
+                SetDialogProbeInterval(AttachedDialogProbeInterval);
+                bar.Reposition();
+                return;
+            }
+
+            var candidates = ObserveQuickSwitchFolderCandidates(_quickSwitchWindowProvider);
+            var activations = CreateDialogFolderActivationsForTarget(dialog);
+            var automaticFolder = _explorerTracker?.GetRecentlyObservedFolder(TimeSpan.FromSeconds(6));
+            if (!string.IsNullOrWhiteSpace(automaticFolder))
+            {
+                try
+                {
+                    await activations.Direct(automaticFolder, _shutdownCancellation.Token);
+                }
+                catch (Exception exception) when (exception is not OperationCanceledException)
+                {
+                    Trace.TraceWarning("Could not automatically jump the dialog: {0}", exception.Message);
+                }
+            }
+
+            if (bar is not null)
+            {
+                await bar.AttachAsync(candidates, activations.Panel, dialog.WindowHandle);
+                _attachedDialogId = dialog.Id;
+                SetDialogProbeInterval(AttachedDialogProbeInterval);
+            }
+        }
+        catch (OperationCanceledException) when (_shutdownCancellation.IsCancellationRequested)
+        {
+        }
+        catch (Exception exception)
+        {
+            Trace.TraceError(exception.ToString());
+        }
+        finally
+        {
+            _dialogAttachmentProbeRunning = false;
+        }
+    }
+
+    internal static bool ShouldRetainDialogAttachmentOnProbeMiss(
+        bool isAttached,
+        bool anchorWindowAvailable) =>
+        isAttached && anchorWindowAvailable;
+
+    internal static bool ShouldDetachDialogAttachment(
+        bool isAttached,
+        bool anchorWindowAlive) =>
+        isAttached && !anchorWindowAlive;
+
+    internal static bool ShouldSkipDialogProbeWhileBarActive(
+        bool isAttached,
+        bool barIsActive,
+        bool anchorWindowAvailable) =>
+        isAttached && barIsActive && anchorWindowAvailable;
+
+    private void SetDialogProbeInterval(TimeSpan interval)
+    {
+        if (_dialogAttachmentTimer is not null && _dialogAttachmentTimer.Interval != interval)
+        {
+            _dialogAttachmentTimer.Interval = interval;
+        }
     }
 
     internal static async Task<HookDialogContext?> TryCaptureHookDialogAsync(
@@ -764,6 +2076,41 @@ public partial class App : Application
         }
     }
 
+    private async Task<DialogAttachmentTarget?> TryCaptureDialogTargetAsync(
+        CancellationToken cancellationToken)
+    {
+        var target = _dialogBridge is null
+            ? null
+            : await _dialogBridge.TryCaptureActiveTargetAsync(cancellationToken).ConfigureAwait(false);
+        if (_e2eControlOptions is not null && target is NativeHookDialogTarget nativeTarget)
+        {
+            Volatile.Write(ref _lastE2eHookDialog, nativeTarget.Dialog);
+        }
+        return target is null
+            ? null
+            : new DialogAttachmentTarget(target.Id, target.WindowHandle, target);
+    }
+
+    private (
+        Func<string, CancellationToken, Task<DialogJumpResult>> Direct,
+        Func<string, CancellationToken, Task<DialogJumpResult>> Panel) CreateDialogFolderActivationsForTarget(
+        DialogAttachmentTarget? target)
+    {
+        if (target is not null)
+        {
+            Func<string, CancellationToken, Task<DialogJumpResult>> capturedActivation =
+                (folderPath, cancellationToken) =>
+                    JumpDialogToFolderAsync(target.Target, folderPath, cancellationToken);
+            return (capturedActivation, capturedActivation);
+        }
+
+        Func<string, CancellationToken, Task<DialogJumpResult>> unavailable = (_, _) =>
+            Task.FromResult(new DialogJumpResult(
+                DialogJumpStatus.Failed,
+                "No native-hook or dialog-plugin target was captured."));
+        return (unavailable, unavailable);
+    }
+
     internal static (
         Func<string, CancellationToken, Task<DialogJumpResult>> Direct,
         Func<string, CancellationToken, Task<DialogJumpResult>> Panel) CreateDialogFolderActivations(
@@ -774,11 +2121,11 @@ public partial class App : Application
         ArgumentNullException.ThrowIfNull(activeDialogActivation);
         ArgumentNullException.ThrowIfNull(capturedDialogActivation);
 
-        var panelActivation = capturedDialog is null
+        var capturedActivation = capturedDialog is null
             ? activeDialogActivation
             : (folderPath, cancellationToken) =>
                 capturedDialogActivation(capturedDialog, folderPath, cancellationToken);
-        return (activeDialogActivation, panelActivation);
+        return (capturedActivation, capturedActivation);
     }
 
     internal static IReadOnlyList<QuickSwitchFolderCandidate> ObserveQuickSwitchFolderCandidates(
@@ -922,14 +2269,6 @@ public partial class App : Application
 
         if (result.Status == DialogJumpStatus.Success)
         {
-            if (result.IsDegradedSuccess)
-            {
-                showStatus(
-                    string.IsNullOrWhiteSpace(result.Message)
-                        ? "Dialog folder changed."
-                        : result.Message);
-            }
-
             return;
         }
 
@@ -949,6 +2288,21 @@ public partial class App : Application
     }
 
     private async Task<DialogJumpResult> JumpDialogToFolderAsync(
+        DialogJumpTarget target,
+        string folderPath,
+        CancellationToken cancellationToken)
+    {
+        var dialogBridge = _dialogBridge;
+        var result = await (dialogBridge is null
+            ? Task.FromResult(new DialogJumpResult(DialogJumpStatus.Failed, "Dialog integration is not available."))
+            : dialogBridge.JumpToFolderAsync(target, folderPath, cancellationToken)).ConfigureAwait(false);
+        return await RecordSuccessfulDialogUsageAsync(
+            result,
+            folderPath,
+            _searchIndex).ConfigureAwait(false);
+    }
+
+    private async Task<DialogJumpResult> JumpDialogToFolderAsync(
         HookDialogContext dialog,
         string folderPath,
         CancellationToken cancellationToken)
@@ -957,6 +2311,21 @@ public partial class App : Application
         var result = await (dialogBridge is null
             ? Task.FromResult(new DialogJumpResult(DialogJumpStatus.Failed, "Dialog integration is not available."))
             : dialogBridge.JumpToFolderAsync(dialog, folderPath, cancellationToken)).ConfigureAwait(false);
+        return await RecordSuccessfulDialogUsageAsync(
+            result,
+            folderPath,
+            _searchIndex).ConfigureAwait(false);
+    }
+
+    private async Task<DialogJumpResult> JumpDialogToFolderAsync(
+        IntPtr dialogWindow,
+        string folderPath,
+        CancellationToken cancellationToken)
+    {
+        var dialogBridge = _dialogBridge;
+        var result = await (dialogBridge is null
+            ? Task.FromResult(new DialogJumpResult(DialogJumpStatus.Failed, "Dialog integration is not available."))
+            : dialogBridge.JumpToFolderAsync(dialogWindow, folderPath, cancellationToken)).ConfigureAwait(false);
         return await RecordSuccessfulDialogUsageAsync(
             result,
             folderPath,
@@ -996,14 +2365,34 @@ public partial class App : Application
         return string.Equals(name, "Dialog", StringComparison.OrdinalIgnoreCase) ||
             string.Equals(name, "Ctrl+G", StringComparison.OrdinalIgnoreCase);
     }
+
+    [DllImport("user32.dll")]
+    private static extern IntPtr GetForegroundWindow();
 }
 
 internal sealed record HotkeyStartupDecision(bool ShouldContinue, string? Message, MessageBoxImage Image);
+
+internal sealed record DialogAttachmentTarget(
+    string Id,
+    IntPtr WindowHandle,
+    DialogJumpTarget Target);
+
+internal sealed record ExplorerTypeSearchRequest(
+    string InitialQuery,
+    string CurrentFolder,
+    IntPtr ExplorerWindow);
 
 internal enum SearchHotkeyPanelAction
 {
     Activate,
     Hide
+}
+
+internal enum OverlayEscapeTarget
+{
+    None,
+    TaskManager,
+    Explorer
 }
 
 internal sealed class AppStartupException : Exception

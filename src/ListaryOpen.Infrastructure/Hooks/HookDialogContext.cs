@@ -9,4 +9,6 @@ public sealed record HookDialogContext(
     string ProcessName,
     string ClassName,
     string Title,
-    DateTimeOffset ObservedAt);
+    DateTimeOffset ObservedAt,
+    bool FirefoxFileDialogUtility = false,
+    bool PreloadConfirmedBeforeDialog = false);

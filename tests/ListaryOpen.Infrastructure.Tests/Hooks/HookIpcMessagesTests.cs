@@ -81,6 +81,17 @@ public sealed class HookIpcMessagesTests
     }
 
     [Fact]
+    public void GracefulShutdownCommandRoundTrips()
+    {
+        var command = HookIpcEnvelope.Command(new HookShutdownCommand());
+
+        var roundTrip = HookIpcSerializer.Deserialize(HookIpcSerializer.Serialize(command));
+
+        Assert.Equal("Shutdown", roundTrip.MessageType);
+        Assert.IsType<HookShutdownCommand>(roundTrip.Payload);
+    }
+
+    [Fact]
     public void GetActiveDialogCommandRoundTrips()
     {
         var command = HookIpcEnvelope.Command(new HookActiveDialogQuery());
@@ -97,7 +108,7 @@ public sealed class HookIpcMessagesTests
     public void ActiveDialogDeserializesFields()
     {
         var json = """
-            {"version":1,"messageType":"ActiveDialog","payload":{"dialogId":"dialog-1","windowHandle":123456,"processId":42,"threadId":84,"architecture":"x64","processName":"notepad.exe","className":"#32770","title":"Open"}}
+            {"version":1,"messageType":"ActiveDialog","payload":{"dialogId":"dialog-1","windowHandle":123456,"processId":42,"threadId":84,"architecture":"x64","processName":"firefox.exe","className":"#32770","title":"Open","firefoxFileDialogUtility":true,"preloadConfirmedBeforeDialog":true}}
             """;
 
         var roundTrip = HookIpcSerializer.Deserialize(json);
@@ -108,9 +119,35 @@ public sealed class HookIpcMessagesTests
         Assert.Equal(42u, payload.ProcessId);
         Assert.Equal(84u, payload.ThreadId);
         Assert.Equal("x64", payload.Architecture);
-        Assert.Equal("notepad.exe", payload.ProcessName);
+        Assert.Equal("firefox.exe", payload.ProcessName);
         Assert.Equal("#32770", payload.ClassName);
         Assert.Equal("Open", payload.Title);
+        Assert.True(payload.FirefoxFileDialogUtility);
+        Assert.True(payload.PreloadConfirmedBeforeDialog);
+    }
+
+    [Fact]
+    public void ActiveDialogWithoutFirefoxUtilityProofFieldIsRejected()
+    {
+        var json = """
+            {"version":1,"messageType":"ActiveDialog","payload":{"dialogId":"dialog-1","windowHandle":123456,"processId":42,"threadId":84,"architecture":"x64","processName":"firefox.exe","className":"#32770","title":"Open","preloadConfirmedBeforeDialog":true}}
+            """;
+
+        var exception = Assert.Throws<InvalidOperationException>(() => HookIpcSerializer.Deserialize(json));
+
+        Assert.Contains("firefoxFileDialogUtility", exception.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void ActiveDialogWithoutPrecaptureTimingProofFieldIsRejected()
+    {
+        var json = """
+            {"version":1,"messageType":"ActiveDialog","payload":{"dialogId":"dialog-1","windowHandle":123456,"processId":42,"threadId":84,"architecture":"x64","processName":"firefox.exe","className":"#32770","title":"Open","firefoxFileDialogUtility":true}}
+            """;
+
+        var exception = Assert.Throws<InvalidOperationException>(() => HookIpcSerializer.Deserialize(json));
+
+        Assert.Contains("preloadConfirmedBeforeDialog", exception.Message, StringComparison.Ordinal);
     }
 
     [Fact]

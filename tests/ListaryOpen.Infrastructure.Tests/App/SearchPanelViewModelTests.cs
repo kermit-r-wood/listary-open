@@ -3,6 +3,7 @@ using ListaryOpen.App.Search;
 using ListaryOpen.App.ViewModels;
 using ListaryOpen.Core.Indexing;
 using ListaryOpen.Core.Search;
+using ListaryOpen.Core.Settings;
 using ListaryOpen.Infrastructure.Dialog;
 using ListaryOpen.Infrastructure.Windows;
 
@@ -10,6 +11,432 @@ namespace ListaryOpen.Infrastructure.Tests.App;
 
 public sealed class SearchPanelViewModelTests
 {
+    [Fact]
+    public async Task ExactQuickLaunchRunsAfterInputStabilizes()
+    {
+        var executor = new RecordingQuickLaunchExecutor();
+        var entry = new QuickLaunchEntry(Guid.NewGuid().ToString("N"), "note", "Notepad", "notepad.exe");
+        var viewModel = new SearchPanelViewModel(
+            new RecordingSearchIndex(Array.Empty<SearchResult>()),
+            _ => null,
+            _ => true,
+            _ => DateTimeOffset.UtcNow,
+            new RecordingActivationService(),
+            DialogJumpNotConfiguredAsync,
+            TimeSpan.Zero,
+            quickLaunchEntries: () => new[] { entry },
+            quickLaunchExecutor: executor);
+        var executed = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        viewModel.QuickLaunchExecuted += (_, _) => executed.TrySetResult();
+
+        viewModel.QueryText = "NoTe";
+        await executed.Task.WaitAsync(TimeSpan.FromSeconds(2));
+
+        Assert.Equal(entry, Assert.Single(executor.Executed));
+    }
+
+    [Fact]
+    public async Task QuickLaunchKeywordDoesNotRunWhileUserContinuesTyping()
+    {
+        var executor = new RecordingQuickLaunchExecutor();
+        var entry = new QuickLaunchEntry(Guid.NewGuid().ToString("N"), "op", "Open tool", "tool.exe");
+        var viewModel = new SearchPanelViewModel(
+            new RecordingSearchIndex(Array.Empty<SearchResult>()),
+            _ => null,
+            _ => true,
+            _ => DateTimeOffset.UtcNow,
+            new RecordingActivationService(),
+            DialogJumpNotConfiguredAsync,
+            TimeSpan.Zero,
+            quickLaunchEntries: () => new[] { entry },
+            quickLaunchExecutor: executor);
+
+        viewModel.QueryText = "op";
+        await Task.Delay(50);
+        viewModel.QueryText = "open";
+        await Task.Delay(400);
+
+        Assert.Empty(executor.Executed);
+    }
+
+    [Fact]
+    public async Task SearchLoadsAdditionalResultPagesInFiftyItemSteps()
+    {
+        var results = Enumerable.Range(0, 120)
+            .Select(index => CreateResult($"C:\\Results\\Report-{index:D3}.txt", isDirectory: false))
+            .ToArray();
+        var searchIndex = new RecordingSearchIndex(results);
+        var viewModel = new SearchPanelViewModel(searchIndex)
+        {
+            QueryText = "report"
+        };
+
+        await viewModel.ActivateFilesAndFoldersSearchAsync();
+
+        Assert.Equal(50, viewModel.Results.Count);
+        Assert.True(viewModel.CanLoadMore);
+        Assert.Equal(50, searchIndex.ObservedQueries.Last().Limit);
+
+        await viewModel.LoadMoreAsync();
+
+        Assert.Equal(100, viewModel.Results.Count);
+        Assert.True(viewModel.CanLoadMore);
+        Assert.Equal(100, searchIndex.ObservedQueries.Last().Limit);
+
+        await viewModel.LoadMoreAsync();
+
+        Assert.Equal(120, viewModel.Results.Count);
+        Assert.False(viewModel.CanLoadMore);
+        Assert.Equal(150, searchIndex.ObservedQueries.Last().Limit);
+    }
+
+    [Fact]
+    public async Task ExplorerSearchPrioritizesCurrentFolderAndSelectsFirstResult()
+    {
+        var currentFolder = Directory.CreateTempSubdirectory("listary-open-type-search-");
+        var childFolder = Directory.CreateDirectory(Path.Combine(currentFolder.FullName, "Child"));
+        try
+        {
+            var global = CreateResult("C:\\Elsewhere\\Report.txt", isDirectory: false);
+            var descendant = CreateResult(Path.Combine(childFolder.FullName, "Report-child.txt"), isDirectory: false);
+            var direct = CreateResult(Path.Combine(currentFolder.FullName, "Report-current.txt"), isDirectory: false);
+            var index = new RecordingSearchIndex(new[] { global, descendant, direct });
+            var viewModel = new SearchPanelViewModel(
+                index,
+                _ => currentFolder.FullName,
+                _ => true,
+                _ => DateTimeOffset.UtcNow,
+                new RecordingActivationService(),
+                DialogJumpNotConfiguredAsync,
+                TimeSpan.Zero,
+                (_, _) => new[] { direct.Record });
+
+            await viewModel.ActivateExplorerSearchAsync("report", currentFolder.FullName);
+
+            Assert.Equal("report", viewModel.QueryText);
+            Assert.True(viewModel.IsExplorerTypeSearchMode);
+            Assert.Equal(
+                Path.TrimEndingDirectorySeparator(currentFolder.FullName),
+                Assert.Single(index.ObservedQueries).PreferredRoot);
+            Assert.Equal(
+                new[] { direct.Record.FullPath, descendant.Record.FullPath, global.Record.FullPath },
+                viewModel.Results.Select(result => result.Record.FullPath));
+            Assert.Equal(direct.Record.FullPath, viewModel.SelectedResult?.Record.FullPath);
+            Assert.Contains("current folder first", viewModel.StatusText, StringComparison.OrdinalIgnoreCase);
+        }
+        finally
+        {
+            currentFolder.Delete(recursive: true);
+        }
+    }
+
+    [Fact]
+    public async Task ExplorerOverlayQueryDoesNotReplaceRegularSearchQuery()
+    {
+        var currentFolder = Directory.CreateTempSubdirectory("listary-open-query-isolation-");
+        try
+        {
+            var index = new RecordingSearchIndex(Array.Empty<SearchResult>());
+            var viewModel = new SearchPanelViewModel(index)
+            {
+                QueryText = "regular query"
+            };
+
+            await viewModel.ActivateExplorerSearchAsync("overlay query", currentFolder.FullName);
+            Assert.Equal("overlay query", viewModel.QueryText);
+
+            await viewModel.ActivateFilesAndFoldersSearchAsync();
+
+            Assert.False(viewModel.IsExplorerTypeSearchMode);
+            Assert.Equal("regular query", viewModel.QueryText);
+            Assert.Equal("regular query", index.ObservedQueries.Last().NormalizedText);
+        }
+        finally
+        {
+            currentFolder.Delete(recursive: true);
+        }
+    }
+
+    [Fact]
+    public async Task ExplorerOverlayFiltersCurrentFolderBeforeIndexResultsOnlyInOverlayMode()
+    {
+        var currentFolder = Directory.CreateTempSubdirectory("listary-open-current-page-");
+        try
+        {
+            var currentFile = Path.Combine(currentFolder.FullName, "Needle-current.txt");
+            File.WriteAllText(currentFile, "test");
+            var currentDirectory = Directory.CreateDirectory(
+                Path.Combine(currentFolder.FullName, "Needle-folder"));
+            var global = CreateResult("C:\\Elsewhere\\Needle-global.txt", isDirectory: false);
+            var index = new RecordingSearchIndex(new[] { global });
+            var viewModel = new SearchPanelViewModel(index)
+            {
+                QueryText = "needle"
+            };
+
+            await viewModel.ActivateFilesAndFoldersSearchAsync();
+            Assert.Equal(new[] { global.Record.FullPath }, viewModel.Results.Select(result => result.Record.FullPath));
+
+            await viewModel.ActivateExplorerSearchAsync("needle", currentFolder.FullName);
+
+            Assert.Equal(3, viewModel.Results.Count);
+            Assert.All(
+                viewModel.Results.Take(2),
+                result => Assert.Equal(
+                    Path.TrimEndingDirectorySeparator(currentFolder.FullName),
+                    Path.TrimEndingDirectorySeparator(result.Record.ParentPath),
+                    ignoreCase: true));
+            Assert.Contains(viewModel.Results.Take(2), result => result.Record.FullPath == currentFile);
+            Assert.Contains(viewModel.Results.Take(2), result => result.Record.FullPath == currentDirectory.FullName);
+            Assert.Equal(global.Record.FullPath, viewModel.Results[2].Record.FullPath);
+        }
+        finally
+        {
+            currentFolder.Delete(recursive: true);
+        }
+    }
+
+    [Fact]
+    public async Task ExplorerOverlayPublishesCurrentFolderWhileIndexSearchIsStillPending()
+    {
+        var currentFolder = Directory.CreateTempSubdirectory("listary-open-current-preview-");
+        try
+        {
+            var currentFile = Path.Combine(currentFolder.FullName, "Needle-preview.txt");
+            File.WriteAllText(currentFile, "test");
+            var index = new BlockingSearchIndex();
+            var viewModel = new SearchPanelViewModel(index);
+
+            var activationTask = viewModel.ActivateExplorerSearchAsync("needle", currentFolder.FullName);
+            await index.WaitForSearchCountAsync(1);
+
+            using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(5));
+            while (viewModel.Results.All(result => result.Record.FullPath != currentFile))
+            {
+                await Task.Delay(10, timeout.Token);
+            }
+
+            Assert.False(activationTask.IsCompleted);
+            Assert.Equal(currentFile, viewModel.SelectedResult?.Record.FullPath);
+
+            index.Complete(Array.Empty<SearchResult>());
+            await activationTask;
+        }
+        finally
+        {
+            currentFolder.Delete(recursive: true);
+        }
+    }
+
+    [Fact]
+    public async Task ExplorerOverlayClearsStaleCurrentFolderResultsWhileIndexSearchIsPending()
+    {
+        var currentFolder = Path.GetFullPath("C:\\Current");
+        var currentRecord = FileRecord.Create(
+            Path.Combine(currentFolder, "Needle.txt"),
+            isDirectory: false,
+            sizeBytes: 0,
+            DateTimeOffset.UtcNow);
+        var index = new BlockingSearchIndex();
+        var viewModel = new SearchPanelViewModel(
+            index,
+            _ => currentFolder,
+            _ => true,
+            _ => DateTimeOffset.UtcNow,
+            new RecordingActivationService(),
+            DialogJumpNotConfiguredAsync,
+            TimeSpan.Zero,
+            (_, _) => new[] { currentRecord });
+
+        var activationTask = viewModel.ActivateExplorerSearchAsync("needle", currentFolder);
+        await index.WaitForSearchCountAsync(1);
+        await WaitUntilAsync(() => viewModel.Results.Count == 1);
+
+        viewModel.QueryText = "missing";
+        await index.WaitForSearchCountAsync(2);
+        await WaitUntilAsync(() => viewModel.Results.Count == 0);
+
+        Assert.Null(viewModel.SelectedResult);
+        Assert.Contains("No current-folder results", viewModel.StatusText, StringComparison.Ordinal);
+
+        index.Complete(Array.Empty<SearchResult>());
+        await activationTask;
+    }
+
+    [Fact]
+    public async Task ExplorerOverlayAppliesStructuredFiltersToCurrentFolderResults()
+    {
+        var currentFolder = Path.GetFullPath("C:\\Current");
+        var expected = FileRecord.Create(
+            Path.Combine(currentFolder, "Report.pdf"),
+            isDirectory: false,
+            sizeBytes: 0,
+            DateTimeOffset.UtcNow);
+        var records = new[]
+        {
+            expected,
+            FileRecord.Create(Path.Combine(currentFolder, "Report.txt"), false, 0, DateTimeOffset.UtcNow),
+            FileRecord.Create(Path.Combine(currentFolder, "Draft.pdf"), false, 0, DateTimeOffset.UtcNow),
+            FileRecord.Create("C:\\Elsewhere\\Report.pdf", false, 0, DateTimeOffset.UtcNow)
+        };
+        var viewModel = new SearchPanelViewModel(
+            new RecordingSearchIndex(Array.Empty<SearchResult>()),
+            _ => currentFolder,
+            _ => true,
+            _ => DateTimeOffset.UtcNow,
+            new RecordingActivationService(),
+            DialogJumpNotConfiguredAsync,
+            TimeSpan.Zero,
+            (_, _) => records);
+
+        await viewModel.ActivateExplorerSearchAsync("ext:pdf path:current !draft", currentFolder);
+
+        Assert.Equal(expected.FullPath, Assert.Single(viewModel.Results).Record.FullPath);
+    }
+
+    [Fact]
+    public async Task ExplorerOverlayReusesCurrentFolderSnapshotAcrossQueryChanges()
+    {
+        var currentFolder = Path.GetFullPath("C:\\Current");
+        var currentRecord = FileRecord.Create(
+            Path.Combine(currentFolder, "Needle.txt"),
+            isDirectory: false,
+            sizeBytes: 0,
+            DateTimeOffset.UtcNow);
+        var enumerationCount = 0;
+        var index = new RecordingSearchIndex(Array.Empty<SearchResult>());
+        var viewModel = new SearchPanelViewModel(
+            index,
+            _ => currentFolder,
+            _ => true,
+            _ => DateTimeOffset.UtcNow,
+            new RecordingActivationService(),
+            DialogJumpNotConfiguredAsync,
+            TimeSpan.Zero,
+            (_, _) =>
+            {
+                Interlocked.Increment(ref enumerationCount);
+                return new[] { currentRecord };
+            });
+
+        await viewModel.ActivateExplorerSearchAsync("n", currentFolder);
+        viewModel.QueryText = "ne";
+        await index.WaitForSearchCountAsync(2);
+        await WaitUntilAsync(() => viewModel.QueryText == "ne" && viewModel.Results.Count == 1);
+
+        Assert.Equal(1, Volatile.Read(ref enumerationCount));
+    }
+
+    [Fact]
+    public async Task ExplorerOverlayRefreshesExpiredCurrentFolderSnapshot()
+    {
+        var currentFolder = Path.GetFullPath("C:\\Current");
+        var enumerationCount = 0;
+        var index = new RecordingSearchIndex(Array.Empty<SearchResult>());
+        var viewModel = new SearchPanelViewModel(
+            index,
+            _ => currentFolder,
+            _ => true,
+            _ => DateTimeOffset.UtcNow,
+            new RecordingActivationService(),
+            DialogJumpNotConfiguredAsync,
+            TimeSpan.Zero,
+            (_, _) =>
+            {
+                Interlocked.Increment(ref enumerationCount);
+                return Array.Empty<FileRecord>();
+            },
+            currentFolderSnapshotLifetime: TimeSpan.FromMilliseconds(20));
+
+        await viewModel.ActivateExplorerSearchAsync("a", currentFolder);
+        await Task.Delay(50);
+        viewModel.QueryText = "ab";
+        await index.WaitForSearchCountAsync(2);
+        await WaitUntilAsync(() => Volatile.Read(ref enumerationCount) == 2);
+
+        Assert.Equal(2, Volatile.Read(ref enumerationCount));
+    }
+
+    [Fact]
+    public async Task DeactivateExplorerSearchCancelsSnapshotAndRestoresRegularQuery()
+    {
+        var currentFolder = Path.GetFullPath("C:\\Current");
+        var enumerationStarted = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var enumerationCancelled = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var index = new RecordingSearchIndex(Array.Empty<SearchResult>());
+        var viewModel = new SearchPanelViewModel(
+            index,
+            _ => currentFolder,
+            _ => true,
+            _ => DateTimeOffset.UtcNow,
+            new RecordingActivationService(),
+            DialogJumpNotConfiguredAsync,
+            TimeSpan.Zero,
+            (_, cancellationToken) =>
+            {
+                enumerationStarted.TrySetResult();
+                try
+                {
+                    cancellationToken.WaitHandle.WaitOne();
+                    cancellationToken.ThrowIfCancellationRequested();
+                    return Array.Empty<FileRecord>();
+                }
+                catch (OperationCanceledException)
+                {
+                    enumerationCancelled.TrySetResult();
+                    throw;
+                }
+            });
+
+        viewModel.QueryText = "regular";
+        await index.WaitForSearchCountAsync(1);
+        var activationTask = viewModel.ActivateExplorerSearchAsync("overlay", currentFolder);
+        await enumerationStarted.Task.WaitAsync(TimeSpan.FromSeconds(5));
+
+        viewModel.DeactivateExplorerSearch();
+
+        await enumerationCancelled.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        await activationTask;
+        Assert.False(viewModel.IsExplorerTypeSearchMode);
+        Assert.Equal("regular", viewModel.QueryText);
+        Assert.Empty(viewModel.Results);
+        Assert.Null(viewModel.SelectedResult);
+    }
+
+    [Fact]
+    public void CurrentFolderFilterChecksCancellationWhenAllEntriesAreExcluded()
+    {
+        using var cancellation = new CancellationTokenSource();
+        var enumeratedCount = 0;
+        var query = new SearchQuery("ext:pdf invoice", SearchMode.FilesAndFolders);
+
+        Assert.Throws<OperationCanceledException>(() => SearchPanelViewModel
+            .FilterCurrentFolderRecords(
+                query,
+                CancelCurrentFolderFiltering(cancellation, () => enumeratedCount++),
+                cancellation.Token)
+            .ToArray());
+
+        Assert.InRange(enumeratedCount, 8, 72);
+    }
+
+    [Fact]
+    public void RootPriorityUsesPathBoundariesAndPreservesRankingWithinGroups()
+    {
+        var root = Path.GetFullPath("C:\\Projects");
+        var firstGlobal = CreateResult("C:\\Projects-archive\\First.txt", isDirectory: false);
+        var secondDirect = CreateResult("C:\\Projects\\Second.txt", isDirectory: false);
+        var thirdDirect = CreateResult("C:\\Projects\\Third.txt", isDirectory: false);
+
+        var prioritized = SearchPanelViewModel.PrioritizeResultsForRoot(
+            new[] { firstGlobal, secondDirect, thirdDirect },
+            root);
+
+        Assert.Equal(
+            new[] { secondDirect, thirdDirect, firstGlobal },
+            prioritized);
+    }
+
     [Fact]
     public async Task ActivateSelectedAsyncOpensSelectedFileInFilesAndFoldersModeAndSetsStatus()
     {
@@ -192,10 +619,10 @@ public sealed class SearchPanelViewModelTests
     }
 
     [Fact]
-    public void ReportDialogJumpResultSurfacesFallbackSuccessMessage()
+    public void ReportDialogJumpResultSurfacesNativeHookSuccessMessage()
     {
         var viewModel = new SearchPanelViewModel(new RecordingSearchIndex(Array.Empty<SearchResult>()));
-        var message = "Dialog folder changed via fallback automation after hook Failed: Hook could not jump.";
+        var message = "Dialog folder changed through the captured native hook.";
 
         viewModel.ReportDialogJumpResult(new DialogJumpResult(DialogJumpStatus.Success, message));
 
@@ -221,8 +648,9 @@ public sealed class SearchPanelViewModelTests
         viewModel.Results.Add(result);
         viewModel.SelectedResult = result;
 
-        await viewModel.ActivateSelectedAsync();
+        var activated = await viewModel.ActivateSelectedAsync();
 
+        Assert.False(activated);
         Assert.Equal(new[] { result.Record.FullPath }, dialogActivation.Paths);
         Assert.Contains(status.ToString(), viewModel.StatusText);
         Assert.Contains(message, viewModel.StatusText);
@@ -242,8 +670,9 @@ public sealed class SearchPanelViewModelTests
         viewModel.Results.Add(result);
         viewModel.SelectedResult = result;
 
-        await viewModel.ActivateSelectedAsync();
+        var activated = await viewModel.ActivateSelectedAsync();
 
+        Assert.False(activated);
         Assert.Equal(new[] { result.Record.FullPath }, dialogActivation.Paths);
         Assert.Contains("Dialog jump failed", viewModel.StatusText);
         Assert.Contains("Dialog automation failed.", viewModel.StatusText);
@@ -364,17 +793,17 @@ public sealed class SearchPanelViewModelTests
     }
 
     [Fact]
-    public async Task QueryTextSearchesAfterTwoHundredMillisecondDefaultDelay()
+    public async Task QueryTextSearchesAfterEightyMillisecondDefaultDelay()
     {
         var index = new RecordingSearchIndex(Array.Empty<SearchResult>());
         var viewModel = new SearchPanelViewModel(index);
 
         viewModel.QueryText = "invoice";
 
-        await Task.Delay(TimeSpan.FromMilliseconds(120));
+        await Task.Delay(TimeSpan.FromMilliseconds(35));
         Assert.Empty(index.ObservedQueries);
 
-        await Task.Delay(TimeSpan.FromMilliseconds(180));
+        await Task.Delay(TimeSpan.FromMilliseconds(90));
         var query = Assert.Single(index.ObservedQueries);
         Assert.Equal("invoice", query.NormalizedText);
     }
@@ -462,6 +891,36 @@ public sealed class SearchPanelViewModelTests
     }
 
     [Fact]
+    public async Task SupersededEmptyQueryRefreshCannotOverwriteTheNextSearchResults()
+    {
+        var staleRecent = CreateResult("C:\\Old\\Recent", isDirectory: true);
+        var expected = CreateResult("C:\\Current\\Other", isDirectory: true);
+        var index = new BlockingRecentSearchIndex([expected]);
+        var viewModel = new SearchPanelViewModel(
+            index,
+            NormalizeTestFolder,
+            _ => true,
+            _ => DateTimeOffset.UtcNow,
+            new RecordingActivationService(),
+            DialogJumpNotConfiguredAsync,
+            TimeSpan.Zero);
+
+        var emptyRefresh = viewModel.ActivateQuickSwitchFolderSearchAsync(Array.Empty<QuickSwitchFolderCandidate>());
+        await index.WaitForRecentAsync();
+
+        viewModel.QueryText = "other";
+        await index.WaitForSearchAsync();
+        await WaitUntilAsync(() => viewModel.Results.Any(result => result.Record.FullPath == expected.Record.FullPath));
+
+        index.CompleteRecent([staleRecent]);
+        await emptyRefresh;
+
+        var result = Assert.Single(viewModel.Results);
+        Assert.Equal(expected.Record.FullPath, result.Record.FullPath);
+        Assert.Equal("other", viewModel.QueryText);
+    }
+
+    [Fact]
     public async Task ActivationCommandsIgnoreSelectedResultThatIsNotInCurrentResults()
     {
         var current = CreateResult("C:\\Docs\\Current.xlsx", isDirectory: false);
@@ -521,6 +980,7 @@ public sealed class SearchPanelViewModelTests
 
         viewModel.QueryText = "invoice";
         await index.WaitForSearchCountAsync(1);
+        await WaitUntilAsync(() => viewModel.StatusText == "1 result.");
         Assert.Equal("1 result.", viewModel.StatusText);
 
         viewModel.QueryText = string.Empty;
@@ -855,6 +1315,51 @@ public sealed class SearchPanelViewModelTests
     }
 
     [Fact]
+    public async Task QuickSwitchBarCanCollapseAndNormalSearchResetsIt()
+    {
+        var viewModel = new SearchPanelViewModel(new RecordingSearchIndex(Array.Empty<SearchResult>()));
+        await viewModel.ActivateQuickSwitchFolderSearchAsync(Array.Empty<QuickSwitchFolderCandidate>());
+
+        viewModel.SetQuickSwitchBarCollapsed(true);
+
+        Assert.True(viewModel.IsQuickSwitchMode);
+        Assert.True(viewModel.IsQuickSwitchBarCollapsed);
+
+        await viewModel.ActivateFilesAndFoldersSearchAsync();
+
+        Assert.False(viewModel.IsQuickSwitchMode);
+        Assert.False(viewModel.IsQuickSwitchBarCollapsed);
+    }
+
+    [Fact]
+    public async Task ResetQuickSwitchQueryStartsTheNextCollapsedSearchFromEmptyText()
+    {
+        var viewModel = new SearchPanelViewModel(new RecordingSearchIndex(Array.Empty<SearchResult>()));
+        await viewModel.ActivateQuickSwitchFolderSearchAsync(Array.Empty<QuickSwitchFolderCandidate>());
+        viewModel.QueryText = "onedrive";
+        viewModel.SelectedResult = CreateResult("C:\\Users\\test\\OneDrive", isDirectory: true);
+
+        viewModel.ResetQuickSwitchQuery();
+
+        Assert.Equal(string.Empty, viewModel.QueryText);
+        Assert.Null(viewModel.SelectedResult);
+    }
+
+    [Fact]
+    public async Task QuickSwitchCandidateAreaIsVisibleOnlyWhenResultsExist()
+    {
+        var viewModel = new SearchPanelViewModel(new RecordingSearchIndex(Array.Empty<SearchResult>()));
+        await viewModel.ActivateQuickSwitchFolderSearchAsync(Array.Empty<QuickSwitchFolderCandidate>());
+        Assert.False(viewModel.AreResultsVisible);
+
+        viewModel.Results.Add(CreateResult("C:\\Projects", isDirectory: true));
+        Assert.True(viewModel.AreResultsVisible);
+
+        viewModel.SetQuickSwitchBarCollapsed(true);
+        Assert.False(viewModel.AreResultsVisible);
+    }
+
+    [Fact]
     public async Task QuickSwitchActivationUsesSessionDialogDelegateAndFolderModeRestoresDefault()
     {
         var result = CreateResult("C:\\Docs\\Invoices", isDirectory: true);
@@ -872,8 +1377,9 @@ public sealed class SearchPanelViewModelTests
             sessionActivation.ActivateAsync);
         viewModel.Results.Add(result);
         viewModel.SelectedResult = result;
-        await viewModel.ActivateSelectedAsync();
+        var activated = await viewModel.ActivateSelectedAsync();
 
+        Assert.True(activated);
         Assert.Equal(new[] { result.Record.FullPath }, sessionActivation.Paths);
         Assert.Empty(defaultActivation.Paths);
 
@@ -984,6 +1490,26 @@ public sealed class SearchPanelViewModelTests
         while (!condition())
         {
             await Task.Delay(TimeSpan.FromMilliseconds(10), timeout.Token);
+        }
+    }
+
+    private static IEnumerable<FileRecord> CancelCurrentFolderFiltering(
+        CancellationTokenSource cancellation,
+        Action onEnumerated)
+    {
+        for (var index = 0; index < 1_000; index++)
+        {
+            onEnumerated();
+            if (index == 7)
+            {
+                cancellation.Cancel();
+            }
+
+            yield return FileRecord.Create(
+                $"C:\\Current\\Invoice-{index:D4}.txt",
+                false,
+                1,
+                DateTimeOffset.UnixEpoch);
         }
     }
 
@@ -1239,6 +1765,46 @@ public sealed class SearchPanelViewModelTests
         }
     }
 
+    private sealed class BlockingRecentSearchIndex : ISearchIndex
+    {
+        private readonly IReadOnlyList<SearchResult> _searchResults;
+        private readonly TaskCompletionSource<IReadOnlyList<SearchResult>> _recentCompletion =
+            new(TaskCreationOptions.RunContinuationsAsynchronously);
+        private readonly TaskCompletionSource _recentObserved =
+            new(TaskCreationOptions.RunContinuationsAsynchronously);
+        private readonly TaskCompletionSource _searchObserved =
+            new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        public BlockingRecentSearchIndex(IReadOnlyList<SearchResult> searchResults)
+        {
+            _searchResults = searchResults;
+        }
+
+        public Task UpsertAsync(FileRecord record, CancellationToken cancellationToken) => Task.CompletedTask;
+
+        public Task DeleteAsync(string fullPath, CancellationToken cancellationToken) => Task.CompletedTask;
+
+        public Task RecordUsageAsync(string fullPath, CancellationToken cancellationToken) => Task.CompletedTask;
+
+        public Task<IReadOnlyList<SearchResult>> GetRecentAsync(int limit, CancellationToken cancellationToken)
+        {
+            _recentObserved.TrySetResult();
+            return _recentCompletion.Task;
+        }
+
+        public Task<IReadOnlyList<SearchResult>> SearchAsync(SearchQuery query, CancellationToken cancellationToken)
+        {
+            _searchObserved.TrySetResult();
+            return Task.FromResult(_searchResults);
+        }
+
+        public void CompleteRecent(IReadOnlyList<SearchResult> results) => _recentCompletion.TrySetResult(results);
+
+        public Task WaitForRecentAsync() => _recentObserved.Task.WaitAsync(TimeSpan.FromSeconds(5));
+
+        public Task WaitForSearchAsync() => _searchObserved.Task.WaitAsync(TimeSpan.FromSeconds(5));
+    }
+
     private sealed class CancellableSearchIndex : ISearchIndex
     {
         private readonly object _lock = new();
@@ -1369,6 +1935,17 @@ public sealed class SearchPanelViewModelTests
         private static TaskCompletionSource CreateCompletionSource()
         {
             return new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        }
+    }
+
+    private sealed class RecordingQuickLaunchExecutor : IQuickLaunchExecutor
+    {
+        public List<QuickLaunchEntry> Executed { get; } = new();
+
+        public Task ExecuteAsync(QuickLaunchEntry entry)
+        {
+            Executed.Add(entry);
+            return Task.CompletedTask;
         }
     }
 }

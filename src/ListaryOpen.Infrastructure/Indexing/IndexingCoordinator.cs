@@ -15,7 +15,13 @@ public enum IndexingRunState
     Failed
 }
 
-public sealed record IndexingStatus(IndexingRunState State, string Message, int IndexedCount);
+public sealed record IndexingStatus(
+    IndexingRunState State,
+    string Message,
+    int IndexedCount,
+    string? CurrentRoot = null,
+    int CurrentRootNumber = 0,
+    int TotalRoots = 0);
 
 public sealed class IndexingCoordinator
 {
@@ -26,13 +32,15 @@ public sealed class IndexingCoordinator
     private readonly IIndexProvider _fallbackProvider;
     private readonly Func<IndexRoot, VolumeInfo> _volumeResolver;
     private readonly int _batchSize;
+    private readonly Func<FileRecord, bool> _recordFilter;
 
     public IndexingCoordinator(
         SqliteSearchIndex index,
         VolumeIndexer volumeIndexer,
         IIndexProvider fallbackProvider,
         Func<IndexRoot, VolumeInfo>? volumeResolver = null,
-        int batchSize = DefaultBatchSize)
+        int batchSize = DefaultBatchSize,
+        Func<FileRecord, bool>? recordFilter = null)
     {
         ArgumentNullException.ThrowIfNull(index);
         ArgumentNullException.ThrowIfNull(volumeIndexer);
@@ -48,6 +56,7 @@ public sealed class IndexingCoordinator
         _fallbackProvider = fallbackProvider;
         _volumeResolver = volumeResolver ?? ResolveVolume;
         _batchSize = batchSize;
+        _recordFilter = recordFilter ?? (_ => true);
     }
 
     public event EventHandler<IndexingStatus>? StatusChanged;
@@ -57,66 +66,115 @@ public sealed class IndexingCoordinator
         ArgumentNullException.ThrowIfNull(roots);
 
         var indexedCount = 0;
+        string? currentRoot = null;
+        var currentRootNumber = 0;
         var hadFailures = false;
         var hadCancellations = false;
         var retainedStaleRecords = false;
         long? indexGeneration = null;
-        RaiseStatus(IndexingRunState.Indexing, "Indexing started.", indexedCount);
-
-        foreach (var root in roots)
-        {
-            cancellationToken.ThrowIfCancellationRequested();
-
-            if (!Directory.Exists(root.Path))
-            {
-                hadFailures = true;
-                RaiseStatus(IndexingRunState.Failed, $"Root missing: {root.Path}", indexedCount);
-                continue;
-            }
-
-            try
-            {
-                indexGeneration ??= await _index.BeginIndexingRunAsync(cancellationToken).ConfigureAwait(false);
-                var provider = SelectProvider(root);
-                var result = await IndexRootWithProviderAsync(
-                    provider,
-                    root,
-                    indexedCount,
-                    indexGeneration.Value,
-                    cancellationToken).ConfigureAwait(false);
-                indexedCount += result.IndexedCount;
-                hadFailures |= result.HadFailure;
-                hadCancellations |= result.WasCanceled;
-                retainedStaleRecords |= result.RetainedStaleRecords;
-            }
-            catch (OperationCanceledException)
-            {
-                throw;
-            }
-            catch (Exception exception)
-            {
-                hadFailures = true;
-                RaiseStatus(IndexingRunState.Failed, $"Indexing failed for {root.Path}: {exception.Message}", indexedCount);
-            }
-        }
-
-        var finalState = hadFailures
-            ? IndexingRunState.Failed
-            : hadCancellations
-                ? IndexingRunState.Canceled
-                : IndexingRunState.Completed;
-        var finalMessage = hadFailures
-            ? "Indexing completed with errors."
-            : hadCancellations
-                ? "Indexing canceled."
-                : retainedStaleRecords
-                    ? "Indexing completed; stale records retained because pruning was skipped."
-                    : "Indexing completed.";
-
         RaiseStatus(
-            finalState,
-            finalMessage,
-            indexedCount);
+            IndexingRunState.Indexing,
+            roots.Count == 0 ? "No indexed roots configured." : "Preparing index...",
+            indexedCount,
+            totalRoots: roots.Count);
+
+        try
+        {
+            for (var rootIndex = 0; rootIndex < roots.Count; rootIndex++)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+
+                var root = roots[rootIndex];
+                currentRoot = root.Path;
+                currentRootNumber = rootIndex + 1;
+                RaiseStatus(
+                    IndexingRunState.Indexing,
+                    "Preparing indexed location...",
+                    indexedCount,
+                    currentRoot,
+                    currentRootNumber,
+                    roots.Count);
+
+                if (!Directory.Exists(root.Path))
+                {
+                    hadFailures = true;
+                    RaiseStatus(
+                        IndexingRunState.Failed,
+                        $"Root missing: {root.Path}",
+                        indexedCount,
+                        currentRoot,
+                        currentRootNumber,
+                        roots.Count);
+                    continue;
+                }
+
+                try
+                {
+                    indexGeneration ??= await _index.BeginIndexingRunAsync(cancellationToken).ConfigureAwait(false);
+                    var provider = SelectProvider(root);
+                    RaiseStatus(
+                        IndexingRunState.Indexing,
+                        $"Scanning with {provider.Name}...",
+                        indexedCount,
+                        currentRoot,
+                        currentRootNumber,
+                        roots.Count);
+                    var result = await IndexRootWithProviderAsync(
+                        provider,
+                        root,
+                        indexedCount,
+                        indexGeneration.Value,
+                        currentRootNumber,
+                        roots.Count,
+                        cancellationToken).ConfigureAwait(false);
+                    indexedCount += result.IndexedCount;
+                    hadFailures |= result.HadFailure;
+                    hadCancellations |= result.WasCanceled;
+                    retainedStaleRecords |= result.RetainedStaleRecords;
+                }
+                catch (OperationCanceledException)
+                {
+                    throw;
+                }
+                catch (Exception exception)
+                {
+                    hadFailures = true;
+                    RaiseStatus(
+                        IndexingRunState.Failed,
+                        $"Indexing failed for {root.Path}: {exception.Message}",
+                        indexedCount,
+                        currentRoot,
+                        currentRootNumber,
+                        roots.Count);
+                }
+            }
+
+            var finalState = hadFailures
+                ? IndexingRunState.Failed
+                : hadCancellations
+                    ? IndexingRunState.Canceled
+                    : IndexingRunState.Completed;
+            var finalMessage = hadFailures
+                ? "Indexing completed with errors."
+                : hadCancellations
+                    ? "Indexing canceled."
+                    : retainedStaleRecords
+                        ? "Indexing completed; stale records retained because pruning was skipped."
+                        : "Indexing completed.";
+
+            RaiseStatus(finalState, finalMessage, indexedCount, totalRoots: roots.Count);
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            RaiseStatus(
+                IndexingRunState.Canceled,
+                "Indexing canceled.",
+                indexedCount,
+                currentRoot,
+                currentRootNumber,
+                roots.Count);
+            throw;
+        }
     }
 
     private IIndexProvider SelectProvider(IndexRoot root)
@@ -140,11 +198,27 @@ public sealed class IndexingCoordinator
         IndexRoot root,
         int currentIndexedCount,
         long indexGeneration,
+        int currentRootNumber,
+        int totalRoots,
         CancellationToken cancellationToken)
     {
         if (!IsNtfsProvider(provider))
         {
-            var count = await ScanAndUpsertAsync(provider, root, indexGeneration, cancellationToken).ConfigureAwait(false);
+            var count = await ScanAndUpsertAsync(
+                provider,
+                root,
+                currentIndexedCount,
+                indexGeneration,
+                currentRootNumber,
+                totalRoots,
+                cancellationToken).ConfigureAwait(false);
+            RaiseStatus(
+                IndexingRunState.Indexing,
+                "Finalizing indexed location...",
+                currentIndexedCount + count,
+                root.Path,
+                currentRootNumber,
+                totalRoots);
             await _index.PruneStaleRecordsUnderRootAsync(root.Path, indexGeneration, cancellationToken).ConfigureAwait(false);
             return new IndexRootResult(count, HadFailure: false, WasCanceled: false);
         }
@@ -152,6 +226,13 @@ public sealed class IndexingCoordinator
         UsnJournalState? preScanJournalState = null;
         try
         {
+            RaiseStatus(
+                IndexingRunState.Indexing,
+                "Checking NTFS journal...",
+                currentIndexedCount,
+                root.Path,
+                currentRootNumber,
+                totalRoots);
             var catchUp = await TryCatchUpNtfsRootAsync(
                 provider,
                 root,
@@ -163,39 +244,72 @@ public sealed class IndexingCoordinator
                 return new IndexRootResult(catchUp.IndexedCount, HadFailure: false, WasCanceled: false);
             }
 
-            var count = await ScanAndUpsertAsync(provider, root, indexGeneration, cancellationToken).ConfigureAwait(false);
-            if (count > 0)
+            var count = await ScanAndUpsertAsync(
+                provider,
+                root,
+                currentIndexedCount,
+                indexGeneration,
+                currentRootNumber,
+                totalRoots,
+                cancellationToken).ConfigureAwait(false);
+            RaiseStatus(
+                IndexingRunState.Indexing,
+                "Finalizing indexed location...",
+                currentIndexedCount + count,
+                root.Path,
+                currentRootNumber,
+                totalRoots);
+            var postScanJournalState = await TryApplyPostScanNtfsChangesAsync(
+                provider,
+                root,
+                preScanJournalState,
+                indexGeneration,
+                cancellationToken).ConfigureAwait(false);
+            if (postScanJournalState is not null)
             {
-                var postScanJournalState = await TryApplyPostScanNtfsChangesAsync(
-                    provider,
-                    root,
-                    preScanJournalState,
-                    indexGeneration,
-                    cancellationToken).ConfigureAwait(false);
-                if (postScanJournalState is null)
-                {
-                    RaiseStatus(
-                        IndexingRunState.Indexing,
-                        $"NTFS prune skipped for {root.Path}: scan completeness could not be verified.",
-                        currentIndexedCount + count);
-                    return new IndexRootResult(
-                        count,
-                        HadFailure: false,
-                        WasCanceled: false,
-                        RetainedStaleRecords: true);
-                }
-
                 await _index.PruneStaleRecordsUnderRootAsync(root.Path, indexGeneration, cancellationToken).ConfigureAwait(false);
                 await SaveNtfsCheckpointAsync(root, postScanJournalState, cancellationToken).ConfigureAwait(false);
                 return new IndexRootResult(count, HadFailure: false, WasCanceled: false);
             }
 
-            RaiseStatus(IndexingRunState.Indexing, $"NTFS returned no records; using fallback for {root.Path}.", currentIndexedCount);
-            var fallbackCount = await ScanAndUpsertAsync(_fallbackProvider, root, indexGeneration, cancellationToken).ConfigureAwait(false);
+            if (count > 0)
+            {
+                RaiseStatus(
+                    IndexingRunState.Indexing,
+                    $"NTFS prune skipped for {root.Path}: scan completeness could not be verified.",
+                    currentIndexedCount + count,
+                    root.Path,
+                    currentRootNumber,
+                    totalRoots);
+                return new IndexRootResult(
+                    count,
+                    HadFailure: false,
+                    WasCanceled: false,
+                    RetainedStaleRecords: true);
+            }
+
+            RaiseStatus(
+                IndexingRunState.Indexing,
+                $"NTFS returned no records; using fallback for {root.Path}.",
+                currentIndexedCount,
+                root.Path,
+                currentRootNumber,
+                totalRoots);
+            var fallbackCount = await ScanAndUpsertAsync(
+                _fallbackProvider,
+                root,
+                currentIndexedCount,
+                indexGeneration,
+                currentRootNumber,
+                totalRoots,
+                cancellationToken).ConfigureAwait(false);
             RaiseStatus(
                 IndexingRunState.Indexing,
                 $"NTFS prune skipped for {root.Path}: recovery scan has no journal completeness proof.",
-                currentIndexedCount + fallbackCount);
+                currentIndexedCount + fallbackCount,
+                root.Path,
+                currentRootNumber,
+                totalRoots);
             return new IndexRootResult(
                 fallbackCount,
                 HadFailure: false,
@@ -210,25 +324,73 @@ public sealed class IndexingCoordinator
         {
             if (IsElevatedIndexerLaunchCanceled(exception))
             {
-                RaiseStatus(IndexingRunState.Canceled, $"NTFS scan canceled for {root.Path}.", currentIndexedCount);
+                RaiseStatus(
+                    IndexingRunState.Canceled,
+                    $"NTFS scan canceled for {root.Path}.",
+                    currentIndexedCount,
+                    root.Path,
+                    currentRootNumber,
+                    totalRoots);
                 return new IndexRootResult(0, HadFailure: false, WasCanceled: true);
             }
 
             if (exception.PartialRecordsAccepted)
             {
                 RaiseStatus(
-                    IndexingRunState.Failed,
-                    $"NTFS scan failed after partial output for {root.Path}; preserving existing index. {exception.Message}",
-                    currentIndexedCount);
-                return new IndexRootResult(0, HadFailure: true, WasCanceled: false);
+                    IndexingRunState.Indexing,
+                    $"NTFS scan failed after partial output for {root.Path}; restarting with fallback. {exception.Message}",
+                    currentIndexedCount,
+                    root.Path,
+                    currentRootNumber,
+                    totalRoots);
+                var recoveredCount = await ScanAndUpsertAsync(
+                    _fallbackProvider,
+                    root,
+                    currentIndexedCount,
+                    indexGeneration,
+                    currentRootNumber,
+                    totalRoots,
+                    cancellationToken).ConfigureAwait(false);
+                RaiseStatus(
+                    IndexingRunState.Indexing,
+                    "Finalizing recovered indexed location...",
+                    currentIndexedCount + recoveredCount,
+                    root.Path,
+                    currentRootNumber,
+                    totalRoots);
+                await _index.PruneStaleRecordsUnderRootAsync(
+                    root.Path,
+                    indexGeneration,
+                    cancellationToken).ConfigureAwait(false);
+                return new IndexRootResult(
+                    recoveredCount,
+                    HadFailure: true,
+                    WasCanceled: false,
+                    RetainedStaleRecords: false);
             }
 
-            RaiseStatus(IndexingRunState.Failed, $"NTFS scan failed for {root.Path}; using fallback. {exception.Message}", currentIndexedCount);
-            var fallbackCount = await ScanAndUpsertAsync(_fallbackProvider, root, indexGeneration, cancellationToken).ConfigureAwait(false);
+            RaiseStatus(
+                IndexingRunState.Failed,
+                $"NTFS scan failed for {root.Path}; using fallback. {exception.Message}",
+                currentIndexedCount,
+                root.Path,
+                currentRootNumber,
+                totalRoots);
+            var fallbackCount = await ScanAndUpsertAsync(
+                _fallbackProvider,
+                root,
+                currentIndexedCount,
+                indexGeneration,
+                currentRootNumber,
+                totalRoots,
+                cancellationToken).ConfigureAwait(false);
             RaiseStatus(
                 IndexingRunState.Indexing,
                 $"NTFS prune skipped for {root.Path}: recovery scan has no journal completeness proof.",
-                currentIndexedCount + fallbackCount);
+                currentIndexedCount + fallbackCount,
+                root.Path,
+                currentRootNumber,
+                totalRoots);
             return new IndexRootResult(
                 fallbackCount,
                 HadFailure: true,
@@ -304,7 +466,12 @@ public sealed class IndexingCoordinator
                 plan.EndUsn,
                 cancellationToken);
             applyResult = await UsnJournalChangeApplier
-                .ApplyAsync(_index, changes, nextCheckpoint, cancellationToken)
+                .ApplyAsync(
+                    _index,
+                    changes,
+                    nextCheckpoint,
+                    cancellationToken,
+                    recordFilter: _recordFilter)
                 .ConfigureAwait(false);
         }
         catch (OperationCanceledException)
@@ -386,7 +553,8 @@ public sealed class IndexingCoordinator
                     changes,
                     CreateCheckpoint(root, postScanJournalState, postScanJournalState.NextUsn),
                     cancellationToken,
-                    indexGeneration)
+                    indexGeneration,
+                    _recordFilter)
                 .ConfigureAwait(false);
             return result.RequiresFullRescan ? null : postScanJournalState;
         }
@@ -418,10 +586,15 @@ public sealed class IndexingCoordinator
     private async Task<int> ScanAndUpsertAsync(
         IIndexProvider provider,
         IndexRoot root,
+        int currentIndexedCount,
         long indexGeneration,
+        int currentRootNumber,
+        int totalRoots,
         CancellationToken cancellationToken)
     {
         var indexedCount = 0;
+        var lastReportedCount = -1;
+        var nextProgressReportAt = 0L;
         var batch = new List<FileRecord>(_batchSize);
         IAsyncEnumerator<FileRecord> enumerator;
 
@@ -465,11 +638,18 @@ public sealed class IndexingCoordinator
                         partialRecordsAccepted: indexedCount > 0 || batch.Count > 0);
                 }
 
+                if (!_recordFilter(record))
+                {
+                    continue;
+                }
+
                 batch.Add(record);
 
                 if (batch.Count == _batchSize)
                 {
+                    var reportedWriting = ReportWritingIfDue(force: false);
                     indexedCount += await FlushBatchAsync(batch, indexGeneration, cancellationToken).ConfigureAwait(false);
+                    ReportScanningIfDue(force: reportedWriting);
                 }
             }
         }
@@ -478,8 +658,59 @@ public sealed class IndexingCoordinator
             await enumerator.DisposeAsync().ConfigureAwait(false);
         }
 
+        if (batch.Count > 0)
+        {
+            ReportWritingIfDue(force: true);
+        }
+
         indexedCount += await FlushBatchAsync(batch, indexGeneration, cancellationToken).ConfigureAwait(false);
+        ReportScanningIfDue(force: true);
         return indexedCount;
+
+        bool ReportWritingIfDue(bool force)
+        {
+            if (!force && !IsProgressReportDue())
+            {
+                return false;
+            }
+
+            RaiseStatus(
+                IndexingRunState.Indexing,
+                $"Writing {batch.Count:N0} indexed items...",
+                currentIndexedCount + indexedCount,
+                root.Path,
+                currentRootNumber,
+                totalRoots);
+            return true;
+        }
+
+        void ReportScanningIfDue(bool force)
+        {
+            if (indexedCount == lastReportedCount)
+            {
+                return;
+            }
+
+            if (!force && !IsProgressReportDue())
+            {
+                return;
+            }
+
+            lastReportedCount = indexedCount;
+            nextProgressReportAt = Stopwatch.GetTimestamp() + (long)(Stopwatch.Frequency * 0.2);
+            RaiseStatus(
+                IndexingRunState.Indexing,
+                $"Scanning with {provider.Name}...",
+                currentIndexedCount + indexedCount,
+                root.Path,
+                currentRootNumber,
+                totalRoots);
+        }
+
+        bool IsProgressReportDue()
+        {
+            return nextProgressReportAt == 0 || Stopwatch.GetTimestamp() >= nextProgressReportAt;
+        }
     }
 
     private async Task<int> FlushBatchAsync(
@@ -498,9 +729,17 @@ public sealed class IndexingCoordinator
         return count;
     }
 
-    private void RaiseStatus(IndexingRunState state, string message, int indexedCount)
+    private void RaiseStatus(
+        IndexingRunState state,
+        string message,
+        int indexedCount,
+        string? currentRoot = null,
+        int currentRootNumber = 0,
+        int totalRoots = 0)
     {
-        StatusChanged?.Invoke(this, new IndexingStatus(state, message, indexedCount));
+        StatusChanged?.Invoke(
+            this,
+            new IndexingStatus(state, message, indexedCount, currentRoot, currentRootNumber, totalRoots));
     }
 
     private static bool IsNtfsProvider(IIndexProvider provider)

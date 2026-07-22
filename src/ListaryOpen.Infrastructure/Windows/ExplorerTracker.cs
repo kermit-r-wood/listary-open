@@ -8,7 +8,11 @@ public sealed class ExplorerTracker : IRefreshableQuickSwitchWindowProvider
 {
     private readonly Func<IntPtr> _foregroundWindowProvider;
     private readonly IExplorerShellWindowsProvider _shellWindowsProvider;
+    private readonly object _snapshotGate = new();
+    private IReadOnlyList<ExplorerShellWindow>? _windowSnapshot;
     private string? _lastFolder;
+    private string? _rememberedFolderPath;
+    private long _lastFolderObservedUtcTicks;
 
     public ExplorerTracker()
         : this(NativeMethods.GetForegroundWindow, new ComExplorerShellWindowsProvider())
@@ -27,7 +31,8 @@ public sealed class ExplorerTracker : IRefreshableQuickSwitchWindowProvider
 
     public void Refresh()
     {
-        ObserveForegroundExplorerFolder();
+        // Shell COM is exclusively owned by the observation STA. Callers consume the
+        // latest immutable snapshot and request freshness through the scheduler.
     }
 
     public IReadOnlyList<QuickSwitchFolderCandidate> GetFolderCandidates()
@@ -38,18 +43,16 @@ public sealed class ExplorerTracker : IRefreshableQuickSwitchWindowProvider
             var candidates = new List<QuickSwitchFolderCandidate>();
             var candidateIndexesByFolderPath = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
 
-            foreach (var window in _shellWindowsProvider.EnumerateWindows())
+            var windows = GetWindowSnapshot() ?? Array.Empty<ExplorerShellWindow>();
+
+            foreach (var window in windows)
             {
                 if (string.IsNullOrWhiteSpace(window.FolderPath))
                 {
                     continue;
                 }
 
-                var folderPath = Path.TrimEndingDirectorySeparator(Path.GetFullPath(window.FolderPath));
-                if (!Directory.Exists(folderPath))
-                {
-                    continue;
-                }
+                var folderPath = window.FolderPath;
 
                 var isForeground = window.Handle == foregroundHandle;
                 var candidate = new QuickSwitchFolderCandidate(
@@ -72,7 +75,7 @@ public sealed class ExplorerTracker : IRefreshableQuickSwitchWindowProvider
                 candidates.Add(candidate);
             }
 
-            var rememberedFolderPath = NormalizeExistingFolderPath(_lastFolder);
+            var rememberedFolderPath = Volatile.Read(ref _rememberedFolderPath);
             return candidates
                 .OrderByDescending(candidate => candidate.IsForeground)
                 .ThenByDescending(candidate => IsRememberedFolderCandidate(candidate, rememberedFolderPath))
@@ -89,22 +92,22 @@ public sealed class ExplorerTracker : IRefreshableQuickSwitchWindowProvider
         try
         {
             var foregroundHandle = _foregroundWindowProvider();
+            var windows = ObserveWindows();
             if (foregroundHandle == IntPtr.Zero)
             {
                 return;
             }
 
-            foreach (var window in _shellWindowsProvider.EnumerateWindows())
+            foreach (var window in windows)
             {
                 if (window.Handle != foregroundHandle || string.IsNullOrWhiteSpace(window.FolderPath))
                 {
                     continue;
                 }
 
-                if (Directory.Exists(window.FolderPath))
-                {
-                    _lastFolder = window.FolderPath;
-                }
+                _lastFolder = window.FolderPath;
+                Volatile.Write(ref _rememberedFolderPath, window.FolderPath);
+                Interlocked.Exchange(ref _lastFolderObservedUtcTicks, DateTimeOffset.UtcNow.UtcTicks);
 
                 return;
             }
@@ -116,9 +119,60 @@ public sealed class ExplorerTracker : IRefreshableQuickSwitchWindowProvider
 
     public void ObserveFolderForTests(string folderPath)
     {
-        if (Directory.Exists(folderPath))
+        var normalizedFolder = NormalizeExistingFolderPath(folderPath);
+        if (normalizedFolder is not null)
         {
             _lastFolder = folderPath;
+            Volatile.Write(ref _rememberedFolderPath, normalizedFolder);
+            Interlocked.Exchange(ref _lastFolderObservedUtcTicks, DateTimeOffset.UtcNow.UtcTicks);
+        }
+    }
+
+    public string? GetRecentlyObservedFolder(TimeSpan maximumAge, DateTimeOffset? now = null)
+    {
+        if (maximumAge < TimeSpan.Zero)
+        {
+            throw new ArgumentOutOfRangeException(nameof(maximumAge));
+        }
+
+        var ticks = Interlocked.Read(ref _lastFolderObservedUtcTicks);
+        var folder = Volatile.Read(ref _rememberedFolderPath);
+        if (ticks <= 0 || string.IsNullOrWhiteSpace(folder))
+        {
+            return null;
+        }
+
+        var observedAt = new DateTimeOffset(ticks, TimeSpan.Zero);
+        return (now ?? DateTimeOffset.UtcNow) - observedAt <= maximumAge && Directory.Exists(folder)
+            ? folder
+            : null;
+    }
+
+    private IReadOnlyList<ExplorerShellWindow> ObserveWindows()
+    {
+        var snapshot = _shellWindowsProvider
+            .EnumerateWindows()
+            .Select(window =>
+            {
+                var folderPath = NormalizeExistingFolderPath(window.FolderPath);
+                return folderPath is null ? null : window with { FolderPath = folderPath };
+            })
+            .Where(window => window is not null)
+            .Cast<ExplorerShellWindow>()
+            .ToArray();
+        lock (_snapshotGate)
+        {
+            _windowSnapshot = snapshot;
+        }
+
+        return snapshot;
+    }
+
+    private IReadOnlyList<ExplorerShellWindow>? GetWindowSnapshot()
+    {
+        lock (_snapshotGate)
+        {
+            return _windowSnapshot;
         }
     }
 
@@ -200,6 +254,9 @@ internal sealed class ComExplorerShellWindowsProvider : IExplorerShellWindowsPro
 
             foreach (var shellWindow in (System.Collections.IEnumerable)shellWindows)
             {
+                object? document = null;
+                object? folder = null;
+                object? folderSelf = null;
                 try
                 {
                     dynamic window = shellWindow;
@@ -212,7 +269,22 @@ internal sealed class ComExplorerShellWindowsProvider : IExplorerShellWindowsPro
                         continue;
                     }
 
-                    var folderPath = window.Document?.Folder?.Self?.Path as string;
+                    document = window.Document;
+                    if (document is null)
+                    {
+                        continue;
+                    }
+
+                    dynamic folderView = document;
+                    folder = folderView.Folder;
+                    if (folder is null)
+                    {
+                        continue;
+                    }
+
+                    dynamic shellFolder = folder;
+                    folderSelf = shellFolder.Self;
+                    var folderPath = folderSelf is null ? null : ((dynamic)folderSelf).Path as string;
                     windows.Add(new ExplorerShellWindow(handle, folderPath));
                 }
                 catch (Exception exception) when (IsExpectedShellWindowException(exception))
@@ -220,6 +292,9 @@ internal sealed class ComExplorerShellWindowsProvider : IExplorerShellWindowsPro
                 }
                 finally
                 {
+                    ReleaseComObject(folderSelf);
+                    ReleaseComObject(folder);
+                    ReleaseComObject(document);
                     ReleaseComObject(shellWindow);
                 }
             }
@@ -240,7 +315,7 @@ internal sealed class ComExplorerShellWindowsProvider : IExplorerShellWindowsPro
             activeTabHandle == shellBrowserHandle;
     }
 
-    private static IntPtr GetActiveExplorerTabHandle(IntPtr explorerWindowHandle)
+    internal static IntPtr GetActiveExplorerTabHandle(IntPtr explorerWindowHandle)
     {
         var activeTabHandle = IntPtr.Zero;
         NativeMethods.EnumChildWindows(
@@ -260,12 +335,13 @@ internal sealed class ComExplorerShellWindowsProvider : IExplorerShellWindowsPro
         return activeTabHandle;
     }
 
-    private static bool TryGetShellBrowserWindowHandle(object shellWindow, out IntPtr shellBrowserHandle)
+    internal static bool TryGetShellBrowserWindowHandle(object shellWindow, out IntPtr shellBrowserHandle)
     {
         shellBrowserHandle = IntPtr.Zero;
         var shellBrowserInterfaceId = typeof(IShellBrowser).GUID;
         var unknown = IntPtr.Zero;
         var shellBrowserPointer = IntPtr.Zero;
+        object? shellBrowserObject = null;
 
         try
         {
@@ -276,7 +352,8 @@ internal sealed class ComExplorerShellWindowsProvider : IExplorerShellWindowsPro
                 return false;
             }
 
-            if (Marshal.GetObjectForIUnknown(shellBrowserPointer) is not IShellBrowser shellBrowser)
+            shellBrowserObject = Marshal.GetObjectForIUnknown(shellBrowserPointer);
+            if (shellBrowserObject is not IShellBrowser shellBrowser)
             {
                 return false;
             }
@@ -291,6 +368,7 @@ internal sealed class ComExplorerShellWindowsProvider : IExplorerShellWindowsPro
         }
         finally
         {
+            ReleaseComObject(shellBrowserObject);
             if (shellBrowserPointer != IntPtr.Zero)
             {
                 Marshal.Release(shellBrowserPointer);

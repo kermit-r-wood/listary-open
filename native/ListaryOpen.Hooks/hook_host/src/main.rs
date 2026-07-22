@@ -1,9 +1,11 @@
 #![windows_subsystem = "windows"]
 
 use listary_open_hook_common::{
-    JumpAckHeader, JumpCommandHeader, DIALOG_CLASS, HOOK_DLL_EXPORT, JUMP_ACK_COPYDATA_MAGIC,
-    JUMP_ACK_STATUS_FAILED, JUMP_ACK_STATUS_SUCCESS, JUMP_ACK_STATUS_UNSUPPORTED_DIALOG,
-    JUMP_COPYDATA_MAGIC,
+    CleanupCommandHeader, JumpAckHeader, JumpCommandHeader, PreloadAcknowledgement,
+    PreloadAuthorization, SpawnProof, CLEANUP_COPYDATA_MAGIC, DIALOG_CLASS, HOOK_DLL_EXPORT,
+    JUMP_ACK_COPYDATA_MAGIC, JUMP_ACK_STATUS_FAILED, JUMP_ACK_STATUS_SUCCESS,
+    JUMP_ACK_STATUS_UNSUPPORTED_DIALOG, JUMP_COPYDATA_MAGIC, PRELOAD_ACK_PENDING,
+    PRELOAD_ACK_SUCCESS, SPAWN_PROOF_PENDING, SPAWN_PROOF_SUCCESS,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
@@ -12,14 +14,14 @@ use std::ffi::c_void;
 use std::io;
 use std::process::{Child, Command};
 use std::ptr::{null, null_mut};
-use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
-use std::sync::{mpsc, Mutex, OnceLock};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
+use std::sync::{mpsc, Arc, Condvar, Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 use windows_sys::Win32::Foundation::{
     CloseHandle, FreeLibrary, GetLastError, LocalFree, BOOL, ERROR_CLASS_ALREADY_EXISTS,
-    ERROR_PIPE_CONNECTED, HANDLE, HMODULE, HWND, INVALID_HANDLE_VALUE, LPARAM, LRESULT, TRUE,
-    WPARAM,
+    ERROR_PIPE_CONNECTED, FALSE, HANDLE, HMODULE, HWND, INVALID_HANDLE_VALUE, LPARAM, LRESULT,
+    TRUE, WAIT_FAILED, WAIT_OBJECT_0, WAIT_TIMEOUT, WPARAM,
 };
 use windows_sys::Win32::Security::Authorization::{
     ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW,
@@ -32,6 +34,10 @@ use windows_sys::Win32::Storage::FileSystem::{
     FlushFileBuffers, ReadFile, WriteFile, PIPE_ACCESS_DUPLEX,
 };
 use windows_sys::Win32::System::DataExchange::COPYDATASTRUCT;
+use windows_sys::Win32::System::Diagnostics::ToolHelp::{
+    CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, Thread32First, Thread32Next,
+    PROCESSENTRY32W, TH32CS_SNAPPROCESS, TH32CS_SNAPTHREAD, THREADENTRY32,
+};
 use windows_sys::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress, LoadLibraryW};
 use windows_sys::Win32::System::Pipes::{
     ConnectNamedPipe, CreateNamedPipeW, DisconnectNamedPipe, GetNamedPipeClientProcessId,
@@ -42,35 +48,87 @@ use windows_sys::Win32::System::SystemInformation::{
     IMAGE_FILE_MACHINE_UNKNOWN,
 };
 use windows_sys::Win32::System::Threading::{
-    GetCurrentProcess, GetExitCodeProcess, IsWow64Process2, OpenProcess, OpenProcessToken,
-    QueryFullProcessImageNameW, PROCESS_QUERY_LIMITED_INFORMATION,
+    GetCurrentProcess, IsWow64Process2, OpenProcess, OpenProcessToken, QueryFullProcessImageNameW,
+    WaitForSingleObject, INFINITE, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE,
 };
+use windows_sys::Win32::UI::Accessibility::{SetWinEventHook, UnhookWinEvent, HWINEVENTHOOK};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     ChangeWindowMessageFilterEx, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW,
-    EnumChildWindows, EnumWindows, GetAncestor, GetClassNameW, GetDlgCtrlID, GetForegroundWindow,
-    GetMessageW, GetWindowLongPtrW, GetWindowTextLengthW, GetWindowTextW, GetWindowThreadProcessId,
-    IsWindow, PeekMessageW, PostMessageW, PostQuitMessage, RegisterClassW, SendMessageTimeoutW,
-    SetWindowLongPtrW, SetWindowsHookExW, TranslateMessage, UnhookWindowsHookEx,
-    CHANGEFILTERSTRUCT, CREATESTRUCTW, GA_ROOT, GWLP_USERDATA, HHOOK, HWND_MESSAGE, MSG,
-    MSGFLT_ALLOW, PM_REMOVE, SMTO_ABORTIFHUNG, WH_CALLWNDPROC, WM_APP, WM_COPYDATA, WM_DESTROY,
-    WM_NCCREATE, WM_QUIT, WNDCLASSW,
+    EnumWindows, GetAncestor, GetClassNameW, GetForegroundWindow, GetMessageW, GetWindowLongPtrW,
+    GetWindowTextLengthW, GetWindowTextW, GetWindowThreadProcessId, IsWindow, IsWindowVisible,
+    MsgWaitForMultipleObjectsEx, PeekMessageW, PostMessageW, PostQuitMessage, PostThreadMessageW,
+    RegisterClassW, SendMessageTimeoutW, SetWindowLongPtrW, SetWindowsHookExW, TranslateMessage,
+    UnhookWindowsHookEx, CHANGEFILTERSTRUCT, CREATESTRUCTW, EVENT_SYSTEM_DIALOGSTART,
+    EVENT_SYSTEM_FOREGROUND, GA_ROOT, GWLP_USERDATA, HHOOK, HWND_MESSAGE, MSG, MSGFLT_ALLOW,
+    MWMO_INPUTAVAILABLE, PM_REMOVE, QS_ALLINPUT, SMTO_ABORTIFHUNG, SMTO_BLOCK, WH_CALLWNDPROC,
+    WH_GETMESSAGE, WINEVENT_OUTOFCONTEXT, WM_APP, WM_COPYDATA, WM_DESTROY, WM_NCCREATE, WM_NULL,
+    WM_QUIT, WNDCLASSW,
 };
 
 const DEFAULT_PIPE_NAME: &str = pipe_name_for_pointer_width(usize::BITS);
 const IPC_VERSION: u32 = 1;
 const BUFFER_SIZE: usize = 64 * 1024;
 const HOOK_RESCAN_INTERVAL: Duration = Duration::from_millis(500);
-const HOOK_LOOP_SLEEP: Duration = Duration::from_millis(50);
-const ADDRESS_BAR_EDIT_CONTROL_ID: i32 = 41477;
+const HOOK_EVENT_RECOVERY_RESCAN_INTERVAL: Duration = Duration::from_secs(5);
+const HOOK_PRELOAD_RESCAN_INTERVAL: Duration = Duration::from_millis(25);
+const HOOK_TARGET_SESSION_RESCAN_INTERVAL: Duration = Duration::from_millis(100);
+const HOOK_PRELOAD_BURST_DURATION: Duration = Duration::from_secs(3);
+const HOOK_SHUTDOWN_POLL_INTERVAL: Duration = Duration::from_millis(50);
+const HOOK_UNLOAD_QUEUE_TURN_GRACE: Duration = Duration::from_millis(50);
 const ACK_WINDOW_CLASS: &str = "ListaryOpenHookAckWindow";
 const ACK_STARTUP_ACCEPT_TIMEOUT: Duration = Duration::from_secs(2);
 const ACK_STARTUP_SHUTDOWN_GRACE: Duration = Duration::from_millis(100);
 const WM_LISTARY_ACK_CLOSE: u32 = WM_APP + 0x4C4F;
 const PIPE_REJECT_REMOTE_CLIENTS: u32 = 0x0000_0008;
-const STILL_ACTIVE: u32 = 259;
+const PRELOAD_HOOK_DLL_EXPORT: &[u8] = b"ListaryOpenPreloadHookProc\0";
+
+#[repr(C)]
+struct FileTime {
+    low: u32,
+    high: u32,
+}
+
+#[link(name = "kernel32")]
+extern "system" {
+    fn CreateFileMappingW(
+        file: HANDLE,
+        attributes: *const c_void,
+        protection: u32,
+        maximum_size_high: u32,
+        maximum_size_low: u32,
+        name: *const u16,
+    ) -> HANDLE;
+    fn MapViewOfFile(
+        mapping: HANDLE,
+        desired_access: u32,
+        file_offset_high: u32,
+        file_offset_low: u32,
+        bytes_to_map: usize,
+    ) -> *mut c_void;
+    fn OpenFileMappingW(access: u32, inherit_handle: i32, name: *const u16) -> HANDLE;
+    fn GetProcessTimes(
+        process: HANDLE,
+        creation: *mut FileTime,
+        exit: *mut FileTime,
+        kernel: *mut FileTime,
+        user: *mut FileTime,
+    ) -> i32;
+    fn UnmapViewOfFile(address: *const c_void) -> i32;
+}
 
 static NEXT_COMMAND_ID: AtomicU64 = AtomicU64::new(1);
 static HOOK_RUNTIME_STATUS: AtomicU8 = AtomicU8::new(HookRuntimeStatus::Starting as u8);
+static DIALOG_SCAN_REQUESTED: AtomicBool = AtomicBool::new(false);
+
+fn confirmed_spawn_proofs() -> &'static Mutex<HashMap<u32, SpawnProof>> {
+    static PROOFS: OnceLock<Mutex<HashMap<u32, SpawnProof>>> = OnceLock::new();
+    PROOFS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn spawn_proof_diagnostics() -> &'static Mutex<HashMap<u32, String>> {
+    static DIAGNOSTICS: OnceLock<Mutex<HashMap<u32, String>>> = OnceLock::new();
+    DIAGNOSTICS.get_or_init(|| Mutex::new(HashMap::new()))
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum HookRuntimeStatus {
@@ -84,8 +142,14 @@ fn main() -> io::Result<()> {
     let pipe_name = pipe_name_from_args();
     let pipe_path = format!(r"\\.\pipe\{}", pipe_name);
     let _child_hosts = start_child_hosts(child_host_launches_from_args(env::args()), &session);
-    start_parent_monitor(session.parent_process_id);
-    start_hook_thread(arg_value("--dll"));
+    let hook_shutdown = Arc::new(HookShutdown::new());
+    start_hook_thread(
+        arg_value("--dll"),
+        arg_value("--preload-pid").and_then(|value| value.parse::<u32>().ok()),
+        cleanup_authorization_token(&session.secret),
+        hook_shutdown.clone(),
+    );
+    start_parent_monitor(session.parent_process_id, hook_shutdown.clone());
 
     println!("ListaryOpen hook host started on pipe '{}'.", pipe_name);
 
@@ -97,8 +161,9 @@ fn main() -> io::Result<()> {
         }
 
         let session = session.clone();
+        let hook_shutdown = hook_shutdown.clone();
         thread::spawn(move || {
-            if let Err(error) = serve_connection(pipe, &session) {
+            if let Err(error) = serve_connection(pipe, &session, &hook_shutdown) {
                 eprintln!("Hook host connection failed: {error}");
             }
         });
@@ -139,25 +204,88 @@ impl HostSession {
     }
 }
 
-fn start_parent_monitor(parent_process_id: u32) {
-    thread::spawn(move || loop {
-        if !parent_process_is_running(parent_process_id) {
+fn cleanup_authorization_token(secret: &str) -> u64 {
+    let mut hash = 0xcbf2_9ce4_8422_2325u64;
+    for byte in secret.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    if hash == 0 {
+        1
+    } else {
+        hash
+    }
+}
+
+fn start_parent_monitor(parent_process_id: u32, hook_shutdown: Arc<HookShutdown>) {
+    thread::spawn(move || {
+        let parent_exited = match open_process_for_exit_wait(parent_process_id) {
+            Some(parent_process) => {
+                let wait_result = unsafe { WaitForSingleObject(parent_process.0, INFINITE) };
+                wait_result == WAIT_OBJECT_0 || wait_result == WAIT_FAILED
+            }
+            None => true,
+        };
+
+        if parent_exited {
+            // The process-wide exit is intentionally delayed until HookState has
+            // uninstalled every Windows hook and released the hook DLL.
+            hook_shutdown.request_and_wait();
             std::process::exit(0);
         }
-
-        thread::sleep(Duration::from_millis(500));
     });
 }
 
-fn parent_process_is_running(parent_process_id: u32) -> bool {
-    let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, parent_process_id) };
-    if handle.is_null() {
-        return false;
+struct HookShutdown {
+    requested: AtomicBool,
+    complete: Mutex<bool>,
+    complete_signal: Condvar,
+}
+
+impl HookShutdown {
+    fn new() -> Self {
+        Self {
+            requested: AtomicBool::new(false),
+            complete: Mutex::new(false),
+            complete_signal: Condvar::new(),
+        }
     }
 
-    let handle = OwnedHandle(handle);
-    let mut exit_code = 0u32;
-    unsafe { GetExitCodeProcess(handle.0, &mut exit_code) != 0 && exit_code == STILL_ACTIVE }
+    fn is_requested(&self) -> bool {
+        self.requested.load(Ordering::Acquire)
+    }
+
+    fn request(&self) {
+        self.requested.store(true, Ordering::Release);
+    }
+
+    fn mark_complete(&self) {
+        let mut complete = self
+            .complete
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *complete = true;
+        self.complete_signal.notify_all();
+    }
+
+    fn request_and_wait(&self) {
+        self.request();
+        let mut complete = self
+            .complete
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        while !*complete {
+            complete = self
+                .complete_signal
+                .wait(complete)
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+        }
+    }
+}
+
+fn open_process_for_exit_wait(process_id: u32) -> Option<OwnedHandle> {
+    let process = unsafe { OpenProcess(PROCESS_SYNCHRONIZE, 0, process_id) };
+    (!process.is_null()).then_some(OwnedHandle(process))
 }
 
 fn pipe_name_from_args() -> String {
@@ -261,23 +389,44 @@ fn start_child_hosts(launches: Vec<ChildHostLaunch>, session: &HostSession) -> V
     children
 }
 
-fn start_hook_thread(dll_path: Option<String>) {
+fn start_hook_thread(
+    dll_path: Option<String>,
+    preload_process_id: Option<u32>,
+    cleanup_authorization_token: u64,
+    hook_shutdown: Arc<HookShutdown>,
+) {
     set_hook_runtime_status(HookRuntimeStatus::Starting);
     let Some(dll_path) = dll_path else {
         set_hook_runtime_status(HookRuntimeStatus::Failed);
         eprintln!("Hook host started without --dll; health IPC will run without native hooks.");
+        hook_shutdown.mark_complete();
         return;
     };
 
-    thread::spawn(move || run_hook_thread(&dll_path));
+    thread::spawn(move || {
+        run_hook_thread(
+            &dll_path,
+            preload_process_id,
+            cleanup_authorization_token,
+            &hook_shutdown,
+        );
+        // run_hook_thread returns only after hook_loop has dropped HookState.
+        hook_shutdown.mark_complete();
+    });
 }
 
-fn run_hook_thread(dll_path: &str) {
-    match HookState::new(dll_path) {
+fn run_hook_thread(
+    dll_path: &str,
+    preload_process_id: Option<u32>,
+    cleanup_authorization_token: u64,
+    hook_shutdown: &HookShutdown,
+) {
+    match HookState::new(dll_path, preload_process_id, cleanup_authorization_token) {
         Ok(mut hook_state) => {
             hook_state.install_new_dialog_hooks();
-            set_hook_runtime_status(HookRuntimeStatus::Ready);
-            hook_loop(hook_state);
+            let scan_events = DialogScanEvents::install();
+            set_hook_runtime_status(hook_state.runtime_status());
+            hook_loop(hook_state, scan_events.is_active(), hook_shutdown);
             set_hook_runtime_status(HookRuntimeStatus::Failed);
         }
         Err(error) => {
@@ -299,20 +448,146 @@ fn hook_runtime_status() -> HookRuntimeStatus {
     }
 }
 
-fn hook_loop(mut hook_state: HookState) {
-    let mut next_scan = Instant::now() + HOOK_RESCAN_INTERVAL;
+fn hook_loop(mut hook_state: HookState, event_scan_active: bool, hook_shutdown: &HookShutdown) {
+    let rescan_interval = rescan_interval(event_scan_active);
+    let mut preload_burst_until = Instant::now() + HOOK_PRELOAD_BURST_DURATION;
+    let mut next_scan = Instant::now() + HOOK_PRELOAD_RESCAN_INTERVAL;
     loop {
+        if hook_shutdown.is_requested() {
+            break;
+        }
+
         if !pump_pending_messages() {
             break;
         }
 
-        if Instant::now() >= next_scan {
+        let scan_requested = DIALOG_SCAN_REQUESTED.swap(false, Ordering::AcqRel);
+        if scan_requested {
+            preload_burst_until = Instant::now() + HOOK_PRELOAD_BURST_DURATION;
+        }
+        if scan_requested || Instant::now() >= next_scan {
             hook_state.install_new_dialog_hooks();
-            next_scan = Instant::now() + HOOK_RESCAN_INTERVAL;
+            let runtime_status = hook_state.runtime_status();
+            set_hook_runtime_status(runtime_status);
+            next_scan = Instant::now()
+                + hook_scan_interval(
+                    hook_state.preload_process_id.is_some(),
+                    runtime_status == HookRuntimeStatus::Ready,
+                    Instant::now() < preload_burst_until,
+                    !hook_state.preload_authorizations.is_empty(),
+                    rescan_interval,
+                );
         }
 
-        thread::sleep(HOOK_LOOP_SLEEP);
+        let timeout = wait_timeout_millis(
+            next_scan
+                .saturating_duration_since(Instant::now())
+                .min(HOOK_SHUTDOWN_POLL_INTERVAL),
+        );
+        let wait_result = unsafe {
+            MsgWaitForMultipleObjectsEx(0, null(), timeout, QS_ALLINPUT, MWMO_INPUTAVAILABLE)
+        };
+        if wait_result == WAIT_FAILED {
+            // Preserve the original bounded retry behavior if message waiting is unavailable.
+            thread::sleep(Duration::from_millis(50));
+        } else {
+            debug_assert!(wait_result == WAIT_OBJECT_0 || wait_result == WAIT_TIMEOUT);
+        }
     }
+}
+
+fn rescan_interval(event_scan_active: bool) -> Duration {
+    if event_scan_active {
+        HOOK_EVENT_RECOVERY_RESCAN_INTERVAL
+    } else {
+        HOOK_RESCAN_INTERVAL
+    }
+}
+
+fn hook_scan_interval(
+    explicit_preload: bool,
+    preload_ready: bool,
+    preload_burst_active: bool,
+    target_session_armed: bool,
+    recovery_interval: Duration,
+) -> Duration {
+    if explicit_preload {
+        return if preload_ready {
+            HOOK_TARGET_SESSION_RESCAN_INTERVAL
+        } else {
+            HOOK_PRELOAD_RESCAN_INTERVAL
+        };
+    }
+    if preload_burst_active {
+        HOOK_PRELOAD_RESCAN_INTERVAL
+    } else if target_session_armed {
+        HOOK_TARGET_SESSION_RESCAN_INTERVAL
+    } else {
+        recovery_interval
+    }
+}
+
+fn wait_timeout_millis(duration: Duration) -> u32 {
+    if duration.is_zero() {
+        return 0;
+    }
+
+    let millis = duration.as_millis().saturating_add(1);
+    millis.min(u128::from(u32::MAX - 1)) as u32
+}
+
+struct DialogScanEvents {
+    hooks: Vec<HWINEVENTHOOK>,
+}
+
+impl DialogScanEvents {
+    fn install() -> Self {
+        let mut hooks = Vec::with_capacity(2);
+        for event in [EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_DIALOGSTART] {
+            let hook = unsafe {
+                SetWinEventHook(
+                    event,
+                    event,
+                    null_mut(),
+                    Some(dialog_scan_event),
+                    0,
+                    0,
+                    WINEVENT_OUTOFCONTEXT,
+                )
+            };
+            if !hook.is_null() {
+                hooks.push(hook);
+            }
+        }
+
+        Self { hooks }
+    }
+
+    fn is_active(&self) -> bool {
+        !self.hooks.is_empty()
+    }
+}
+
+impl Drop for DialogScanEvents {
+    fn drop(&mut self) {
+        for hook in self.hooks.drain(..) {
+            unsafe {
+                UnhookWinEvent(hook);
+            }
+        }
+    }
+}
+
+unsafe extern "system" fn dialog_scan_event(
+    _hook: HWINEVENTHOOK,
+    _event: u32,
+    _window: HWND,
+    _object_id: i32,
+    _child_id: i32,
+    _event_thread: u32,
+    _event_time: u32,
+) {
+    DIALOG_SCAN_REQUESTED.store(true, Ordering::Release);
 }
 
 fn pump_pending_messages() -> bool {
@@ -334,15 +609,28 @@ fn pump_pending_messages() -> bool {
 struct HookState {
     module: HMODULE,
     hook_proc: DialogHookProc,
+    preload_hook_proc: DialogHookProc,
     hooked_threads: HashSet<HookThreadKey>,
+    preloaded_threads: HashSet<HookThreadKey>,
     logged_mobaxterm_threads: HashSet<u32>,
     hooks: HashMap<HookThreadKey, HHOOK>,
+    preload_hooks: HashMap<HookThreadKey, HHOOK>,
+    preload_acknowledgements: HashMap<HookThreadKey, HANDLE>,
+    preload_confirmed_threads: HashSet<HookThreadKey>,
+    preload_authorizations: HashMap<u32, HANDLE>,
+    preload_process_id: Option<u32>,
+    cleanup_authorization_token: u64,
+    lifecycle_threads: HashSet<HookThreadKey>,
 }
 
 impl HookState {
-    fn new(dll_path: &str) -> Result<Self, String> {
+    fn new(
+        dll_path: &str,
+        preload_process_id: Option<u32>,
+        cleanup_authorization_token: u64,
+    ) -> Result<Self, String> {
         let module = load_hook_module(dll_path)?;
-        let hook_proc = match hook_proc(module) {
+        let hook_proc = match load_hook_proc(module, HOOK_DLL_EXPORT) {
             Ok(hook_proc) => hook_proc,
             Err(error) => {
                 unsafe {
@@ -351,17 +639,41 @@ impl HookState {
                 return Err(error);
             }
         };
-
-        Ok(Self {
+        let preload_hook_proc = match load_hook_proc(module, PRELOAD_HOOK_DLL_EXPORT) {
+            Ok(hook_proc) => hook_proc,
+            Err(error) => {
+                unsafe { FreeLibrary(module) };
+                return Err(error);
+            }
+        };
+        let mut state = Self {
             module,
             hook_proc,
+            preload_hook_proc,
             hooked_threads: HashSet::new(),
+            preloaded_threads: HashSet::new(),
             logged_mobaxterm_threads: HashSet::new(),
             hooks: HashMap::new(),
-        })
+            preload_hooks: HashMap::new(),
+            preload_acknowledgements: HashMap::new(),
+            preload_confirmed_threads: HashSet::new(),
+            preload_authorizations: HashMap::new(),
+            preload_process_id,
+            cleanup_authorization_token,
+            lifecycle_threads: HashSet::new(),
+        };
+        if let Some(process_id) = preload_process_id {
+            state.allow_preload_process_session(process_id);
+        }
+        Ok(state)
     }
 
     fn install_new_dialog_hooks(&mut self) {
+        if self.preload_process_id.is_none() {
+            if let Some(process_id) = foreground_root_process_id() {
+                self.allow_preload_process_session(process_id);
+            }
+        }
         let dialogs = match discover_observed_dialogs() {
             Ok(dialogs) => dialogs,
             Err(error) => {
@@ -374,21 +686,211 @@ impl HookState {
             self.log_dialog_diagnostics(dialog);
         }
 
-        let threads = dialogs
+        let explicit_session_threads = self
+            .preload_process_id
+            .map(|process_id| discover_process_session_threads(process_id, host_architecture()))
+            .unwrap_or_default();
+        let explicit_session_processes = explicit_session_threads
+            .iter()
+            .map(|thread| thread.process_id)
+            .collect::<HashSet<_>>();
+        let explicit_preload_threads = if self
+            .preload_process_id
+            .is_some_and(|process_id| process_name(process_id).eq_ignore_ascii_case("firefox"))
+        {
+            explicit_session_threads
+                .iter()
+                .copied()
+                .filter(|thread| Some(thread.process_id) == self.preload_process_id)
+                .collect::<HashSet<_>>()
+        } else {
+            explicit_session_threads.clone()
+        };
+        let observed_dialog_threads = dialogs
             .iter()
             .filter(|dialog| {
                 should_hook_observed_dialog(
                     host_architecture(),
                     dialog.architecture,
                     &dialog.class_name,
-                    &dialog.title,
-                    has_address_control(dialog.window_handle),
-                )
+                ) && (self.preload_process_id.is_none()
+                    || explicit_session_processes.contains(&dialog.process_id))
             })
             .map(|dialog| HookThreadKey::new(dialog.process_id, dialog.thread_id))
             .collect::<HashSet<_>>();
-        let pruned_hooks = prune_missing_hook_threads(
+        let mut threads = observed_dialog_threads.clone();
+        if self.preload_process_id.is_none() {
+            match discover_foreground_process_threads() {
+                Ok(preload_threads) => threads.extend(preload_threads),
+                Err(error) => eprintln!("Hook host foreground preload discovery failed: {error}"),
+            }
+        }
+        threads.extend(explicit_preload_threads);
+        let previously_hooked = self
+            .hooked_threads
+            .union(&self.preloaded_threads)
+            .copied()
+            .collect::<HashSet<_>>();
+        threads.extend(live_hook_thread_keys(&previously_hooked));
+        self.lifecycle_threads.extend(threads.iter().copied());
+        for process_id in threads
+            .iter()
+            .map(|thread| thread.process_id)
+            .collect::<HashSet<_>>()
+        {
+            self.allow_preload_process_session(process_id);
+        }
+        for child_process_id in threads
+            .iter()
+            .map(|thread| thread.process_id)
+            .collect::<HashSet<_>>()
+        {
+            for parent_process_id in self.preload_authorizations.keys().copied() {
+                match read_spawn_proof(
+                    parent_process_id,
+                    child_process_id,
+                    self.cleanup_authorization_token,
+                ) {
+                    Ok(proof) => {
+                        spawn_proof_diagnostics()
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner())
+                            .remove(&child_process_id);
+                        let mut proofs = confirmed_spawn_proofs()
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner());
+                        if proofs.insert(child_process_id, proof).is_none() {
+                            eprintln!(
+                                "Hook host confirmed Firefox precapture proof parent={} child={} generation={} hook_before_resume=true captured_show=true.",
+                                parent_process_id, child_process_id, proof.generation
+                            );
+                        }
+                    }
+                    Err(reason) => {
+                        let diagnostic = format!(
+                            "parent={parent_process_id} child={child_process_id}: {reason}"
+                        );
+                        let mut diagnostics = spawn_proof_diagnostics()
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner());
+                        if diagnostics.get(&child_process_id) != Some(&diagnostic) {
+                            eprintln!("Hook host Firefox spawn proof rejected: {diagnostic}");
+                            diagnostics.insert(child_process_id, diagnostic);
+                        }
+                    }
+                }
+            }
+        }
+        let pruned_preload_hooks = prune_missing_hook_threads(
             &threads,
+            &mut self.preloaded_threads,
+            &mut self.preload_hooks,
+            |_| {},
+        );
+        for hook in pruned_preload_hooks {
+            unhook_thread_hook(hook);
+        }
+        self.preload_confirmed_threads
+            .retain(|thread| threads.contains(thread));
+        self.preload_acknowledgements.retain(|thread, mapping| {
+            if threads.contains(thread) {
+                true
+            } else {
+                unsafe { CloseHandle(*mapping) };
+                false
+            }
+        });
+        self.retire_confirmed_preload_hooks();
+        for thread in unhooked_threads(&threads, &self.preloaded_threads)
+            .into_iter()
+            .filter(|thread| {
+                !process_has_confirmed_precapture(
+                    thread.process_id,
+                    &self.preload_confirmed_threads,
+                ) && !has_confirmed_spawn_proof(thread.process_id)
+            })
+        {
+            match install_thread_hook(
+                self.module,
+                self.preload_hook_proc,
+                thread.thread_id,
+                WH_GETMESSAGE,
+            ) {
+                Ok(hook) => {
+                    self.preloaded_threads.insert(thread);
+                    self.preload_hooks.insert(thread, hook);
+                }
+                Err(error) => eprintln!(
+                    "Hook host failed to install preload hook for thread {}: {error}",
+                    thread.thread_id
+                ),
+            }
+        }
+        let pending_preload_threads = self
+            .preloaded_threads
+            .difference(&self.preload_confirmed_threads)
+            .copied()
+            .collect::<Vec<_>>();
+        let mut posted_preload_threads = Vec::new();
+        for thread in &pending_preload_threads {
+            if !self.preload_acknowledgements.contains_key(thread) {
+                if let Some(mapping) =
+                    create_preload_acknowledgement(*thread, self.cleanup_authorization_token)
+                {
+                    self.preload_acknowledgements.insert(*thread, mapping);
+                }
+            }
+            if let Some(mapping) = self.preload_acknowledgements.get(thread) {
+                reset_preload_acknowledgement(*mapping, self.cleanup_authorization_token);
+                if unsafe { PostThreadMessageW(thread.thread_id, WM_NULL, 0, 0) } != 0 {
+                    posted_preload_threads.push(*thread);
+                }
+            }
+        }
+        let observed_dialog_processes = dialogs
+            .iter()
+            .map(|dialog| dialog.process_id)
+            .collect::<HashSet<_>>();
+        let acknowledgement_deadline = Instant::now() + Duration::from_millis(100);
+        while !posted_preload_threads.is_empty() && Instant::now() < acknowledgement_deadline {
+            for thread in &posted_preload_threads {
+                if self.preload_confirmed_threads.contains(thread) {
+                    continue;
+                }
+                let acknowledgement_succeeded = self
+                    .preload_acknowledgements
+                    .get(thread)
+                    .is_some_and(|mapping| {
+                        preload_acknowledgement_succeeded(
+                            *mapping,
+                            self.cleanup_authorization_token,
+                        )
+                    });
+                let process_was_preloaded = has_confirmed_spawn_proof(thread.process_id)
+                    || self
+                        .preload_confirmed_threads
+                        .iter()
+                        .any(|confirmed| confirmed.process_id == thread.process_id);
+                if acknowledgement_succeeded
+                    && preload_confirmation_is_early(
+                        process_was_preloaded,
+                        observed_dialog_processes.contains(&thread.process_id),
+                    )
+                {
+                    self.preload_confirmed_threads.insert(*thread);
+                }
+            }
+            if posted_preload_threads
+                .iter()
+                .all(|thread| self.preload_confirmed_threads.contains(thread))
+            {
+                break;
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+        self.retire_confirmed_preload_hooks();
+        let pruned_hooks = prune_missing_hook_threads(
+            &observed_dialog_threads,
             &mut self.hooked_threads,
             &mut self.hooks,
             clear_confirmed_hook_thread,
@@ -397,21 +899,78 @@ impl HookState {
             unhook_thread_hook(hook);
         }
 
-        for thread in unhooked_threads(&threads, &self.hooked_threads) {
-            match install_thread_hook(self.module, self.hook_proc, thread.thread_id) {
+        for thread in unhooked_threads(&observed_dialog_threads, &self.hooked_threads) {
+            match install_thread_hook(
+                self.module,
+                self.hook_proc,
+                thread.thread_id,
+                WH_CALLWNDPROC,
+            ) {
                 Ok(hook) => {
                     self.hooked_threads.insert(thread);
-                    mark_hook_thread_confirmed(thread);
                     self.hooks.insert(thread, hook);
                     eprintln!(
-                        "Hook host installed native dialog hook for thread {}.",
-                        thread.thread_id
+                        "Hook host installed native hook for process {} thread {}.",
+                        thread.process_id, thread.thread_id
                     );
                 }
                 Err(error) => eprintln!(
                     "Hook host failed to hook thread {}: {error}",
                     thread.thread_id
                 ),
+            }
+        }
+
+        for thread in self.hooked_threads.iter().copied().collect::<Vec<_>>() {
+            if !is_hook_thread_confirmed(thread) {
+                let has_precapture_proof = process_has_confirmed_precapture(
+                    thread.process_id,
+                    &self.preload_confirmed_threads,
+                ) || has_confirmed_spawn_proof(thread.process_id);
+                let callwnd_delivered = confirm_hook_thread_delivery(thread.thread_id);
+                // Precapture proof is required for the direct COM path, but a
+                // late-installed hook is still valid for the safe address-bar
+                // fallback. Confirm the target hook from delivery itself.
+                let ready = if has_precapture_proof {
+                    target_hook_ready_after_preload(true, callwnd_delivered)
+                } else {
+                    callwnd_delivered
+                };
+                if ready {
+                    mark_hook_thread_confirmed(thread);
+                }
+            }
+        }
+    }
+
+    fn runtime_status(&self) -> HookRuntimeStatus {
+        if explicit_preload_runtime_ready(self.preload_process_id, &self.preload_confirmed_threads)
+        {
+            HookRuntimeStatus::Ready
+        } else {
+            HookRuntimeStatus::Starting
+        }
+    }
+
+    fn retire_confirmed_preload_hooks(&mut self) {
+        let confirmed_processes = self
+            .preload_confirmed_threads
+            .iter()
+            .map(|thread| thread.process_id)
+            .collect::<HashSet<_>>();
+        let retired_threads = self
+            .preloaded_threads
+            .iter()
+            .copied()
+            .filter(|thread| confirmed_processes.contains(&thread.process_id))
+            .collect::<Vec<_>>();
+        for thread in retired_threads {
+            self.preloaded_threads.remove(&thread);
+            if let Some(hook) = self.preload_hooks.remove(&thread) {
+                unhook_thread_hook(hook);
+            }
+            if let Some(mapping) = self.preload_acknowledgements.remove(&thread) {
+                unsafe { CloseHandle(mapping) };
             }
         }
     }
@@ -428,23 +987,819 @@ impl HookState {
             dialog.architecture, dialog.class_name, dialog.title
         );
     }
+
+    fn allow_preload_process_session(&mut self, process_id: u32) {
+        let Some(root_process_id) = process_session_root_id(process_id) else {
+            return;
+        };
+        self.allow_preload_process(root_process_id);
+        if self.preload_process_id == Some(process_id) && process_id != root_process_id {
+            // Firefox can hand the browser window from a short-lived launcher
+            // to another firefox.exe process.  Bind explicit preload to that
+            // actual window owner as well as the transient same-name root.
+            self.allow_preload_process(process_id);
+        }
+    }
+
+    fn allow_preload_process(&mut self, process_id: u32) {
+        if self.preload_authorizations.contains_key(&process_id) {
+            return;
+        }
+        const PAGE_READWRITE: u32 = 0x04;
+        const FILE_MAP_WRITE: u32 = 0x0002;
+        let name = to_wide_null(&preload_authorization_name(process_id));
+        let mapping = unsafe {
+            CreateFileMappingW(
+                INVALID_HANDLE_VALUE,
+                null(),
+                PAGE_READWRITE,
+                0,
+                std::mem::size_of::<PreloadAuthorization>() as u32,
+                name.as_ptr(),
+            )
+        };
+        if mapping.is_null() {
+            eprintln!(
+                "Hook host could not authorize preload session root {}: {}",
+                process_id,
+                io::Error::last_os_error()
+            );
+        } else {
+            let view = unsafe {
+                MapViewOfFile(
+                    mapping,
+                    FILE_MAP_WRITE,
+                    0,
+                    0,
+                    std::mem::size_of::<PreloadAuthorization>(),
+                )
+            };
+            if view.is_null() {
+                eprintln!(
+                    "Hook host could not write preload authorization for root {}: {}",
+                    process_id,
+                    io::Error::last_os_error()
+                );
+                unsafe { CloseHandle(mapping) };
+                return;
+            }
+            unsafe {
+                *(view as *mut PreloadAuthorization) = PreloadAuthorization {
+                    token: self.cleanup_authorization_token,
+                    host_process_id: std::process::id(),
+                    generation: self.cleanup_authorization_token as u32,
+                };
+                UnmapViewOfFile(view);
+            }
+            self.preload_authorizations.insert(process_id, mapping);
+        }
+    }
+}
+
+fn discover_process_session_threads(
+    seed_process_id: u32,
+    expected_architecture: &str,
+) -> HashSet<HookThreadKey> {
+    let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS | TH32CS_SNAPTHREAD, 0) };
+    if snapshot == INVALID_HANDLE_VALUE {
+        return HashSet::new();
+    }
+    let mut processes = Vec::new();
+    let mut process = unsafe { std::mem::zeroed::<PROCESSENTRY32W>() };
+    process.dwSize = std::mem::size_of::<PROCESSENTRY32W>() as u32;
+    let mut has_process = unsafe { Process32FirstW(snapshot, &mut process) } != 0;
+    while has_process {
+        let name_len = process
+            .szExeFile
+            .iter()
+            .position(|unit| *unit == 0)
+            .unwrap_or(process.szExeFile.len());
+        processes.push(ProcessFamilyEntry {
+            process_id: process.th32ProcessID,
+            parent_process_id: process.th32ParentProcessID,
+            executable_name: String::from_utf16_lossy(&process.szExeFile[..name_len]),
+        });
+        has_process = unsafe { Process32NextW(snapshot, &mut process) } != 0;
+    }
+    let Some((session_root, executable_name)) = session_process_root(seed_process_id, &processes)
+    else {
+        unsafe { CloseHandle(snapshot) };
+        return HashSet::new();
+    };
+    let parent_pairs = processes
+        .iter()
+        .map(|process| (process.process_id, process.parent_process_id))
+        .collect::<Vec<_>>();
+    let mut process_ids = descendant_process_ids(session_root, &parent_pairs);
+    process_ids.retain(|process_id| {
+        processes.iter().any(|process| {
+            process.process_id == *process_id
+                && process
+                    .executable_name
+                    .eq_ignore_ascii_case(&executable_name)
+        })
+    });
+    process_ids.retain(|process_id| {
+        process_architecture(*process_id)
+            .is_some_and(|architecture| architecture.eq_ignore_ascii_case(expected_architecture))
+    });
+    let threads = discover_threads_from_snapshot(snapshot, &process_ids);
+    unsafe { CloseHandle(snapshot) };
+    threads
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ProcessFamilyEntry {
+    process_id: u32,
+    parent_process_id: u32,
+    executable_name: String,
+}
+
+fn session_process_root(
+    seed_process_id: u32,
+    processes: &[ProcessFamilyEntry],
+) -> Option<(u32, String)> {
+    let seed = processes
+        .iter()
+        .find(|process| process.process_id == seed_process_id)?;
+    let executable_name = seed.executable_name.clone();
+    let mut root = seed;
+    for _ in 0..processes.len() {
+        let Some(parent) = processes.iter().find(|process| {
+            process.process_id == root.parent_process_id
+                && process
+                    .executable_name
+                    .eq_ignore_ascii_case(&executable_name)
+        }) else {
+            break;
+        };
+        if parent.process_id == root.process_id {
+            break;
+        }
+        root = parent;
+    }
+    Some((root.process_id, executable_name))
+}
+
+fn process_session_root_id(seed_process_id: u32) -> Option<u32> {
+    let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) };
+    if snapshot == INVALID_HANDLE_VALUE {
+        return None;
+    }
+    let mut processes = Vec::new();
+    let mut process = unsafe { std::mem::zeroed::<PROCESSENTRY32W>() };
+    process.dwSize = std::mem::size_of::<PROCESSENTRY32W>() as u32;
+    let mut has_process = unsafe { Process32FirstW(snapshot, &mut process) } != 0;
+    while has_process {
+        let name_len = process
+            .szExeFile
+            .iter()
+            .position(|unit| *unit == 0)
+            .unwrap_or(process.szExeFile.len());
+        processes.push(ProcessFamilyEntry {
+            process_id: process.th32ProcessID,
+            parent_process_id: process.th32ParentProcessID,
+            executable_name: String::from_utf16_lossy(&process.szExeFile[..name_len]),
+        });
+        has_process = unsafe { Process32NextW(snapshot, &mut process) } != 0;
+    }
+    unsafe { CloseHandle(snapshot) };
+    session_process_root(seed_process_id, &processes).map(|(root, _)| root)
+}
+
+fn preload_authorization_name(root_process_id: u32) -> String {
+    format!(
+        "Local\\ListaryOpen.NativePreload.{}.{}",
+        host_architecture(),
+        root_process_id
+    )
+}
+
+fn preload_acknowledgement_name(thread: HookThreadKey, generation: u32) -> String {
+    format!(
+        "Local\\ListaryOpen.PreloadAck.{}.{}.{}.{}",
+        host_architecture(),
+        thread.process_id,
+        thread.thread_id,
+        generation
+    )
+}
+
+fn spawn_proof_name(parent_process_id: u32, child_process_id: u32, generation: u32) -> String {
+    format!(
+        "Local\\ListaryOpen.SpawnProof.{}.{}.{}.{}",
+        host_architecture(),
+        parent_process_id,
+        child_process_id,
+        generation
+    )
+}
+
+fn read_spawn_proof(
+    parent_process_id: u32,
+    child_process_id: u32,
+    authorization_token: u64,
+) -> Result<SpawnProof, String> {
+    const FILE_MAP_READ: u32 = 0x0004;
+    let generation = authorization_token as u32;
+    let name = to_wide_null(&spawn_proof_name(
+        parent_process_id,
+        child_process_id,
+        generation,
+    ));
+    let mapping = unsafe { OpenFileMappingW(FILE_MAP_READ, 0, name.as_ptr()) };
+    if mapping.is_null() {
+        return Err(format!("mapping missing ({})", io::Error::last_os_error()));
+    }
+    let view = unsafe {
+        MapViewOfFile(
+            mapping,
+            FILE_MAP_READ,
+            0,
+            0,
+            std::mem::size_of::<SpawnProof>(),
+        )
+    };
+    if view.is_null() {
+        unsafe { CloseHandle(mapping) };
+        return Err(format!(
+            "mapping view failed ({})",
+            io::Error::last_os_error()
+        ));
+    }
+    let proof = unsafe { std::ptr::read_volatile(view as *const SpawnProof) };
+    unsafe { UnmapViewOfFile(view) };
+    let current_creation_time = process_creation_time(child_process_id);
+    let rejection = spawn_proof_rejection(
+        proof,
+        authorization_token,
+        parent_process_id,
+        child_process_id,
+        current_creation_time,
+    );
+    unsafe { CloseHandle(mapping) };
+    rejection.map_or(Ok(proof), Err)
+}
+
+fn spawn_proof_rejection(
+    proof: SpawnProof,
+    authorization_token: u64,
+    parent_process_id: u32,
+    child_process_id: u32,
+    current_creation_time: Option<u64>,
+) -> Option<String> {
+    if proof.status != SPAWN_PROOF_SUCCESS {
+        return Some(format!(
+            "status {} (pending={} means child factory hook ACK is not complete; other values failed)",
+            proof.status,
+            SPAWN_PROOF_PENDING,
+        ));
+    }
+    if proof.token != authorization_token {
+        return Some("token mismatch".to_string());
+    }
+    if proof.generation != authorization_token as u32 {
+        return Some("generation mismatch".to_string());
+    }
+    if proof.parent_process_id != parent_process_id {
+        return Some("parent mismatch".to_string());
+    }
+    if proof.child_process_id != child_process_id {
+        return Some("child mismatch".to_string());
+    }
+    if proof.child_thread_id == 0 {
+        return Some("primary child thread id is zero".to_string());
+    }
+    if proof.installed_before_resume == 0 {
+        return Some("hookInstalledBeforeResume false".to_string());
+    }
+    if proof.captured_show_observed == 0 {
+        return Some("captured Show has not been observed".to_string());
+    }
+    if current_creation_time != Some(proof.child_creation_time) {
+        return Some(format!(
+            "creationTime mismatch (proof={}, live={current_creation_time:?})",
+            proof.child_creation_time
+        ));
+    }
+    None
+}
+
+#[cfg(test)]
+fn spawn_proof_matches(
+    proof: SpawnProof,
+    authorization_token: u64,
+    parent_process_id: u32,
+    child_process_id: u32,
+    current_creation_time: Option<u64>,
+) -> bool {
+    spawn_proof_rejection(
+        proof,
+        authorization_token,
+        parent_process_id,
+        child_process_id,
+        current_creation_time,
+    )
+    .is_none()
+}
+
+fn process_creation_time(process_id: u32) -> Option<u64> {
+    let process = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, process_id) };
+    if process.is_null() {
+        return None;
+    }
+    let mut creation = FileTime { low: 0, high: 0 };
+    let mut exit = FileTime { low: 0, high: 0 };
+    let mut kernel = FileTime { low: 0, high: 0 };
+    let mut user = FileTime { low: 0, high: 0 };
+    let succeeded =
+        unsafe { GetProcessTimes(process, &mut creation, &mut exit, &mut kernel, &mut user) } != 0;
+    unsafe { CloseHandle(process) };
+    succeeded.then_some((u64::from(creation.high) << 32) | u64::from(creation.low))
+}
+
+fn has_confirmed_spawn_proof(process_id: u32) -> bool {
+    let mut proofs = confirmed_spawn_proofs()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let valid = proofs
+        .get(&process_id)
+        .is_some_and(|proof| process_creation_time(process_id) == Some(proof.child_creation_time));
+    if !valid {
+        proofs.remove(&process_id);
+    }
+    valid
+}
+
+fn create_preload_acknowledgement(
+    thread: HookThreadKey,
+    authorization_token: u64,
+) -> Option<HANDLE> {
+    const PAGE_READWRITE: u32 = 0x04;
+    let generation = authorization_token as u32;
+    let name = to_wide_null(&preload_acknowledgement_name(thread, generation));
+    let mapping = unsafe {
+        CreateFileMappingW(
+            INVALID_HANDLE_VALUE,
+            null(),
+            PAGE_READWRITE,
+            0,
+            std::mem::size_of::<PreloadAcknowledgement>() as u32,
+            name.as_ptr(),
+        )
+    };
+    if mapping.is_null() {
+        return None;
+    }
+    reset_preload_acknowledgement(mapping, authorization_token);
+    Some(mapping)
+}
+
+fn reset_preload_acknowledgement(mapping: HANDLE, authorization_token: u64) {
+    const FILE_MAP_WRITE: u32 = 0x0002;
+    let view = unsafe {
+        MapViewOfFile(
+            mapping,
+            FILE_MAP_WRITE,
+            0,
+            0,
+            std::mem::size_of::<PreloadAcknowledgement>(),
+        )
+    };
+    if view.is_null() {
+        return;
+    }
+    unsafe {
+        *(view as *mut PreloadAcknowledgement) = PreloadAcknowledgement {
+            token: authorization_token,
+            status: PRELOAD_ACK_PENDING,
+            host_handle: 0,
+        };
+        UnmapViewOfFile(view);
+    }
+}
+
+fn preload_acknowledgement_succeeded(mapping: HANDLE, authorization_token: u64) -> bool {
+    const FILE_MAP_READ: u32 = 0x0004;
+    let view = unsafe {
+        MapViewOfFile(
+            mapping,
+            FILE_MAP_READ,
+            0,
+            0,
+            std::mem::size_of::<PreloadAcknowledgement>(),
+        )
+    };
+    if view.is_null() {
+        return false;
+    }
+    let acknowledgement = unsafe { *(view as *const PreloadAcknowledgement) };
+    unsafe { UnmapViewOfFile(view) };
+    preload_acknowledgement_matches(acknowledgement, authorization_token)
+}
+
+fn preload_acknowledgement_matches(
+    acknowledgement: PreloadAcknowledgement,
+    authorization_token: u64,
+) -> bool {
+    acknowledgement.token == authorization_token && acknowledgement.status == PRELOAD_ACK_SUCCESS
+}
+
+fn target_hook_ready_after_preload(
+    preload_capture_confirmed: bool,
+    callwnd_delivery_confirmed: bool,
+) -> bool {
+    preload_capture_confirmed && callwnd_delivery_confirmed
+}
+
+fn preload_confirmation_is_early(
+    process_was_preloaded_before_dialog: bool,
+    dialog_is_already_observed: bool,
+) -> bool {
+    process_was_preloaded_before_dialog || !dialog_is_already_observed
+}
+
+fn explicit_preload_runtime_ready(
+    preload_process_id: Option<u32>,
+    preload_confirmed_threads: &HashSet<HookThreadKey>,
+) -> bool {
+    preload_process_id.is_none_or(|process_id| {
+        process_has_confirmed_precapture(process_id, preload_confirmed_threads)
+    })
+}
+
+fn process_has_confirmed_precapture(
+    process_id: u32,
+    preload_confirmed_threads: &HashSet<HookThreadKey>,
+) -> bool {
+    preload_confirmed_threads
+        .iter()
+        .any(|thread| thread.process_id == process_id)
+}
+
+fn descendant_process_ids(root_process_id: u32, parents: &[(u32, u32)]) -> HashSet<u32> {
+    let mut result = HashSet::from([root_process_id]);
+    loop {
+        let previous_len = result.len();
+        for (process_id, parent_process_id) in parents {
+            if result.contains(parent_process_id) {
+                result.insert(*process_id);
+            }
+        }
+        if result.len() == previous_len {
+            return result;
+        }
+    }
+}
+
+fn discover_threads_from_snapshot(
+    snapshot: HANDLE,
+    process_ids: &HashSet<u32>,
+) -> HashSet<HookThreadKey> {
+    let mut result = HashSet::new();
+    let mut thread = unsafe { std::mem::zeroed::<THREADENTRY32>() };
+    thread.dwSize = std::mem::size_of::<THREADENTRY32>() as u32;
+    let mut has_thread = unsafe { Thread32First(snapshot, &mut thread) } != 0;
+    while has_thread {
+        if process_ids.contains(&thread.th32OwnerProcessID) {
+            result.insert(HookThreadKey::new(
+                thread.th32OwnerProcessID,
+                thread.th32ThreadID,
+            ));
+        }
+        has_thread = unsafe { Thread32Next(snapshot, &mut thread) } != 0;
+    }
+    result
+}
+
+fn live_hook_thread_keys(candidates: &HashSet<HookThreadKey>) -> HashSet<HookThreadKey> {
+    if candidates.is_empty() {
+        return HashSet::new();
+    }
+    let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0) };
+    if snapshot == INVALID_HANDLE_VALUE {
+        return candidates.clone();
+    }
+    let process_ids = candidates
+        .iter()
+        .map(|thread| thread.process_id)
+        .collect::<HashSet<_>>();
+    let live = discover_threads_from_snapshot(snapshot, &process_ids);
+    unsafe { CloseHandle(snapshot) };
+    live.intersection(candidates).copied().collect()
+}
+
+fn discover_foreground_process_threads() -> io::Result<HashSet<HookThreadKey>> {
+    let Some(foreground_process_id) = foreground_root_process_id() else {
+        return Ok(HashSet::new());
+    };
+    Ok(discover_process_session_threads(
+        foreground_process_id,
+        host_architecture(),
+    ))
+}
+
+fn foreground_root_process_id() -> Option<u32> {
+    let foreground = unsafe { GetForegroundWindow() };
+    if foreground.is_null() {
+        return None;
+    }
+    let root = unsafe { GetAncestor(foreground, GA_ROOT) };
+    let root = if root.is_null() { foreground } else { root };
+    let mut process_id = 0u32;
+    (unsafe { GetWindowThreadProcessId(root, &mut process_id) } != 0 && process_id != 0)
+        .then_some(process_id)
+}
+
+fn confirm_hook_thread_delivery(thread_id: u32) -> bool {
+    let Some(hwnd) = top_level_window_for_thread(thread_id) else {
+        return false;
+    };
+    let mut result = 0usize;
+    (unsafe {
+        SendMessageTimeoutW(
+            hwnd,
+            WM_NULL,
+            0,
+            0,
+            SMTO_ABORTIFHUNG | SMTO_BLOCK,
+            1_000,
+            &mut result,
+        )
+    }) != 0
 }
 
 impl Drop for HookState {
     fn drop(&mut self) {
-        for (_, hook) in self.hooks.drain() {
-            unhook_thread_hook(hook);
-        }
+        let dialog_hooks = self.hooks.drain().collect();
+        let preload_hooks = self.preload_hooks.drain().collect();
+        let confirmed_threads = self.hooked_threads.drain().collect();
+        let preloaded_threads = self.preloaded_threads.drain().collect();
+        let preload_authorizations = self.preload_authorizations.drain().collect::<Vec<_>>();
+        let preload_acknowledgements = self
+            .preload_acknowledgements
+            .drain()
+            .map(|(_, mapping)| mapping)
+            .collect::<Vec<_>>();
+        self.preload_confirmed_threads.clear();
+        let lifecycle_threads = self.lifecycle_threads.drain().collect::<HashSet<_>>();
+        let cleanup_authorization_token = self.cleanup_authorization_token;
 
-        for thread in self.hooked_threads.drain() {
-            clear_confirmed_hook_thread(thread);
-        }
-
+        shutdown_hook_resources(
+            dialog_hooks,
+            preload_hooks,
+            confirmed_threads,
+            preloaded_threads,
+            || {
+                let cleanup_threads = live_hook_thread_keys(&lifecycle_threads)
+                    .into_iter()
+                    .collect::<Vec<_>>();
+                if !cleanup_remote_dialog_captures(&cleanup_threads, cleanup_authorization_token) {
+                    eprintln!("Hook host could not confirm remote dialog capture cleanup.");
+                }
+            },
+            unhook_thread_hook,
+            || {
+                for mapping in preload_acknowledgements {
+                    unsafe { CloseHandle(mapping) };
+                }
+                for (_, mapping) in preload_authorizations {
+                    unsafe { CloseHandle(mapping) };
+                }
+            },
+            clear_confirmed_hook_thread,
+            drive_hook_threads_after_unhook,
+        );
+        confirmed_spawn_proofs()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clear();
+        spawn_proof_diagnostics()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clear();
         if !self.module.is_null() {
             unsafe {
                 FreeLibrary(self.module);
             }
         }
+    }
+}
+
+fn cleanup_remote_dialog_captures(threads: &[HookThreadKey], authorization_token: u64) -> bool {
+    let mut targets = threads.to_vec();
+    targets.sort_unstable();
+    let mut all_cleaned = true;
+    let process_ids = targets
+        .iter()
+        .map(|target| target.process_id)
+        .collect::<HashSet<_>>();
+    for process_id in process_ids {
+        let hwnd = targets
+            .iter()
+            .filter(|target| target.process_id == process_id)
+            .find_map(|target| top_level_window_for_thread(target.thread_id));
+        all_cleaned &= hwnd
+            .map(|hwnd| send_capture_cleanup_command(hwnd, authorization_token))
+            .unwrap_or(false);
+    }
+    all_cleaned
+}
+
+fn top_level_window_for_thread(thread_id: u32) -> Option<HWND> {
+    struct Search {
+        thread_id: u32,
+        hwnd: HWND,
+    }
+    unsafe extern "system" fn callback(hwnd: HWND, l_param: LPARAM) -> BOOL {
+        let search = unsafe { &mut *(l_param as *mut Search) };
+        if unsafe { GetWindowThreadProcessId(hwnd, null_mut()) } == search.thread_id {
+            search.hwnd = hwnd;
+            return FALSE;
+        }
+        TRUE
+    }
+
+    let mut search = Search {
+        thread_id,
+        hwnd: null_mut(),
+    };
+    unsafe {
+        EnumWindows(
+            Some(callback),
+            (&mut search as *mut Search).cast::<c_void>() as LPARAM,
+        );
+    }
+    (!search.hwnd.is_null()).then_some(search.hwnd)
+}
+
+fn send_capture_cleanup_command(hwnd: HWND, authorization_token: u64) -> bool {
+    let command_id = next_command_id();
+    let mut target_process_id = 0u32;
+    if unsafe { GetWindowThreadProcessId(hwnd, &mut target_process_id) } == 0 {
+        return false;
+    }
+    let Ok(ack_receiver) = AckReceiver::new(command_id, target_process_id) else {
+        return false;
+    };
+    let mut payload =
+        build_cleanup_copydata_payload(ack_receiver.hwnd(), command_id, authorization_token);
+    let mut copy_data = COPYDATASTRUCT {
+        dwData: CLEANUP_COPYDATA_MAGIC,
+        cbData: payload.len() as u32,
+        lpData: payload.as_mut_ptr().cast(),
+    };
+    let mut result = 0usize;
+    let sent = unsafe {
+        SendMessageTimeoutW(
+            hwnd,
+            WM_COPYDATA,
+            ack_receiver.hwnd() as WPARAM,
+            (&mut copy_data as *mut COPYDATASTRUCT) as LPARAM,
+            SMTO_ABORTIFHUNG | SMTO_BLOCK,
+            2_000,
+            &mut result,
+        )
+    };
+    sent != 0 && ack_receiver.wait(Duration::from_secs(2)) == Some(JumpAckStatus::Success)
+}
+
+fn build_cleanup_copydata_payload(
+    ack_hwnd: HWND,
+    command_id: u64,
+    authorization_token: u64,
+) -> Vec<u8> {
+    let mut payload = Vec::with_capacity(std::mem::size_of::<CleanupCommandHeader>());
+    payload.extend_from_slice(&CLEANUP_COPYDATA_MAGIC.to_ne_bytes());
+    payload.extend_from_slice(&(ack_hwnd as usize).to_ne_bytes());
+    payload.resize(align_up(payload.len(), std::mem::align_of::<u64>()), 0);
+    payload.extend_from_slice(&command_id.to_ne_bytes());
+    payload.extend_from_slice(&authorization_token.to_ne_bytes());
+    payload.resize(std::mem::size_of::<CleanupCommandHeader>(), 0);
+    payload
+}
+
+fn shutdown_hook_resources<L, U, R, C, D>(
+    mut dialog_hooks: Vec<(HookThreadKey, HHOOK)>,
+    mut preload_hooks: Vec<(HookThreadKey, HHOOK)>,
+    mut confirmed_threads: Vec<HookThreadKey>,
+    preloaded_threads: Vec<HookThreadKey>,
+    cleanup_captures: L,
+    mut unhook: U,
+    revoke_preload_authorizations: R,
+    mut clear_confirmed: C,
+    drive_threads: D,
+) where
+    L: FnOnce(),
+    U: FnMut(HHOOK),
+    R: FnOnce(),
+    C: FnMut(HookThreadKey),
+    D: FnOnce(&[u32]),
+{
+    let mut affected_thread_ids = dialog_hooks
+        .iter()
+        .chain(preload_hooks.iter())
+        .map(|(thread, _)| thread.thread_id)
+        .chain(confirmed_threads.iter().map(|thread| thread.thread_id))
+        .chain(preloaded_threads.iter().map(|thread| thread.thread_id))
+        .collect::<Vec<_>>();
+    affected_thread_ids.sort_unstable();
+    affected_thread_ids.dedup();
+
+    // Restore every patched COM vtable while thread-specific hooks and the
+    // authenticated acknowledgement channel are still alive.
+    cleanup_captures();
+
+    // Keep the authorization mapping through cleanup, then revoke it before the
+    // remaining hooks are removed.
+    revoke_preload_authorizations();
+
+    dialog_hooks.sort_unstable_by_key(|(thread, _)| *thread);
+    for (_, hook) in dialog_hooks {
+        unhook(hook);
+    }
+    preload_hooks.sort_unstable_by_key(|(thread, _)| *thread);
+    for (_, hook) in preload_hooks {
+        unhook(hook);
+    }
+    confirmed_threads.sort_unstable();
+    for thread in confirmed_threads {
+        clear_confirmed(thread);
+    }
+
+    // UnhookWindowsHookEx can return while a remote thread is still inside the
+    // hook procedure. Drive every affected queue after all hooks are gone so
+    // USER32 can finish the callback and promptly release the injected DLL.
+    drive_threads(&affected_thread_ids);
+}
+
+fn drive_hook_threads_after_unhook(thread_ids: &[u32]) {
+    drive_hook_threads_after_unhook_with(
+        thread_ids,
+        |thread_id| unsafe {
+            PostThreadMessageW(thread_id, WM_NULL, 0, 0);
+        },
+        || thread::sleep(HOOK_UNLOAD_QUEUE_TURN_GRACE),
+        synchronize_hook_thread,
+    );
+}
+
+fn drive_hook_threads_after_unhook_with<P, W, S>(
+    thread_ids: &[u32],
+    mut post_queue_message: P,
+    wait_for_queue_turn: W,
+    mut synchronize_thread: S,
+) where
+    P: FnMut(u32),
+    W: FnOnce(),
+    S: FnMut(u32),
+{
+    for thread_id in thread_ids {
+        post_queue_message(*thread_id);
+    }
+    if !thread_ids.is_empty() {
+        wait_for_queue_turn();
+    }
+    for thread_id in thread_ids {
+        synchronize_thread(*thread_id);
+    }
+}
+
+fn synchronize_hook_thread(thread_id: u32) {
+    struct Delivery {
+        thread_id: u32,
+    }
+
+    unsafe extern "system" fn callback(hwnd: HWND, l_param: LPARAM) -> BOOL {
+        let delivery = unsafe { &mut *(l_param as *mut Delivery) };
+        if unsafe { GetWindowThreadProcessId(hwnd, null_mut()) } != delivery.thread_id {
+            return TRUE;
+        }
+
+        let mut message_result = 0usize;
+        let delivered = unsafe {
+            SendMessageTimeoutW(
+                hwnd,
+                WM_NULL,
+                0,
+                0,
+                SMTO_ABORTIFHUNG | SMTO_BLOCK,
+                1_000,
+                &mut message_result,
+            )
+        };
+        if delivered != 0 {
+            return FALSE;
+        }
+        TRUE
+    }
+
+    let mut delivery = Delivery { thread_id };
+    unsafe {
+        EnumWindows(
+            Some(callback),
+            (&mut delivery as *mut Delivery).cast::<c_void>() as LPARAM,
+        );
     }
 }
 
@@ -488,8 +1843,8 @@ fn load_hook_module(dll_path: &str) -> Result<HMODULE, String> {
     Ok(module)
 }
 
-fn hook_proc(module: HMODULE) -> Result<DialogHookProc, String> {
-    let raw_proc = unsafe { GetProcAddress(module, HOOK_DLL_EXPORT.as_ptr()) };
+fn load_hook_proc(module: HMODULE, export: &[u8]) -> Result<DialogHookProc, String> {
+    let raw_proc = unsafe { GetProcAddress(module, export.as_ptr()) };
     let Some(raw_proc) = raw_proc else {
         return Err(format!(
             "GetProcAddress failed for ListaryOpenHookProc: {}",
@@ -506,13 +1861,24 @@ fn install_thread_hook(
     module: HMODULE,
     hook_proc: DialogHookProc,
     thread_id: u32,
+    hook_type: i32,
 ) -> Result<HHOOK, String> {
-    let hook = unsafe { SetWindowsHookExW(WH_CALLWNDPROC, Some(hook_proc), module, thread_id) };
+    validate_target_thread_id(thread_id)?;
+    let hook = unsafe { SetWindowsHookExW(hook_type, Some(hook_proc), module, thread_id) };
     if hook.is_null() {
         return Err(io::Error::last_os_error().to_string());
     }
 
     Ok(hook)
+}
+
+fn validate_target_thread_id(thread_id: u32) -> Result<(), String> {
+    if thread_id == 0 {
+        Err("Process-wide/global Windows hooks are prohibited; a concrete target thread is required."
+            .to_string())
+    } else {
+        Ok(())
+    }
 }
 
 fn discover_observed_dialogs() -> io::Result<Vec<ObservedDialog>> {
@@ -610,38 +1976,30 @@ unsafe extern "system" fn enum_windows_proc(hwnd: HWND, l_param: LPARAM) -> BOOL
     TRUE
 }
 
+fn firefox_child_dialog_requires_spawn_proof(dialog: &ObservedDialog) -> bool {
+    dialog
+        .process_name
+        .trim()
+        .trim_end_matches(".exe")
+        .eq_ignore_ascii_case("firefox")
+        && process_session_root_id(dialog.process_id)
+            .is_some_and(|root_process_id| root_process_id != dialog.process_id)
+}
+
+fn firefox_dialog_precapture_ready(requires_spawn_proof: bool, has_spawn_proof: bool) -> bool {
+    !requires_spawn_proof || has_spawn_proof
+}
+
 fn is_supported_dialog_window(hwnd: HWND) -> bool {
     let Some(class_name) = class_name(hwnd) else {
         return false;
     };
 
-    is_supported_dialog_shape(&class_name, &window_text(hwnd), has_address_control(hwnd))
+    is_supported_dialog_shape(&class_name)
 }
 
-fn is_supported_dialog_shape(class_name: &str, title: &str, has_address_control: bool) -> bool {
+fn is_supported_dialog_shape(class_name: &str) -> bool {
     class_name == DIALOG_CLASS
-        && (has_address_control || title_contains_supported_dialog_keyword(title))
-}
-
-fn title_contains_supported_dialog_keyword(title: &str) -> bool {
-    let title = title.to_ascii_lowercase();
-    ["open", "upload", "choose", "folder"]
-        .iter()
-        .any(|keyword| title.contains(keyword))
-}
-
-fn has_address_control(hwnd: HWND) -> bool {
-    find_navigation_edit_control(hwnd).is_some()
-}
-
-fn dialog_without_navigation_edit_can_jump(class_name: &str, title: &str) -> bool {
-    class_name == DIALOG_CLASS && title.trim().eq_ignore_ascii_case("Browse For Folder")
-}
-
-fn window_without_navigation_edit_can_jump(hwnd: HWND) -> bool {
-    class_name(hwnd).as_deref().is_some_and(|class_name| {
-        dialog_without_navigation_edit_can_jump(class_name, &window_text(hwnd))
-    })
 }
 
 fn unsupported_foreground_window_message() -> Option<String> {
@@ -692,96 +2050,13 @@ fn is_blender_custom_file_browser(process_name: &str, class_name: &str, title: &
         && title.trim().eq_ignore_ascii_case("Blender File View")
 }
 
-#[derive(Clone, Copy)]
-struct AddressControlCandidate<'a> {
-    hwnd: HWND,
-    control_id: i32,
-    class_name: &'a str,
-}
-
-fn select_address_edit_control<'a, I>(candidates: I) -> Option<HWND>
-where
-    I: IntoIterator<Item = AddressControlCandidate<'a>>,
-{
-    select_edit_control_by_id(candidates, ADDRESS_BAR_EDIT_CONTROL_ID)
-}
-
-fn select_edit_control_by_id<'a, I>(candidates: I, control_id: i32) -> Option<HWND>
-where
-    I: IntoIterator<Item = AddressControlCandidate<'a>>,
-{
-    candidates
-        .into_iter()
-        .find(|candidate| {
-            candidate.control_id == control_id && candidate.class_name.eq_ignore_ascii_case("Edit")
-        })
-        .map(|candidate| candidate.hwnd)
-}
-
-struct AddressControlSearch {
-    found_hwnd: HWND,
-}
-
-fn find_navigation_edit_control(hwnd: HWND) -> Option<HWND> {
-    find_address_edit_control(hwnd)
-}
-
-fn find_address_edit_control(hwnd: HWND) -> Option<HWND> {
-    let mut search = AddressControlSearch {
-        found_hwnd: null_mut(),
-    };
-
-    unsafe {
-        EnumChildWindows(
-            hwnd,
-            Some(enum_address_edit_control_proc),
-            (&mut search as *mut AddressControlSearch) as LPARAM,
-        );
-    }
-
-    if search.found_hwnd.is_null() {
-        None
-    } else {
-        Some(search.found_hwnd)
-    }
-}
-
-unsafe extern "system" fn enum_address_edit_control_proc(hwnd: HWND, l_param: LPARAM) -> BOOL {
-    if l_param == 0 {
-        return TRUE;
-    }
-
-    let search = unsafe { &mut *(l_param as *mut AddressControlSearch) };
-    let control_id = unsafe { GetDlgCtrlID(hwnd) };
-    if control_id != ADDRESS_BAR_EDIT_CONTROL_ID {
-        return TRUE;
-    }
-
-    let Some(class_name) = class_name(hwnd) else {
-        return TRUE;
-    };
-    let candidate = AddressControlCandidate {
-        hwnd,
-        control_id,
-        class_name: &class_name,
-    };
-    if let Some(address_edit) = select_address_edit_control([candidate]) {
-        search.found_hwnd = address_edit;
-        return 0;
-    }
-
-    TRUE
-}
-
 fn should_hook_observed_dialog(
     host_architecture: &str,
     dialog_architecture: &str,
     class_name: &str,
-    title: &str,
-    has_address_control: bool,
 ) -> bool {
     dialog_architecture.eq_ignore_ascii_case(host_architecture)
-        && is_supported_dialog_shape(class_name, title, has_address_control)
+        && is_supported_dialog_shape(class_name)
 }
 
 #[cfg(test)]
@@ -800,6 +2075,9 @@ where
 }
 
 fn observed_dialog(hwnd: HWND) -> Option<ObservedDialog> {
+    if unsafe { IsWindowVisible(hwnd) } == 0 {
+        return None;
+    }
     let mut class_buffer = [0u16; 64];
     let class_len =
         unsafe { GetClassNameW(hwnd, class_buffer.as_mut_ptr(), class_buffer.len() as i32) };
@@ -833,16 +2111,25 @@ fn observed_dialog(hwnd: HWND) -> Option<ObservedDialog> {
     })
 }
 
-fn serve_connection(pipe: NamedPipeHandle, session: &HostSession) -> io::Result<()> {
+fn serve_connection(
+    pipe: NamedPipeHandle,
+    session: &HostSession,
+    hook_shutdown: &HookShutdown,
+) -> io::Result<()> {
     let client_process_id = named_pipe_client_process_id(pipe.raw())?;
-    let response = match read_line(pipe.raw()) {
-        Ok(request) => response_for_request(&request, session, client_process_id),
-        Err(_) => command_reply("Failed", "Unknown command."),
+    let outcome = match read_line(pipe.raw()) {
+        Ok(request) => request_outcome(&request, session, client_process_id),
+        Err(_) => RequestOutcome::reply(command_reply("Failed", "Unknown command.")),
     };
 
-    let result = write_line(pipe.raw(), &response).and_then(|_| flush_pipe(pipe.raw()));
+    let result = write_line(pipe.raw(), &outcome.response).and_then(|_| flush_pipe(pipe.raw()));
     unsafe {
         DisconnectNamedPipe(pipe.raw());
+    }
+
+    if outcome.shutdown_requested {
+        hook_shutdown.request_and_wait();
+        std::process::exit(0);
     }
 
     result
@@ -977,14 +2264,40 @@ fn write_line(handle: HANDLE, line: &str) -> io::Result<()> {
     Ok(())
 }
 
+#[cfg(test)]
 fn response_for_request(request: &str, session: &HostSession, client_process_id: u32) -> String {
+    request_outcome(request, session, client_process_id).response
+}
+
+struct RequestOutcome {
+    response: String,
+    shutdown_requested: bool,
+}
+
+impl RequestOutcome {
+    fn reply(response: String) -> Self {
+        Self {
+            response,
+            shutdown_requested: false,
+        }
+    }
+
+    fn shutdown(response: String) -> Self {
+        Self {
+            response,
+            shutdown_requested: true,
+        }
+    }
+}
+
+fn request_outcome(request: &str, session: &HostSession, client_process_id: u32) -> RequestOutcome {
     let envelope = serde_json::from_str::<IncomingEnvelope>(request);
     let Ok(envelope) = envelope else {
-        return command_reply("Failed", "Unknown command.");
+        return RequestOutcome::reply(command_reply("Failed", "Unknown command."));
     };
 
     if envelope.version != IPC_VERSION {
-        return command_reply("Failed", "Unsupported IPC version.");
+        return RequestOutcome::reply(command_reply("Failed", "Unsupported IPC version."));
     }
 
     if !session.accepts_client(
@@ -992,10 +2305,10 @@ fn response_for_request(request: &str, session: &HostSession, client_process_id:
         envelope.client_process_id,
         &envelope.secret,
     ) {
-        return command_reply("Failed", "Unauthorized hook IPC client.");
+        return RequestOutcome::reply(command_reply("Failed", "Unauthorized hook IPC client."));
     }
 
-    match envelope.message_type.as_str() {
+    let response = match envelope.message_type.as_str() {
         "GetActiveDialog" => active_dialog_response(),
         "JumpDialogToFolder" => {
             let payload = serde_json::from_value::<JumpCommandPayload>(envelope.payload);
@@ -1005,8 +2318,16 @@ fn response_for_request(request: &str, session: &HostSession, client_process_id:
             }
         }
         "HealthProbe" => health_probe_reply(hook_runtime_status()),
+        "Shutdown" => {
+            return RequestOutcome::shutdown(command_reply(
+                "Success",
+                "Hook host graceful shutdown accepted.",
+            ));
+        }
         _ => command_reply("Failed", "Unknown command."),
-    }
+    };
+
+    RequestOutcome::reply(response)
 }
 
 fn health_probe_reply(status: HookRuntimeStatus) -> String {
@@ -1041,6 +2362,7 @@ fn active_dialog_response() -> String {
         return command_reply("NoActiveDialog", &message);
     }
 
+    let firefox_file_dialog_utility = firefox_child_dialog_requires_spawn_proof(&dialog);
     let payload = ActiveDialogPayload {
         dialog_id: dialog.dialog_id,
         window_handle: dialog.window_handle as usize,
@@ -1050,6 +2372,8 @@ fn active_dialog_response() -> String {
         process_name: dialog.process_name,
         class_name: dialog.class_name,
         title: dialog.title,
+        preload_confirmed_before_dialog: has_confirmed_spawn_proof(dialog.process_id),
+        firefox_file_dialog_utility,
     };
 
     let envelope = OutgoingEnvelope {
@@ -1124,15 +2448,6 @@ fn jump_dialog_to_folder(payload: JumpCommandPayload) -> String {
         );
     }
 
-    if find_navigation_edit_control(hwnd).is_none()
-        && !window_without_navigation_edit_can_jump(hwnd)
-    {
-        return command_reply(
-            "UnsupportedDialog",
-            "Dialog does not expose a supported path edit control.",
-        );
-    }
-
     if let Err(failure) = target_hook_ready(
         expected_process_id,
         expected_thread_id,
@@ -1142,7 +2457,7 @@ fn jump_dialog_to_folder(payload: JumpCommandPayload) -> String {
     }
 
     let command_id = next_command_id();
-    let ack_receiver = match AckReceiver::new(command_id) {
+    let ack_receiver = match AckReceiver::new(command_id, expected_process_id) {
         Ok(receiver) => receiver,
         Err(error) => {
             return command_reply(
@@ -1190,15 +2505,6 @@ fn jump_dialog_to_folder(payload: JumpCommandPayload) -> String {
     let (status, message) = jump_status_for_ack(ack, is_live_window(hwnd));
     if status != "Success" {
         return command_reply(status, message);
-    }
-
-    if find_navigation_edit_control(hwnd).is_none()
-        && !window_without_navigation_edit_can_jump(hwnd)
-    {
-        return command_reply(
-            "UnsupportedDialog",
-            "Dialog path edit control disappeared after jump command was acknowledged.",
-        );
     }
 
     if let Err(failure) = target_hook_ready(
@@ -1404,7 +2710,7 @@ enum AckStartupControl {
 }
 
 impl AckReceiver {
-    fn new(command_id: u64) -> io::Result<Self> {
+    fn new(command_id: u64, expected_sender_process_id: u32) -> io::Result<Self> {
         let (ready_sender, ready_receiver) = mpsc::channel();
         let (ack_sender, ack_receiver) = mpsc::channel();
         let (startup_control_sender, startup_control_receiver) = mpsc::channel();
@@ -1412,6 +2718,7 @@ impl AckReceiver {
         let thread = thread::spawn(move || {
             ack_window_thread(
                 command_id,
+                expected_sender_process_id,
                 ack_sender,
                 ready_sender,
                 startup_control_receiver,
@@ -1508,11 +2815,13 @@ fn wait_for_ack_window_startup(
 
 struct AckWindowState {
     command_id: u64,
+    expected_sender_process_id: u32,
     sender: mpsc::Sender<JumpAckStatus>,
 }
 
 fn ack_window_thread(
     command_id: u64,
+    expected_sender_process_id: u32,
     ack_sender: mpsc::Sender<JumpAckStatus>,
     ready_sender: mpsc::Sender<Result<usize, String>>,
     startup_control_receiver: mpsc::Receiver<AckStartupControl>,
@@ -1534,6 +2843,7 @@ fn ack_window_thread(
 
     let state = Box::new(AckWindowState {
         command_id,
+        expected_sender_process_id,
         sender: ack_sender,
     });
     let state_ptr = Box::into_raw(state);
@@ -1696,7 +3006,17 @@ unsafe extern "system" fn ack_window_proc(
             };
             if let Some((command_id, status)) = decode_jump_ack_payload(copy_data.dwData, bytes) {
                 let state = unsafe { &*state_ptr };
-                if command_id == state.command_id {
+                let sender_hwnd = w_param as HWND;
+                let mut sender_process_id = 0u32;
+                let sender_thread_id = if sender_hwnd.is_null() {
+                    0
+                } else {
+                    unsafe { GetWindowThreadProcessId(sender_hwnd, &mut sender_process_id) }
+                };
+                if command_id == state.command_id
+                    && sender_thread_id != 0
+                    && sender_process_id == state.expected_sender_process_id
+                {
                     let _ = state.sender.send(status);
                     return TRUE as LRESULT;
                 }
@@ -2080,6 +3400,8 @@ struct ActiveDialogPayload {
     process_name: String,
     class_name: String,
     title: String,
+    preload_confirmed_before_dialog: bool,
+    firefox_file_dialog_utility: bool,
 }
 
 struct ObservedDialog {
@@ -2102,6 +3424,385 @@ struct CommandReplyPayload<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cleanup_authorization_is_session_bound_and_never_zero() {
+        assert_ne!(0, cleanup_authorization_token(""));
+        assert_ne!(
+            cleanup_authorization_token("session-a"),
+            cleanup_authorization_token("session-b")
+        );
+        assert_eq!(
+            cleanup_authorization_token("session-a"),
+            cleanup_authorization_token("session-a")
+        );
+    }
+
+    #[test]
+    fn preload_acknowledgements_are_unique_per_architecture_process_thread_and_generation() {
+        let first = preload_acknowledgement_name(HookThreadKey::new(100, 7), 11);
+        let other_thread = preload_acknowledgement_name(HookThreadKey::new(100, 8), 11);
+        let other_process = preload_acknowledgement_name(HookThreadKey::new(101, 7), 11);
+        let other_generation = preload_acknowledgement_name(HookThreadKey::new(100, 7), 12);
+
+        assert!(first.contains(host_architecture()));
+        assert_ne!(first, other_thread);
+        assert_ne!(first, other_process);
+        assert_ne!(first, other_generation);
+    }
+
+    #[test]
+    fn spawn_proof_rejects_a_reused_child_process_id() {
+        let proof = SpawnProof {
+            token: 0x1234,
+            child_creation_time: 77,
+            generation: 0x1234,
+            parent_process_id: 100,
+            child_process_id: 200,
+            child_thread_id: 300,
+            status: SPAWN_PROOF_SUCCESS,
+            installed_before_resume: 1,
+            captured_show_observed: 1,
+        };
+        assert!(spawn_proof_matches(proof, 0x1234, 100, 200, Some(77)));
+        assert!(!spawn_proof_matches(proof, 0x1234, 100, 200, Some(78)));
+        assert!(!spawn_proof_matches(proof, 0x1234, 100, 201, Some(77)));
+    }
+
+    #[test]
+    fn spawn_proof_diagnostic_identifies_each_fail_closed_gate() {
+        let proof = SpawnProof {
+            token: 0x1234,
+            child_creation_time: 77,
+            generation: 0x1234,
+            parent_process_id: 100,
+            child_process_id: 200,
+            child_thread_id: 7,
+            status: SPAWN_PROOF_SUCCESS,
+            installed_before_resume: 1,
+            captured_show_observed: 1,
+        };
+        let rejection = |proof| spawn_proof_rejection(proof, 0x1234, 100, 200, Some(77));
+        assert_eq!(None, rejection(proof));
+        assert!(rejection(SpawnProof { status: 2, ..proof })
+            .unwrap()
+            .contains("other values failed"));
+        assert!(rejection(SpawnProof {
+            status: SPAWN_PROOF_PENDING,
+            ..proof
+        })
+        .unwrap()
+        .contains("not complete"));
+        assert_eq!(
+            Some("token mismatch".to_string()),
+            rejection(SpawnProof { token: 9, ..proof })
+        );
+        assert_eq!(
+            Some("hookInstalledBeforeResume false".to_string()),
+            rejection(SpawnProof {
+                installed_before_resume: 0,
+                ..proof
+            })
+        );
+        assert_eq!(
+            Some("captured Show has not been observed".to_string()),
+            rejection(SpawnProof {
+                captured_show_observed: 0,
+                ..proof
+            })
+        );
+        assert!(spawn_proof_rejection(proof, 0x1234, 100, 200, Some(78))
+            .unwrap()
+            .contains("creationTime mismatch"));
+    }
+
+    #[test]
+    fn firefox_child_dialog_is_fail_closed_without_spawn_precapture_proof() {
+        assert!(firefox_dialog_precapture_ready(false, false));
+        assert!(firefox_dialog_precapture_ready(false, true));
+        assert!(firefox_dialog_precapture_ready(true, true));
+        assert!(!firefox_dialog_precapture_ready(true, false));
+    }
+
+    #[test]
+    fn target_hook_readiness_requires_matching_preload_success_and_callwnd_delivery() {
+        let token = 0x1234u64;
+        assert!(preload_acknowledgement_matches(
+            PreloadAcknowledgement {
+                token,
+                status: PRELOAD_ACK_SUCCESS,
+                host_handle: 0,
+            },
+            token
+        ));
+        assert!(!preload_acknowledgement_matches(
+            PreloadAcknowledgement {
+                token,
+                status: PRELOAD_ACK_PENDING,
+                host_handle: 0,
+            },
+            token
+        ));
+        assert!(!preload_acknowledgement_matches(
+            PreloadAcknowledgement {
+                token: token + 1,
+                status: PRELOAD_ACK_SUCCESS,
+                host_handle: 0,
+            },
+            token
+        ));
+        assert!(target_hook_ready_after_preload(true, true));
+        assert!(!target_hook_ready_after_preload(false, true));
+        assert!(!target_hook_ready_after_preload(true, false));
+        assert!(preload_confirmation_is_early(false, false));
+        assert!(preload_confirmation_is_early(true, true));
+        assert!(!preload_confirmation_is_early(false, true));
+    }
+
+    #[test]
+    fn explicit_preload_health_waits_for_target_process_precapture_acknowledgement() {
+        let target = HookThreadKey::new(100, 7);
+        let other_process = HookThreadKey::new(200, 8);
+
+        assert!(explicit_preload_runtime_ready(None, &HashSet::new()));
+        assert!(!explicit_preload_runtime_ready(Some(100), &HashSet::new()));
+        assert!(!explicit_preload_runtime_ready(
+            Some(100),
+            &HashSet::from([other_process])
+        ));
+        assert!(explicit_preload_runtime_ready(
+            Some(100),
+            &HashSet::from([target])
+        ));
+    }
+
+    #[test]
+    fn process_precapture_allows_a_new_dialog_thread_to_confirm_callwnd_delivery() {
+        let preload_thread = HookThreadKey::new(100, 7);
+        let new_dialog_thread = HookThreadKey::new(100, 99);
+        let other_process_dialog_thread = HookThreadKey::new(200, 99);
+        let confirmed = HashSet::from([preload_thread]);
+
+        assert!(process_has_confirmed_precapture(
+            new_dialog_thread.process_id,
+            &confirmed
+        ));
+        assert!(!process_has_confirmed_precapture(
+            other_process_dialog_thread.process_id,
+            &confirmed
+        ));
+        assert!(target_hook_ready_after_preload(
+            process_has_confirmed_precapture(new_dialog_thread.process_id, &confirmed),
+            true
+        ));
+        assert!(!target_hook_ready_after_preload(
+            process_has_confirmed_precapture(other_process_dialog_thread.process_id, &confirmed),
+            true
+        ));
+    }
+
+    #[test]
+    fn cleanup_payload_binds_ack_command_and_authorization_token() {
+        let payload = build_cleanup_copydata_payload(42usize as HWND, 7, 11);
+        let pointer_size = std::mem::size_of::<usize>();
+        let command_offset = align_up(pointer_size * 2, std::mem::align_of::<u64>());
+
+        assert_eq!(std::mem::size_of::<CleanupCommandHeader>(), payload.len());
+        assert_eq!(
+            CLEANUP_COPYDATA_MAGIC,
+            usize::from_ne_bytes(payload[..pointer_size].try_into().unwrap())
+        );
+        assert_eq!(
+            42,
+            usize::from_ne_bytes(payload[pointer_size..pointer_size * 2].try_into().unwrap())
+        );
+        assert_eq!(
+            7,
+            u64::from_ne_bytes(
+                payload[command_offset..command_offset + 8]
+                    .try_into()
+                    .unwrap()
+            )
+        );
+        assert_eq!(
+            11,
+            u64::from_ne_bytes(
+                payload[command_offset + 8..command_offset + 16]
+                    .try_into()
+                    .unwrap()
+            )
+        );
+    }
+
+    #[test]
+    fn event_driven_scan_keeps_original_interval_as_registration_fallback() {
+        assert_eq!(HOOK_EVENT_RECOVERY_RESCAN_INTERVAL, rescan_interval(true));
+        assert_eq!(HOOK_RESCAN_INTERVAL, rescan_interval(false));
+    }
+
+    #[test]
+    fn explicit_preload_scan_is_bounded_and_slows_after_root_is_armed() {
+        let recovery_interval = Duration::from_secs(5);
+        assert_eq!(Duration::from_millis(25), HOOK_PRELOAD_RESCAN_INTERVAL);
+        assert_eq!(
+            HOOK_PRELOAD_RESCAN_INTERVAL,
+            hook_scan_interval(true, false, true, true, recovery_interval)
+        );
+        assert_eq!(
+            HOOK_TARGET_SESSION_RESCAN_INTERVAL,
+            hook_scan_interval(true, true, true, true, recovery_interval)
+        );
+        assert!(HOOK_PRELOAD_RESCAN_INTERVAL >= Duration::from_millis(25));
+        assert!(HOOK_TARGET_SESSION_RESCAN_INTERVAL >= Duration::from_millis(100));
+    }
+
+    #[test]
+    fn parent_monitor_uses_a_waitable_process_handle() {
+        let current_process = open_process_for_exit_wait(std::process::id()).unwrap();
+
+        assert_eq!(WAIT_TIMEOUT, unsafe {
+            WaitForSingleObject(current_process.0, 0)
+        });
+    }
+
+    #[test]
+    fn parent_shutdown_waits_until_hook_resources_are_dropped() {
+        struct CleanupProbe(std::sync::Arc<AtomicBool>);
+
+        impl Drop for CleanupProbe {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::Release);
+            }
+        }
+
+        let hook_shutdown = Arc::new(HookShutdown::new());
+        let resources_dropped = std::sync::Arc::new(AtomicBool::new(false));
+        let worker_shutdown = hook_shutdown.clone();
+        let worker_resources_dropped = resources_dropped.clone();
+        let worker = thread::spawn(move || {
+            let probe = CleanupProbe(worker_resources_dropped);
+            while !worker_shutdown.is_requested() {
+                thread::yield_now();
+            }
+            drop(probe);
+            worker_shutdown.mark_complete();
+        });
+
+        hook_shutdown.request_and_wait();
+        assert!(resources_dropped.load(Ordering::Acquire));
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn hook_shutdown_restores_captures_before_unhooking_target_threads() {
+        #[derive(Debug, PartialEq, Eq)]
+        enum Event {
+            CleanupCaptures,
+            Unhook(usize),
+            RevokeAuthorization,
+            Clear(HookThreadKey),
+            Drive(Vec<u32>),
+        }
+
+        let events = std::cell::RefCell::new(Vec::new());
+        let thread_42 = HookThreadKey::new(100, 42);
+        let thread_7 = HookThreadKey::new(100, 7);
+        let thread_99 = HookThreadKey::new(200, 99);
+
+        shutdown_hook_resources(
+            vec![(thread_42, 420usize as HHOOK), (thread_7, 70usize as HHOOK)],
+            vec![
+                (thread_99, 990usize as HHOOK),
+                (thread_42, 421usize as HHOOK),
+            ],
+            vec![thread_42, thread_7],
+            vec![thread_99, thread_42],
+            || events.borrow_mut().push(Event::CleanupCaptures),
+            |hook| events.borrow_mut().push(Event::Unhook(hook as usize)),
+            || events.borrow_mut().push(Event::RevokeAuthorization),
+            |thread| events.borrow_mut().push(Event::Clear(thread)),
+            |thread_ids| events.borrow_mut().push(Event::Drive(thread_ids.to_vec())),
+        );
+
+        assert_eq!(
+            vec![
+                Event::CleanupCaptures,
+                Event::RevokeAuthorization,
+                Event::Unhook(70),
+                Event::Unhook(420),
+                Event::Unhook(421),
+                Event::Unhook(990),
+                Event::Clear(thread_7),
+                Event::Clear(thread_42),
+                Event::Drive(vec![7, 42, 99]),
+            ],
+            *events.borrow()
+        );
+    }
+
+    #[test]
+    fn native_hook_installation_is_fail_closed_for_global_thread_zero() {
+        assert!(validate_target_thread_id(42).is_ok());
+        let error = validate_target_thread_id(0).unwrap_err();
+        assert!(error.contains("global Windows hooks are prohibited"));
+
+        let source = include_str!("main.rs");
+        let removed_field = ["global_", "preload_hook"].concat();
+        assert!(!source.contains(&removed_field));
+        let install_api = ["SetWindowsHook", "ExW("].concat();
+        assert_eq!(1, source.matches(&install_api).count());
+    }
+
+    #[test]
+    fn hook_unload_posts_every_queue_before_the_synchronous_thread_barrier() {
+        #[derive(Debug, PartialEq, Eq)]
+        enum Event {
+            Post(u32),
+            QueueTurn,
+            Synchronize(u32),
+        }
+
+        let events = std::cell::RefCell::new(Vec::new());
+        drive_hook_threads_after_unhook_with(
+            &[7, 42],
+            |thread_id| events.borrow_mut().push(Event::Post(thread_id)),
+            || events.borrow_mut().push(Event::QueueTurn),
+            |thread_id| events.borrow_mut().push(Event::Synchronize(thread_id)),
+        );
+
+        assert_eq!(
+            vec![
+                Event::Post(7),
+                Event::Post(42),
+                Event::QueueTurn,
+                Event::Synchronize(7),
+                Event::Synchronize(42),
+            ],
+            *events.borrow()
+        );
+    }
+
+    #[test]
+    fn message_wait_timeout_rounds_up_and_never_uses_infinite_value() {
+        assert_eq!(0, wait_timeout_millis(Duration::ZERO));
+        assert_eq!(1, wait_timeout_millis(Duration::from_nanos(1)));
+        assert_eq!(501, wait_timeout_millis(Duration::from_millis(500)));
+        assert_eq!(
+            u32::MAX - 1,
+            wait_timeout_millis(Duration::from_secs(u64::MAX))
+        );
+    }
+
+    #[test]
+    fn dialog_event_requests_an_immediate_scan() {
+        DIALOG_SCAN_REQUESTED.store(false, Ordering::Release);
+
+        unsafe {
+            dialog_scan_event(null_mut(), EVENT_SYSTEM_DIALOGSTART, null_mut(), 0, 0, 0, 0);
+        }
+
+        assert!(DIALOG_SCAN_REQUESTED.swap(false, Ordering::AcqRel));
+    }
 
     #[test]
     fn host_session_accepts_only_its_parent_and_secret() {
@@ -2135,6 +3836,24 @@ mod tests {
     }
 
     #[test]
+    fn graceful_shutdown_requires_the_bound_parent_identity_and_secret() {
+        let session = HostSession {
+            parent_process_id: 123,
+            secret: "session-secret".to_string(),
+        };
+        let authorized = r#"{"version":1,"messageType":"Shutdown","clientProcessId":123,"secret":"session-secret","payload":{}}"#;
+        let wrong_secret = r#"{"version":1,"messageType":"Shutdown","clientProcessId":123,"secret":"wrong","payload":{}}"#;
+
+        let accepted = request_outcome(authorized, &session, 123);
+        let rejected = request_outcome(wrong_secret, &session, 123);
+
+        assert!(accepted.shutdown_requested);
+        assert!(accepted.response.contains("graceful shutdown accepted"));
+        assert!(!rejected.shutdown_requested);
+        assert!(rejected.response.contains("Unauthorized hook IPC client."));
+    }
+
+    #[test]
     fn arg_value_from_returns_value_after_named_option() {
         let args = [
             "ListaryOpen.HookHost.exe",
@@ -2164,6 +3883,65 @@ mod tests {
         assert_eq!(
             None,
             arg_value_from(["host.exe", "--pipe", "pipe"], "--dll")
+        );
+    }
+
+    #[test]
+    fn preload_process_family_contains_only_root_and_descendants() {
+        let parents = [(10, 1), (20, 10), (30, 20), (40, 1), (50, 40)];
+
+        assert_eq!(
+            HashSet::from([10, 20, 30]),
+            descendant_process_ids(10, &parents)
+        );
+        assert_eq!(
+            HashSet::from([40, 50]),
+            descendant_process_ids(40, &parents)
+        );
+    }
+
+    #[test]
+    fn preload_process_family_handles_out_of_order_process_snapshot() {
+        let parents = [(30, 20), (20, 10), (10, 1)];
+
+        assert_eq!(
+            HashSet::from([10, 20, 30]),
+            descendant_process_ids(10, &parents)
+        );
+    }
+
+    #[test]
+    fn preload_session_uses_topmost_same_executable_ancestor() {
+        let processes = [
+            ProcessFamilyEntry {
+                process_id: 10,
+                parent_process_id: 1,
+                executable_name: "firefox.exe".to_string(),
+            },
+            ProcessFamilyEntry {
+                process_id: 20,
+                parent_process_id: 10,
+                executable_name: "firefox.exe".to_string(),
+            },
+            ProcessFamilyEntry {
+                process_id: 30,
+                parent_process_id: 20,
+                executable_name: "firefox.exe".to_string(),
+            },
+            ProcessFamilyEntry {
+                process_id: 40,
+                parent_process_id: 1,
+                executable_name: "firefox.exe".to_string(),
+            },
+        ];
+
+        assert_eq!(
+            Some((10, "firefox.exe".to_string())),
+            session_process_root(30, &processes)
+        );
+        assert_eq!(
+            Some((40, "firefox.exe".to_string())),
+            session_process_root(40, &processes)
         );
     }
 
@@ -2387,130 +4165,13 @@ mod tests {
     }
 
     #[test]
-    fn supported_dialog_shape_accepts_standard_file_dialog_titles() {
-        assert!(is_supported_dialog_shape("#32770", "Open", false));
-        assert!(is_supported_dialog_shape("#32770", "Open Folder", false));
-        assert!(is_supported_dialog_shape("#32770", "File Upload", false));
-        assert!(is_supported_dialog_shape(
-            "#32770",
-            "Choose which file(s) to upload...",
-            false
-        ));
+    fn supported_dialog_shape_is_locale_independent() {
+        assert!(is_supported_dialog_shape("#32770"));
     }
 
     #[test]
-    fn supported_dialog_shape_accepts_address_control_without_process_whitelist() {
-        assert!(is_supported_dialog_shape("#32770", "Firefox", true));
-        assert!(is_supported_dialog_shape("#32770", "Untitled", true));
-    }
-
-    #[test]
-    fn supported_dialog_shape_rejects_non_dialog_class_and_unknown_shape() {
-        assert!(!is_supported_dialog_shape(
-            "Chrome_WidgetWin_1",
-            "Open",
-            true
-        ));
-        assert!(!is_supported_dialog_shape("#32770", "Properties", false));
-    }
-
-    #[test]
-    fn address_control_selector_prefers_edit_with_address_control_id() {
-        let address_root = 101usize as HWND;
-        let combo_ex = 102usize as HWND;
-        let combo = 103usize as HWND;
-        let edit = 104usize as HWND;
-
-        let selected = select_address_edit_control([
-            AddressControlCandidate {
-                hwnd: address_root,
-                control_id: ADDRESS_BAR_EDIT_CONTROL_ID,
-                class_name: "Address Band Root",
-            },
-            AddressControlCandidate {
-                hwnd: combo_ex,
-                control_id: ADDRESS_BAR_EDIT_CONTROL_ID,
-                class_name: "ComboBoxEx32",
-            },
-            AddressControlCandidate {
-                hwnd: combo,
-                control_id: ADDRESS_BAR_EDIT_CONTROL_ID,
-                class_name: "ComboBox",
-            },
-            AddressControlCandidate {
-                hwnd: edit,
-                control_id: ADDRESS_BAR_EDIT_CONTROL_ID,
-                class_name: "Edit",
-            },
-        ]);
-
-        assert_eq!(Some(edit), selected);
-    }
-
-    #[test]
-    fn address_control_selector_rejects_non_address_ids_and_classes() {
-        assert_eq!(
-            None,
-            select_address_edit_control([
-                AddressControlCandidate {
-                    hwnd: 201usize as HWND,
-                    control_id: ADDRESS_BAR_EDIT_CONTROL_ID,
-                    class_name: "Button",
-                },
-                AddressControlCandidate {
-                    hwnd: 202usize as HWND,
-                    control_id: 42,
-                    class_name: "Edit",
-                },
-            ])
-        );
-    }
-
-    #[test]
-    fn navigation_edit_selector_rejects_file_name_edit_when_address_edit_is_missing() {
-        let file_name_edit = 301usize as HWND;
-
-        let selected = select_address_edit_control([AddressControlCandidate {
-            hwnd: file_name_edit,
-            control_id: 1148,
-            class_name: "Edit",
-        }]);
-
-        assert_eq!(None, selected);
-    }
-
-    #[test]
-    fn navigation_edit_selector_prefers_address_edit_over_file_name_edit() {
-        let file_name_edit = 401usize as HWND;
-        let address_edit = 402usize as HWND;
-
-        let selected = select_address_edit_control([
-            AddressControlCandidate {
-                hwnd: file_name_edit,
-                control_id: 1148,
-                class_name: "Edit",
-            },
-            AddressControlCandidate {
-                hwnd: address_edit,
-                control_id: ADDRESS_BAR_EDIT_CONTROL_ID,
-                class_name: "Edit",
-            },
-        ]);
-
-        assert_eq!(Some(address_edit), selected);
-    }
-
-    #[test]
-    fn standard_dialog_without_navigation_edit_requires_browse_for_folder_shape() {
-        assert!(dialog_without_navigation_edit_can_jump(
-            "#32770",
-            "Browse For Folder"
-        ));
-        assert!(!dialog_without_navigation_edit_can_jump("#32770", "Open"));
-        assert!(!dialog_without_navigation_edit_can_jump(
-            "GHOST_WindowClass",
-            "Blender File View"
-        ));
+    fn supported_dialog_shape_rejects_non_dialog_class() {
+        assert!(!is_supported_dialog_shape("Chrome_WidgetWin_1"));
     }
 
     #[test]
@@ -2536,29 +4197,13 @@ mod tests {
 
     #[test]
     fn observed_dialog_hooking_requires_matching_host_architecture_and_supported_shape() {
-        assert!(should_hook_observed_dialog(
-            "x64",
-            "x64",
-            "#32770",
-            "File Upload",
-            false
-        ));
-        assert!(should_hook_observed_dialog(
-            "x86", "x86", "#32770", "Firefox", true
-        ));
-        assert!(!should_hook_observed_dialog(
-            "x64",
-            "x86",
-            "#32770",
-            "File Upload",
-            true
-        ));
+        assert!(should_hook_observed_dialog("x64", "x64", "#32770"));
+        assert!(should_hook_observed_dialog("x86", "x86", "#32770"));
+        assert!(!should_hook_observed_dialog("x64", "x86", "#32770"));
         assert!(!should_hook_observed_dialog(
             "x86",
             "x86",
-            "#32770",
-            "Properties",
-            false
+            "Chrome_WidgetWin_1"
         ));
     }
 

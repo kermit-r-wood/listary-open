@@ -95,7 +95,27 @@ public sealed class HotkeyServiceTests
         messageSource.RaiseHotkey(1);
         messageSource.RaiseHotkey(2);
 
-        Assert.Equal(new[] { "Ctrl+Space", "Ctrl+G" }, receivedNames);
+        Assert.Equal(new[] { "Search", "Dialog" }, receivedNames);
+    }
+
+    [Fact]
+    public void RegisterCustomHotkeysReplacesExistingRegistrations()
+    {
+        var registrar = new RecordingHotkeyRegistrar();
+        var messageSource = new RecordingHotkeyMessageSource();
+        using var service = new HotkeyService(registrar, messageSource);
+
+        service.RegisterDefaults();
+        var result = service.Register("Alt+F1", "Ctrl+Shift+D");
+
+        Assert.True(result.AllRegistered);
+        Assert.Equal(new[] { 1, 2 }, registrar.UnregisteredIds);
+        Assert.Contains(
+            new ObservedHotkey(1, HotkeyModifiers.Alt | HotkeyModifiers.NoRepeat, 0x70),
+            registrar.RegisteredHotkeys);
+        Assert.Contains(
+            new ObservedHotkey(2, HotkeyModifiers.Control | HotkeyModifiers.Shift | HotkeyModifiers.NoRepeat, 0x44),
+            registrar.RegisteredHotkeys);
     }
 
     [Fact]

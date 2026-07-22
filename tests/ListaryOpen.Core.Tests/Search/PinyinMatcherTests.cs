@@ -36,6 +36,15 @@ public sealed class PinyinMatcherTests
         Assert.True(score > 50);
     }
 
+    [Theory]
+    [InlineData("xingkong", "星空.jpg")]
+    [InlineData("xk", "星空.jpg")]
+    [InlineData("zvezda", "звезда.txt")]
+    public void ScoreMatchesCompleteChineseAndMultilingualTransliteration(string query, string candidate)
+    {
+        Assert.True(PinyinMatcher.Score(query, candidate) > 0);
+    }
+
     [Fact]
     public void CreateSearchTextIncludesKnownPinyinAndInitials()
     {
@@ -46,6 +55,17 @@ public sealed class PinyinMatcherTests
         Assert.Contains("ht.docx", searchText);
     }
 
+    [Fact]
+    public void CreateSearchAliasesOmitsOriginalTextAndAsciiDuplicates()
+    {
+        var aliases = PinyinMatcher.CreateSearchAliases("合同.docx");
+
+        Assert.DoesNotContain("合同", aliases);
+        Assert.Contains("hetong.docx", aliases);
+        Assert.Contains("ht.docx", aliases);
+        Assert.Equal(string.Empty, PinyinMatcher.CreateSearchAliases("invoice.docx"));
+    }
+
     [Theory]
     [InlineData(null)]
     [InlineData("")]
@@ -53,6 +73,7 @@ public sealed class PinyinMatcherTests
     public void CreateSearchTextReturnsEmptyForBlankInput(string? value)
     {
         Assert.Equal(string.Empty, PinyinMatcher.CreateSearchText(value));
+        Assert.Equal(string.Empty, PinyinMatcher.CreateSearchAliases(value));
     }
 
     [Theory]

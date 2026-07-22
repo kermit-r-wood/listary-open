@@ -448,6 +448,57 @@ public sealed class ElevatedIndexerClientTests
     }
 
     [Fact]
+    public async Task ScanNtfsAsyncParsesCrLfAndUtf8RecordAcrossTailBufferBoundaries()
+    {
+        var tempDirectory = Path.Combine(Path.GetTempPath(), "listary-open-" + Guid.NewGuid());
+        Directory.CreateDirectory(tempDirectory);
+
+        try
+        {
+            const int tailBufferSize = 64 * 1024;
+            const string prefix = "{\"padding\":\"";
+            var paddingLength = tailBufferSize - 1 - Encoding.UTF8.GetByteCount(prefix);
+            var firstLine = prefix
+                + new string('a', paddingLength)
+                + "项目\",\"fullPath\":\"C:\\\\Docs\\\\项目.txt\",\"isDirectory\":false,"
+                + "\"sizeBytes\":21,\"lastWriteTime\":\"2026-07-15T00:00:00+00:00\"}";
+            var secondLine =
+                "{\"fullPath\":\"C:\\\\Docs\\\\Second.txt\",\"isDirectory\":false,"
+                + "\"sizeBytes\":22,\"lastWriteTime\":\"2026-07-15T00:00:01+00:00\"}";
+            var output = firstLine + "\r\n" + secondLine;
+            var helperPath = CreateUsableHelperBundle(tempDirectory);
+            var client = new ElevatedIndexerClient(
+                helperPath,
+                (_, _, outputPath, errorPath) => new FileWritingElevatedIndexerProcess(
+                    outputPath,
+                    errorPath,
+                    output,
+                    error: string.Empty,
+                    exitCode: 0));
+
+            var records = await CollectAsync(
+                client.ScanNtfsAsync(new IndexRoot("C:\\Docs"), CancellationToken.None));
+
+            Assert.Collection(
+                records,
+                record =>
+                {
+                    Assert.Equal("C:\\Docs\\项目.txt", record.FullPath);
+                    Assert.Equal(21, record.SizeBytes);
+                },
+                record =>
+                {
+                    Assert.Equal("C:\\Docs\\Second.txt", record.FullPath);
+                    Assert.Equal(22, record.SizeBytes);
+                });
+        }
+        finally
+        {
+            Directory.Delete(tempDirectory, recursive: true);
+        }
+    }
+
+    [Fact]
     public async Task QueryJournalStateAsyncParsesJsonStateFromHelperOutput()
     {
         var tempDirectory = Path.Combine(Path.GetTempPath(), "listary-open-" + Guid.NewGuid());
@@ -471,6 +522,45 @@ public sealed class ElevatedIndexerClientTests
             Assert.Equal(9ul, state!.UsnJournalId);
             Assert.Equal(50, state.LowestValidUsn);
             Assert.Equal(200, state.NextUsn);
+        }
+        finally
+        {
+            Directory.Delete(tempDirectory, recursive: true);
+        }
+    }
+
+    [Fact]
+    public async Task ScanNtfsAsyncYieldsFlushedRecordsBeforeHelperExits()
+    {
+        var tempDirectory = Path.Combine(Path.GetTempPath(), "listary-open-" + Guid.NewGuid());
+        Directory.CreateDirectory(tempDirectory);
+
+        try
+        {
+            var helperPath = CreateUsableHelperBundle(tempDirectory);
+            StreamingFileWritingElevatedIndexerProcess? helperProcess = null;
+            var client = new ElevatedIndexerClient(
+                helperPath,
+                (_, _, outputPath, errorPath) =>
+                {
+                    helperProcess = new StreamingFileWritingElevatedIndexerProcess(outputPath, errorPath);
+                    return helperProcess;
+                });
+
+            await using var enumerator = client
+                .ScanNtfsAsync(new IndexRoot("C:\\Docs"), CancellationToken.None)
+                .GetAsyncEnumerator();
+            var firstMove = enumerator.MoveNextAsync().AsTask();
+
+            await helperProcess!.FirstRecordWritten.WaitAsync(TimeSpan.FromSeconds(5));
+            Assert.True(await firstMove.WaitAsync(TimeSpan.FromSeconds(5)));
+            Assert.Equal("C:\\Docs\\First.txt", enumerator.Current.FullPath);
+            Assert.False(helperProcess.HasExited);
+
+            helperProcess.AllowExit();
+            Assert.True(await enumerator.MoveNextAsync().AsTask().WaitAsync(TimeSpan.FromSeconds(5)));
+            Assert.Equal("C:\\Docs\\Second.txt", enumerator.Current.FullPath);
+            Assert.False(await enumerator.MoveNextAsync().AsTask().WaitAsync(TimeSpan.FromSeconds(5)));
         }
         finally
         {
@@ -646,7 +736,7 @@ public sealed class ElevatedIndexerClientTests
             Assert.True(helperProcess.KillCalled);
             Assert.Equal(2, helperProcess.WaitForExitTokens.Count);
             Assert.True(helperProcess.WaitForExitTokens[0].CanBeCanceled);
-            Assert.False(helperProcess.WaitForExitTokens[1].CanBeCanceled);
+            Assert.True(helperProcess.WaitForExitTokens[1].CanBeCanceled);
         }
         finally
         {
@@ -801,6 +891,78 @@ public sealed class ElevatedIndexerClientTests
 
         public void Dispose()
         {
+        }
+    }
+
+    private sealed class StreamingFileWritingElevatedIndexerProcess : IElevatedIndexerProcess
+    {
+        private const string FirstRecord =
+            "{\"fullPath\":\"C:\\\\Docs\\\\First.txt\",\"isDirectory\":false,\"sizeBytes\":1,\"lastWriteTime\":\"2026-07-15T00:00:00+00:00\"}";
+        private const string SecondRecord =
+            "{\"fullPath\":\"C:\\\\Docs\\\\Second.txt\",\"isDirectory\":false,\"sizeBytes\":2,\"lastWriteTime\":\"2026-07-15T00:00:01+00:00\"}";
+
+        private readonly string _outputPath;
+        private readonly string _errorPath;
+        private readonly TaskCompletionSource _allowExit = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        private readonly TaskCompletionSource _firstRecordWritten = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        private Task _runTask = Task.CompletedTask;
+
+        public StreamingFileWritingElevatedIndexerProcess(string outputPath, string errorPath)
+        {
+            _outputPath = outputPath;
+            _errorPath = errorPath;
+        }
+
+        public Task FirstRecordWritten => _firstRecordWritten.Task;
+
+        public int ExitCode => 0;
+
+        public bool HasExited { get; private set; }
+
+        public bool Start()
+        {
+            _runTask = RunAsync();
+            return true;
+        }
+
+        public Task<string> ReadStandardErrorToEndAsync(CancellationToken cancellationToken)
+            => Task.FromResult(string.Empty);
+
+        public Task WaitForExitAsync(CancellationToken cancellationToken)
+            => _runTask.WaitAsync(cancellationToken);
+
+        public void AllowExit() => _allowExit.TrySetResult();
+
+        public void Kill() => _allowExit.TrySetResult();
+
+        public void Dispose()
+        {
+        }
+
+        private async Task RunAsync()
+        {
+            try
+            {
+                await using var stream = new FileStream(
+                    _outputPath,
+                    FileMode.CreateNew,
+                    FileAccess.Write,
+                    FileShare.Read,
+                    bufferSize: 4096,
+                    useAsync: true);
+                await using var writer = new StreamWriter(stream);
+                await writer.WriteLineAsync(FirstRecord);
+                await writer.FlushAsync();
+                _firstRecordWritten.TrySetResult();
+                await _allowExit.Task;
+                await writer.WriteLineAsync(SecondRecord);
+                await writer.FlushAsync();
+                await File.WriteAllTextAsync(_errorPath, string.Empty);
+            }
+            finally
+            {
+                HasExited = true;
+            }
         }
     }
 

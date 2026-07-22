@@ -1,0 +1,313 @@
+{
+  "schemaVersion": 1,
+  "featureGroups": [
+    {
+      "id": "appearance-theme-layout",
+      "requirement": "Light, dark, system and geek themes render readable, vertically aligned controls and system theme changes are applied consistently.",
+      "evidence": [
+        { "suite": "dotnet", "testNameContains": "UiResourcesAndWindowsLoadOnStaThread" },
+        { "suite": "dotnet", "testNameContains": "ComboBoxUsesThemeAwareTemplateAndCentersSelectedText" },
+        { "suite": "visual", "testNameContains": "ProductionWindowsRenderVisualAcceptanceMatrix", "screenshot": "10-settings-appearance-dark-en.png" },
+        { "suite": "visual", "testNameContains": "ProductionWindowsRenderVisualAcceptanceMatrix", "screenshot": "11-settings-appearance-geek-en.png" },
+        { "suite": "packagedBlackbox", "testNameContains": "PublishedTrayOpensSettingsAndAppearancePersistsAcrossARealRestart" }
+      ]
+    },
+    {
+      "id": "settings-language-save",
+      "requirement": "Chinese and English interface language changes obey save semantics and update the complete settings surface.",
+      "evidence": [
+        { "suite": "dotnet", "testNameContains": "InterfaceLanguageAppliesOnlyAfterSuccessfulSave" },
+        { "suite": "dotnet", "testNameContains": "SettingsWindowDefinesOperationalSectionsAndPresentationBindings" },
+        { "suite": "visual", "testNameContains": "ProductionWindowsRenderVisualAcceptanceMatrix", "screenshot": "12-settings-language-light-zh.png" },
+        { "suite": "visual", "testNameContains": "ProductionWindowsRenderVisualAcceptanceMatrix", "screenshot": "19-settings-actions-light-zh.png" }
+      ]
+    },
+    {
+      "id": "settings-drive-roots",
+      "requirement": "Every ready fixed drive is selected by default and full-drive roots do not reappear as duplicate additional folders.",
+      "evidence": [
+        { "suite": "dotnet", "testNameContains": "DefaultDriveOptionsSelectEveryReadyDrive" },
+        { "suite": "dotnet", "testNameContains": "CreateIndexRootsCollapsesDescendantsToAvoidDuplicateScans" },
+        { "suite": "dotnet", "testNameContains": "LoadMigratesLegacyUserProfileDefaultToAllReadyDrives" }
+      ]
+    },
+    {
+      "id": "indexing-fast-uac",
+      "requirement": "Fast NTFS indexing is enabled at startup, the app requests elevation once, and enabling the session feature does not launch a second elevation flow.",
+      "evidence": [
+        { "suite": "dotnet", "testNameContains": "DefaultAppManifestRequestsAdministratorOnceAtStartup" },
+        { "suite": "dotnet", "testNameContains": "EnableNtfsFastIndexingOnStartupEnablesClientWithoutRequestingImmediateReindex" },
+        { "suite": "dotnet", "testNameContains": "EnableNtfsFastIndexingOnStartupDoesNotEnableUacWhenProcessIsNotElevated" }
+      ]
+    },
+    {
+      "id": "indexing-providers-continuous",
+      "requirement": "NTFS, fallback and continuous indexing select correctly, persist records, apply journal changes and recover safely.",
+      "evidence": [
+        { "suite": "dotnet", "testNameContains": "SelectProviderPrefersNtfsForReadyNtfsVolume" },
+        { "suite": "dotnet", "testNameContains": "ScanAsyncReturnsFilesAndFolders" },
+        { "suite": "dotnet", "testNameContains": "CreateAndDeleteHintsUpdateSearchIndex" },
+        { "suite": "dotnet", "testNameContains": "ApplyUsnJournalChangesDeletesUpsertsAndSavesCheckpointAtomically" }
+      ]
+    },
+    {
+      "id": "github-release-check",
+      "requirement": "GitHub latest-release metadata is compared to the running version and missing releases are reported without a false update.",
+      "evidence": [
+        { "suite": "dotnet", "testNameContains": "LatestReleaseResponseIsComparedWithCurrentVersion" },
+        { "suite": "dotnet", "testNameContains": "MissingLatestReleaseIsReportedAsNoPublishedRelease" }
+      ]
+    },
+    {
+      "id": "search-ranking-filters",
+      "requirement": "Indexed search supports exact, substring and fuzzy ranking plus file type, extension, path and date filters before paging.",
+      "evidence": [
+        { "suite": "dotnet", "testNameContains": "SearchReturnsExactMatchAfterMoreThanFiveThousandEarlierFuzzyCandidates" },
+        { "suite": "dotnet", "testNameContains": "SearchAppliesExtensionPathPhraseAndExclusionFilters" },
+        { "suite": "dotnet", "testNameContains": "SqliteSearchAppliesTypeAndDateFiltersBeforePaging" }
+      ]
+    },
+    {
+      "id": "search-pinyin-multilingual",
+      "requirement": "Chinese full pinyin and initials plus multilingual Unicode-to-Latin transliteration are searchable.",
+      "evidence": [
+        { "suite": "dotnet", "testNameContains": "ScoreMatchesCompleteChineseAndMultilingualTransliteration" },
+        { "suite": "dotnet", "testNameContains": "SearchFindsChineseFilenameByPinyinQuery" }
+      ]
+    },
+    {
+      "id": "search-recent-recommendations",
+      "requirement": "An empty launcher query shows recent files and fresh recommended folders in deterministic order.",
+      "evidence": [
+        { "suite": "dotnet", "testNameContains": "EmptyGlobalQueryShowsRecentItems" },
+        { "suite": "dotnet", "testNameContains": "ExplorerTrackerReturnsOnlyFreshRecommendedFolder" }
+      ]
+    },
+    {
+      "id": "search-preview",
+      "requirement": "The preview pane renders supported metadata and images inside a finite uniformly scaled surface.",
+      "evidence": [
+        { "suite": "dotnet", "testNameContains": "SearchPanelContainsCollapsiblePreviewPane" },
+        { "suite": "dotnet", "testNameContains": "ImagePreviewUsesAFiniteUniformSurfaceInsteadOfANativeSizeScroller" },
+        { "suite": "dotnet", "testNameContains": "UiResourcesAndWindowsLoadOnStaThread" },
+        { "suite": "visual", "testNameContains": "ProductionWindowsRenderVisualAcceptanceMatrix", "screenshot": "14-search-results-preview-light-en.png" },
+        { "suite": "visual", "testNameContains": "ProductionWindowsRenderVisualAcceptanceMatrix", "screenshot": "15-search-results-dark-zh.png" },
+        { "suite": "packagedBlackbox", "testNameContains": "PublishedAppGlobalHotkeyDrivesSearchPreviewContextMenuEscapeAndQuickLaunch" }
+      ]
+    },
+    {
+      "id": "search-debounce-stability",
+      "requirement": "Search waits for the configured idle delay, preserves the current frame and cancels superseded work without flicker or crashes.",
+      "evidence": [
+        { "suite": "dotnet", "testNameContains": "QueryTextSearchesAfterEightyMillisecondDefaultDelay" },
+        { "suite": "dotnet", "testNameContains": "QueryTextPreservesCurrentResultsWhileWaitingForIdleDelay" },
+        { "suite": "dotnet", "testNameContains": "QueryTextCancelsPreviousSearchWhenNewQueryStarts" },
+        { "suite": "packagedBlackbox", "testNameContains": "PublishedAppGlobalHotkeyDrivesSearchPreviewContextMenuEscapeAndQuickLaunch" }
+      ]
+    },
+    {
+      "id": "search-context-menu",
+      "requirement": "Result context menus open from a result, close on left input and do not block the next right click.",
+      "evidence": [
+        { "suite": "dotnet", "testNameContains": "PointerClosesAnExistingResultMenuWithoutCancelingANewRightClick" },
+        { "suite": "dotnet", "testNameContains": "RightArrowRequestsSelectedResultMenu" },
+        { "suite": "packagedBlackbox", "testNameContains": "PublishedAppGlobalHotkeyDrivesSearchPreviewContextMenuEscapeAndQuickLaunch" }
+      ]
+    },
+    {
+      "id": "explorer-repeat-focus-input",
+      "requirement": "Explorer direct typing starts search, repeated typing stays in the same session, and Escape, navigation, Ctrl+A and Backspace target only the active overlay.",
+      "evidence": [
+        { "suite": "dotnet", "testNameContains": "FollowUpInputFromSameExplorerAlwaysAppendsWhileSearchPanelIsVisible" },
+        { "suite": "dotnet", "testNameContains": "EscapeFromSameExplorerDismissesVisibleTypeSearch" },
+        { "suite": "desktop", "testNameContains": "OverlayCaptureRoutesBackspaceNavigationEnterAndEscapeWithoutClosingHost" },
+        { "suite": "desktop", "testNameContains": "LowLevelHookRoutesTextFromRealForegroundAndFocusedHostControls" },
+        { "suite": "packagedBlackbox", "testNameContains": "PackagedElevatedAppCapturesRealExplorerInputAndSynchronizesSelection" }
+      ]
+    },
+    {
+      "id": "task-manager-search",
+      "requirement": "Task Manager search is debounced, deduplicates provider rows, resolves icons, and synchronizes keyboard selection into both the real elevated system Task Manager and the final packaged app.",
+      "evidence": [
+        { "suite": "dotnet", "testNameContains": "QueryRefreshIsDebouncedAndKeepsPreviousFrameUntilReady" },
+        { "suite": "dotnet", "testNameContains": "DuplicateChildProcessesCollapseToOneVisibleResult" },
+        { "suite": "dotnet", "testNameContains": "ProcessDisplayNameResolvesExecutableIconPath" },
+        { "suite": "dotnet", "testNameContains": "OverlayCapturesKeyboardSelectionAndConfirmation" },
+        { "suite": "dotnet", "testNameContains": "PreviewSelectionReachesTheStaProviderWithoutActivatingTaskManager" },
+        { "suite": "dotnet", "testNameContains": "UiResourcesAndWindowsLoadOnStaThread" },
+        { "suite": "dotnet", "testNameContains": "SelectionRematchesRowsWhenTaskManagerRuntimeIdsChange" },
+        { "suite": "desktop", "testNameContains": "LowLevelHookRoutesTextFromRealForegroundAndFocusedHostControls" },
+        { "suite": "elevatedDesktop", "testNameContains": "ProductionOverlaySynchronizesTwoSelectionsWithRealSystemTaskManager" },
+        { "suite": "packagedBlackbox", "testNameContains": "PackagedAppCapturesRealTaskManagerInputAndSynchronizesTwoRows" },
+        { "suite": "visual", "testNameContains": "ProductionWindowsRenderVisualAcceptanceMatrix", "screenshot": "18-task-manager-search-dark-en.png" },
+        { "suite": "visual", "testNameContains": "ProductionWindowsRenderVisualAcceptanceMatrix", "screenshot": "20-task-manager-selection-next-dark-en.png" }
+      ]
+    },
+    {
+      "id": "dialog-attachment-lifetime",
+      "requirement": "Quick Switch remains attached across transient foreground changes but detaches when the captured native dialog is destroyed.",
+      "evidence": [
+        { "suite": "dotnet", "testNameContains": "DialogAttachmentSurvivesOnlyATransientProbeMissWithALiveAnchor" },
+        { "suite": "dotnet", "testNameContains": "DestroyedDialogAlwaysDetachesEvenWhileTheSearchBarIsActive" },
+        { "suite": "packagedBlackbox", "testNameContains": "PublishedAppUsesCtrlGAndItsNativeHookToNavigateARealFirefoxPicker" }
+      ]
+    },
+    {
+      "id": "dialog-native-file-jump-focus",
+      "requirement": "A real standard file dialog is captured and jumps to a folder, restores file-name focus, accepts Ctrl+A/input/Backspace/Enter and closes on Escape.",
+      "evidence": [
+        { "suite": "desktop", "testNameContains": "NativeFileDialogAcceptsTypingControlAAndBackspaceAfterFolderJump" },
+        { "suite": "desktop", "testNameContains": "NativeHookCapturesJumpsRestoresInputFocusAndEscapeClosesDialog" }
+      ]
+    },
+    {
+      "id": "dialog-native-folder-focus",
+      "requirement": "A real standard folder dialog jumps through the native hook, restores folder-name focus, accepts the exact target folder and closes on Escape.",
+      "evidence": [
+        { "suite": "desktop", "testNameContains": "NativeFolderDialogAcceptsTheActuallyJumpedFolder" },
+        { "suite": "desktop", "testNameContains": "NativeHookCapturesJumpsRestoresInputFocusAndEscapeClosesDialog" }
+      ]
+    },
+    {
+      "id": "dialog-repeat-input",
+      "requirement": "After one dialog search/jump session, the next direct input starts a new search; Ctrl+A and other edit commands remain routed to the overlay.",
+      "evidence": [
+        { "suite": "dotnet", "testNameContains": "ResetQuickSwitchQueryStartsTheNextCollapsedSearchFromEmptyText" },
+        { "suite": "desktop", "testNameContains": "DialogInputCanRestartAfterACompletedSearchAndStillRoutesEditCommands" },
+        { "suite": "visual", "testNameContains": "ProductionWindowsRenderVisualAcceptanceMatrix", "screenshot": "16-quick-switch-collapsed-geek-en.png" },
+        { "suite": "visual", "testNameContains": "ProductionWindowsRenderVisualAcceptanceMatrix", "screenshot": "17-quick-switch-expanded-geek-en.png" }
+      ]
+    },
+    {
+      "id": "global-host-isolation",
+      "requirement": "Global input is isolated to supported hosts, does not leak Escape, and is verified through real Explorer and elevated Task Manager packaged-app black-box flows.",
+      "evidence": [
+        { "suite": "dotnet", "testNameContains": "DialogQuickSwitchCommandsRequireTheActiveAttachedDialog" },
+        { "suite": "desktop", "testNameContains": "LowLevelHookRoutesTextFromRealForegroundAndFocusedHostControls" },
+        { "suite": "desktop", "testNameContains": "OverlayCaptureRoutesBackspaceNavigationEnterAndEscapeWithoutClosingHost" },
+        { "suite": "desktop", "testNameContains": "ForegroundSwitchRoutesRepeatedInputToTheActiveExplorerWindow" },
+        { "suite": "desktop", "testNameContains": "UnsupportedForegroundWindowDoesNotStartGlobalTypeSearch" }
+        ,{ "suite": "packagedBlackbox", "testNameContains": "PackagedElevatedAppCapturesRealExplorerInputAndSynchronizesSelection" }
+        ,{ "suite": "packagedBlackbox", "testNameContains": "PackagedAppCapturesRealTaskManagerInputAndSynchronizesTwoRows" }
+      ]
+    },
+    {
+      "id": "global-hotkey-registration",
+      "requirement": "A real Win32 global hotkey registration receives the configured gesture through the WPF message pump, publishes Search and toggles the search panel.",
+      "evidence": [
+        { "suite": "desktop", "testNameContains": "RealWin32GlobalHotkeyRegistrationPublishesConfiguredGestures" },
+        { "suite": "dotnet", "testNameContains": "SearchHotkeyTogglesSearchPanelVisibility" },
+        { "suite": "packagedBlackbox", "testNameContains": "PublishedAppGlobalHotkeyDrivesSearchPreviewContextMenuEscapeAndQuickLaunch" }
+      ]
+    },
+    {
+      "id": "search-actions-quick-launch",
+      "requirement": "Search results can be opened, revealed and copied, while exact quick-launch commands execute only after input stabilizes.",
+      "evidence": [
+        { "suite": "dotnet", "testNameContains": "ActivateSelectedAsyncOpensSelectedFileInFilesAndFoldersModeAndSetsStatus" },
+        { "suite": "dotnet", "testNameContains": "RevealSelectedAsyncRevealsSelectedPathAndSetsStatus" },
+        { "suite": "dotnet", "testNameContains": "CopySelectedPathCopiesSelectedPathAndSetsStatus" },
+        { "suite": "dotnet", "testNameContains": "ExactQuickLaunchRunsAfterInputStabilizes" },
+        { "suite": "packagedBlackbox", "testNameContains": "PublishedAppGlobalHotkeyDrivesSearchPreviewContextMenuEscapeAndQuickLaunch" }
+      ]
+    },
+    {
+      "id": "explorer-menu-selection",
+      "requirement": "Explorer menu commands expand the active folder correctly and overlay selection synchronizes only a direct child into the intended Explorer window.",
+      "evidence": [
+        { "suite": "dotnet", "testNameContains": "PowerShellStartsInTheExplorerFolder" },
+        { "suite": "dotnet", "testNameContains": "CustomCommandExpandsConfiguredValuesAndExecutionOptions" },
+        { "suite": "dotnet", "testNameContains": "DirectChildIsSelectedInRequestedExplorerWindow" },
+        { "suite": "desktop", "testNameContains": "ProductionTrackerAndSelectionServiceDriveARealSystemExplorerWindow" }
+      ]
+    },
+    {
+      "id": "quick-switch-folder-providers",
+      "requirement": "Quick Switch merges live Explorer, Directory Opus and Total Commander folders, deduplicates them and keeps the active source first.",
+      "evidence": [
+        { "suite": "dotnet", "testNameContains": "CompositeQuickSwitchWindowProviderRefreshesProvidersDeduplicatesAndKeepsForegroundFirst" },
+        { "suite": "dotnet", "testNameContains": "DirectoryOpusQuickSwitchProviderParsesActiveListerActiveTabBeforeOtherTabs" },
+        { "suite": "dotnet", "testNameContains": "TotalCommanderQuickSwitchProviderReturnsPanelPathsForegroundFirst" }
+      ]
+    },
+    {
+      "id": "dialog-native-hook-plugins-no-fallback",
+      "requirement": "Standard dialogs use preloaded native IFileDialog direct navigation only; failures are terminal, while nonstandard dialogs require an exact-target manifest plugin and can never claim #32770.",
+      "evidence": [
+        { "suite": "desktop", "testNameContains": "FirefoxCtrlOOpensNativeDialogWithoutHook" },
+        { "suite": "desktop", "testNameContains": "FirefoxCtrlOFilePickerAttachesQuickSwitchAndJumpsWithoutOpeningFile" },
+        { "suite": "packagedBlackbox", "testNameContains": "PublishedAppUsesCtrlGAndItsNativeHookToNavigateARealFirefoxPicker" },
+        { "suite": "dotnet", "testNameContains": "CapturedNativeResultIsTerminalWithoutPluginExecution" },
+        { "suite": "dotnet", "testNameContains": "StandardDialogCannotBeClaimedByPlugin" },
+        { "suite": "dotnet", "testNameContains": "InvalidApiVersionIsRejectedWithDiagnostic" },
+        { "suite": "dotnet", "testNameContains": "ActivateSelectedAsyncInFolderSearchModeSurfacesDialogJumpFailure" },
+        { "suite": "desktop", "testNameContains": "CompiledPluginDirectlyNavigatesRealNonstandardHostThroughStructuredMessage" },
+        { "suite": "packagedBlackbox", "testNameContains": "PublishedAppUsesCompiledPluginToDirectlyNavigateRealNonstandardWindow" }
+      ]
+    },
+    {
+      "id": "hook-ipc-security-bitness",
+      "requirement": "Native hook IPC round-trips commands, binds hosts to their parent and secret, and selects architecture-specific binaries safely.",
+      "evidence": [
+        { "suite": "dotnet", "testNameContains": "CommandReplyRoundTripsOverNamedPipe" },
+        { "suite": "dotnet", "testNameContains": "CreateStartInfoIncludesParentAndSecretForBoundHost" },
+        { "suite": "dotnet", "testNameContains": "DetectFromProbeResultMapsArchitecture" },
+        { "suite": "native", "testNameContains": "host_session_accepts_only_its_parent_and_secret" }
+      ]
+    },
+    {
+      "id": "app-startup-single-instance-tray",
+      "requirement": "Startup initializes Quick Switch, enforces a single running instance without showing a modal duplicate-instance prompt, and exposes the shared application icon through the tray and windows.",
+      "evidence": [
+        { "suite": "dotnet", "testNameContains": "StartHookQuickSwitchEnablementOnStartupInvokesEnablementCallback" },
+        { "suite": "dotnet", "testNameContains": "TryAcquireReportsAlreadyRunningForSecondInstance" },
+        { "suite": "dotnet", "testNameContains": "DuplicateInstanceStartupExitsWithoutAModalNotification" },
+        { "suite": "dotnet", "testNameContains": "TrayControllerUsesSharedIconResource" },
+        { "suite": "packagedBlackbox", "testNameContains": "PublishedAppHasAHealthyBackgroundLifecycleAndSilentSingleInstanceExit" },
+        { "suite": "packagedBlackbox", "testNameContains": "PublishedTrayOpensSettingsAndAppearancePersistsAcrossARealRestart" }
+      ]
+    },
+    {
+      "id": "dpi-dispatcher-layout",
+      "requirement": "Windows declare per-monitor-v2 DPI awareness, dialog placement is invalidated across DPI changes and UI work is marshalled onto the WPF dispatcher.",
+      "evidence": [
+        { "suite": "dotnet", "testNameContains": "AppManifestsEnablePerMonitorV2DpiAwareness" },
+        { "suite": "dotnet", "testNameContains": "QuickSwitchReusesPositionOnlyWhenAnchorDpiAndLayoutAreUnchanged" },
+        { "suite": "dotnet", "testNameContains": "InvokeOnDispatcherAsyncRunsActionOnDispatcherThreadWhenCalledFromWorkerThread" }
+      ]
+    },
+    {
+      "id": "performance-data-recovery",
+      "requirement": "Search stays within its large-index performance budget, performance metrics persist safely, and application data directories are created predictably.",
+      "evidence": [
+        { "suite": "dotnet", "testNameContains": "SearchLargeIndexReturnsTargetWithinPerformanceBudget" },
+        { "suite": "dotnet", "testNameContains": "DisposeFlushesQueuedMetricsAsJsonLines" },
+        { "suite": "dotnet", "testNameContains": "EnsureDirectoriesCreatesDataAndTmp" }
+      ]
+    },
+    {
+      "id": "settings-actions-hotkeys-menu",
+      "requirement": "Hotkeys, quick launch entries, exclusions and Explorer menu actions persist and apply without requiring unrelated page changes.",
+      "evidence": [
+        { "suite": "dotnet", "testNameContains": "UpdatePreferenceSavesImmediatelyWithoutApplyingDraftsFromOtherPages" },
+        { "suite": "dotnet", "testNameContains": "SaveHotkeysCommandAppliesAndUpdatesSettings" },
+        { "suite": "dotnet", "testNameContains": "SavePreferencesPersistsQuickLaunchEntries" }
+      ]
+    },
+    {
+      "id": "package-windows-distributable",
+      "requirement": "The win-x64 distributable contains the app, elevated indexer and complete x64/x86 native hook bundles and is archived as the required ZIP.",
+      "evidence": [
+        { "suite": "package", "artifact": "ListaryOpen.App.exe" },
+        { "suite": "package", "artifact": "ListaryOpen.Indexer.Elevated.exe" },
+        { "suite": "package", "artifact": "hooks/x64/ListaryOpen.HookHost.exe" },
+        { "suite": "package", "artifact": "hooks/x64/ListaryOpen.Hook.dll" },
+        { "suite": "package", "artifact": "hooks/x64/libunwind.dll" },
+        { "suite": "package", "artifact": "hooks/x86/ListaryOpen.HookHost.exe" },
+        { "suite": "package", "artifact": "hooks/x86/ListaryOpen.Hook.dll" },
+        { "suite": "package", "artifact": "hooks/x86/libunwind.dll" },
+        { "suite": "packagedBlackbox", "testNameContains": "PublishedAppHasAHealthyBackgroundLifecycleAndSilentSingleInstanceExit" }
+      ]
+    }
+  ]
+}

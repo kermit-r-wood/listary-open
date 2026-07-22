@@ -1,5 +1,6 @@
 using ListaryOpen.Core.Indexing;
 using ListaryOpen.Indexer.Elevated;
+using System.Text;
 
 namespace ListaryOpen.Infrastructure.Tests.Indexing;
 
@@ -73,12 +74,63 @@ public sealed class ElevatedIndexerRecordWriterTests
         }
     }
 
+    [Fact]
+    public async Task WriteAsyncFlushesCompletedBatchBeforeEnumerationFinishes()
+    {
+        var batchConsumed = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var allowCompletion = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var writer = new FlushTrackingWriter();
+
+        var writeTask = ElevatedIndexerRecordWriter.WriteAsync(
+            EnumerateBatch(batchConsumed, allowCompletion),
+            writer,
+            CancellationToken.None);
+
+        await batchConsumed.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        Assert.True(writer.FlushCount > 0);
+        Assert.False(writeTask.IsCompleted);
+
+        allowCompletion.TrySetResult();
+        await writeTask.WaitAsync(TimeSpan.FromSeconds(5));
+    }
+
     private static async IAsyncEnumerable<FileRecord> Enumerate(params FileRecord[] records)
     {
         foreach (var record in records)
         {
             await Task.Yield();
             yield return record;
+        }
+    }
+
+    private static async IAsyncEnumerable<FileRecord> EnumerateBatch(
+        TaskCompletionSource batchConsumed,
+        TaskCompletionSource allowCompletion)
+    {
+        for (var index = 0; index < ElevatedIndexerRecordWriter.StreamingFlushRecordCount; index++)
+        {
+            yield return FileRecord.Create(
+                $"C:\\Docs\\{index}.txt",
+                isDirectory: false,
+                sizeBytes: index,
+                DateTimeOffset.UnixEpoch);
+        }
+
+        batchConsumed.TrySetResult();
+        await allowCompletion.Task;
+    }
+
+    private sealed class FlushTrackingWriter : StringWriter
+    {
+        public override Encoding Encoding => Encoding.UTF8;
+
+        public int FlushCount { get; private set; }
+
+        public override Task FlushAsync(CancellationToken cancellationToken)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            FlushCount++;
+            return Task.CompletedTask;
         }
     }
 }

@@ -1,34 +1,35 @@
-using System.Diagnostics;
-using ListaryOpen.Core.Search;
-using ListaryOpen.Infrastructure.Search;
+using ListaryOpen.SearchBenchmark;
 
-if (args.Length < 2)
+if (args.Length == 0)
 {
-    Console.Error.WriteLine("Usage: ListaryOpen.SearchBenchmark <index.db> <query> [query ...]");
+    PrintUsage();
     return 2;
 }
 
-await using var index = await SqliteSearchIndex.OpenAsync(args[0], CancellationToken.None);
-foreach (var text in args.Skip(1))
+try
 {
-    _ = await index.SearchAsync(new SearchQuery(text, SearchMode.FilesAndFolders), CancellationToken.None);
-
-    var timings = new List<double>();
-    IReadOnlyList<SearchResult> results = Array.Empty<SearchResult>();
-    for (var iteration = 0; iteration < 5; iteration++)
+    if (string.Equals(args[0], "ab", StringComparison.OrdinalIgnoreCase))
     {
-        var stopwatch = Stopwatch.StartNew();
-        results = await index.SearchAsync(
-            new SearchQuery(text, SearchMode.FilesAndFolders),
-            CancellationToken.None);
-        stopwatch.Stop();
-        timings.Add(stopwatch.Elapsed.TotalMilliseconds);
+        return await AblationBenchmarkRunner.RunAsync(args[1..], CancellationToken.None);
     }
 
-    var first = results.FirstOrDefault();
-    Console.WriteLine(
-        $"{text}\tcount={results.Count}\tfirst={first?.Record.Name ?? "<none>"}\t" +
-        $"reason={first?.MatchReason ?? "<none>"}\tms={string.Join(',', timings.Select(value => value.ToString("F1")))}");
+    if (string.Equals(args[0], "search", StringComparison.OrdinalIgnoreCase))
+    {
+        return await SearchBenchmarkRunner.RunAsync(args[1..], CancellationToken.None);
+    }
+
+    // Preserve the original CLI: <index.db> [--root <path>] <query> [...].
+    return await SearchBenchmarkRunner.RunAsync(args, CancellationToken.None);
+}
+catch (Exception exception)
+{
+    Console.Error.WriteLine(exception);
+    return 1;
 }
 
-return 0;
+static void PrintUsage()
+{
+    Console.Error.WriteLine("Usage:");
+    Console.Error.WriteLine("  ListaryOpen.SearchBenchmark search <index.db> [--root <path>] <query> [query ...]");
+    Console.Error.WriteLine("  ListaryOpen.SearchBenchmark ab <index.db> --root <path> --query <query> [--iterations N] [--sample N] [--upserts N]");
+}

@@ -52,7 +52,13 @@ internal sealed class ExplorerObservationScheduler : IDisposable
     private readonly Action _observe;
     private readonly TimeSpan _interval;
     private readonly Func<IExplorerObservationTimer> _timerFactory;
+    private readonly AutoResetEvent _observationSignal = new(initialState: false);
+    private readonly object _waiterGate = new();
+    private readonly List<TaskCompletionSource> _observationWaiters = new();
     private IExplorerObservationTimer? _timer;
+    private Thread? _observationThread;
+    private int _observationPending;
+    private int _disposed;
 
     public ExplorerObservationScheduler(
         Action observe,
@@ -72,38 +78,130 @@ internal sealed class ExplorerObservationScheduler : IDisposable
 
     public void Start()
     {
-        if (_timer is not null)
+        if (_timer is not null || Volatile.Read(ref _disposed) != 0)
         {
             return;
         }
 
+        _observationThread = new Thread(ProcessObservations)
+        {
+            IsBackground = true,
+            Name = "ListaryOpen Explorer observation"
+        };
+        _observationThread.SetApartmentState(ApartmentState.STA);
+        _observationThread.Start();
         _timer = _timerFactory();
         _timer.Tick += OnTick;
         _timer.Start(_interval);
+        RequestObservation();
     }
 
     public void Dispose()
     {
-        if (_timer is null)
+        if (Interlocked.Exchange(ref _disposed, 1) != 0)
         {
             return;
         }
 
-        _timer.Tick -= OnTick;
-        _timer.Stop();
-        _timer.Dispose();
-        _timer = null;
+        if (_timer is not null)
+        {
+            _timer.Tick -= OnTick;
+            _timer.Stop();
+            _timer.Dispose();
+            _timer = null;
+        }
+
+        _observationSignal.Set();
+        if (_observationThread is null ||
+            _observationThread.Join(TimeSpan.FromSeconds(2)))
+        {
+            _observationSignal.Dispose();
+        }
+
+        TaskCompletionSource[] waiters;
+        lock (_waiterGate)
+        {
+            waiters = _observationWaiters.ToArray();
+            _observationWaiters.Clear();
+        }
+
+        foreach (var waiter in waiters)
+        {
+            waiter.TrySetCanceled();
+        }
+    }
+
+    public Task RequestObservationAsync()
+    {
+        if (Volatile.Read(ref _disposed) != 0)
+        {
+            return Task.FromCanceled(new CancellationToken(canceled: true));
+        }
+
+        var completion = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        lock (_waiterGate)
+        {
+            if (Volatile.Read(ref _disposed) != 0)
+            {
+                completion.TrySetCanceled();
+                return completion.Task;
+            }
+
+            _observationWaiters.Add(completion);
+        }
+
+        RequestObservation();
+        return completion.Task;
     }
 
     private void OnTick(object? sender, EventArgs e)
     {
-        try
+        RequestObservation();
+    }
+
+    private void RequestObservation()
+    {
+        if (Volatile.Read(ref _disposed) == 0 &&
+            Interlocked.Exchange(ref _observationPending, 1) == 0)
         {
-            _observe();
+            _observationSignal.Set();
         }
-        catch (Exception exception)
+    }
+
+    private void ProcessObservations()
+    {
+        while (true)
         {
-            Trace.TraceError(exception.ToString());
+            _observationSignal.WaitOne();
+            if (Volatile.Read(ref _disposed) != 0)
+            {
+                return;
+            }
+
+            Interlocked.Exchange(ref _observationPending, 0);
+            TaskCompletionSource[] waiters;
+            lock (_waiterGate)
+            {
+                waiters = _observationWaiters.ToArray();
+                _observationWaiters.Clear();
+            }
+
+            try
+            {
+                _observe();
+                foreach (var waiter in waiters)
+                {
+                    waiter.TrySetResult();
+                }
+            }
+            catch (Exception exception)
+            {
+                Trace.TraceError(exception.ToString());
+                foreach (var waiter in waiters)
+                {
+                    waiter.TrySetException(exception);
+                }
+            }
         }
     }
 }

@@ -13,6 +13,7 @@ public sealed class SearchMatchReasonDisplayConverter : IValueConverter
             ["name"] = "Name",
             ["path"] = "Path",
             ["pinyin"] = "Pinyin",
+            ["recent"] = "Recent",
             ["explorer"] = "Pinned"
         };
 
@@ -21,16 +22,16 @@ public sealed class SearchMatchReasonDisplayConverter : IValueConverter
         var reason = value?.ToString();
         if (string.IsNullOrWhiteSpace(reason))
         {
-            return "Match";
+            return LocalizationManager.Translate("Match");
         }
 
         reason = reason.Trim();
         if (KnownLabels.TryGetValue(reason, out var label))
         {
-            return label;
+            return LocalizationManager.Translate(label);
         }
 
-        return ToReadableLabel(reason);
+        return LocalizationManager.Translate(ToReadableLabel(reason));
     }
 
     public object ConvertBack(object? value, Type targetType, object? parameter, CultureInfo culture)

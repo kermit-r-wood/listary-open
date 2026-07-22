@@ -5,243 +5,221 @@ namespace ListaryOpen.Infrastructure.Tests.Dialog;
 public sealed class DialogBridgeTests
 {
     [Fact]
-    public async Task JumpToFolderReportsUnsupportedWhenNoStandardDialogIsActive()
+    public async Task NoCapturedExecutorFailsWithoutTryingAnotherPath()
     {
-        var automation = new FakeDialogAutomation(DialogProbeResult.Unsupported("No standard dialog"));
-        var bridge = new DialogBridge(automation);
+        var bridge = new DialogBridge(hookBridge: null);
 
-        var result = await bridge.JumpToFolderAsync("C:\\Docs", CancellationToken.None);
-
-        Assert.Equal(DialogJumpStatus.UnsupportedDialog, result.Status);
-        Assert.Equal("No standard dialog", result.Message);
-        Assert.Equal(0, automation.SetFolderCallCount);
-    }
-
-    [Fact]
-    public async Task JumpToFolderReportsPermissionLimitedForElevatedTarget()
-    {
-        var automation = new FakeDialogAutomation(DialogProbeResult.PermissionLimited("Elevated target"));
-        var bridge = new DialogBridge(automation);
-
-        var result = await bridge.JumpToFolderAsync("C:\\Docs", CancellationToken.None);
-
-        Assert.Equal(DialogJumpStatus.PermissionLimited, result.Status);
-        Assert.Equal("Elevated target", result.Message);
-        Assert.Equal(0, automation.SetFolderCallCount);
-    }
-
-    [Fact]
-    public async Task JumpToFolderChangesFolderForStandardDialog()
-    {
-        var folder = Directory.CreateTempSubdirectory("listary-open-dialog-");
-        var automation = new FakeDialogAutomation(DialogProbeResult.StandardDialog());
-        var bridge = new DialogBridge(automation);
-
-        try
-        {
-            var result = await bridge.JumpToFolderAsync(folder.FullName, CancellationToken.None);
-
-            Assert.Equal(DialogJumpStatus.Success, result.Status);
-            Assert.Equal(folder.FullName, automation.LastFolder);
-        }
-        finally
-        {
-            folder.Delete(recursive: true);
-        }
-    }
-
-    [Fact]
-    public async Task JumpToFolderUsesCustomAdapterBeforeStandardAutomation()
-    {
-        var folder = Directory.CreateTempSubdirectory("listary-open-custom-adapter-");
-        var automation = new FakeDialogAutomation(DialogProbeResult.Unsupported("No standard dialog."));
-        var adapter = new FakeCustomDialogAdapter("Blender file browser", canHandle: true);
-        var bridge = new DialogBridge(
-            automation,
-            customAdapters: new ICustomDialogAdapter[] { adapter });
-
-        try
-        {
-            var result = await bridge.JumpToFolderAsync(folder.FullName, CancellationToken.None);
-
-            Assert.Equal(DialogJumpStatus.Success, result.Status);
-            Assert.Contains("Blender file browser", result.Message, StringComparison.Ordinal);
-            Assert.Equal(folder.FullName, adapter.LastFolder);
-            Assert.Equal(1, adapter.CanHandleCallCount);
-            Assert.Equal(1, adapter.SetFolderCallCount);
-            Assert.Equal(0, automation.ProbeCallCount);
-        }
-        finally
-        {
-            folder.Delete(recursive: true);
-        }
-    }
-
-    [Fact]
-    public async Task JumpToFolderSkipsCustomAdapterThatCannotHandleActiveWindow()
-    {
-        var automation = new FakeDialogAutomation(DialogProbeResult.Unsupported("No standard dialog."));
-        var adapter = new FakeCustomDialogAdapter("Blender file browser", canHandle: false);
-        var bridge = new DialogBridge(
-            automation,
-            customAdapters: new ICustomDialogAdapter[] { adapter });
-
-        var result = await bridge.JumpToFolderAsync("C:\\Docs", CancellationToken.None);
-
-        Assert.Equal(DialogJumpStatus.UnsupportedDialog, result.Status);
-        Assert.Equal("No standard dialog.", result.Message);
-        Assert.Equal(1, adapter.CanHandleCallCount);
-        Assert.Equal(0, adapter.SetFolderCallCount);
-        Assert.Equal(1, automation.ProbeCallCount);
-    }
-
-    [Fact]
-    public async Task JumpToFolderReportsFailedAndSkipsAutomationForUnknownProbeStatus()
-    {
-        var automation = new FakeDialogAutomation(new DialogProbeResult((DialogProbeStatus)999, "Unknown dialog probe"));
-        var bridge = new DialogBridge(automation);
-
-        var result = await bridge.JumpToFolderAsync("C:\\Docs", CancellationToken.None);
+        var result = await bridge.JumpToFolderAsync(Path.GetTempPath(), CancellationToken.None);
 
         Assert.Equal(DialogJumpStatus.Failed, result.Status);
-        Assert.Equal("Unknown dialog probe status: 999.", result.Message);
-        Assert.Equal(0, automation.SetFolderCallCount);
+        Assert.Contains("native-hook or dialog-plugin", result.Message, StringComparison.Ordinal);
     }
 
     [Fact]
-    public async Task JumpToFolderReportsFailedWhenSetFolderCannotChangeDialog()
+    public async Task CapturedPluginTargetUsesOnlyItsOwningPlugin()
     {
-        var folder = Directory.CreateTempSubdirectory("listary-open-dialog-");
-        var automation = new FakeDialogAutomation(DialogProbeResult.StandardDialog(), setFolderResult: false);
-        var bridge = new DialogBridge(automation);
+        using var folder = new TemporaryDirectory();
+        var owner = new FakeDialogPlugin("owner", "GHOST_WindowClass", canCapture: true);
+        var other = new FakeDialogPlugin("other", "OtherWindow", canCapture: false);
+        var bridge = CreateBridge([owner, other]);
+        var target = Assert.IsType<DialogPluginTarget>(
+            await bridge.TryCaptureActiveTargetAsync(CancellationToken.None));
 
-        try
-        {
-            var result = await bridge.JumpToFolderAsync(folder.FullName, CancellationToken.None);
+        var result = await bridge.JumpToFolderAsync(target, folder.Path, CancellationToken.None);
 
-            Assert.Equal(DialogJumpStatus.Failed, result.Status);
-            Assert.Equal("Dialog folder could not be changed.", result.Message);
-            Assert.Equal(1, automation.SetFolderCallCount);
-        }
-        finally
-        {
-            folder.Delete(recursive: true);
-        }
+        Assert.Equal(DialogJumpStatus.Success, result.Status);
+        Assert.Equal(1, owner.JumpCount);
+        Assert.Equal(0, other.JumpCount);
+        Assert.Equal(target.Window.WindowHandle, owner.LastTarget?.Window.WindowHandle);
     }
 
     [Fact]
-    public async Task JumpToFolderReportsTargetGoneWhenFolderNoLongerExists()
+    public async Task StandardDialogCannotBeClaimedByPlugin()
     {
-        var missingFolder = Path.Combine(Path.GetTempPath(), "listary-open-missing-" + Guid.NewGuid());
-        var automation = new FakeDialogAutomation(DialogProbeResult.StandardDialog());
-        var bridge = new DialogBridge(automation);
+        var plugin = new FakeDialogPlugin("unsafe", "#32770", canCapture: true);
+        var bridge = CreateBridge([plugin]);
 
-        var result = await bridge.JumpToFolderAsync(missingFolder, CancellationToken.None);
+        var target = await bridge.TryCaptureActiveTargetAsync(CancellationToken.None);
+
+        Assert.Null(target);
+        Assert.Equal(0, plugin.JumpCount);
+    }
+
+    [Fact]
+    public async Task MultiplePluginMatchesAreRejectedInsteadOfChoosingAnExecutor()
+    {
+        var first = new FakeDialogPlugin("first", "Custom", canCapture: true);
+        var second = new FakeDialogPlugin("second", "Custom", canCapture: true);
+        var bridge = CreateBridge([first, second]);
+
+        Assert.Null(await bridge.TryCaptureActiveTargetAsync(CancellationToken.None));
+    }
+
+    [Fact]
+    public void DuplicatePluginIdsAreRejected()
+    {
+        var plugins = new[]
+        {
+            new FakeDialogPlugin("duplicate", "One", false),
+            new FakeDialogPlugin("DUPLICATE", "Two", false)
+        };
+
+        Assert.Throws<ArgumentException>(() => new DialogBridge(null, plugins));
+    }
+
+    [Fact]
+    public async Task PluginExceptionIsTerminalAndDoesNotTryAnotherPlugin()
+    {
+        using var folder = new TemporaryDirectory();
+        var owner = new FakeDialogPlugin("owner", "Custom", true, new InvalidOperationException("broken"));
+        var other = new FakeDialogPlugin("other", "Other", false);
+        var bridge = CreateBridge([owner, other]);
+        var target = Assert.IsType<DialogPluginTarget>(await bridge.TryCaptureActiveTargetAsync(CancellationToken.None));
+
+        var result = await bridge.JumpToFolderAsync(target, folder.Path, CancellationToken.None);
+
+        Assert.Equal(DialogJumpStatus.Failed, result.Status);
+        Assert.Contains("broken", result.Message, StringComparison.Ordinal);
+        Assert.Equal(1, owner.JumpCount);
+        Assert.Equal(0, other.JumpCount);
+    }
+
+    [Fact]
+    public async Task MissingFolderIsTerminalBeforeExecutorRuns()
+    {
+        var plugin = new FakeDialogPlugin("owner", "Custom", true);
+        var bridge = CreateBridge([plugin]);
+        var target = Assert.IsType<DialogPluginTarget>(await bridge.TryCaptureActiveTargetAsync(CancellationToken.None));
+        var missing = System.IO.Path.Combine(System.IO.Path.GetTempPath(), Guid.NewGuid().ToString("N"));
+
+        var result = await bridge.JumpToFolderAsync(target, missing, CancellationToken.None);
 
         Assert.Equal(DialogJumpStatus.TargetGone, result.Status);
-        Assert.Contains("no longer exists", result.Message);
-        Assert.Equal(1, automation.ProbeCallCount);
-        Assert.Equal(0, automation.SetFolderCallCount);
+        Assert.Equal(0, plugin.JumpCount);
     }
 
     [Fact]
-    public void ConstructorRejectsNullAutomation()
+    public async Task PluginCaptureRejectsTargetThatIsNotTheExactForegroundWindow()
     {
-        var exception = Assert.Throws<ArgumentNullException>(() => new DialogBridge(null!));
+        var plugin = new FakeDialogPlugin("owner", "Custom", true);
+        var reader = new FakeDialogWindowIdentityReader(new IntPtr(0x9999), Identity("Custom"));
+        var bridge = new DialogBridge(null, [plugin], reader);
 
-        Assert.Equal("automation", exception.ParamName);
+        Assert.Null(await bridge.TryCaptureActiveTargetAsync(CancellationToken.None));
     }
 
     [Theory]
-    [InlineData("")]
-    [InlineData("   ")]
-    public async Task JumpToFolderRejectsBlankFolderPathBeforeAutomation(string folderPath)
+    [InlineData(43u, "fixture.exe", "Custom")]
+    [InlineData(42u, "other.exe", "Custom")]
+    [InlineData(42u, "fixture.exe", "OtherClass")]
+    public async Task PluginCaptureRejectsPidProcessOrClassIdentityMismatch(
+        uint processId,
+        string processName,
+        string className)
     {
-        var automation = new FakeDialogAutomation(DialogProbeResult.StandardDialog());
-        var bridge = new DialogBridge(automation);
+        var plugin = new FakeDialogPlugin("owner", "Custom", true);
+        var reader = new FakeDialogWindowIdentityReader(
+            new IntPtr(0x1234),
+            new DialogWindowIdentity(new IntPtr(0x1234), processId, processName, className));
+        var bridge = new DialogBridge(null, [plugin], reader);
 
-        var exception = await Assert.ThrowsAsync<ArgumentException>(() => bridge.JumpToFolderAsync(folderPath, CancellationToken.None));
-
-        Assert.Equal("folderPath", exception.ParamName);
-        Assert.Equal(0, automation.ProbeCallCount);
-        Assert.Equal(0, automation.SetFolderCallCount);
+        Assert.Null(await bridge.TryCaptureActiveTargetAsync(CancellationToken.None));
     }
 
     [Fact]
-    public async Task JumpToFolderRejectsNullFolderPathBeforeAutomation()
+    public async Task PluginJumpRevalidatesCapturedTargetIdentityBeforeExecution()
     {
-        var automation = new FakeDialogAutomation(DialogProbeResult.StandardDialog());
-        var bridge = new DialogBridge(automation);
+        using var folder = new TemporaryDirectory();
+        var plugin = new FakeDialogPlugin("owner", "Custom", true);
+        var reader = new FakeDialogWindowIdentityReader(new IntPtr(0x1234), Identity("Custom"));
+        var bridge = new DialogBridge(null, [plugin], reader);
+        var target = Assert.IsType<DialogPluginTarget>(
+            await bridge.TryCaptureActiveTargetAsync(CancellationToken.None));
+        reader.ForegroundWindow = new IntPtr(0x9999);
 
-        var exception = await Assert.ThrowsAsync<ArgumentNullException>(() => bridge.JumpToFolderAsync(null!, CancellationToken.None));
+        var result = await bridge.JumpToFolderAsync(target, folder.Path, CancellationToken.None);
 
-        Assert.Equal("folderPath", exception.ParamName);
-        Assert.Equal(0, automation.ProbeCallCount);
-        Assert.Equal(0, automation.SetFolderCallCount);
-    }
-}
-
-internal sealed class FakeCustomDialogAdapter : ICustomDialogAdapter
-{
-    private readonly bool _canHandle;
-    private readonly bool _setFolderResult;
-
-    public FakeCustomDialogAdapter(string name, bool canHandle, bool setFolderResult = true)
-    {
-        Name = name;
-        _canHandle = canHandle;
-        _setFolderResult = setFolderResult;
+        Assert.Equal(DialogJumpStatus.TargetGone, result.Status);
+        Assert.Equal(0, plugin.JumpCount);
     }
 
-    public string Name { get; }
-
-    public string? LastFolder { get; private set; }
-
-    public int CanHandleCallCount { get; private set; }
-
-    public int SetFolderCallCount { get; private set; }
-
-    public bool CanHandleActiveWindow()
+    private static DialogBridge CreateBridge(IReadOnlyList<FakeDialogPlugin> plugins)
     {
-        CanHandleCallCount++;
-        return _canHandle;
+        var captured = plugins.FirstOrDefault(plugin => plugin.CanCapture);
+        return new DialogBridge(
+            null,
+            plugins,
+            new FakeDialogWindowIdentityReader(
+                new IntPtr(0x1234),
+                Identity(captured?.ClassName ?? "Custom")));
     }
 
-    public Task<bool> SetFolderAsync(string folderPath, CancellationToken cancellationToken)
+    private static DialogWindowIdentity Identity(string className) => new(
+        new IntPtr(0x1234),
+        42,
+        "fixture.exe",
+        className);
+
+    private sealed class FakeDialogPlugin : IDialogJumpPlugin
     {
-        SetFolderCallCount++;
-        LastFolder = folderPath;
-        return Task.FromResult(_setFolderResult);
+        private readonly string _className;
+        private readonly bool _canCapture;
+        private readonly Exception? _exception;
+
+        public FakeDialogPlugin(string id, string className, bool canCapture, Exception? exception = null)
+        {
+            Id = id;
+            Name = id;
+            _className = className;
+            _canCapture = canCapture;
+            _exception = exception;
+        }
+
+        public string Id { get; }
+        public string Name { get; }
+        public string ClassName => _className;
+        public bool CanCapture => _canCapture;
+        public int JumpCount { get; private set; }
+        public DialogPluginTarget? LastTarget { get; private set; }
+
+        public DialogPluginTarget? TryCaptureActiveTarget() => _canCapture
+            ? new DialogPluginTarget(Id, new DialogWindowSnapshot(
+                new IntPtr(0x1234), 42, "fixture.exe", _className, "Fixture", DateTimeOffset.UtcNow))
+            : null;
+
+        public Task<DialogJumpResult> JumpToFolderAsync(
+            DialogPluginTarget target,
+            string folderPath,
+            CancellationToken cancellationToken)
+        {
+            JumpCount++;
+            LastTarget = target;
+            return _exception is null
+                ? Task.FromResult(new DialogJumpResult(DialogJumpStatus.Success, "Plugin verified direct navigation."))
+                : Task.FromException<DialogJumpResult>(_exception);
+        }
     }
-}
 
-internal sealed class FakeDialogAutomation : IDialogAutomation
-{
-    private readonly DialogProbeResult _probe;
-    private readonly bool _setFolderResult;
-
-    public FakeDialogAutomation(DialogProbeResult probe, bool setFolderResult = true)
+    private sealed class FakeDialogWindowIdentityReader(
+        IntPtr foregroundWindow,
+        DialogWindowIdentity identity) : IDialogWindowIdentityReader
     {
-        _probe = probe;
-        _setFolderResult = setFolderResult;
+        public IntPtr ForegroundWindow { get; set; } = foregroundWindow;
+        public DialogWindowIdentity Identity { get; set; } = identity;
+
+        public IntPtr GetForegroundWindow() => ForegroundWindow;
+
+        public bool TryRead(IntPtr windowHandle, out DialogWindowIdentity value)
+        {
+            value = Identity;
+            return windowHandle == Identity.WindowHandle;
+        }
     }
 
-    public string? LastFolder { get; private set; }
-
-    public int ProbeCallCount { get; private set; }
-
-    public int SetFolderCallCount { get; private set; }
-
-    public DialogProbeResult ProbeActiveDialog()
+    private sealed class TemporaryDirectory : IDisposable
     {
-        ProbeCallCount++;
-        return _probe;
-    }
-
-    public Task<bool> SetFolderAsync(string folderPath, CancellationToken cancellationToken)
-    {
-        SetFolderCallCount++;
-        LastFolder = folderPath;
-        return Task.FromResult(_setFolderResult);
+        public TemporaryDirectory() => Path = Directory.CreateTempSubdirectory("listary-dialog-").FullName;
+        public string Path { get; }
+        public void Dispose() => Directory.Delete(Path, recursive: true);
     }
 }

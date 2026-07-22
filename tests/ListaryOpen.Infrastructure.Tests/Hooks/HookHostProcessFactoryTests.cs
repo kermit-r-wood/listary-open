@@ -6,6 +6,83 @@ namespace ListaryOpen.Infrastructure.Tests.Hooks;
 public sealed class HookHostProcessFactoryTests
 {
     [Fact]
+    public void TerminateDoesNotReturnUntilTheOwnedProcessHasExited()
+    {
+        var process = Process.Start(new ProcessStartInfo
+        {
+            FileName = "powershell.exe",
+            Arguments = "-NoProfile -Command Start-Sleep -Seconds 30",
+            UseShellExecute = false,
+            CreateNoWindow = true
+        });
+        Assert.NotNull(process);
+        var processId = process.Id;
+
+        new HookHostProcessFactory().Terminate(process);
+
+        Assert.Throws<ArgumentException>(() => Process.GetProcessById(processId));
+    }
+
+    [Fact]
+    public void GracefulTerminationWaitsForNaturalExit()
+    {
+        var marker = Path.Combine(Path.GetTempPath(), $"listary-open-hook-graceful-{Guid.NewGuid():N}.txt");
+        var startInfo = new ProcessStartInfo
+        {
+            FileName = "powershell.exe",
+            UseShellExecute = false,
+            CreateNoWindow = true
+        };
+        startInfo.ArgumentList.Add("-NoProfile");
+        startInfo.ArgumentList.Add("-Command");
+        startInfo.ArgumentList.Add($"Start-Sleep -Milliseconds 200; Set-Content -LiteralPath '{marker}' -Value complete");
+        var process = Process.Start(startInfo);
+        Assert.NotNull(process);
+
+        try
+        {
+            new HookHostProcessFactory().WaitForGracefulExitOrTerminate(process);
+
+            Assert.True(File.Exists(marker));
+            Assert.Equal("complete", File.ReadAllText(marker).Trim());
+        }
+        finally
+        {
+            File.Delete(marker);
+        }
+    }
+
+    [Fact]
+    public void GracefulTerminationTimeoutDetachesWithoutKillingTheHost()
+    {
+        var process = Process.Start(new ProcessStartInfo
+        {
+            FileName = "powershell.exe",
+            Arguments = "-NoProfile -Command Start-Sleep -Seconds 30",
+            UseShellExecute = false,
+            CreateNoWindow = true
+        });
+        Assert.NotNull(process);
+        var processId = process.Id;
+
+        new HookHostProcessFactory().WaitForGracefulExitOrTerminate(process);
+
+        using var stillRunning = Process.GetProcessById(processId);
+        try
+        {
+            Assert.False(stillRunning.HasExited);
+        }
+        finally
+        {
+            if (!stillRunning.HasExited)
+            {
+                stillRunning.Kill(entireProcessTree: true);
+                stillRunning.WaitForExit();
+            }
+        }
+    }
+
+    [Fact]
     public void CreateStartInfoForNonElevatedHostUsesNoConsoleAndPipeDllArguments()
     {
         var factory = new HookHostProcessFactory();

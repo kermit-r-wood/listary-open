@@ -34,6 +34,10 @@ public sealed record AppDataPaths(
             "index.db");
     }
 
+    public string SettingsPath => Path.Combine(DataDirectory, "settings.json");
+
+    public string PerformanceMetricsPath => Path.Combine(DataDirectory, "performance-metrics.jsonl");
+
     public void EnsureDirectories()
     {
         Directory.CreateDirectory(DataDirectory);

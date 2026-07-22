@@ -8,6 +8,245 @@ namespace ListaryOpen.Infrastructure.Tests.App;
 public sealed class SettingsViewModelTests
 {
     [Fact]
+    public void SavePreferencesPersistsThemeFrequencyExclusionsAndMenu()
+    {
+        AppSettings? applied = null;
+        var viewModel = new SettingsViewModel(
+            AppSettings.Defaults(),
+            enableNtfsFastIndexing: null,
+            enableHookQuickSwitch: null,
+            applySettings: settings => { applied = settings; return null; });
+        viewModel.SelectedTheme = AppTheme.Dark;
+        viewModel.SelectedIndexFrequency = IndexUpdateFrequency.Every15Minutes;
+        viewModel.ExcludedPathsText = "node_modules\n*.tmp";
+        viewModel.MenuEntries[0].Title = "Favorites";
+
+        viewModel.SavePreferencesCommand.Execute(null);
+
+        Assert.NotNull(applied);
+        Assert.Equal(AppTheme.Dark, applied!.Theme);
+        Assert.Equal(IndexUpdateFrequency.Every15Minutes, applied.IndexFrequency);
+        Assert.Equal(new[] { "node_modules", "*.tmp" }, applied.ExcludedPaths);
+        Assert.Equal("Favorites", applied.QuickMenuEntries[0].Title);
+    }
+
+    [Fact]
+    public void SavePreferencesPersistsSearchTransliterationMode()
+    {
+        AppSettings? applied = null;
+        var viewModel = new SettingsViewModel(
+            AppSettings.Defaults(),
+            enableNtfsFastIndexing: null,
+            enableHookQuickSwitch: null,
+            applySettings: settings => { applied = settings; return null; });
+
+        viewModel.SelectedSearchTransliteration = SearchTransliterationMode.ChinesePinyin;
+        viewModel.SavePreferencesCommand.Execute(null);
+
+        Assert.Equal(SearchTransliterationMode.ChinesePinyin, applied!.SearchTransliteration);
+        Assert.Equal(3, viewModel.SearchTransliterationOptions.Count);
+    }
+
+    [Fact]
+    public void UpdatePreferenceSavesImmediatelyWithoutApplyingDraftsFromOtherPages()
+    {
+        AppSettings? applied = null;
+        var defaults = AppSettings.Defaults();
+        var viewModel = new SettingsViewModel(
+            defaults,
+            enableNtfsFastIndexing: null,
+            enableHookQuickSwitch: null,
+            applySettings: settings => { applied = settings; return null; });
+        viewModel.SelectedTheme = AppTheme.Dark;
+        viewModel.CheckForUpdates = false;
+
+        viewModel.SaveUpdatePreferenceCommand.Execute(null);
+
+        Assert.NotNull(applied);
+        Assert.False(applied!.CheckForUpdates);
+        Assert.Equal(defaults.Theme, applied.Theme);
+        Assert.Equal(AppTheme.Dark, viewModel.SelectedTheme);
+        Assert.Equal("Update preference saved.", viewModel.UpdatePreferenceStatusText);
+    }
+
+    [Fact]
+    public void FailedUpdatePreferenceSaveRestoresThePersistedValue()
+    {
+        var viewModel = new SettingsViewModel(
+            AppSettings.Defaults(),
+            enableNtfsFastIndexing: null,
+            enableHookQuickSwitch: null,
+            applySettings: _ => "Could not save update preference.");
+        viewModel.CheckForUpdates = false;
+
+        viewModel.SaveUpdatePreferenceCommand.Execute(null);
+
+        Assert.True(viewModel.CheckForUpdates);
+        Assert.Contains("Could not save", viewModel.UpdatePreferenceStatusText);
+    }
+
+    [Fact]
+    public void ThemeSelectionIsPreviewedImmediatelyAndSavedWithoutASecondApply()
+    {
+        var appliedThemes = new List<AppTheme>();
+        var viewModel = new SettingsViewModel(
+            AppSettings.Defaults(),
+            enableNtfsFastIndexing: null,
+            enableHookQuickSwitch: null,
+            applySettings: _ => null,
+            applyTheme: appliedThemes.Add);
+
+        viewModel.SelectedTheme = AppTheme.Dark;
+
+        Assert.Equal(new[] { AppTheme.Dark }, appliedThemes);
+
+        viewModel.SavePreferencesCommand.Execute(null);
+
+        Assert.Equal(new[] { AppTheme.Dark }, appliedThemes);
+    }
+
+    [Fact]
+    public void InterfaceLanguageAppliesOnlyAfterSuccessfulSave()
+    {
+        AppSettings? applied = null;
+        var viewModel = new SettingsViewModel(
+            AppSettings.Defaults(),
+            enableNtfsFastIndexing: null,
+            enableHookQuickSwitch: null,
+            applySettings: settings => { applied = settings; return null; });
+
+        viewModel.SelectedLanguage = AppLanguage.SimplifiedChinese;
+
+        Assert.Null(applied);
+        Assert.Equal(3, viewModel.LanguageOptions.Count);
+
+        viewModel.SavePreferencesCommand.Execute(null);
+
+        Assert.Equal(AppLanguage.SimplifiedChinese, applied!.Language);
+    }
+
+    [Fact]
+    public void DefaultDriveOptionsSelectEveryReadyDrive()
+    {
+        var viewModel = new SettingsViewModel(AppSettings.Defaults());
+
+        Assert.NotEmpty(viewModel.Drives);
+        Assert.All(viewModel.Drives, drive => Assert.True(drive.IsSelected));
+    }
+
+    [Fact]
+    public void SavePreferencesPersistsQuickLaunchEntries()
+    {
+        AppSettings? applied = null;
+        var viewModel = new SettingsViewModel(
+            AppSettings.Defaults(),
+            enableNtfsFastIndexing: null,
+            enableHookQuickSwitch: null,
+            applySettings: settings => { applied = settings; return null; });
+        viewModel.AddQuickLaunchEntryCommand.Execute(null);
+        var entry = Assert.IsType<QuickLaunchEntryEditor>(viewModel.SelectedQuickLaunchEntry);
+        entry.Keyword = "note";
+        entry.Title = "Notepad";
+        entry.Path = "notepad.exe";
+
+        viewModel.SavePreferencesCommand.Execute(null);
+
+        var saved = Assert.Single(Assert.IsType<AppSettings>(applied).QuickLaunchEntries);
+        Assert.Equal("note", saved.Keyword);
+        Assert.Equal("notepad.exe", saved.Path);
+    }
+
+    [Fact]
+    public void DuplicateEnabledQuickLaunchKeywordBlocksSave()
+    {
+        var applyCount = 0;
+        var settings = AppSettings.Defaults().WithPreferences(
+            AppSettings.Defaults().IndexedRoots,
+            [],
+            AppTheme.System,
+            IndexUpdateFrequency.StartupOnly,
+            AppSettings.Defaults().QuickMenuEntries,
+            true,
+            [
+                new QuickLaunchEntry("one", "note", "One", "one.exe"),
+                new QuickLaunchEntry("two", "NOTE", "Two", "two.exe")
+            ]);
+        var viewModel = new SettingsViewModel(
+            settings,
+            enableNtfsFastIndexing: null,
+            enableHookQuickSwitch: null,
+            applySettings: _ => { applyCount++; return null; });
+
+        viewModel.SavePreferencesCommand.Execute(null);
+
+        Assert.Equal(0, applyCount);
+        Assert.Contains("duplicated", viewModel.SettingsStatusText, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public void SuccessfulUpdateCheckExposesAndOpensReleasePage()
+    {
+        string? openedUri = null;
+        var viewModel = new SettingsViewModel(
+            AppSettings.Defaults(),
+            enableNtfsFastIndexing: null,
+            enableHookQuickSwitch: null,
+            checkUpdates: _ => Task.FromResult(new ListaryOpen.Infrastructure.AppData.UpdateCheckResult(
+                true,
+                "1.0.0",
+                "v2.0.0",
+                "https://github.com/example/releases/tag/v2.0.0",
+                "Update v2.0.0 is available.")),
+            openUri: uri => openedUri = uri);
+
+        viewModel.CheckForUpdatesCommand.Execute(null);
+        viewModel.OpenReleaseCommand.Execute(null);
+
+        Assert.True(viewModel.HasReleaseUrl);
+        Assert.Equal("https://github.com/example/releases/tag/v2.0.0", openedUri);
+    }
+
+    [Fact]
+    public void SaveHotkeysCommandAppliesAndUpdatesSettings()
+    {
+        var applied = new List<string>();
+        var viewModel = new SettingsViewModel(
+            AppSettings.Defaults(),
+            enableNtfsFastIndexing: null,
+            enableHookQuickSwitch: null,
+            applyHotkeys: (search, dialog) =>
+            {
+                applied.Add(search + "|" + dialog);
+                return null;
+            });
+        viewModel.SearchHotkeyText = "Alt+F1";
+        viewModel.DialogHotkeyText = "Ctrl+Shift+D";
+
+        viewModel.SaveHotkeysCommand.Execute(null);
+
+        Assert.Equal(new[] { "Alt+F1|Ctrl+Shift+D" }, applied);
+        Assert.Equal("Alt+F1", viewModel.Settings.SearchHotkey);
+        Assert.Equal("Ctrl+Shift+D", viewModel.Settings.DialogHotkey);
+        Assert.Contains("saved", viewModel.HotkeyStatusText, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public void SaveHotkeysCommandKeepsSettingsWhenApplyFails()
+    {
+        var viewModel = new SettingsViewModel(
+            AppSettings.Defaults(),
+            enableNtfsFastIndexing: null,
+            enableHookQuickSwitch: null,
+            applyHotkeys: (_, _) => "Conflict");
+        viewModel.SearchHotkeyText = "Alt+F1";
+
+        viewModel.SaveHotkeysCommand.Execute(null);
+
+        Assert.Equal("Ctrl+Space", viewModel.Settings.SearchHotkey);
+        Assert.Equal("Conflict", viewModel.HotkeyStatusText);
+    }
+
+    [Fact]
     public void ConstructorStartsWithIdleIndexingStatus()
     {
         var viewModel = new SettingsViewModel(AppSettings.Defaults());
@@ -24,9 +263,29 @@ public sealed class SettingsViewModelTests
 
         viewModel.UpdateIndexingStatus(new IndexingStatus(IndexingRunState.Indexing, "Indexing started.", 7));
 
-        Assert.Equal("Indexing: Indexing started. (7)", viewModel.IndexingStatusText);
+        Assert.Equal("Indexing started.", viewModel.IndexingStatusText);
+        Assert.Equal("7 items indexed", viewModel.IndexingProgressText);
+        Assert.True(viewModel.IsIndexing);
         Assert.Contains(nameof(SettingsViewModel.IndexingStatusText), changedProperties);
         Assert.IsAssignableFrom<INotifyPropertyChanged>(viewModel);
+    }
+
+    [Fact]
+    public void UpdateIndexingStatusShowsRootProgressWithoutInventingAPercentage()
+    {
+        var viewModel = new SettingsViewModel(AppSettings.Defaults());
+
+        viewModel.UpdateIndexingStatus(new IndexingStatus(
+            IndexingRunState.Indexing,
+            "Scanning with NTFS...",
+            12500,
+            "C:\\Users\\Paul",
+            CurrentRootNumber: 2,
+            TotalRoots: 3));
+
+        Assert.Equal("12,500 items indexed · Location 2 of 3", viewModel.IndexingProgressText);
+        Assert.Equal("C:\\Users\\Paul", viewModel.CurrentIndexRootText);
+        Assert.True(viewModel.HasCurrentIndexRoot);
     }
 
     [Fact]
@@ -84,6 +343,7 @@ public sealed class SettingsViewModelTests
         viewModel.UpdateIndexingStatus(new IndexingStatus(IndexingRunState.Completed, "Indexing completed.", 42));
 
         Assert.Equal("Completed", viewModel.IndexingBadgeText);
+        Assert.False(viewModel.IsIndexing);
         Assert.Contains(nameof(SettingsViewModel.IndexingBadgeText), changedProperties);
     }
 

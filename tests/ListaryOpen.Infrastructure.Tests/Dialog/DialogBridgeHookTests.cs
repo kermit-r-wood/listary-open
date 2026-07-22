@@ -5,298 +5,131 @@ namespace ListaryOpen.Infrastructure.Tests.Dialog;
 
 public sealed class DialogBridgeHookTests
 {
-    [Fact]
-    public async Task JumpToFolderUsesHookBeforeFallbackAutomation()
+    public static TheoryData<HookJumpStatus, DialogJumpStatus> TerminalStatuses => new()
     {
-        var folder = Directory.CreateTempSubdirectory("listary-open-hook-jump-");
-        var hook = new FakeHookBridge(HookJumpResult.Success("Hook changed folder."));
-        var fallback = new FakeDialogAutomation(DialogProbeResult.StandardDialog());
-        var bridge = new DialogBridge(fallback, hook);
-
-        try
-        {
-            var result = await bridge.JumpToFolderAsync(folder.FullName, CancellationToken.None);
-
-            Assert.Equal(DialogJumpStatus.Success, result.Status);
-            Assert.False(result.IsDegradedSuccess);
-            Assert.Equal(1, hook.JumpCount);
-            Assert.Equal(0, fallback.ProbeCallCount);
-        }
-        finally
-        {
-            folder.Delete(recursive: true);
-        }
-    }
+        { HookJumpStatus.Success, DialogJumpStatus.Success },
+        { HookJumpStatus.AccessDenied, DialogJumpStatus.PermissionLimited },
+        { HookJumpStatus.TargetGone, DialogJumpStatus.TargetGone },
+        { HookJumpStatus.UnsupportedDialog, DialogJumpStatus.UnsupportedDialog },
+        { HookJumpStatus.NoActiveDialog, DialogJumpStatus.Failed },
+        { HookJumpStatus.HostUnavailable, DialogJumpStatus.Failed },
+        { HookJumpStatus.Timeout, DialogJumpStatus.Failed },
+        { HookJumpStatus.Failed, DialogJumpStatus.Failed }
+    };
 
     [Theory]
-    [InlineData(HookJumpStatus.NoActiveDialog)]
-    [InlineData(HookJumpStatus.HostUnavailable)]
-    [InlineData(HookJumpStatus.Timeout)]
-    public async Task JumpToFolderReportsDegradedFallbackWhenHookCannotProvideNativeJump(HookJumpStatus hookStatus)
-    {
-        var folder = Directory.CreateTempSubdirectory("listary-open-hook-fallback-");
-        var hook = new FakeHookBridge(new HookJumpResult(hookStatus, "Hook could not provide a native jump."));
-        var fallback = new FakeDialogAutomation(DialogProbeResult.StandardDialog());
-        var bridge = new DialogBridge(fallback, hook);
-
-        try
-        {
-            var result = await bridge.JumpToFolderAsync(folder.FullName, CancellationToken.None);
-
-            Assert.Equal(DialogJumpStatus.Success, result.Status);
-            Assert.True(result.IsDegradedSuccess);
-            Assert.Contains("fallback", result.Message, StringComparison.OrdinalIgnoreCase);
-            Assert.Contains(hookStatus.ToString(), result.Message, StringComparison.Ordinal);
-            Assert.Equal(1, hook.JumpCount);
-            Assert.Equal(1, fallback.ProbeCallCount);
-        }
-        finally
-        {
-            folder.Delete(recursive: true);
-        }
-    }
-
-    [Fact]
-    public async Task JumpToFolderFallsBackWhenHookThrowsNonCancellationException()
-    {
-        var folder = Directory.CreateTempSubdirectory("listary-open-hook-exception-fallback-");
-        var hook = new FakeHookBridge(new InvalidOperationException("Hook host failed."));
-        var fallback = new FakeDialogAutomation(DialogProbeResult.StandardDialog());
-        var bridge = new DialogBridge(fallback, hook);
-
-        try
-        {
-            var result = await bridge.JumpToFolderAsync(folder.FullName, CancellationToken.None);
-
-            Assert.Equal(DialogJumpStatus.Success, result.Status);
-            Assert.True(result.IsDegradedSuccess);
-            Assert.Contains("fallback", result.Message, StringComparison.OrdinalIgnoreCase);
-            Assert.Contains("hook", result.Message, StringComparison.OrdinalIgnoreCase);
-            Assert.Contains("Hook host failed.", result.Message, StringComparison.Ordinal);
-            Assert.Equal(1, hook.JumpCount);
-            Assert.Equal(1, fallback.ProbeCallCount);
-        }
-        finally
-        {
-            folder.Delete(recursive: true);
-        }
-    }
-
-    [Fact]
-    public async Task JumpToFolderPropagatesCancellationFromHookWhenTokenIsCanceled()
-    {
-        var folder = Directory.CreateTempSubdirectory("listary-open-hook-cancellation-");
-        using var cancellation = new CancellationTokenSource();
-        cancellation.Cancel();
-        var hook = new FakeHookBridge(new OperationCanceledException(cancellation.Token));
-        var fallback = new FakeDialogAutomation(DialogProbeResult.StandardDialog());
-        var bridge = new DialogBridge(fallback, hook);
-
-        try
-        {
-            await Assert.ThrowsAsync<OperationCanceledException>(
-                () => bridge.JumpToFolderAsync(folder.FullName, cancellation.Token));
-
-            Assert.Equal(1, hook.JumpCount);
-            Assert.Equal(0, fallback.ProbeCallCount);
-        }
-        finally
-        {
-            folder.Delete(recursive: true);
-        }
-    }
-
-    [Fact]
-    public async Task JumpToFolderMapsHookAccessDeniedWithoutFallback()
-    {
-        var folder = Directory.CreateTempSubdirectory("listary-open-hook-access-denied-");
-        var hook = new FakeHookBridge(new HookJumpResult(HookJumpStatus.AccessDenied, "Hook access denied."));
-        var fallback = new FakeDialogAutomation(DialogProbeResult.StandardDialog());
-        var bridge = new DialogBridge(fallback, hook);
-
-        try
-        {
-            var result = await bridge.JumpToFolderAsync(folder.FullName, CancellationToken.None);
-
-            Assert.Equal(DialogJumpStatus.PermissionLimited, result.Status);
-            Assert.Equal("Hook access denied.", result.Message);
-            Assert.Equal(1, hook.JumpCount);
-            Assert.Equal(0, fallback.ProbeCallCount);
-        }
-        finally
-        {
-            folder.Delete(recursive: true);
-        }
-    }
-
-    [Fact]
-    public async Task JumpToFolderMapsHookTargetGoneWithoutFallback()
-    {
-        var folder = Directory.CreateTempSubdirectory("listary-open-hook-target-gone-");
-        var hook = new FakeHookBridge(new HookJumpResult(HookJumpStatus.TargetGone, "Hook target is gone."));
-        var fallback = new FakeDialogAutomation(DialogProbeResult.StandardDialog());
-        var bridge = new DialogBridge(fallback, hook);
-
-        try
-        {
-            var result = await bridge.JumpToFolderAsync(folder.FullName, CancellationToken.None);
-
-            Assert.Equal(DialogJumpStatus.TargetGone, result.Status);
-            Assert.Equal("Hook target is gone.", result.Message);
-            Assert.Equal(1, hook.JumpCount);
-            Assert.Equal(0, fallback.ProbeCallCount);
-        }
-        finally
-        {
-            folder.Delete(recursive: true);
-        }
-    }
-
-    [Theory]
-    [InlineData(HookJumpStatus.Success, DialogJumpStatus.Success)]
-    [InlineData(HookJumpStatus.AccessDenied, DialogJumpStatus.PermissionLimited)]
-    [InlineData(HookJumpStatus.TargetGone, DialogJumpStatus.TargetGone)]
-    [InlineData(HookJumpStatus.UnsupportedDialog, DialogJumpStatus.UnsupportedDialog)]
-    [InlineData(HookJumpStatus.Failed, DialogJumpStatus.Failed)]
-    public async Task JumpToCapturedDialogMapsHookResultWithoutForegroundFallback(
+    [MemberData(nameof(TerminalStatuses))]
+    public async Task CapturedNativeResultIsTerminalWithoutPluginExecution(
         HookJumpStatus hookStatus,
         DialogJumpStatus expectedStatus)
     {
-        var folder = Directory.CreateTempSubdirectory("listary-open-captured-hook-");
-        var hook = new FakeHookBridge(new HookJumpResult(hookStatus, "Captured hook result."));
-        var fallback = new FakeDialogAutomation(DialogProbeResult.StandardDialog());
-        var adapter = new FakeCustomDialogAdapter("Foreground adapter", canHandle: true);
-        var bridge = new DialogBridge(
-            fallback,
-            hook,
-            new ICustomDialogAdapter[] { adapter });
-        var dialog = new HookDialogContext(
-            "captured-dialog",
-            new IntPtr(100),
-            200,
-            300,
-            HookArchitecture.X64,
-            "notepad",
-            "#32770",
-            "Open",
-            DateTimeOffset.UtcNow);
+        using var folder = new TemporaryDirectory();
+        var hook = new FakeHookBridge(new HookJumpResult(hookStatus, "native result"));
+        var plugin = new CountingPlugin();
+        var bridge = new DialogBridge(hook, [plugin]);
 
-        try
-        {
-            var result = await bridge.JumpToFolderAsync(dialog, folder.FullName, CancellationToken.None);
+        var result = await bridge.JumpToFolderAsync(Target(), folder.Path, CancellationToken.None);
 
-            Assert.Equal(expectedStatus, result.Status);
-            Assert.Equal("Captured hook result.", result.Message);
-            Assert.Equal(1, hook.CapturedJumpCount);
-            Assert.Equal(0, hook.ActiveJumpCount);
-            Assert.Equal(0, adapter.CanHandleCallCount);
-            Assert.Equal(0, fallback.ProbeCallCount);
-        }
-        finally
-        {
-            folder.Delete(recursive: true);
-        }
-    }
-
-    [Theory]
-    [InlineData(HookJumpStatus.Failed)]
-    [InlineData(HookJumpStatus.UnsupportedDialog)]
-    public async Task JumpToFolderFallsBackWhenHookCannotJump(HookJumpStatus hookStatus)
-    {
-        var folder = Directory.CreateTempSubdirectory("listary-open-hook-status-fallback-");
-        var hook = new FakeHookBridge(new HookJumpResult(hookStatus, "Hook could not jump."));
-        var fallback = new FakeDialogAutomation(DialogProbeResult.StandardDialog());
-        var bridge = new DialogBridge(fallback, hook);
-
-        try
-        {
-            var result = await bridge.JumpToFolderAsync(folder.FullName, CancellationToken.None);
-
-            Assert.Equal(DialogJumpStatus.Success, result.Status);
-            Assert.True(result.IsDegradedSuccess);
-            Assert.Contains("fallback", result.Message, StringComparison.OrdinalIgnoreCase);
-            Assert.Contains("hook", result.Message, StringComparison.OrdinalIgnoreCase);
-            Assert.Contains(hookStatus.ToString(), result.Message, StringComparison.Ordinal);
-            Assert.Contains("Hook could not jump.", result.Message, StringComparison.Ordinal);
-            Assert.Equal(1, hook.JumpCount);
-            Assert.Equal(1, fallback.ProbeCallCount);
-        }
-        finally
-        {
-            folder.Delete(recursive: true);
-        }
+        Assert.Equal(expectedStatus, result.Status);
+        Assert.Equal("native result", result.Message);
+        Assert.Equal(1, hook.CapturedJumpCount);
+        Assert.Equal(0, hook.ActiveJumpCount);
+        Assert.Equal(0, plugin.JumpCount);
     }
 
     [Fact]
-    public async Task JumpToFolderSkipsHookWhenFolderIsMissing()
+    public async Task NativeExceptionIsTerminalWithoutPluginExecution()
     {
-        var missingFolder = Path.Combine(Path.GetTempPath(), "listary-open-missing-hook-" + Guid.NewGuid());
-        var hook = new FakeHookBridge(HookJumpResult.Success("Hook changed folder."));
-        var fallback = new FakeDialogAutomation(DialogProbeResult.StandardDialog());
-        var bridge = new DialogBridge(fallback, hook);
+        using var folder = new TemporaryDirectory();
+        var hook = new FakeHookBridge(new InvalidOperationException("host broke"));
+        var plugin = new CountingPlugin();
+        var bridge = new DialogBridge(hook, [plugin]);
 
-        var result = await bridge.JumpToFolderAsync(missingFolder, CancellationToken.None);
+        var result = await bridge.JumpToFolderAsync(Target(), folder.Path, CancellationToken.None);
 
-        Assert.Equal(DialogJumpStatus.TargetGone, result.Status);
-        Assert.Contains("no longer exists", result.Message);
-        Assert.Equal(0, hook.JumpCount);
-        Assert.Equal(1, fallback.ProbeCallCount);
+        Assert.Equal(DialogJumpStatus.Failed, result.Status);
+        Assert.Contains("host broke", result.Message, StringComparison.Ordinal);
+        Assert.Equal(0, plugin.JumpCount);
     }
+
+    [Fact]
+    public async Task CancellationPropagatesWithoutTryingPlugin()
+    {
+        using var folder = new TemporaryDirectory();
+        using var cancellation = new CancellationTokenSource();
+        var hook = new FakeHookBridge(new OperationCanceledException(cancellation.Token));
+        var plugin = new CountingPlugin();
+        var bridge = new DialogBridge(hook, [plugin]);
+
+        await Assert.ThrowsAsync<OperationCanceledException>(
+            () => bridge.JumpToFolderAsync(Target(), folder.Path, cancellation.Token));
+        Assert.Equal(0, plugin.JumpCount);
+    }
+
+    [Fact]
+    public async Task CapturePrefersNativeHookAndDoesNotProbePlugins()
+    {
+        var hook = new FakeHookBridge(HookJumpResult.Success("ok"), Target());
+        var plugin = new CountingPlugin();
+        var bridge = new DialogBridge(hook, [plugin]);
+
+        var target = await bridge.TryCaptureActiveTargetAsync(CancellationToken.None);
+
+        Assert.IsType<NativeHookDialogTarget>(target);
+        Assert.Equal(0, plugin.CaptureCount);
+    }
+
+    private static HookDialogContext Target() => new(
+        "captured", new IntPtr(0x4567), 12, 34, HookArchitecture.X64,
+        "firefox.exe", "#32770", "File Upload", DateTimeOffset.UtcNow);
 
     private sealed class FakeHookBridge : IHookQuickSwitchBridge
     {
         private readonly Exception? _exception;
-        private readonly HookJumpResult? _jumpResult;
+        private readonly HookJumpResult? _result;
+        private readonly HookDialogContext? _active;
 
-        public FakeHookBridge(HookJumpResult jumpResult)
+        public FakeHookBridge(HookJumpResult result, HookDialogContext? active = null)
         {
-            _jumpResult = jumpResult;
+            _result = result;
+            _active = active;
         }
 
-        public FakeHookBridge(Exception exception)
-        {
-            _exception = exception;
-        }
-
+        public FakeHookBridge(Exception exception) => _exception = exception;
         public HookQuickSwitchStatus Status => HookQuickSwitchStatus.Disabled();
-
-        public int JumpCount => ActiveJumpCount + CapturedJumpCount;
-
         public int ActiveJumpCount { get; private set; }
-
         public int CapturedJumpCount { get; private set; }
-
-        public event EventHandler<HookQuickSwitchStatus>? StatusChanged
-        {
-            add { }
-            remove { }
-        }
-
+        public event EventHandler<HookQuickSwitchStatus>? StatusChanged { add { } remove { } }
         public Task EnableAsync(CancellationToken cancellationToken) => Task.CompletedTask;
-
-        public Task<HookDialogContext?> GetActiveDialogAsync(CancellationToken cancellationToken) => Task.FromResult<HookDialogContext?>(null);
-
-        public Task<HookJumpResult> JumpDialogToFolderAsync(
-            HookDialogContext dialog,
-            string folderPath,
-            CancellationToken cancellationToken)
+        public Task<HookDialogContext?> GetActiveDialogAsync(CancellationToken cancellationToken) => Task.FromResult(_active);
+        public Task<HookJumpResult> JumpDialogToFolderAsync(HookDialogContext dialog, string folderPath, CancellationToken cancellationToken)
         {
             CapturedJumpCount++;
-            return _exception is null
-                ? Task.FromResult(_jumpResult!)
-                : Task.FromException<HookJumpResult>(_exception);
+            return _exception is null ? Task.FromResult(_result!) : Task.FromException<HookJumpResult>(_exception);
         }
-
         public Task<HookJumpResult> JumpActiveDialogToFolderAsync(string folderPath, CancellationToken cancellationToken)
         {
             ActiveJumpCount++;
-            return _exception is null
-                ? Task.FromResult(_jumpResult!)
-                : Task.FromException<HookJumpResult>(_exception);
+            return _exception is null ? Task.FromResult(_result!) : Task.FromException<HookJumpResult>(_exception);
         }
+        public void Dispose() { }
+    }
 
-        public void Dispose()
-        {
-        }
+    private sealed class CountingPlugin : IDialogJumpPlugin
+    {
+        public string Id => "plugin";
+        public string Name => "Plugin";
+        public int CaptureCount { get; private set; }
+        public int JumpCount { get; private set; }
+        public DialogPluginTarget? TryCaptureActiveTarget() { CaptureCount++; return null; }
+        public Task<DialogJumpResult> JumpToFolderAsync(DialogPluginTarget target, string folderPath, CancellationToken cancellationToken)
+        { JumpCount++; return Task.FromResult(new DialogJumpResult(DialogJumpStatus.Success, "plugin")); }
+    }
+
+    private sealed class TemporaryDirectory : IDisposable
+    {
+        public TemporaryDirectory() => Path = Directory.CreateTempSubdirectory("listary-hook-").FullName;
+        public string Path { get; }
+        public void Dispose() => Directory.Delete(Path, recursive: true);
     }
 }

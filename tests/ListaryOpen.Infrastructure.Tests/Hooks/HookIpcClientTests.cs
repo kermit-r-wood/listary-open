@@ -96,6 +96,42 @@ public sealed class HookIpcClientTests
     }
 
     [Fact]
+    public async Task GracefulShutdownRoundTripsWithBoundIdentityAndSecret()
+    {
+        var pipeName = "listary-open-shutdown-" + Guid.NewGuid();
+        using var serverCancellation = new CancellationTokenSource(TimeSpan.FromSeconds(5));
+        var serverTask = ServeOnceAsync(
+            pipeName,
+            HookIpcSerializer.Serialize(new HookIpcEnvelope(
+                HookIpcEnvelope.CurrentVersion,
+                "CommandReply",
+                new HookCommandReply("Success", "Hook host graceful shutdown accepted."))),
+            serverCancellation.Token);
+        IHookShutdownClient client = new HookIpcClient(
+            pipeName,
+            TimeSpan.FromSeconds(2),
+            clientProcessId: 123,
+            secret: "session-secret");
+
+        try
+        {
+            var result = await client.ShutdownAsync(CancellationToken.None);
+            var exchange = await serverTask.WaitAsync(TimeSpan.FromSeconds(1));
+
+            var request = HookIpcSerializer.Deserialize(exchange.Request);
+            Assert.Equal("Shutdown", request.MessageType);
+            Assert.IsType<HookShutdownCommand>(request.Payload);
+            Assert.Equal(123, request.ClientProcessId);
+            Assert.Equal("session-secret", request.Secret);
+            Assert.Equal(HookJumpStatus.Success, result.Status);
+        }
+        finally
+        {
+            await StopServerAsync(serverCancellation, serverTask);
+        }
+    }
+
+    [Fact]
     public async Task GetActiveDialogRoundTripsOverNamedPipe()
     {
         var pipeName = "listary-open-active-dialog-" + Guid.NewGuid();
@@ -113,7 +149,9 @@ public sealed class HookIpcClientTests
                     "x86",
                     "notepad.exe",
                     "#32770",
-                    "Open"))),
+                    "Open",
+                    FirefoxFileDialogUtility: true,
+                    PreloadConfirmedBeforeDialog: true))),
             serverCancellation.Token);
         var client = new HookIpcClient(pipeName, TimeSpan.FromSeconds(2));
 
@@ -136,6 +174,8 @@ public sealed class HookIpcClientTests
             Assert.Equal("#32770", dialog.ClassName);
             Assert.Equal("Open", dialog.Title);
             Assert.True(dialog.ObservedAt >= before);
+            Assert.True(dialog.FirefoxFileDialogUtility);
+            Assert.True(dialog.PreloadConfirmedBeforeDialog);
         }
         finally
         {

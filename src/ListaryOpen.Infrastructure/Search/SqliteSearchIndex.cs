@@ -5,6 +5,7 @@ using System.Diagnostics;
 using ListaryOpen.Core.Indexing;
 using ListaryOpen.Core.Search;
 using ListaryOpen.Core.Usage;
+using ListaryOpen.Infrastructure.Indexing;
 using ListaryOpen.Infrastructure.Indexing.Ntfs;
 using Microsoft.Data.Sqlite;
 
@@ -12,6 +13,7 @@ namespace ListaryOpen.Infrastructure.Search;
 
 public sealed class SqliteSearchIndex : ISearchIndex, IAsyncDisposable
 {
+    internal const int CurrentSchemaVersion = 2;
     internal const long CurrentIndexContentVersion = 2;
 
     private const int FallbackCandidateLimit = 200;
@@ -33,17 +35,21 @@ public sealed class SqliteSearchIndex : ISearchIndex, IAsyncDisposable
     private readonly SqliteConnection _searchConnection;
     private readonly CancellationTokenSource _lifetimeCancellation = new();
     private Task _ftsBuildTask = Task.CompletedTask;
+    private Task _performanceIndexBuildTask = Task.CompletedTask;
     private volatile bool _ftsReady;
+    private volatile bool _preferredRootIndexReady;
     private bool _disposed;
 
     private SqliteSearchIndex(
         SqliteConnection connection,
         SqliteConnection searchConnection,
-        bool ftsReady)
+        bool ftsReady,
+        bool preferredRootIndexReady)
     {
         _connection = connection;
         _searchConnection = searchConnection;
         _ftsReady = ftsReady;
+        _preferredRootIndexReady = preferredRootIndexReady;
     }
 
     public static async Task<SqliteSearchIndex> OpenAsync(string dbPath, CancellationToken cancellationToken)
@@ -71,9 +77,14 @@ public sealed class SqliteSearchIndex : ISearchIndex, IAsyncDisposable
         try
         {
             await ConfigureWriterConnectionAsync(connection, cancellationToken).ConfigureAwait(false);
-            RegisterSearchFunctions(connection);
+            await EnsureSupportedSchemaVersionAsync(connection, cancellationToken).ConfigureAwait(false);
             await CreateSchemaAsync(connection, cancellationToken).ConfigureAwait(false);
             await MigrateSchemaAsync(connection, cancellationToken).ConfigureAwait(false);
+            await EnsureIndexContentVersionAsync(connection, cancellationToken).ConfigureAwait(false);
+            var preferredRootIndexReady = await HasIndexAsync(
+                connection,
+                "ix_files_parent_path_nocase_name",
+                cancellationToken).ConfigureAwait(false);
             var ftsReady = await EnsureFtsSchemaAsync(connection, cancellationToken).ConfigureAwait(false);
             var searchConnectionString = new SqliteConnectionStringBuilder
             {
@@ -87,11 +98,21 @@ public sealed class SqliteSearchIndex : ISearchIndex, IAsyncDisposable
             try
             {
                 await ConfigureSearchConnectionAsync(searchConnection, cancellationToken).ConfigureAwait(false);
-                RegisterSearchFunctions(searchConnection);
-                var index = new SqliteSearchIndex(connection, searchConnection, ftsReady);
+                var index = new SqliteSearchIndex(
+                    connection,
+                    searchConnection,
+                    ftsReady,
+                    preferredRootIndexReady);
                 if (!ftsReady)
                 {
-                    index._ftsBuildTask = index.BuildFtsIndexAsync(index._lifetimeCancellation.Token);
+                    index._ftsBuildTask = Task.Run(
+                        () => index.BuildFtsIndexAsync(index._lifetimeCancellation.Token));
+                }
+
+                if (!preferredRootIndexReady)
+                {
+                    index._performanceIndexBuildTask = Task.Run(
+                        () => index.BuildPreferredRootIndexAsync(index._lifetimeCancellation.Token));
                 }
 
                 return index;
@@ -115,7 +136,8 @@ public sealed class SqliteSearchIndex : ISearchIndex, IAsyncDisposable
         try
         {
             ThrowIfDisposed();
-            await ExecuteUpsertAsync(record, DefaultIndexGeneration, null, cancellationToken).ConfigureAwait(false);
+            using var command = CreateUpsertCommand(transaction: null);
+            await ExecuteUpsertAsync(command, record, DefaultIndexGeneration, cancellationToken).ConfigureAwait(false);
         }
         finally
         {
@@ -135,9 +157,10 @@ public sealed class SqliteSearchIndex : ISearchIndex, IAsyncDisposable
             using var transaction = _connection.BeginTransaction();
             try
             {
+                using var command = CreateUpsertCommand(transaction);
                 foreach (var record in records)
                 {
-                    await ExecuteUpsertAsync(record, DefaultIndexGeneration, transaction, cancellationToken).ConfigureAwait(false);
+                    await ExecuteUpsertAsync(command, record, DefaultIndexGeneration, cancellationToken).ConfigureAwait(false);
                 }
 
                 await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
@@ -237,9 +260,10 @@ public sealed class SqliteSearchIndex : ISearchIndex, IAsyncDisposable
             using var transaction = _connection.BeginTransaction();
             try
             {
+                using var command = CreateUpsertCommand(transaction);
                 foreach (var record in records)
                 {
-                    await ExecuteUpsertAsync(record, indexGeneration, transaction, cancellationToken).ConfigureAwait(false);
+                    await ExecuteUpsertAsync(command, record, indexGeneration, cancellationToken).ConfigureAwait(false);
                 }
 
                 await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
@@ -394,6 +418,75 @@ public sealed class SqliteSearchIndex : ISearchIndex, IAsyncDisposable
         }
     }
 
+    internal async Task ApplyLiveIndexChangesAsync(
+        IReadOnlyList<LiveIndexChange> changes,
+        CancellationToken cancellationToken)
+    {
+        ArgumentNullException.ThrowIfNull(changes);
+        if (changes.Count == 0)
+        {
+            return;
+        }
+
+        await _connectionGate.WaitAsync(cancellationToken).ConfigureAwait(false);
+        try
+        {
+            ThrowIfDisposed();
+            using var transaction = _connection.BeginTransaction();
+            try
+            {
+                using var upsertCommand = CreateUpsertCommand(transaction);
+                using var deleteTreeCommand = _connection.CreateCommand();
+                deleteTreeCommand.Transaction = transaction;
+                deleteTreeCommand.CommandText = """
+                    delete from files
+                    where path_key = $path_key
+                       or path_key like $descendant_path_key_pattern escape '\';
+                    """;
+                var pathKeyParameter = deleteTreeCommand.Parameters.Add("$path_key", SqliteType.Text);
+                var descendantsParameter = deleteTreeCommand.Parameters.Add(
+                    "$descendant_path_key_pattern",
+                    SqliteType.Text);
+
+                foreach (var change in changes)
+                {
+                    cancellationToken.ThrowIfCancellationRequested();
+                    switch (change.Kind)
+                    {
+                        case LiveIndexChangeKind.Upsert:
+                            await ExecuteUpsertAsync(
+                                upsertCommand,
+                                change.Record!,
+                                DefaultIndexGeneration,
+                                cancellationToken).ConfigureAwait(false);
+                            break;
+
+                        case LiveIndexChangeKind.DeletePathAndDescendants:
+                            var pathKey = CreatePathKey(change.FullPath!);
+                            pathKeyParameter.Value = pathKey;
+                            descendantsParameter.Value = EscapeLike(CreateDescendantPathKeyPrefix(pathKey)) + "%";
+                            await deleteTreeCommand.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+                            break;
+
+                        default:
+                            throw new NotSupportedException($"Unsupported live index change kind: {change.Kind}.");
+                    }
+                }
+
+                await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
+            }
+            catch
+            {
+                await transaction.RollbackAsync(CancellationToken.None).ConfigureAwait(false);
+                throw;
+            }
+        }
+        finally
+        {
+            _connectionGate.Release();
+        }
+    }
+
     public async Task RecordUsageAsync(string fullPath, CancellationToken cancellationToken)
     {
         var normalizedFullPath = NormalizeFullPath(fullPath);
@@ -425,6 +518,59 @@ public sealed class SqliteSearchIndex : ISearchIndex, IAsyncDisposable
         }
     }
 
+    public async Task<IReadOnlyList<SearchResult>> GetRecentAsync(
+        int limit,
+        CancellationToken cancellationToken)
+    {
+        if (limit <= 0)
+        {
+            return Array.Empty<SearchResult>();
+        }
+
+        await _searchConnectionGate.WaitAsync(cancellationToken).ConfigureAwait(false);
+        try
+        {
+            ThrowIfDisposed();
+            using var command = _searchConnection.CreateCommand();
+            command.CommandText = """
+                select
+                    files.full_path,
+                    files.is_directory,
+                    files.size_bytes,
+                    files.last_write_time
+                from usage
+                inner join files on files.path_key = usage.path_key
+                order by usage.last_used_at desc, usage.open_count desc
+                limit $limit;
+                """;
+            command.Parameters.AddWithValue("$limit", Math.Min(limit * 4, 200));
+
+            var results = new List<SearchResult>(limit);
+            var reader = await command.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
+            await using (reader.ConfigureAwait(false))
+            {
+                while (results.Count < limit && await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
+                {
+                    var record = FileRecord.Create(
+                        reader.GetString(0),
+                        reader.GetInt64(1) != 0,
+                        reader.GetInt64(2),
+                        ParseDateTime(reader.GetString(3)));
+                    if (record.IsDirectory ? Directory.Exists(record.FullPath) : File.Exists(record.FullPath))
+                    {
+                        results.Add(new SearchResult(record, 1, "recent"));
+                    }
+                }
+            }
+
+            return results;
+        }
+        finally
+        {
+            _searchConnectionGate.Release();
+        }
+    }
+
     internal async Task ApplyUsnJournalChangesAsync(
         IEnumerable<UsnJournalIndexChange> changes,
         UsnJournalCheckpoint checkpoint,
@@ -448,22 +594,24 @@ public sealed class SqliteSearchIndex : ISearchIndex, IAsyncDisposable
             using var transaction = _connection.BeginTransaction();
             try
             {
+                using var upsertCommand = CreateUpsertCommand(transaction);
+                using var deleteCommand = CreateDeleteCommand(transaction);
                 foreach (var change in materializedChanges)
                 {
                     switch (change.Kind)
                     {
                         case UsnJournalIndexChangeKind.Upsert:
                             await ExecuteUpsertAsync(
+                                upsertCommand,
                                 change.Record!,
                                 indexGeneration,
-                                transaction,
                                 cancellationToken).ConfigureAwait(false);
                             break;
 
                         case UsnJournalIndexChangeKind.Delete:
                             await ExecuteDeleteAsync(
+                                deleteCommand,
                                 change.FullPath!,
-                                transaction,
                                 cancellationToken).ConfigureAwait(false);
                             break;
 
@@ -497,23 +645,38 @@ public sealed class SqliteSearchIndex : ISearchIndex, IAsyncDisposable
         IReadOnlyList<FileRecord> candidates;
         IReadOnlyList<UsageRecord> usage;
 
-        await _searchConnectionGate.WaitAsync(cancellationToken).ConfigureAwait(false);
+        using (PerformanceMetrics.MeasureStage("index.connection_wait"))
+        {
+            await _searchConnectionGate.WaitAsync(cancellationToken).ConfigureAwait(false);
+        }
         try
         {
             ThrowIfDisposed();
 
-            candidates = await ReadCandidatesAsync(query, cancellationToken).ConfigureAwait(false);
-            usage = string.IsNullOrWhiteSpace(query.NormalizedText)
-                ? Array.Empty<UsageRecord>()
-                : await ReadUsageAsync(candidates.Select(record => record.PathKey), cancellationToken).ConfigureAwait(false);
+            using (PerformanceMetrics.MeasureStage("index.read_candidates"))
+            {
+                candidates = await ReadCandidatesAsync(query, cancellationToken).ConfigureAwait(false);
+            }
+
+            using (PerformanceMetrics.MeasureStage("index.read_usage"))
+            {
+                usage = string.IsNullOrWhiteSpace(query.NormalizedText)
+                    ? Array.Empty<UsageRecord>()
+                    : await ReadUsageAsync(candidates.Select(record => record.PathKey), cancellationToken).ConfigureAwait(false);
+            }
         }
         finally
         {
             _searchConnectionGate.Release();
         }
 
+        PerformanceMetrics.SetCounter("candidate_count", candidates.Count);
+        PerformanceMetrics.SetCounter("usage_count", usage.Count);
         cancellationToken.ThrowIfCancellationRequested();
-        return ResultRanker.Rank(query, candidates, usage, Array.Empty<string>());
+        using (PerformanceMetrics.MeasureStage("rank.total"))
+        {
+            return ResultRanker.Rank(query, candidates, usage, Array.Empty<string>(), cancellationToken);
+        }
     }
 
     public async ValueTask DisposeAsync()
@@ -524,7 +687,7 @@ public sealed class SqliteSearchIndex : ISearchIndex, IAsyncDisposable
         }
 
         _lifetimeCancellation.Cancel();
-        await _ftsBuildTask.ConfigureAwait(false);
+        await Task.WhenAll(_ftsBuildTask, _performanceIndexBuildTask).ConfigureAwait(false);
         await _searchConnectionGate.WaitAsync().ConfigureAwait(false);
         try
         {
@@ -595,6 +758,48 @@ public sealed class SqliteSearchIndex : ISearchIndex, IAsyncDisposable
 
     private static async Task MigrateSchemaAsync(SqliteConnection connection, CancellationToken cancellationToken)
     {
+        var schemaVersion = await ReadSchemaVersionAsync(connection, cancellationToken).ConfigureAwait(false);
+        if (schemaVersion > CurrentSchemaVersion)
+        {
+            throw new InvalidOperationException(
+                $"Index schema version {schemaVersion} is newer than supported version {CurrentSchemaVersion}.");
+        }
+
+        while (schemaVersion < CurrentSchemaVersion)
+        {
+            switch (schemaVersion + 1)
+            {
+                case 1:
+                    await MigrateToSchemaVersion1Async(connection, cancellationToken).ConfigureAwait(false);
+                    break;
+                case 2:
+                    await RemoveObsoleteIndexesAsync(connection, cancellationToken).ConfigureAwait(false);
+                    break;
+                default:
+                    throw new InvalidOperationException($"Missing index migration for schema version {schemaVersion + 1}.");
+            }
+
+            schemaVersion++;
+            await WriteSchemaVersionAsync(connection, schemaVersion, cancellationToken).ConfigureAwait(false);
+        }
+    }
+
+    private static async Task EnsureSupportedSchemaVersionAsync(
+        SqliteConnection connection,
+        CancellationToken cancellationToken)
+    {
+        var schemaVersion = await ReadSchemaVersionAsync(connection, cancellationToken).ConfigureAwait(false);
+        if (schemaVersion > CurrentSchemaVersion)
+        {
+            throw new InvalidOperationException(
+                $"Index schema version {schemaVersion} is newer than supported version {CurrentSchemaVersion}.");
+        }
+    }
+
+    private static async Task MigrateToSchemaVersion1Async(
+        SqliteConnection connection,
+        CancellationToken cancellationToken)
+    {
         if (!await HasColumnAsync(connection, "files", "search_text", cancellationToken).ConfigureAwait(false))
         {
             using var addColumnCommand = connection.CreateCommand();
@@ -611,7 +816,27 @@ public sealed class SqliteSearchIndex : ISearchIndex, IAsyncDisposable
 
         await EnsureIndexContentVersionAsync(connection, cancellationToken).ConfigureAwait(false);
         await BackfillSearchTextAsync(connection, cancellationToken).ConfigureAwait(false);
-        await EnsureIndexesAsync(connection, cancellationToken).ConfigureAwait(false);
+        await EnsureBaseIndexesAsync(connection, cancellationToken).ConfigureAwait(false);
+    }
+
+    private static async Task<int> ReadSchemaVersionAsync(
+        SqliteConnection connection,
+        CancellationToken cancellationToken)
+    {
+        using var command = connection.CreateCommand();
+        command.CommandText = "pragma user_version;";
+        var value = await command.ExecuteScalarAsync(cancellationToken).ConfigureAwait(false);
+        return Convert.ToInt32(value, CultureInfo.InvariantCulture);
+    }
+
+    private static async Task WriteSchemaVersionAsync(
+        SqliteConnection connection,
+        int version,
+        CancellationToken cancellationToken)
+    {
+        using var command = connection.CreateCommand();
+        command.CommandText = $"pragma user_version = {version};";
+        await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
     }
 
     private static async Task<bool> EnsureFtsSchemaAsync(
@@ -724,6 +949,35 @@ public sealed class SqliteSearchIndex : ISearchIndex, IAsyncDisposable
         }
     }
 
+    private async Task BuildPreferredRootIndexAsync(CancellationToken cancellationToken)
+    {
+        try
+        {
+            await _connectionGate.WaitAsync(cancellationToken).ConfigureAwait(false);
+            try
+            {
+                using var command = _connection.CreateCommand();
+                command.CommandText = """
+                    create index if not exists ix_files_parent_path_nocase_name
+                    on files(parent_path collate nocase, name collate nocase);
+                    """;
+                await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+                _preferredRootIndexReady = true;
+            }
+            finally
+            {
+                _connectionGate.Release();
+            }
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+        }
+        catch (Exception exception)
+        {
+            Trace.TraceError("Preferred-root index build failed: {0}", exception);
+        }
+    }
+
     private static async Task<bool> HasColumnAsync(
         SqliteConnection connection,
         string tableName,
@@ -742,6 +996,25 @@ public sealed class SqliteSearchIndex : ISearchIndex, IAsyncDisposable
         var result = await command.ExecuteScalarAsync(cancellationToken).ConfigureAwait(false);
         return Convert.ToInt64(result, CultureInfo.InvariantCulture) > 0;
     }
+
+    private static async Task<bool> HasIndexAsync(
+        SqliteConnection connection,
+        string indexName,
+        CancellationToken cancellationToken)
+    {
+        using var command = connection.CreateCommand();
+        command.CommandText = """
+            select count(*)
+            from sqlite_master
+            where type = 'index' and name = $index_name;
+            """;
+        command.Parameters.AddWithValue("$index_name", indexName);
+        var result = await command.ExecuteScalarAsync(cancellationToken).ConfigureAwait(false);
+        return Convert.ToInt64(result, CultureInfo.InvariantCulture) > 0;
+    }
+
+    internal Task WaitForBackgroundMaintenanceAsync() =>
+        Task.WhenAll(_ftsBuildTask, _performanceIndexBuildTask);
 
     private static async Task EnsureIndexContentVersionAsync(
         SqliteConnection connection,
@@ -988,15 +1261,14 @@ public sealed class SqliteSearchIndex : ISearchIndex, IAsyncDisposable
 
     private static async Task BackfillSearchTextAsync(SqliteConnection connection, CancellationToken cancellationToken)
     {
-        var rows = new List<(string PathKey, string FullPath, string Name)>();
+        var rows = new List<(string PathKey, string FullPath)>();
 
         using (var readCommand = connection.CreateCommand())
         {
             readCommand.CommandText = """
                 select
                     path_key,
-                    full_path,
-                    name
+                    full_path
                 from files
                 where search_text = '';
                 """;
@@ -1006,7 +1278,7 @@ public sealed class SqliteSearchIndex : ISearchIndex, IAsyncDisposable
             {
                 while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
                 {
-                    rows.Add((reader.GetString(0), reader.GetString(1), reader.GetString(2)));
+                    rows.Add((reader.GetString(0), reader.GetString(1)));
                 }
             }
         }
@@ -1019,17 +1291,21 @@ public sealed class SqliteSearchIndex : ISearchIndex, IAsyncDisposable
         using var transaction = connection.BeginTransaction();
         try
         {
+            using var updateCommand = connection.CreateCommand();
+            updateCommand.Transaction = transaction;
+            updateCommand.CommandText = """
+                update files
+                set search_text = $search_text
+                where path_key = $path_key;
+                """;
+            updateCommand.Parameters.Add("$search_text", SqliteType.Text);
+            updateCommand.Parameters.Add("$path_key", SqliteType.Text);
+            updateCommand.Prepare();
+
             foreach (var row in rows)
             {
-                using var updateCommand = connection.CreateCommand();
-                updateCommand.Transaction = transaction;
-                updateCommand.CommandText = """
-                    update files
-                    set search_text = $search_text
-                    where path_key = $path_key;
-                    """;
-                updateCommand.Parameters.AddWithValue("$search_text", CreateRecordSearchText(row.FullPath, row.Name));
-                updateCommand.Parameters.AddWithValue("$path_key", row.PathKey);
+                updateCommand.Parameters[0].Value = CreateRecordSearchText(row.FullPath);
+                updateCommand.Parameters[1].Value = row.PathKey;
 
                 await updateCommand.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
             }
@@ -1043,7 +1319,7 @@ public sealed class SqliteSearchIndex : ISearchIndex, IAsyncDisposable
         }
     }
 
-    private static async Task EnsureIndexesAsync(SqliteConnection connection, CancellationToken cancellationToken)
+    private static async Task EnsureBaseIndexesAsync(SqliteConnection connection, CancellationToken cancellationToken)
     {
         using var command = connection.CreateCommand();
         command.CommandText = """
@@ -1051,22 +1327,15 @@ public sealed class SqliteSearchIndex : ISearchIndex, IAsyncDisposable
             create index if not exists ix_files_name_nocase on files(name collate nocase);
             create index if not exists ix_files_is_directory_name on files(is_directory, name);
             create index if not exists ix_files_is_directory_name_nocase on files(is_directory, name collate nocase);
-            create index if not exists ix_files_search_text on files(search_text);
             create index if not exists ix_usage_path_key on usage(path_key);
             """;
 
         await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
     }
 
-    private async Task ExecuteUpsertAsync(
-        FileRecord record,
-        long indexGeneration,
-        SqliteTransaction? transaction,
-        CancellationToken cancellationToken)
+    private SqliteCommand CreateUpsertCommand(SqliteTransaction? transaction)
     {
-        ArgumentNullException.ThrowIfNull(record);
-
-        using var command = _connection.CreateCommand();
+        var command = _connection.CreateCommand();
         command.Transaction = transaction;
         command.CommandText = """
             insert into files (
@@ -1102,16 +1371,45 @@ public sealed class SqliteSearchIndex : ISearchIndex, IAsyncDisposable
                 index_generation = excluded.index_generation;
             """;
 
-        command.Parameters.AddWithValue("$full_path", record.FullPath);
-        command.Parameters.AddWithValue("$path_key", record.PathKey);
-        command.Parameters.AddWithValue("$name", record.Name);
-        command.Parameters.AddWithValue("$parent_path", record.ParentPath);
-        command.Parameters.AddWithValue("$search_text", CreateRecordSearchText(record.FullPath, record.Name));
-        command.Parameters.AddWithValue("$is_directory", record.IsDirectory ? 1 : 0);
-        command.Parameters.AddWithValue("$size_bytes", record.SizeBytes);
-        command.Parameters.AddWithValue("$last_write_time", FormatDateTime(record.LastWriteTime));
-        command.Parameters.AddWithValue("$index_generation", indexGeneration);
+        command.Parameters.Add("$full_path", SqliteType.Text);
+        command.Parameters.Add("$path_key", SqliteType.Text);
+        command.Parameters.Add("$name", SqliteType.Text);
+        command.Parameters.Add("$parent_path", SqliteType.Text);
+        command.Parameters.Add("$search_text", SqliteType.Text);
+        command.Parameters.Add("$is_directory", SqliteType.Integer);
+        command.Parameters.Add("$size_bytes", SqliteType.Integer);
+        command.Parameters.Add("$last_write_time", SqliteType.Text);
+        command.Parameters.Add("$index_generation", SqliteType.Integer);
+        command.Prepare();
+        return command;
+    }
 
+    private static async Task ExecuteUpsertAsync(
+        SqliteCommand command,
+        FileRecord record,
+        long indexGeneration,
+        CancellationToken cancellationToken)
+    {
+        ArgumentNullException.ThrowIfNull(record);
+
+        command.Parameters[0].Value = record.FullPath;
+        command.Parameters[1].Value = record.PathKey;
+        command.Parameters[2].Value = record.Name;
+        command.Parameters[3].Value = record.ParentPath;
+        command.Parameters[4].Value = CreateRecordSearchText(record.FullPath);
+        command.Parameters[5].Value = record.IsDirectory ? 1 : 0;
+        command.Parameters[6].Value = record.SizeBytes;
+        command.Parameters[7].Value = FormatDateTime(record.LastWriteTime);
+        command.Parameters[8].Value = indexGeneration;
+        await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+    }
+
+    private static async Task RemoveObsoleteIndexesAsync(
+        SqliteConnection connection,
+        CancellationToken cancellationToken)
+    {
+        using var command = connection.CreateCommand();
+        command.CommandText = "drop index if exists ix_files_search_text;";
         await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
     }
 
@@ -1120,13 +1418,26 @@ public sealed class SqliteSearchIndex : ISearchIndex, IAsyncDisposable
         SqliteTransaction? transaction,
         CancellationToken cancellationToken)
     {
-        var pathKey = CreatePathKey(fullPath);
+        using var command = CreateDeleteCommand(transaction);
+        await ExecuteDeleteAsync(command, fullPath, cancellationToken).ConfigureAwait(false);
+    }
 
-        using var command = _connection.CreateCommand();
+    private SqliteCommand CreateDeleteCommand(SqliteTransaction? transaction)
+    {
+        var command = _connection.CreateCommand();
         command.Transaction = transaction;
         command.CommandText = "delete from files where path_key = $path_key;";
-        command.Parameters.AddWithValue("$path_key", pathKey);
+        command.Parameters.Add("$path_key", SqliteType.Text);
+        command.Prepare();
+        return command;
+    }
 
+    private static async Task ExecuteDeleteAsync(
+        SqliteCommand command,
+        string fullPath,
+        CancellationToken cancellationToken)
+    {
+        command.Parameters[0].Value = CreatePathKey(fullPath);
         await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
     }
 
@@ -1176,7 +1487,11 @@ public sealed class SqliteSearchIndex : ISearchIndex, IAsyncDisposable
         var records = new Dictionary<string, FileRecord>(StringComparer.Ordinal);
         if (string.IsNullOrWhiteSpace(query.NormalizedText))
         {
-            await AddFallbackCandidatesAsync(query, query.Limit, records, cancellationToken).ConfigureAwait(false);
+            using (PerformanceMetrics.MeasureStage("candidates.fallback"))
+            {
+                await AddFallbackCandidatesAsync(query, query.Limit, records, cancellationToken).ConfigureAwait(false);
+            }
+
             return records.Values
                 .Where(record => MatchesParsedFilters(query, record))
                 .ToArray();
@@ -1185,21 +1500,43 @@ public sealed class SqliteSearchIndex : ISearchIndex, IAsyncDisposable
         var candidateLimit = CreateCandidateLimit(query);
         var useExpensiveFuzzy = UsesExpensiveFuzzyCandidates(query);
 
-        await AddExactCandidatesAsync(query, candidateLimit, records, cancellationToken).ConfigureAwait(false);
-        cancellationToken.ThrowIfCancellationRequested();
-        var hasExactName = records.Values.Any(record =>
-            string.Equals(record.Name, query.NormalizedText, StringComparison.OrdinalIgnoreCase));
-        if (useExpensiveFuzzy && !hasExactName)
+        if (query.PreferredRoot is not null && _preferredRootIndexReady)
         {
-            await AddFuzzyCandidatesAsync(query, candidateLimit, records, cancellationToken).ConfigureAwait(false);
+            using (PerformanceMetrics.MeasureStage("candidates.preferred_root"))
+            {
+                await AddPreferredRootCandidatesAsync(query, candidateLimit, records, cancellationToken).ConfigureAwait(false);
+            }
+        }
+
+        using (PerformanceMetrics.MeasureStage("candidates.exact"))
+        {
+            await AddExactCandidatesAsync(query, candidateLimit, records, cancellationToken).ConfigureAwait(false);
         }
 
         cancellationToken.ThrowIfCancellationRequested();
-        await AddFallbackCandidatesAsync(query, FallbackCandidateLimit, records, cancellationToken).ConfigureAwait(false);
+        if (useExpensiveFuzzy && records.Count < query.Limit)
+        {
+            using (PerformanceMetrics.MeasureStage("candidates.fts"))
+            {
+                await AddFuzzyCandidatesAsync(query, candidateLimit, records, cancellationToken).ConfigureAwait(false);
+            }
+        }
 
-        return records.Values
-            .Where(record => MatchesParsedFilters(query, record))
-            .ToArray();
+        cancellationToken.ThrowIfCancellationRequested();
+        if (records.Count < query.Limit)
+        {
+            using (PerformanceMetrics.MeasureStage("candidates.fallback"))
+            {
+                await AddFallbackCandidatesAsync(query, FallbackCandidateLimit, records, cancellationToken).ConfigureAwait(false);
+            }
+        }
+
+        using (PerformanceMetrics.MeasureStage("candidates.filter"))
+        {
+            return records.Values
+                .Where(record => MatchesParsedFilters(query, record))
+                .ToArray();
+        }
     }
 
     internal static bool UsesExpensiveFuzzyCandidatesForTests(SearchQuery query)
@@ -1272,6 +1609,11 @@ public sealed class SqliteSearchIndex : ISearchIndex, IAsyncDisposable
             candidateLimit,
             records,
             cancellationToken).ConfigureAwait(false);
+        if (records.Count >= query.Limit)
+        {
+            return;
+        }
+
         cancellationToken.ThrowIfCancellationRequested();
         await AddFtsCandidatesAsync(
             query,
@@ -1316,91 +1658,6 @@ public sealed class SqliteSearchIndex : ISearchIndex, IAsyncDisposable
         await AddRecordsAsync(command, records, cancellationToken).ConfigureAwait(false);
     }
 
-    private async Task AddUsageCandidatesAsync(
-        SearchQuery query,
-        int candidateLimit,
-        IDictionary<string, FileRecord> records,
-        CancellationToken cancellationToken)
-    {
-        var normalizedQuery = NormalizeSearchText(query.NormalizedText);
-        var containsPattern = $"%{EscapeLike(normalizedQuery)}%";
-        var orderedPattern = CreateOrderedLikePattern(normalizedQuery);
-        var directoryFilter = CreateDirectoryFilter(query, "files.");
-
-        using var command = _searchConnection.CreateCommand();
-        var parsedFilter = CreateParsedFilter(query, command, "files.");
-        command.CommandText = $"""
-            select
-                files.full_path,
-                files.is_directory,
-                files.size_bytes,
-                files.last_write_time
-            from files
-            inner join usage on usage.path_key = files.path_key
-            where (
-                files.search_text like $contains escape '\'
-                or files.search_text like $ordered escape '\'
-            ){directoryFilter}{parsedFilter}
-            order by
-                min(usage.open_count * 5, 50) desc,
-                usage.last_used_at desc,
-                files.name,
-                files.full_path
-            limit $limit;
-            """;
-        command.Parameters.AddWithValue("$contains", containsPattern);
-        command.Parameters.AddWithValue("$ordered", orderedPattern);
-        command.Parameters.AddWithValue("$limit", candidateLimit);
-
-        await AddRecordsAsync(command, records, cancellationToken).ConfigureAwait(false);
-    }
-
-    private async Task AddCombinedScoreCandidatesAsync(
-        SearchQuery query,
-        int candidateLimit,
-        IDictionary<string, FileRecord> records,
-        CancellationToken cancellationToken)
-    {
-        var normalizedQuery = NormalizeSearchText(query.NormalizedText);
-        var containsPattern = $"%{EscapeLike(normalizedQuery)}%";
-        var orderedPattern = CreateOrderedLikePattern(normalizedQuery);
-        var directoryFilter = CreateDirectoryFilter(query, "files.");
-
-        using var command = _searchConnection.CreateCommand();
-        var parsedFilter = CreateParsedFilter(query, command, "files.");
-        command.CommandText = $"""
-            select
-                files.full_path,
-                files.is_directory,
-                files.size_bytes,
-                files.last_write_time
-            from files
-            left join usage on usage.path_key = files.path_key
-            where (
-                files.search_text like $contains escape '\'
-                or files.search_text like $ordered escape '\'
-            ){directoryFilter}{parsedFilter}
-            order by
-                (
-                    listary_rank_score($query, files.full_path, files.name)
-                    + min(coalesce(usage.open_count, 0) * 5, 50)
-                    + listary_recency_boost(usage.last_used_at, $now)
-                ) desc,
-                files.name collate nocase,
-                files.name,
-                files.full_path collate nocase,
-                files.full_path
-            limit $limit;
-            """;
-        command.Parameters.AddWithValue("$contains", containsPattern);
-        command.Parameters.AddWithValue("$ordered", orderedPattern);
-        command.Parameters.AddWithValue("$query", query.NormalizedText);
-        command.Parameters.AddWithValue("$now", FormatDateTime(DateTimeOffset.UtcNow));
-        command.Parameters.AddWithValue("$limit", candidateLimit);
-
-        await AddRecordsAsync(command, records, cancellationToken).ConfigureAwait(false);
-    }
-
     private async Task AddFallbackCandidatesAsync(
         SearchQuery query,
         int candidateLimit,
@@ -1427,6 +1684,69 @@ public sealed class SqliteSearchIndex : ISearchIndex, IAsyncDisposable
         await AddRecordsAsync(command, records, cancellationToken).ConfigureAwait(false);
     }
 
+    private async Task AddPreferredRootCandidatesAsync(
+        SearchQuery query,
+        int candidateLimit,
+        IDictionary<string, FileRecord> records,
+        CancellationToken cancellationToken)
+    {
+        var preferredRoot = query.PreferredRoot;
+        if (preferredRoot is null)
+        {
+            return;
+        }
+
+        await AddPreferredRootDirectChildrenAsync(
+            query,
+            preferredRoot,
+            candidateLimit,
+            records,
+            cancellationToken).ConfigureAwait(false);
+    }
+
+    private async Task AddPreferredRootDirectChildrenAsync(
+        SearchQuery query,
+        string preferredRoot,
+        int candidateLimit,
+        IDictionary<string, FileRecord> records,
+        CancellationToken cancellationToken)
+    {
+        var normalizedQuery = NormalizeSearchText(query.NormalizedText);
+        var containsPattern = $"%{EscapeLike(normalizedQuery)}%";
+        var orderedPattern = CreateOrderedLikePattern(normalizedQuery);
+        var directoryFilter = CreateDirectoryFilter(query, "files.");
+
+        using var command = _searchConnection.CreateCommand();
+        var parsedFilter = CreateParsedFilter(query, command, "files.");
+        command.CommandText = $"""
+            select
+                files.full_path,
+                files.is_directory,
+                files.size_bytes,
+                files.last_write_time
+            from files
+            where files.parent_path = $root collate nocase
+              and (
+                lower(files.full_path) like $contains escape '\'
+                or files.search_text like $contains escape '\'
+                or lower(files.full_path) like $ordered escape '\'
+                or files.search_text like $ordered escape '\'
+              ){directoryFilter}{parsedFilter}
+            order by
+                length(files.name),
+                files.name collate nocase,
+                files.name,
+                files.full_path
+            limit $limit;
+            """;
+        command.Parameters.AddWithValue("$root", preferredRoot);
+        command.Parameters.AddWithValue("$contains", containsPattern);
+        command.Parameters.AddWithValue("$ordered", orderedPattern);
+        command.Parameters.AddWithValue("$limit", candidateLimit);
+
+        await AddRecordsAsync(command, records, cancellationToken).ConfigureAwait(false);
+    }
+
     private static string CreateFtsMatchQuery(SearchQuery query)
     {
         var terms = query.Parsed.Phrases
@@ -1440,6 +1760,22 @@ public sealed class SqliteSearchIndex : ISearchIndex, IAsyncDisposable
 
     private static bool MatchesParsedFilters(SearchQuery query, FileRecord record)
     {
+        if (query.IsDirectory is not null && record.IsDirectory != query.IsDirectory)
+        {
+            return false;
+        }
+
+        if (query.RequiredExtensions.Count > 0 &&
+            (record.IsDirectory || !query.RequiredExtensions.Contains(GetExtension(record), StringComparer.OrdinalIgnoreCase)))
+        {
+            return false;
+        }
+
+        if (query.ModifiedAfter is not null && record.LastWriteTime < query.ModifiedAfter)
+        {
+            return false;
+        }
+
         if (query.Parsed.FileOnly && record.IsDirectory)
         {
             return false;
@@ -1491,7 +1827,11 @@ public sealed class SqliteSearchIndex : ISearchIndex, IAsyncDisposable
     private static string CreateFallbackWhereClause(SearchQuery query, SqliteCommand command)
     {
         var clauses = new List<string>();
-        if (query.Parsed.FileOnly)
+        if (query.IsDirectory is not null)
+        {
+            clauses.Add($"is_directory = {(query.IsDirectory.Value ? 1 : 0)}");
+        }
+        else if (query.Parsed.FileOnly)
         {
             clauses.Add("is_directory = 0");
         }
@@ -1515,11 +1855,30 @@ public sealed class SqliteSearchIndex : ISearchIndex, IAsyncDisposable
         string tablePrefix = "")
     {
         var clauses = new List<string>();
+        if (query.RequiredExtensions.Count > 0)
+        {
+            var extensionClauses = new List<string>();
+            for (var index = 0; index < query.RequiredExtensions.Count; index++)
+            {
+                var parameterName = $"$quick_ext_{index}";
+                command.Parameters.AddWithValue(parameterName, $"%.{EscapeLike(query.RequiredExtensions[index])}");
+                extensionClauses.Add($"lower({tablePrefix}name) like {parameterName} escape '\\'");
+            }
+
+            clauses.Add("(" + string.Join(" or ", extensionClauses) + ")");
+        }
+
+        if (query.ModifiedAfter is not null)
+        {
+            command.Parameters.AddWithValue("$quick_modified_after", FormatDateTime(query.ModifiedAfter.Value));
+            clauses.Add($"julianday({tablePrefix}last_write_time) >= julianday($quick_modified_after)");
+        }
+
         AddLikeFilters(clauses, command, query.Parsed.Extensions, $"lower({tablePrefix}name)", "include_ext", include: true, extension: true);
         AddLikeFilters(clauses, command, query.Parsed.ExcludedExtensions, $"lower({tablePrefix}name)", "exclude_ext", include: false, extension: true);
-        AddLikeFilters(clauses, command, query.Parsed.PathTerms, $"{tablePrefix}search_text", "path", include: true, extension: false);
-        AddLikeFilters(clauses, command, query.Parsed.Phrases, $"{tablePrefix}search_text", "phrase", include: true, extension: false);
-        AddLikeFilters(clauses, command, query.Parsed.ExcludedTerms, $"{tablePrefix}search_text", "exclude", include: false, extension: false);
+        AddSearchTextFilters(clauses, command, query.Parsed.PathTerms, tablePrefix, "path", include: true);
+        AddSearchTextFilters(clauses, command, query.Parsed.Phrases, tablePrefix, "phrase", include: true);
+        AddSearchTextFilters(clauses, command, query.Parsed.ExcludedTerms, tablePrefix, "exclude", include: false);
 
         return clauses.Count == 0 ? string.Empty : " and " + string.Join(" and ", clauses);
     }
@@ -1546,6 +1905,31 @@ public sealed class SqliteSearchIndex : ISearchIndex, IAsyncDisposable
                 ? $"%.{EscapeLike(value)}"
                 : $"%{EscapeLike(value)}%";
             clauses.Add($"{column} {(include ? string.Empty : "not ")}like {parameterName} escape '\\'");
+            command.Parameters.AddWithValue(parameterName, pattern);
+        }
+    }
+
+    private static void AddSearchTextFilters(
+        ICollection<string> clauses,
+        SqliteCommand command,
+        IReadOnlyList<string> values,
+        string tablePrefix,
+        string namePrefix,
+        bool include)
+    {
+        for (var index = 0; index < values.Count; index++)
+        {
+            var value = NormalizeSearchText(values[index]);
+            if (string.IsNullOrWhiteSpace(value))
+            {
+                continue;
+            }
+
+            var parameterName = $"${namePrefix}_{index}";
+            var pattern = $"%{EscapeLike(value)}%";
+            clauses.Add(include
+                ? $"(lower({tablePrefix}full_path) like {parameterName} escape '\\' or {tablePrefix}search_text like {parameterName} escape '\\')"
+                : $"(lower({tablePrefix}full_path) not like {parameterName} escape '\\' and {tablePrefix}search_text not like {parameterName} escape '\\')");
             command.Parameters.AddWithValue(parameterName, pattern);
         }
     }
@@ -1640,50 +2024,17 @@ public sealed class SqliteSearchIndex : ISearchIndex, IAsyncDisposable
 
     private static string CreateDirectoryFilter(SearchQuery query, string tablePrefix = "")
     {
+        if (query.IsDirectory is not null)
+        {
+            return $" and {tablePrefix}is_directory = {(query.IsDirectory.Value ? 1 : 0)}";
+        }
+
         if (query.Parsed.FileOnly)
         {
             return $" and {tablePrefix}is_directory = 0";
         }
 
         return query.EffectiveMode == SearchMode.FoldersOnly ? $" and {tablePrefix}is_directory = 1" : string.Empty;
-    }
-
-    private static void RegisterSearchFunctions(SqliteConnection connection)
-    {
-        connection.CreateFunction<string, string, string, double>(
-            "listary_rank_score",
-            CalculateSqlRankScore,
-            isDeterministic: true);
-        connection.CreateFunction<string?, string, double>(
-            "listary_recency_boost",
-            CalculateSqlRecencyBoost,
-            isDeterministic: false);
-    }
-
-    private static double CalculateSqlRankScore(string query, string fullPath, string name)
-    {
-        var nameScore = FuzzyMatcher.Score(query, name);
-        var pathScore = FuzzyMatcher.Score(query, fullPath) * 0.6;
-        var pinyinScore = PinyinMatcher.Score(query, name) * 0.9;
-
-        return Math.Max(nameScore, Math.Max(pathScore, pinyinScore));
-    }
-
-    private static double CalculateSqlRecencyBoost(string? lastUsedAt, string now)
-    {
-        if (string.IsNullOrWhiteSpace(lastUsedAt))
-        {
-            return 0;
-        }
-
-        if (!DateTimeOffset.TryParse(lastUsedAt, CultureInfo.InvariantCulture, DateTimeStyles.RoundtripKind, out var parsedLastUsedAt) ||
-            !DateTimeOffset.TryParse(now, CultureInfo.InvariantCulture, DateTimeStyles.RoundtripKind, out var parsedNow))
-        {
-            return 0;
-        }
-
-        var daysSinceUse = (parsedNow - parsedLastUsedAt).TotalDays;
-        return Math.Clamp(20 - daysSinceUse, 0, 20);
     }
 
     private static string CreatePathKey(string fullPath)
@@ -1733,13 +2084,8 @@ public sealed class SqliteSearchIndex : ISearchIndex, IAsyncDisposable
         return DateTimeOffset.Parse(value, CultureInfo.InvariantCulture, DateTimeStyles.RoundtripKind);
     }
 
-    private static string CreateRecordSearchText(string fullPath, string name)
-    {
-        return string.Join(
-            ' ',
-            PinyinMatcher.CreateSearchText(fullPath),
-            PinyinMatcher.CreateSearchText(name));
-    }
+    private static string CreateRecordSearchText(string fullPath)
+        => PinyinMatcher.CreateSearchAliases(fullPath);
 
     private static string NormalizeSearchText(string value)
     {

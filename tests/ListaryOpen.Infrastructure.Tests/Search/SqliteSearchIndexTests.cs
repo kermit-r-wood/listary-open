@@ -12,6 +12,97 @@ namespace ListaryOpen.Infrastructure.Tests.Search;
 public sealed class SqliteSearchIndexTests
 {
     [Fact]
+    public async Task OpenMigratesDatabaseToCurrentSchemaVersion()
+    {
+        var dbPath = CreateTempDbPath();
+        try
+        {
+            await using (var index = await SqliteSearchIndex.OpenAsync(dbPath, CancellationToken.None))
+            {
+                await index.WaitForBackgroundMaintenanceAsync();
+            }
+
+            await using var connection = new SqliteConnection($"Data Source={dbPath};Pooling=False");
+            await connection.OpenAsync();
+            using var command = connection.CreateCommand();
+            command.CommandText = "pragma user_version;";
+            Assert.Equal(SqliteSearchIndex.CurrentSchemaVersion, Convert.ToInt32(await command.ExecuteScalarAsync()));
+        }
+        finally
+        {
+            DeleteIfExists(dbPath);
+        }
+    }
+
+    [Fact]
+    public async Task OpenRejectsDatabaseCreatedByNewerApplication()
+    {
+        var dbPath = CreateTempDbPath();
+        try
+        {
+            await using (var connection = new SqliteConnection($"Data Source={dbPath};Pooling=False"))
+            {
+                await connection.OpenAsync();
+                using var command = connection.CreateCommand();
+                command.CommandText = "pragma user_version = 999;";
+                await command.ExecuteNonQueryAsync();
+            }
+
+            var exception = await Assert.ThrowsAsync<InvalidOperationException>(
+                () => SqliteSearchIndex.OpenAsync(dbPath, CancellationToken.None));
+            Assert.Contains("newer", exception.Message, StringComparison.OrdinalIgnoreCase);
+        }
+        finally
+        {
+            DeleteIfExists(dbPath);
+        }
+    }
+
+    [Fact]
+    public async Task OpenMigratesVersionOneDatabaseAndCreatesPreferredRootIndex()
+    {
+        var dbPath = CreateTempDbPath();
+        try
+        {
+            await using (var index = await SqliteSearchIndex.OpenAsync(dbPath, CancellationToken.None))
+            {
+                await index.WaitForBackgroundMaintenanceAsync();
+            }
+
+            await using (var connection = new SqliteConnection($"Data Source={dbPath};Pooling=False"))
+            {
+                await connection.OpenAsync();
+                using var command = connection.CreateCommand();
+                command.CommandText = """
+                    drop index ix_files_parent_path_nocase_name;
+                    pragma user_version = 1;
+                    """;
+                await command.ExecuteNonQueryAsync();
+            }
+
+            await using (var index = await SqliteSearchIndex.OpenAsync(dbPath, CancellationToken.None))
+            {
+                await index.WaitForBackgroundMaintenanceAsync();
+            }
+
+            await using var verificationConnection = new SqliteConnection($"Data Source={dbPath};Pooling=False");
+            await verificationConnection.OpenAsync();
+            using var verificationCommand = verificationConnection.CreateCommand();
+            verificationCommand.CommandText = """
+                select count(*)
+                from sqlite_master
+                where type = 'index'
+                  and name = 'ix_files_parent_path_nocase_name';
+                """;
+            Assert.Equal(1L, Convert.ToInt64(await verificationCommand.ExecuteScalarAsync()));
+        }
+        finally
+        {
+            DeleteIfExists(dbPath);
+        }
+    }
+
+    [Fact]
     public async Task OpenEnablesWalForConcurrentSearchAndIndexing()
     {
         var dbPath = CreateTempDbPath();
@@ -191,6 +282,153 @@ public sealed class SqliteSearchIndexTests
                 var result = Assert.Single(results);
                 Assert.Equal("合同.docx", result.Record.Name);
             }
+        }
+        finally
+        {
+            DeleteIfExists(dbPath);
+        }
+    }
+
+    [Fact]
+    public async Task UpsertStoresOnlyNonDuplicatePinyinAliasesInSearchText()
+    {
+        var dbPath = CreateTempDbPath();
+
+        try
+        {
+            await using (var index = await SqliteSearchIndex.OpenAsync(dbPath, CancellationToken.None))
+            {
+                await index.UpsertManyAsync(
+                    [
+                        FileRecord.Create("C:\\Docs\\Invoice.xlsx", false, 10, DateTimeOffset.UtcNow),
+                        FileRecord.Create("C:\\Docs\\合同.docx", false, 10, DateTimeOffset.UtcNow)
+                    ],
+                    CancellationToken.None);
+            }
+
+            Assert.Equal(string.Empty, await ReadFileSearchTextAsync(dbPath, "C:\\Docs\\Invoice.xlsx"));
+            var chineseAliases = await ReadFileSearchTextAsync(dbPath, "C:\\Docs\\合同.docx");
+            Assert.DoesNotContain("合同", chineseAliases);
+            Assert.Contains("hetong.docx", chineseAliases);
+            Assert.Contains("ht.docx", chineseAliases);
+        }
+        finally
+        {
+            DeleteIfExists(dbPath);
+        }
+    }
+
+    [Fact]
+    public async Task SearchIncludesPreferredRootMatchOutsideGlobalCandidateWindow()
+    {
+        var dbPath = CreateTempDbPath();
+
+        try
+        {
+            await using var index = await SqliteSearchIndex.OpenAsync(dbPath, CancellationToken.None);
+            await index.WaitForBackgroundMaintenanceAsync();
+            var records = Enumerable.Range(0, 250)
+                .Select(number => FileRecord.Create(
+                    $"C:\\A{number:D3}\\Report.txt",
+                    false,
+                    1,
+                    DateTimeOffset.UtcNow))
+                .Append(FileRecord.Create(
+                    "C:\\ZCurrent\\Report.txt",
+                    false,
+                    1,
+                    DateTimeOffset.UtcNow))
+                .ToArray();
+            await index.UpsertManyAsync(records, cancellationToken: CancellationToken.None);
+
+            var results = await index.SearchAsync(
+                new SearchQuery(
+                    "report",
+                    SearchMode.FilesAndFolders,
+                    limit: 1,
+                    preferredRoot: "C:\\ZCurrent"),
+                CancellationToken.None);
+
+            Assert.Equal("C:\\ZCurrent\\Report.txt", Assert.Single(results).Record.FullPath);
+        }
+        finally
+        {
+            DeleteIfExists(dbPath);
+        }
+    }
+
+    [Fact]
+    public async Task SearchScopesPreferredRootDirectLookupWithoutIncludingSiblingPrefix()
+    {
+        var dbPath = CreateTempDbPath();
+
+        try
+        {
+            await using var index = await SqliteSearchIndex.OpenAsync(dbPath, CancellationToken.None);
+            await index.WaitForBackgroundMaintenanceAsync();
+            var records = Enumerable.Range(0, 250)
+                .Select(number => FileRecord.Create(
+                    $"C:\\ZCurrent2\\A{number:D3}\\Report.txt",
+                    false,
+                    1,
+                    DateTimeOffset.UtcNow))
+                .Append(FileRecord.Create(
+                    "C:\\ZCurrent\\Report.txt",
+                    false,
+                    1,
+                    DateTimeOffset.UtcNow))
+                .ToArray();
+            await index.UpsertManyAsync(records, cancellationToken: CancellationToken.None);
+
+            var results = await index.SearchAsync(
+                new SearchQuery(
+                    "report",
+                    SearchMode.FilesAndFolders,
+                    limit: 1,
+                    preferredRoot: "C:\\ZCurrent"),
+                CancellationToken.None);
+
+            Assert.Equal("C:\\ZCurrent\\Report.txt", Assert.Single(results).Record.FullPath);
+        }
+        finally
+        {
+            DeleteIfExists(dbPath);
+        }
+    }
+
+    [Fact]
+    public async Task PreferredRootDirectQueryPlanUsesParentPathIndex()
+    {
+        var dbPath = CreateTempDbPath();
+
+        try
+        {
+            await using var index = await SqliteSearchIndex.OpenAsync(dbPath, CancellationToken.None);
+            await index.WaitForBackgroundMaintenanceAsync();
+            var plan = await ReadQueryPlanAsync(
+                dbPath,
+                """
+                explain query plan
+                select full_path
+                from files
+                where parent_path = $root collate nocase
+                  and (
+                    lower(full_path) like $contains escape '\'
+                    or search_text like $contains escape '\'
+                    or lower(full_path) like $ordered escape '\'
+                    or search_text like $ordered escape '\'
+                  )
+                order by length(name), name collate nocase, name, full_path
+                limit 1000;
+                """,
+                ("$root", "C:\\ZCurrent"),
+                ("$contains", "%report%"),
+                ("$ordered", "%r%e%p%o%r%t%"));
+
+            Assert.Contains(plan, detail =>
+                detail.Contains("ix_files_parent_path_nocase_name", StringComparison.OrdinalIgnoreCase));
+            Assert.DoesNotContain(plan, detail =>
+                string.Equals(detail, "SCAN files", StringComparison.OrdinalIgnoreCase));
         }
         finally
         {
@@ -939,13 +1177,15 @@ public sealed class SqliteSearchIndexTests
 
             await using (var index = await SqliteSearchIndex.OpenAsync(dbPath, CancellationToken.None))
             {
+                await index.WaitForBackgroundMaintenanceAsync();
             }
 
             var indexNames = await ReadIndexNamesAsync(dbPath);
 
             Assert.Contains("ix_files_name", indexNames);
             Assert.Contains("ix_files_is_directory_name", indexNames);
-            Assert.Contains("ix_files_search_text", indexNames);
+            Assert.Contains("ix_files_parent_path_nocase_name", indexNames);
+            Assert.DoesNotContain("ix_files_search_text", indexNames);
             Assert.Contains("ix_usage_path_key", indexNames);
         }
         finally
@@ -1255,6 +1495,56 @@ public sealed class SqliteSearchIndexTests
         Assert.True(SqliteSearchIndex.UsesExpensiveFuzzyCandidatesForTests(new SearchQuery("abc", SearchMode.FilesAndFolders)));
     }
 
+    [Fact]
+    public async Task SearchSkipsFallbackPassWhenIndexedCandidatesAlreadyFillResultLimit()
+    {
+        var dbPath = CreateTempDbPath();
+        try
+        {
+            await using var index = await SqliteSearchIndex.OpenAsync(dbPath, CancellationToken.None);
+            await InsertMatchingInvoiceFilesAsync(index, 250);
+
+            using var measurement = PerformanceMetrics.Begin("test.search");
+            var results = await index.SearchAsync(
+                new SearchQuery("invoice", SearchMode.FilesAndFolders, limit: 10),
+                CancellationToken.None);
+            var snapshot = measurement.Complete("success", results.Count);
+
+            Assert.Equal(10, results.Count);
+            Assert.DoesNotContain("candidates.fallback", snapshot.Stages.Keys);
+        }
+        finally
+        {
+            DeleteIfExists(dbPath);
+        }
+    }
+
+    [Fact]
+    public async Task SearchRunsFallbackPassWhenIndexedCandidatesCannotFillResultLimit()
+    {
+        var dbPath = CreateTempDbPath();
+        try
+        {
+            await using var index = await SqliteSearchIndex.OpenAsync(dbPath, CancellationToken.None);
+            await index.UpsertAsync(
+                FileRecord.Create("C:\\Docs\\I-n-v-o-i-c-e.txt", false, 1, DateTimeOffset.UtcNow),
+                CancellationToken.None);
+
+            using var measurement = PerformanceMetrics.Begin("test.search");
+            var results = await index.SearchAsync(
+                new SearchQuery("invoice", SearchMode.FilesAndFolders, limit: 10),
+                CancellationToken.None);
+            var snapshot = measurement.Complete("success", results.Count);
+
+            Assert.Equal("I-n-v-o-i-c-e.txt", Assert.Single(results).Record.Name);
+            Assert.Contains("candidates.fallback", snapshot.Stages.Keys);
+        }
+        finally
+        {
+            DeleteIfExists(dbPath);
+        }
+    }
+
     private static async Task InsertAlphabeticallyEarlierRowsAsync(SqliteSearchIndex index)
     {
         var lastWriteTime = DateTimeOffset.UtcNow;
@@ -1554,6 +1844,23 @@ public sealed class SqliteSearchIndexTests
         }
     }
 
+    private static async Task<string> ReadFileSearchTextAsync(string dbPath, string fullPath)
+    {
+        var connectionString = new SqliteConnectionStringBuilder
+        {
+            DataSource = dbPath,
+            Mode = SqliteOpenMode.ReadOnly,
+            Pooling = false
+        }.ToString();
+
+        await using var connection = new SqliteConnection(connectionString);
+        await connection.OpenAsync();
+        using var command = connection.CreateCommand();
+        command.CommandText = "select search_text from files where path_key = $path_key;";
+        command.Parameters.AddWithValue("$path_key", fullPath.ToUpperInvariant());
+        return Assert.IsType<string>(await command.ExecuteScalarAsync());
+    }
+
     private static IEnumerable<(string FullPath, int OpenCount, DateTimeOffset LastUsedAt)> CreateUnrelatedUsageRows(
         int count,
         DateTimeOffset lastUsedAt)
@@ -1618,6 +1925,40 @@ public sealed class SqliteSearchIndexTests
         command.CommandText = commandText;
 
         await Assert.ThrowsAsync<SqliteException>(() => command.ExecuteNonQueryAsync());
+    }
+
+    private static async Task<IReadOnlyList<string>> ReadQueryPlanAsync(
+        string dbPath,
+        string commandText,
+        params (string Name, object Value)[] parameters)
+    {
+        var connectionString = new SqliteConnectionStringBuilder
+        {
+            DataSource = dbPath,
+            Mode = SqliteOpenMode.ReadOnly,
+            Pooling = false
+        }.ToString();
+
+        await using var connection = new SqliteConnection(connectionString);
+        await connection.OpenAsync();
+        using var command = connection.CreateCommand();
+        command.CommandText = commandText;
+        foreach (var parameter in parameters)
+        {
+            command.Parameters.AddWithValue(parameter.Name, parameter.Value);
+        }
+
+        var details = new List<string>();
+        var reader = await command.ExecuteReaderAsync();
+        await using (reader.ConfigureAwait(false))
+        {
+            while (await reader.ReadAsync())
+            {
+                details.Add(reader.GetString(3));
+            }
+        }
+
+        return details;
     }
 
     private static string CreateTempDbPath()

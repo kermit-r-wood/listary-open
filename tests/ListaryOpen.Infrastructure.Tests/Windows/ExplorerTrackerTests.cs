@@ -140,6 +140,7 @@ public sealed class ExplorerTrackerTests
                     new ExplorerShellWindow(foregroundHandle, second.FullName),
                     new ExplorerShellWindow(new IntPtr(3333), first.FullName + Path.DirectorySeparatorChar)
                 }));
+            tracker.ObserveForegroundExplorerFolder();
 
             var candidates = tracker.GetFolderCandidates();
 
@@ -170,6 +171,7 @@ public sealed class ExplorerTrackerTests
                     new ExplorerShellWindow(new IntPtr(1111), folder.FullName),
                     new ExplorerShellWindow(foregroundHandle, folder.FullName + Path.DirectorySeparatorChar)
                 }));
+            tracker.ObserveForegroundExplorerFolder();
 
             var candidate = Assert.Single(tracker.GetFolderCandidates());
 
@@ -198,6 +200,7 @@ public sealed class ExplorerTrackerTests
                     new ExplorerShellWindow(new IntPtr(1234), missing),
                     new ExplorerShellWindow(new IntPtr(5678), existing.FullName)
                 }));
+            tracker.ObserveForegroundExplorerFolder();
 
             var candidate = Assert.Single(tracker.GetFolderCandidates());
 
@@ -226,6 +229,7 @@ public sealed class ExplorerTrackerTests
                     new ExplorerShellWindow(new IntPtr(2222), remembered.FullName)
                 }));
             tracker.ObserveFolderForTests(remembered.FullName);
+            tracker.ObserveForegroundExplorerFolder();
 
             var candidates = tracker.GetFolderCandidates();
 

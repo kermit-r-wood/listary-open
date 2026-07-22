@@ -2,28 +2,41 @@
         xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
         xmlns:converters="clr-namespace:ListaryOpen.App.Converters"
+        xmlns:local="clr-namespace:ListaryOpen.App"
         Title="ListaryOpen Search"
+        AutomationProperties.AutomationId="GlobalSearchWindow"
         Icon="{StaticResource ListaryOpenIcon}"
-        Width="760"
-        Height="460"
-        MinWidth="620"
-        MinHeight="360"
+        Width="1080"
+        Height="560"
+        MinWidth="760"
+        MinHeight="420"
         WindowStartupLocation="CenterScreen"
         Topmost="True"
-        Background="{StaticResource Brush.AppBackground}">
+        UseLayoutRounding="True"
+        SnapsToDevicePixels="True"
+        TextOptions.TextFormattingMode="Display"
+        PreviewMouseLeftButtonDown="SearchPanel_PreviewMouseLeftButtonDown"
+        Background="{DynamicResource Brush.AppBackground}">
     <Window.Resources>
         <converters:SearchMatchReasonDisplayConverter x:Key="SearchMatchReasonDisplayConverter" />
+        <converters:ShortcutIndexConverter x:Key="ShortcutIndexConverter" />
+        <BooleanToVisibilityConverter x:Key="BooleanToVisibilityConverter" />
+        <converters:InverseBooleanToVisibilityConverter x:Key="InverseBooleanToVisibilityConverter" />
+        <converters:SearchResultNameConverter x:Key="SearchResultNameConverter" />
+        <converters:SearchResultKindConverter x:Key="SearchResultKindConverter" />
+        <converters:SettingsOptionDisplayConverter x:Key="SettingsOptionDisplayConverter" />
     </Window.Resources>
 
-    <Grid x:Name="SearchPanelRoot" Margin="16">
+    <Grid x:Name="SearchPanelRoot" Margin="18">
         <Grid.RowDefinitions>
-            <RowDefinition Height="Auto" />
+            <RowDefinition x:Name="ModeHeaderRow" Height="Auto" />
             <RowDefinition Height="Auto" />
             <RowDefinition Height="*" />
-            <RowDefinition Height="Auto" />
+            <RowDefinition x:Name="StatusRow" Height="Auto" />
         </Grid.RowDefinitions>
 
-        <Grid Margin="2,0,2,10">
+        <Grid x:Name="SearchModeHeader" Margin="2,0,2,10"
+              Visibility="{Binding IsQuickSwitchBarCollapsed, Converter={StaticResource InverseBooleanToVisibilityConverter}}">
             <Grid.ColumnDefinitions>
                 <ColumnDefinition Width="Auto" />
                 <ColumnDefinition Width="*" />
@@ -38,49 +51,131 @@
                        VerticalAlignment="Center"
                        TextAlignment="Right"
                        Style="{StaticResource SearchStatusTextStyle}"
-                       Text="{Binding StatusText}" />
+                       Text="{Binding PerformanceText}" />
         </Grid>
 
-        <Grid Grid.Row="1" Margin="0,0,0,12">
-            <TextBox x:Name="QueryBox"
-                     AutomationProperties.Name="Search query"
-                     Style="{StaticResource SearchQueryBoxStyle}"
-                     Text="{Binding QueryText, UpdateSourceTrigger=PropertyChanged}" />
-            <TextBlock Margin="17,0"
-                       VerticalAlignment="Center"
-                       IsHitTestVisible="False"
-                       FontFamily="{StaticResource Font.Primary}"
-                       FontSize="18"
-                       Foreground="{StaticResource Brush.TextMuted}"
-                       Text="{Binding QueryPlaceholderText}">
-                <TextBlock.Style>
-                    <Style TargetType="TextBlock">
-                        <Setter Property="Visibility" Value="Collapsed" />
-                        <Style.Triggers>
-                            <DataTrigger Binding="{Binding Text, ElementName=QueryBox}" Value="">
-                                <Setter Property="Visibility" Value="Visible" />
-                            </DataTrigger>
-                        </Style.Triggers>
-                    </Style>
-                </TextBlock.Style>
-            </TextBlock>
+        <Grid x:Name="QueryRow" Grid.Row="1" Margin="0,0,0,14">
+            <Grid.RowDefinitions>
+                <RowDefinition Height="Auto" />
+                <RowDefinition Height="Auto" />
+            </Grid.RowDefinitions>
+            <Border x:Name="SearchInputChrome"
+                    Style="{StaticResource OverlaySearchInputChromeStyle}">
+                <Grid Margin="16,0">
+                    <Grid.ColumnDefinitions>
+                        <ColumnDefinition Width="24" />
+                        <ColumnDefinition Width="*" />
+                    </Grid.ColumnDefinitions>
+                    <TextBlock HorizontalAlignment="Left"
+                               VerticalAlignment="Center"
+                               IsHitTestVisible="False"
+                               FontFamily="Segoe MDL2 Assets"
+                               FontSize="17"
+                               Foreground="{DynamicResource Brush.TextMuted}"
+                               Text="&#xE721;" />
+                    <TextBox x:Name="QueryBox"
+                             Grid.Column="1"
+                             Margin="7,0,0,0"
+                             AutomationProperties.AutomationId="GlobalSearchQuery"
+                             AutomationProperties.Name="Search query"
+                             Style="{StaticResource SearchQueryBoxStyle}"
+                             Text="{Binding QueryText, UpdateSourceTrigger=PropertyChanged}" />
+                    <TextBlock Grid.Column="1"
+                               Margin="7,0,0,0"
+                               VerticalAlignment="Center"
+                               IsHitTestVisible="False"
+                               FontFamily="{StaticResource Font.Primary}"
+                               FontSize="15"
+                               Foreground="{DynamicResource Brush.TextMuted}"
+                               Text="{Binding QueryPlaceholderText}">
+                        <TextBlock.Style>
+                            <Style TargetType="TextBlock">
+                                <Setter Property="Visibility" Value="Collapsed" />
+                                <Style.Triggers>
+                                    <DataTrigger Binding="{Binding Text, ElementName=QueryBox}" Value="">
+                                        <Setter Property="Visibility" Value="Visible" />
+                                    </DataTrigger>
+                                </Style.Triggers>
+                            </Style>
+                        </TextBlock.Style>
+                    </TextBlock>
+                </Grid>
+            </Border>
+            <Border x:Name="SearchFilterBar"
+                    Grid.Row="1"
+                    Margin="0,10,0,0"
+                    Padding="10,7"
+                    Background="{DynamicResource Brush.SurfaceMuted}"
+                    BorderBrush="{DynamicResource Brush.Border}"
+                    BorderThickness="1"
+                    CornerRadius="8"
+                    Visibility="Collapsed">
+                <DockPanel LastChildFill="False">
+                    <TextBlock Margin="2,0,12,0"
+                               VerticalAlignment="Center"
+                               FontFamily="Segoe MDL2 Assets"
+                               FontSize="15"
+                               Foreground="{DynamicResource Brush.Accent}"
+                               Text="&#xE71C;" />
+                    <ComboBox Width="142"
+                              Height="32"
+                              ItemsSource="{Binding ItemTypeFilterOptions}"
+                              SelectedItem="{Binding SelectedItemTypeFilter}">
+                        <ComboBox.ItemTemplate><DataTemplate><TextBlock Text="{Binding Converter={StaticResource SettingsOptionDisplayConverter}}" /></DataTemplate></ComboBox.ItemTemplate>
+                    </ComboBox>
+                    <ComboBox Width="142"
+                              Height="32"
+                              Margin="8,0,0,0"
+                              ItemsSource="{Binding DateFilterOptions}"
+                              SelectedItem="{Binding SelectedDateFilter}">
+                        <ComboBox.ItemTemplate><DataTemplate><TextBlock Text="{Binding Converter={StaticResource SettingsOptionDisplayConverter}}" /></DataTemplate></ComboBox.ItemTemplate>
+                    </ComboBox>
+                </DockPanel>
+            </Border>
         </Grid>
+
+        <Grid Grid.Row="2">
+            <Grid.ColumnDefinitions>
+                <ColumnDefinition x:Name="ResultsColumn" Width="*" />
+                <ColumnDefinition x:Name="PreviewGapColumn" Width="0" />
+                <ColumnDefinition x:Name="PreviewColumn" Width="0" />
+            </Grid.ColumnDefinitions>
 
         <ListBox x:Name="ResultsList"
-                 Grid.Row="2"
+                 AutomationProperties.AutomationId="GlobalSearchResults"
                  AutomationProperties.Name="Search results"
+                 AlternationCount="9"
+                 Visibility="{Binding AreResultsVisible, Converter={StaticResource BooleanToVisibilityConverter}}"
                  ItemsSource="{Binding Results}"
+                 MouseLeftButtonUp="ResultsList_MouseLeftButtonUp"
                  MouseDoubleClick="ResultsList_MouseDoubleClick"
+                 PreviewMouseLeftButtonDown="ResultsList_PreviewMouseLeftButtonDown"
+                 PreviewMouseRightButtonDown="ResultsList_PreviewMouseRightButtonDown"
+                 PreviewMouseRightButtonUp="ResultsList_PreviewMouseRightButtonUp"
                  SelectedItem="{Binding SelectedResult, Mode=TwoWay}"
                  Style="{StaticResource SearchPanelResultListStyle}"
                  ItemContainerStyle="{StaticResource SearchResultItemContainerStyle}">
+            <ListBox.ContextMenu>
+                <ContextMenu StaysOpen="False"
+                             Opened="ResultsContextMenu_Opened"
+                             Closed="ResultsContextMenu_Closed">
+                    <MenuItem x:Name="OpenResultMenuItem"
+                              Header="Open / switch"
+                              Click="OpenResultMenuItem_Click" />
+                    <MenuItem Header="Show in File Explorer"
+                              Click="RevealResultMenuItem_Click" />
+                    <Separator />
+                    <MenuItem Header="Copy full path"
+                              InputGestureText="Ctrl+C"
+                              Click="CopyPathMenuItem_Click" />
+                </ContextMenu>
+            </ListBox.ContextMenu>
             <ListBox.ItemTemplate>
                 <DataTemplate>
-                    <Grid Margin="10,8">
+                    <Grid Margin="12,9">
                         <Grid.ColumnDefinitions>
-                            <ColumnDefinition Width="32" />
+                            <ColumnDefinition Width="36" />
                             <ColumnDefinition Width="*" />
-                            <ColumnDefinition Width="Auto" />
                             <ColumnDefinition Width="Auto" />
                         </Grid.ColumnDefinitions>
 
@@ -88,69 +183,83 @@
                                 Height="28"
                                 HorizontalAlignment="Center"
                                 VerticalAlignment="Center"
-                                Background="{StaticResource Brush.SurfaceMuted}"
+                                Background="{DynamicResource Brush.SurfaceMuted}"
                                 CornerRadius="6">
-                            <TextBlock HorizontalAlignment="Center"
-                                       VerticalAlignment="Center"
-                                       FontFamily="Segoe MDL2 Assets"
-                                       FontSize="15">
-                                <TextBlock.Style>
-                                    <Style TargetType="TextBlock">
-                                        <Setter Property="Text" Value="&#xE7C3;" />
-                                        <Setter Property="Foreground" Value="{StaticResource Brush.TextMuted}" />
-                                        <Style.Triggers>
-                                            <DataTrigger Binding="{Binding Record.IsDirectory}" Value="True">
-                                                <Setter Property="Text" Value="&#xE8B7;" />
-                                                <Setter Property="Foreground" Value="{StaticResource Brush.Accent}" />
-                                            </DataTrigger>
-                                        </Style.Triggers>
-                                    </Style>
-                                </TextBlock.Style>
-                            </TextBlock>
+                            <Grid>
+                                <TextBlock HorizontalAlignment="Center"
+                                           VerticalAlignment="Center"
+                                           FontFamily="Segoe MDL2 Assets"
+                                           FontSize="15">
+                                    <TextBlock.Style>
+                                        <Style TargetType="TextBlock">
+                                            <Setter Property="Text" Value="&#xE7C3;" />
+                                            <Setter Property="Foreground" Value="{DynamicResource Brush.TextMuted}" />
+                                            <Style.Triggers>
+                                                <DataTrigger Binding="{Binding Record.IsDirectory}" Value="True">
+                                                    <Setter Property="Text" Value="&#xE8B7;" />
+                                                    <Setter Property="Foreground" Value="{DynamicResource Brush.Accent}" />
+                                                </DataTrigger>
+                                            </Style.Triggers>
+                                        </Style>
+                                    </TextBlock.Style>
+                                </TextBlock>
+                                <Image Width="24"
+                                       Height="24"
+                                       RenderOptions.BitmapScalingMode="HighQuality"
+                                       local:FileIcon.Path="{Binding Record.FullPath}"
+                                       local:FileIcon.IsDirectory="{Binding Record.IsDirectory}" />
+                            </Grid>
                         </Border>
 
                         <StackPanel Grid.Column="1"
-                                    Margin="10,0,12,0"
+                                    Margin="11,0,14,0"
                                     VerticalAlignment="Center">
                             <TextBlock Style="{StaticResource SearchResultTitleStyle}"
-                                       Text="{Binding Record.Name}" />
+                                       Text="{Binding Record.FullPath, Converter={StaticResource SearchResultNameConverter}}" />
                             <TextBlock Margin="0,3,0,0"
                                        Style="{StaticResource SearchResultPathStyle}"
                                        Text="{Binding Record.ParentPath}" />
                         </StackPanel>
 
-                        <TextBlock Grid.Column="2"
-                                   VerticalAlignment="Center">
-                            <TextBlock.Style>
-                                <Style TargetType="TextBlock" BasedOn="{StaticResource BadgeTextBlockStyle}">
-                                    <Setter Property="MinWidth" Value="56" />
-                                    <Setter Property="Text" Value="File" />
-                                    <Style.Triggers>
-                                        <DataTrigger Binding="{Binding Record.IsDirectory}" Value="True">
-                                            <Setter Property="Text" Value="Folder" />
-                                            <Setter Property="Foreground" Value="{StaticResource Brush.Accent}" />
-                                            <Setter Property="Background" Value="{StaticResource Brush.AccentSoft}" />
-                                        </DataTrigger>
-                                    </Style.Triggers>
-                                </Style>
-                            </TextBlock.Style>
-                        </TextBlock>
-
-                        <TextBlock Grid.Column="3"
-                                   Margin="8,0,0,0"
-                                   VerticalAlignment="Center"
-                                   Style="{StaticResource BadgeTextBlockStyle}"
-                                   Text="{Binding MatchReason, Converter={StaticResource SearchMatchReasonDisplayConverter}}" />
+                        <StackPanel Grid.Column="2"
+                                    MinWidth="84"
+                                    HorizontalAlignment="Right"
+                                    VerticalAlignment="Center">
+                            <TextBlock HorizontalAlignment="Right"
+                                       Style="{StaticResource SearchReasonTextStyle}"
+                                       Text="{Binding MatchReason, Converter={StaticResource SearchMatchReasonDisplayConverter}}" />
+                            <TextBlock Margin="0,5,0,0"
+                                       HorizontalAlignment="Right"
+                                       Foreground="{DynamicResource Brush.TextMuted}"
+                                       FontSize="10"
+                                       Text="{Binding RelativeSource={RelativeSource AncestorType=ListBoxItem}, Path=(ItemsControl.AlternationIndex), Converter={StaticResource ShortcutIndexConverter}}" />
+                        </StackPanel>
                     </Grid>
                 </DataTemplate>
             </ListBox.ItemTemplate>
         </ListBox>
 
+            <GridSplitter x:Name="PreviewSplitter"
+                          Grid.Column="1"
+                          Width="6"
+                          HorizontalAlignment="Stretch"
+                          Background="Transparent"
+                          ResizeBehavior="PreviousAndNext"
+                          ResizeDirection="Columns"
+                          Visibility="Collapsed" />
+            <local:FilePreviewPane x:Name="PreviewPane"
+                                   Grid.Column="2"
+                                   AutomationProperties.AutomationId="GlobalSearchPreview"
+                                   Visibility="Collapsed" />
+        </Grid>
+
         <TextBlock x:Name="SearchStatusText"
                    Grid.Row="3"
                    Margin="2,8,2,0"
                    MinHeight="18"
+                   AutomationProperties.AutomationId="GlobalSearchStatus"
                    AutomationProperties.Name="Search status"
+                   Visibility="{Binding IsQuickSwitchBarCollapsed, Converter={StaticResource InverseBooleanToVisibilityConverter}}"
                    Style="{StaticResource SearchStatusTextStyle}"
                    Text="{Binding StatusText}" />
     </Grid>

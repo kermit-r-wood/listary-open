@@ -1,9 +1,11 @@
 using System.ComponentModel;
+using System.Buffers;
 using System.Diagnostics;
 using System.IO;
 using System.Runtime.CompilerServices;
 using System.Security;
 using System.Security.Principal;
+using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
 using ListaryOpen.Core.Indexing;
@@ -76,6 +78,7 @@ public sealed class DisabledElevatedIndexerClient : IElevatedIndexerClient
 
 public sealed class ElevatedIndexerClient : IElevatedIndexerClient
 {
+    private static readonly TimeSpan ProcessCleanupTimeout = TimeSpan.FromSeconds(2);
     private const string HelperExecutableName = "ListaryOpen.Indexer.Elevated.exe";
     private const string HelperAssemblyName = "ListaryOpen.Indexer.Elevated.dll";
     private const string HelperDepsName = "ListaryOpen.Indexer.Elevated.deps.json";
@@ -319,28 +322,61 @@ public sealed class ElevatedIndexerClient : IElevatedIndexerClient
     {
         var outputPath = CreateTempIndexerFilePath(".jsonl");
         var errorPath = CreateTempIndexerFilePath(".err");
+        IElevatedIndexerProcess? process = null;
+        Task? completionTask = null;
+        var processStarted = false;
 
         try
         {
-            await WriteHelperOutputFileAsync(
+            process = launchMode == HelperLaunchMode.UacFile
+                ? _createElevatedProcess(
                     HelperFileCommand.Scan,
                     helperPath,
                     rootPath,
-                    expectedUsnJournalId: 0,
-                    startUsn: 0,
-                    endUsn: 0,
+                    0,
+                    0,
+                    0,
                     outputPath,
-                    errorPath,
-                    launchMode,
-                    cancellationToken).ConfigureAwait(false);
+                    errorPath)
+                : _createFileProcess(
+                    HelperFileCommand.Scan,
+                    helperPath,
+                    rootPath,
+                    0,
+                    0,
+                    0,
+                    outputPath,
+                    errorPath);
+            StartHelperProcess(process, helperPath, launchMode);
+            processStarted = true;
+            completionTask = WaitForHelperSuccessAsync(
+                process,
+                helperPath,
+                errorPath,
+                cancellationToken);
 
-            await foreach (var record in ParseOutputFileIfExistsAsync(outputPath, cancellationToken).ConfigureAwait(false))
+            await foreach (var record in TailOutputRecordsAsync(outputPath, completionTask, cancellationToken)
+                               .ConfigureAwait(false))
             {
                 yield return record;
             }
+
+            await completionTask.ConfigureAwait(false);
         }
         finally
         {
+            if (process is not null)
+            {
+                if (processStarted && !process.HasExited)
+                {
+                    await CleanupCanceledProcessAsync(process, stdoutTask: null, stderrTask: null)
+                        .ConfigureAwait(false);
+                }
+
+                await ObserveCompletionAsync(completionTask).ConfigureAwait(false);
+                process.Dispose();
+            }
+
             TryDeleteFile(outputPath);
             TryDeleteFile(errorPath);
         }
@@ -362,25 +398,48 @@ public sealed class ElevatedIndexerClient : IElevatedIndexerClient
             ? _createElevatedProcess(command, helperPath, rootPath, expectedUsnJournalId, startUsn, endUsn, outputPath, errorPath)
             : _createFileProcess(command, helperPath, rootPath, expectedUsnJournalId, startUsn, endUsn, outputPath, errorPath);
 
+        StartHelperProcess(process, helperPath, launchMode);
+
         try
         {
-            if (!process.Start())
-            {
-                if (launchMode == HelperLaunchMode.UacFile)
-                {
-                    Trace.TraceInformation("Elevated indexer helper launch was canceled or declined.");
-                    throw new ElevatedIndexerLaunchCanceledException("Elevated indexer helper launch was canceled or declined.");
-                }
+            await WaitForHelperSuccessAsync(process, helperPath, errorPath, cancellationToken)
+                .ConfigureAwait(false);
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            await CleanupCanceledProcessAsync(process, stdoutTask: null, stderrTask: null).ConfigureAwait(false);
+            throw;
+        }
+    }
 
-                var message = $"Failed to start elevated indexer helper '{helperPath}'.";
-                Trace.TraceError(message);
-                throw new ElevatedIndexerException(message);
+    private static void StartHelperProcess(
+        IElevatedIndexerProcess process,
+        string helperPath,
+        HelperLaunchMode launchMode)
+    {
+        try
+        {
+            if (process.Start())
+            {
+                return;
             }
+
+            if (launchMode == HelperLaunchMode.UacFile)
+            {
+                Trace.TraceInformation("Elevated indexer helper launch was canceled or declined.");
+                throw new ElevatedIndexerLaunchCanceledException("Elevated indexer helper launch was canceled or declined.");
+            }
+
+            var message = $"Failed to start elevated indexer helper '{helperPath}'.";
+            Trace.TraceError(message);
+            throw new ElevatedIndexerException(message);
         }
         catch (Exception exception) when (launchMode == HelperLaunchMode.UacFile && IsUacCanceled(exception))
         {
             Trace.TraceInformation("Elevated indexer helper launch was canceled by the user.");
-            throw new ElevatedIndexerLaunchCanceledException("Elevated indexer helper launch was canceled by the user.", exception);
+            throw new ElevatedIndexerLaunchCanceledException(
+                "Elevated indexer helper launch was canceled by the user.",
+                exception);
         }
         catch (Exception exception) when (exception is not OperationCanceledException
                                          and not ElevatedIndexerException
@@ -390,27 +449,29 @@ public sealed class ElevatedIndexerClient : IElevatedIndexerClient
             Trace.TraceError("Failed to start elevated indexer helper '{0}': {1}", helperPath, exception);
             throw new ElevatedIndexerException(message, exception);
         }
+    }
 
+    private static async Task WaitForHelperSuccessAsync(
+        IElevatedIndexerProcess process,
+        string helperPath,
+        string errorPath,
+        CancellationToken cancellationToken)
+    {
         try
         {
             await process.WaitForExitAsync(cancellationToken).ConfigureAwait(false);
-
-            if (process.ExitCode != 0)
+            if (process.ExitCode == 0)
             {
-                var diagnostic = TrimDiagnostic(await ReadFileIfExistsAsync(errorPath, cancellationToken).ConfigureAwait(false));
-                var message = $"Elevated indexer helper '{helperPath}' exited with code {process.ExitCode}. stderr: {diagnostic}";
-                Trace.TraceError(message);
-                throw new ElevatedIndexerException(message);
+                return;
             }
 
-            return;
+            var diagnostic = TrimDiagnostic(
+                await ReadFileIfExistsAsync(errorPath, cancellationToken).ConfigureAwait(false));
+            var message = $"Elevated indexer helper '{helperPath}' exited with code {process.ExitCode}. stderr: {diagnostic}";
+            Trace.TraceError(message);
+            throw new ElevatedIndexerException(message);
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
-        {
-            await CleanupCanceledProcessAsync(process, stdoutTask: null, stderrTask: null).ConfigureAwait(false);
-            throw;
-        }
-        catch (InvalidDataException)
         {
             throw;
         }
@@ -426,36 +487,183 @@ public sealed class ElevatedIndexerClient : IElevatedIndexerClient
         }
     }
 
-    private static async IAsyncEnumerable<FileRecord> ParseOutputFileIfExistsAsync(
+    private static async IAsyncEnumerable<FileRecord> TailOutputRecordsAsync(
         string path,
-        [EnumeratorCancellation]
-        CancellationToken cancellationToken)
+        Task processCompletion,
+        [EnumeratorCancellation] CancellationToken cancellationToken)
     {
-        if (!File.Exists(path))
-        {
-            yield break;
-        }
-
-        using var stream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read, bufferSize: 64 * 1024, useAsync: true);
-        using var reader = new StreamReader(stream);
+        const int bufferSize = 64 * 1024;
+        var bytes = ArrayPool<byte>.Shared.Rent(bufferSize);
+        var pending = ArrayPool<byte>.Shared.Rent(bufferSize);
+        var pendingLength = 0;
         var lineNumber = 0;
-        while (await reader.ReadLineAsync(cancellationToken).ConfigureAwait(false) is { } line)
+        FileStream? stream = null;
+
+        try
         {
-            lineNumber++;
-            if (string.IsNullOrWhiteSpace(line))
+            while (true)
             {
-                continue;
+                cancellationToken.ThrowIfCancellationRequested();
+                var completionObservedBeforeRead = processCompletion.IsCompleted;
+
+                if (stream is null && File.Exists(path))
+                {
+                    try
+                    {
+                        stream = new FileStream(
+                            path,
+                            FileMode.Open,
+                            FileAccess.Read,
+                            FileShare.ReadWrite | FileShare.Delete,
+                            bufferSize,
+                            useAsync: true);
+                    }
+                    catch (FileNotFoundException)
+                    {
+                        // The helper has not created the output file yet.
+                    }
+                }
+
+                var readAny = false;
+                if (stream is not null)
+                {
+                    while (true)
+                    {
+                        var bytesRead = await stream
+                            .ReadAsync(bytes.AsMemory(0, bufferSize), cancellationToken)
+                            .ConfigureAwait(false);
+                        if (bytesRead == 0)
+                        {
+                            break;
+                        }
+
+                        readAny = true;
+                        var lineStart = 0;
+                        while (FindNewline(bytes, lineStart, bytesRead) is var lineEnd
+                               && lineEnd >= 0)
+                        {
+                            var length = lineEnd - lineStart;
+                            lineNumber++;
+                            FileRecord? record;
+                            if (pendingLength == 0)
+                            {
+                                record = ParseRecordIfPresent(bytes, lineStart, length, lineNumber);
+                            }
+                            else
+                            {
+                                EnsurePendingCapacity(ref pending, pendingLength, pendingLength + length);
+                                Buffer.BlockCopy(bytes, lineStart, pending, pendingLength, length);
+                                pendingLength += length;
+                                record = ParseRecordIfPresent(pending, 0, pendingLength, lineNumber);
+                                pendingLength = 0;
+                            }
+
+                            if (record is not null)
+                            {
+                                yield return record;
+                            }
+
+                            lineStart = lineEnd + 1;
+                        }
+
+                        if (lineStart < bytesRead)
+                        {
+                            var remaining = bytesRead - lineStart;
+                            EnsurePendingCapacity(ref pending, pendingLength, pendingLength + remaining);
+                            Buffer.BlockCopy(bytes, lineStart, pending, pendingLength, remaining);
+                            pendingLength += remaining;
+                        }
+                    }
+                }
+
+                if (completionObservedBeforeRead)
+                {
+                    break;
+                }
+
+                if (!readAny)
+                {
+                    await Task.WhenAny(
+                            processCompletion,
+                            Task.Delay(TimeSpan.FromMilliseconds(25), cancellationToken))
+                        .ConfigureAwait(false);
+                }
             }
 
-            yield return ParseRecord(line, lineNumber);
+            if (pendingLength > 0)
+            {
+                lineNumber++;
+                var record = ParseRecordIfPresent(pending, 0, pendingLength, lineNumber);
+                if (record is not null)
+                {
+                    yield return record;
+                }
+            }
+        }
+        finally
+        {
+            stream?.Dispose();
+            ArrayPool<byte>.Shared.Return(bytes);
+            ArrayPool<byte>.Shared.Return(pending);
         }
     }
 
-    private static FileRecord ParseRecord(string line, int lineNumber)
+    private static int FindNewline(byte[] bytes, int startIndex, int byteCount)
     {
+        var relativeIndex = bytes.AsSpan(startIndex, byteCount - startIndex).IndexOf((byte)'\n');
+        return relativeIndex < 0 ? -1 : startIndex + relativeIndex;
+    }
+
+    private static void EnsurePendingCapacity(ref byte[] pending, int pendingLength, int requiredLength)
+    {
+        if (requiredLength <= pending.Length)
+        {
+            return;
+        }
+
+        var expanded = ArrayPool<byte>.Shared.Rent(Math.Max(requiredLength, pending.Length * 2));
+        Buffer.BlockCopy(pending, 0, expanded, 0, pendingLength);
+        ArrayPool<byte>.Shared.Return(pending);
+        pending = expanded;
+    }
+
+    private static async Task ObserveCompletionAsync(Task? task)
+    {
+        if (task is null)
+        {
+            return;
+        }
+
         try
         {
-            var dto = JsonSerializer.Deserialize<ElevatedIndexerRecordDto>(line);
+            await task.ConfigureAwait(false);
+        }
+        catch (Exception)
+        {
+            // The iterator already propagates helper failures. This await only observes
+            // completion when the consumer stops enumerating early or parsing fails.
+        }
+    }
+
+    private static FileRecord? ParseRecordIfPresent(
+        byte[] line,
+        int offset,
+        int length,
+        int lineNumber)
+    {
+        if (length > 0 && line[offset + length - 1] == (byte)'\r')
+        {
+            length--;
+        }
+
+        if (IsWhiteSpace(line, offset, length))
+        {
+            return null;
+        }
+
+        try
+        {
+            var dto = JsonSerializer.Deserialize<ElevatedIndexerRecordDto>(line.AsSpan(offset, length));
             if (dto is null)
             {
                 throw new InvalidDataException("Record was empty.");
@@ -488,6 +696,27 @@ public sealed class ElevatedIndexerClient : IElevatedIndexerClient
         {
             throw new InvalidDataException("Record is missing one or more required fields.");
         }
+    }
+
+    private static bool IsWhiteSpace(byte[] value, int offset, int length)
+    {
+        for (var index = offset; index < offset + length; index++)
+        {
+            var current = value[index];
+            if (current is (byte)' ' or >= (byte)'\t' and <= (byte)'\r')
+            {
+                continue;
+            }
+
+            if (current >= 0x80)
+            {
+                return string.IsNullOrWhiteSpace(Encoding.UTF8.GetString(value, offset, length));
+            }
+
+            return false;
+        }
+
+        return true;
     }
 
     private static async Task<UsnJournalState?> ParseJournalStateFileIfExistsAsync(
@@ -740,7 +969,12 @@ public sealed class ElevatedIndexerClient : IElevatedIndexerClient
     {
         try
         {
-            await process.WaitForExitAsync(CancellationToken.None).ConfigureAwait(false);
+            using var timeout = new CancellationTokenSource(ProcessCleanupTimeout);
+            await process.WaitForExitAsync(timeout.Token).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException)
+        {
+            Trace.TraceWarning("Timed out waiting for the elevated indexer helper to exit after termination.");
         }
         catch (InvalidOperationException)
         {

@@ -36,6 +36,8 @@ public sealed record HookHostLaunchRequest
 
 public class HookHostProcessFactory
 {
+    private static readonly TimeSpan TerminationTimeout = TimeSpan.FromSeconds(5);
+
     public virtual ProcessStartInfo CreateStartInfo(
         string hostExePath,
         string pipeName,
@@ -112,13 +114,35 @@ public class HookHostProcessFactory
 
     public virtual void Terminate(Process process)
     {
+        TerminateCore(process, waitForGracefulExit: false);
+    }
+
+    public virtual void WaitForGracefulExitOrTerminate(Process process)
+    {
+        TerminateCore(process, waitForGracefulExit: true);
+    }
+
+    private void TerminateCore(Process process, bool waitForGracefulExit)
+    {
         ArgumentNullException.ThrowIfNull(process);
 
         try
         {
             if (IsRunning(process))
             {
+                if (waitForGracefulExit)
+                {
+                    // An authenticated graceful shutdown may legitimately take
+                    // longer when a target UI thread is suspended. Killing here
+                    // would bypass native vtable restoration and hook rundown.
+                    // The host also monitors its parent and will finish cleanup
+                    // after the app exits, so timeout means detach, never kill.
+                    _ = process.WaitForExit(checked((int)TerminationTimeout.TotalMilliseconds));
+                    return;
+                }
+
                 process.Kill(entireProcessTree: true);
+                _ = process.WaitForExit(checked((int)TerminationTimeout.TotalMilliseconds));
             }
         }
         catch (Exception exception) when (exception is InvalidOperationException or Win32Exception or NotSupportedException)

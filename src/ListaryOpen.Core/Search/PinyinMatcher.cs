@@ -1,26 +1,25 @@
+using System.Text;
+using AnyAscii;
+using ListaryOpen.Core.Settings;
+using TinyPinyin;
+
 namespace ListaryOpen.Core.Search;
 
 public static class PinyinMatcher
 {
-    private static readonly IReadOnlyDictionary<char, string> KnownPinyin = new Dictionary<char, string>
+    private static int _mode = (int)SearchTransliterationMode.Multilingual;
+
+    public static SearchTransliterationMode Mode => (SearchTransliterationMode)Volatile.Read(ref _mode);
+
+    public static void Configure(SearchTransliterationMode mode)
     {
-        ['发'] = "fa",
-        ['票'] = "piao",
-        ['合'] = "he",
-        ['同'] = "tong",
-        ['报'] = "bao",
-        ['告'] = "gao",
-        ['资'] = "zi",
-        ['料'] = "liao",
-        ['下'] = "xia",
-        ['载'] = "zai",
-        ['文'] = "wen",
-        ['件'] = "jian",
-        ['图'] = "tu",
-        ['片'] = "pian",
-        ['项'] = "xiang",
-        ['目'] = "mu"
-    };
+        if (!Enum.IsDefined(mode))
+        {
+            throw new ArgumentOutOfRangeException(nameof(mode));
+        }
+
+        Volatile.Write(ref _mode, (int)mode);
+    }
 
     public static double Score(string? query, string? candidate)
     {
@@ -29,10 +28,7 @@ public static class PinyinMatcher
             return 0;
         }
 
-        var pinyin = ToPinyin(candidate);
-        var initials = ToInitials(candidate);
-
-        return Math.Max(FuzzyMatcher.Score(query, pinyin), FuzzyMatcher.Score(query, initials));
+        return Score(query, CreateCandidateForms(candidate));
     }
 
     public static string CreateSearchText(string? value)
@@ -43,27 +39,74 @@ public static class PinyinMatcher
         }
 
         var normalized = value.Trim().ToLowerInvariant();
-        var forms = new[]
+        var forms = CreateCandidateForms(normalized);
+        var aliases = CreateSearchAliases(normalized, forms);
+        return aliases.Length == 0 ? normalized : normalized + ' ' + aliases;
+    }
+
+    public static string CreateSearchAliases(string? value)
+    {
+        if (string.IsNullOrWhiteSpace(value))
         {
-            normalized,
-            ToPinyin(normalized).ToLowerInvariant(),
-            ToInitials(normalized).ToLowerInvariant()
-        };
+            return string.Empty;
+        }
 
-        return string.Join(' ', forms.Distinct(StringComparer.Ordinal));
+        var normalized = value.Trim().ToLowerInvariant();
+        return CreateSearchAliases(normalized, CreateCandidateForms(normalized));
     }
 
-    private static string ToPinyin(string value)
+    private static string CreateSearchAliases(string normalized, CandidateForms forms)
     {
-        return string.Concat(value.Select(ch => KnownPinyin.TryGetValue(ch, out var pinyin)
-            ? pinyin
-            : ch.ToString()));
+        var builder = new StringBuilder(normalized);
+        builder.Clear();
+        if (!string.Equals(forms.Pinyin, normalized, StringComparison.Ordinal))
+        {
+            builder.Append(forms.Pinyin);
+        }
+
+        if (!string.Equals(forms.Initials, normalized, StringComparison.Ordinal) &&
+            !string.Equals(forms.Initials, forms.Pinyin, StringComparison.Ordinal))
+        {
+            if (builder.Length > 0)
+            {
+                builder.Append(' ');
+            }
+
+            builder.Append(forms.Initials);
+        }
+
+        return builder.ToString();
     }
 
-    private static string ToInitials(string value)
+    internal static CandidateForms CreateCandidateForms(string candidate)
     {
-        return string.Concat(value.Select(ch => KnownPinyin.TryGetValue(ch, out var pinyin)
-            ? pinyin[0].ToString()
-            : ch.ToString()));
+        if (Mode == SearchTransliterationMode.Disabled)
+        {
+            return new CandidateForms(candidate, candidate);
+        }
+
+        var pinyin = PinyinHelper.GetPinyin(candidate, string.Empty).ToLowerInvariant();
+        var initials = PinyinHelper.GetPinyinInitials(candidate).ToLowerInvariant();
+        if (Mode == SearchTransliterationMode.Multilingual)
+        {
+            var multilingual = candidate.Transliterate().ToLowerInvariant().Replace(" ", string.Empty, StringComparison.Ordinal);
+            if (!string.Equals(multilingual, candidate, StringComparison.Ordinal) &&
+                !string.Equals(multilingual, pinyin, StringComparison.Ordinal))
+            {
+                pinyin = pinyin + ' ' + multilingual;
+            }
+        }
+
+        return new CandidateForms(pinyin, initials);
     }
+
+    internal static double Score(string query, CandidateForms forms)
+    {
+        var pinyinScore = FuzzyMatcher.Score(query, forms.Pinyin);
+        return string.Equals(forms.Initials, forms.Pinyin, StringComparison.Ordinal)
+            ? pinyinScore
+            : Math.Max(pinyinScore, FuzzyMatcher.Score(query, forms.Initials));
+    }
+
+    internal readonly record struct CandidateForms(string Pinyin, string Initials);
 }

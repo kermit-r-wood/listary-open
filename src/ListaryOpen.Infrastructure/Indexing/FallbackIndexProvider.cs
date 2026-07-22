@@ -43,6 +43,7 @@ public sealed class FallbackIndexProvider : IIndexProvider
         IndexRoot root,
         [EnumeratorCancellation] CancellationToken cancellationToken)
     {
+        await Task.CompletedTask.ConfigureAwait(false);
         EnsureRootCanBeEnumerated(root.Path, cancellationToken);
 
         var pending = new Stack<string>();
@@ -74,7 +75,6 @@ public sealed class FallbackIndexProvider : IIndexProvider
 
                 yield return record;
                 pending.Push(fullName);
-                await Task.Yield();
             }
 
             foreach (var file in EnumerateFiles(current, cancellationToken, failOnEnumerationFailure: true))
@@ -87,7 +87,6 @@ public sealed class FallbackIndexProvider : IIndexProvider
                 }
 
                 yield return record;
-                await Task.Yield();
             }
         }
     }

@@ -75,6 +75,17 @@ public sealed class AppIndexRootTests
     }
 
     [Fact]
+    public void CreateIndexRootsCollapsesDescendantsToAvoidDuplicateScans()
+    {
+        var parent = Path.Combine(Path.GetTempPath(), "listary-open-parent-" + Guid.NewGuid());
+        var child = Path.Combine(parent, "Start Menu", "Programs");
+
+        var roots = WpfApp.CreateIndexRoots(new[] { child, parent, child });
+
+        Assert.Equal(Path.GetFullPath(parent), Assert.Single(roots).Path);
+    }
+
+    [Fact]
     public void EnableNtfsFastIndexingEnablesClientAndRequestsReindex()
     {
         var helperDirectory = Path.Combine(Path.GetTempPath(), "listary-open-" + Guid.NewGuid());
@@ -134,7 +145,7 @@ public sealed class AppIndexRootTests
     }
 
     [Fact]
-    public void EnableNtfsFastIndexingOnStartupDoesNotEnableUacWhenProcessIsNotElevated()
+    public void EnableNtfsFastIndexingOnStartupArmsUacWhenProcessIsNotElevated()
     {
         var helperDirectory = Path.Combine(Path.GetTempPath(), "listary-open-" + Guid.NewGuid());
         Directory.CreateDirectory(helperDirectory);
@@ -145,9 +156,9 @@ public sealed class AppIndexRootTests
         {
             var enabled = WpfApp.EnableNtfsFastIndexingOnStartup(client);
 
-            Assert.False(enabled);
-            Assert.False(client.UacElevationEnabled);
-            Assert.False(client.IsAvailable);
+            Assert.True(enabled);
+            Assert.True(client.UacElevationEnabled);
+            Assert.True(client.IsAvailable);
         }
         finally
         {

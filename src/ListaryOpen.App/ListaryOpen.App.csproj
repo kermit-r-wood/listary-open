@@ -24,6 +24,7 @@
     <Nullable>enable</Nullable>
     <ImplicitUsings>enable</ImplicitUsings>
     <UseWPF>true</UseWPF>
+    <PublishReadyToRun Condition="'$(Configuration)' == 'Release' And '$(RuntimeIdentifier)' != ''">true</PublishReadyToRun>
     <BuildNativeHooks Condition="'$(BuildNativeHooks)' == ''">false</BuildNativeHooks>
     <NativeHooksRoot Condition="'$(NativeHooksRoot)' == ''">$(MSBuildProjectDirectory)\..\..\native\ListaryOpen.Hooks</NativeHooksRoot>
     <NativeHooksX64Target Condition="'$(NativeHooksX64Target)' == ''">x86_64-pc-windows-gnullvm</NativeHooksX64Target>
@@ -74,10 +75,10 @@
     <PropertyGroup>
       <NativeHooksX64OutputDir>$(OutDir)hooks\x64\</NativeHooksX64OutputDir>
       <NativeHooksX86OutputDir>$(OutDir)hooks\x86\</NativeHooksX86OutputDir>
-      <NativeHooksX64HostSource>$(NativeHooksRoot)\target\$(NativeHooksX64Target)\debug\listary_open_hook_host.exe</NativeHooksX64HostSource>
-      <NativeHooksX64DllSource>$(NativeHooksRoot)\target\$(NativeHooksX64Target)\debug\listary_open_hook.dll</NativeHooksX64DllSource>
-      <NativeHooksX86HostSource>$(NativeHooksRoot)\target\$(NativeHooksX86Target)\debug\listary_open_hook_host.exe</NativeHooksX86HostSource>
-      <NativeHooksX86DllSource>$(NativeHooksRoot)\target\$(NativeHooksX86Target)\debug\listary_open_hook.dll</NativeHooksX86DllSource>
+      <NativeHooksX64HostSource>$(NativeHooksRoot)\target\$(NativeHooksX64Target)\release\listary_open_hook_host.exe</NativeHooksX64HostSource>
+      <NativeHooksX64DllSource>$(NativeHooksRoot)\target\$(NativeHooksX64Target)\release\listary_open_hook.dll</NativeHooksX64DllSource>
+      <NativeHooksX86HostSource>$(NativeHooksRoot)\target\$(NativeHooksX86Target)\release\listary_open_hook_host.exe</NativeHooksX86HostSource>
+      <NativeHooksX86DllSource>$(NativeHooksRoot)\target\$(NativeHooksX86Target)\release\listary_open_hook.dll</NativeHooksX86DllSource>
       <NativeHooksX64HostDestination>$(OutDir)hooks\x64\ListaryOpen.HookHost.exe</NativeHooksX64HostDestination>
       <NativeHooksX64DllDestination>$(OutDir)hooks\x64\ListaryOpen.Hook.dll</NativeHooksX64DllDestination>
       <NativeHooksX64RuntimeDestination>$(OutDir)hooks\x64\libunwind.dll</NativeHooksX64RuntimeDestination>
@@ -87,9 +88,9 @@
     </PropertyGroup>
 
     <Exec WorkingDirectory="$(NativeHooksRoot)"
-          Command="cargo build --locked -p listary_open_hook_host -p listary_open_hook --target $(NativeHooksX64Target)" />
+          Command="cargo build --release --locked -p listary_open_hook_host -p listary_open_hook --target $(NativeHooksX64Target)" />
     <Exec WorkingDirectory="$(NativeHooksRoot)"
-          Command="cargo build --locked -p listary_open_hook_host -p listary_open_hook --target $(NativeHooksX86Target)" />
+          Command="cargo build --release --locked -p listary_open_hook_host -p listary_open_hook --target $(NativeHooksX86Target)" />
 
     <Error Condition="!Exists('$(NativeHooksX64HostSource)')"
            Text="Expected native x64 hook host output was not found: $(NativeHooksX64HostSource)" />

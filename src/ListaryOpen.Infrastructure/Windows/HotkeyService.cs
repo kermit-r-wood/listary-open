@@ -7,12 +7,6 @@ public sealed class HotkeyService : IDisposable
 {
     internal const int HotkeyMessageId = 0x0312;
 
-    private static readonly HotkeyDefinition[] DefaultHotkeys =
-    {
-        new(1, "Ctrl+Space", HotkeyModifiers.Control | HotkeyModifiers.NoRepeat, KeyCodes.Space),
-        new(2, "Ctrl+G", HotkeyModifiers.Control | HotkeyModifiers.NoRepeat, KeyCodes.G)
-    };
-
     private readonly IHotkeyMessageSource _messageSource;
     private readonly IHotkeyRegistrar _registrar;
     private readonly Dictionary<int, string> _registeredHotkeys = new();
@@ -20,6 +14,8 @@ public sealed class HotkeyService : IDisposable
     private bool _messageHookAttached;
     private bool _registrationAttempted;
     private HotkeyRegistrationResult? _registrationResult;
+    private string? _configuredSearchHotkey;
+    private string? _configuredDialogHotkey;
 
     public HotkeyService()
         : this(new Win32HotkeyRegistrar(), new ComponentDispatcherHotkeyMessageSource())
@@ -35,28 +31,52 @@ public sealed class HotkeyService : IDisposable
     public event EventHandler<string>? HotkeyPressed;
 
     public HotkeyRegistrationResult RegisterDefaults()
+        => Register("Ctrl+Space", "Ctrl+G");
+
+    public HotkeyRegistrationResult Register(string searchHotkey, string dialogHotkey)
     {
         ObjectDisposedException.ThrowIf(_disposed, this);
-        if (_registrationAttempted)
+        if (_registrationAttempted &&
+            string.Equals(_configuredSearchHotkey, searchHotkey, StringComparison.OrdinalIgnoreCase) &&
+            string.Equals(_configuredDialogHotkey, dialogHotkey, StringComparison.OrdinalIgnoreCase))
         {
             return _registrationResult ?? HotkeyRegistrationResult.Empty;
         }
 
-        _registrationAttempted = true;
+        var searchValid = HotkeyGesture.TryParse(searchHotkey, out var searchGesture);
+        var dialogValid = HotkeyGesture.TryParse(dialogHotkey, out var dialogGesture);
+        if (!searchValid || !dialogValid)
+        {
+            return new HotkeyRegistrationResult(
+            [
+                new HotkeyRegistration(searchHotkey, searchValid),
+                new HotkeyRegistration(dialogHotkey, dialogValid)
+            ]);
+        }
 
-        var registrations = new List<HotkeyRegistration>(DefaultHotkeys.Length);
-        foreach (var hotkey in DefaultHotkeys)
+        UnregisterCurrent();
+        _registrationAttempted = true;
+        _configuredSearchHotkey = searchHotkey;
+        _configuredDialogHotkey = dialogHotkey;
+
+        var hotkeys = new[]
+        {
+            new HotkeyDefinition(1, "Search", searchHotkey, searchGesture!.Modifiers, searchGesture.VirtualKey),
+            new HotkeyDefinition(2, "Dialog", dialogHotkey, dialogGesture!.Modifiers, dialogGesture.VirtualKey)
+        };
+        var registrations = new List<HotkeyRegistration>(hotkeys.Length);
+        foreach (var hotkey in hotkeys)
         {
             var registered = _registrar.Register(hotkey.Id, hotkey.Modifiers, hotkey.VirtualKey);
-            registrations.Add(new HotkeyRegistration(hotkey.Name, registered));
+            registrations.Add(new HotkeyRegistration(hotkey.DisplayName, registered));
 
             if (!registered)
             {
-                Trace.TraceWarning("Failed to register global hotkey '{0}'. Another application may already own it.", hotkey.Name);
+                Trace.TraceWarning("Failed to register global hotkey '{0}'. Another application may already own it.", hotkey.DisplayName);
                 continue;
             }
 
-            _registeredHotkeys.Add(hotkey.Id, hotkey.Name);
+            _registeredHotkeys.Add(hotkey.Id, hotkey.SemanticName);
         }
 
         if (_registeredHotkeys.Count > 0)
@@ -81,6 +101,12 @@ public sealed class HotkeyService : IDisposable
             return;
         }
 
+        UnregisterCurrent();
+        _disposed = true;
+    }
+
+    private void UnregisterCurrent()
+    {
         if (_messageHookAttached)
         {
             _messageSource.Detach(OnThreadPreprocessMessage);
@@ -93,7 +119,6 @@ public sealed class HotkeyService : IDisposable
         }
 
         _registeredHotkeys.Clear();
-        _disposed = true;
     }
 
     private void OnThreadPreprocessMessage(ref MSG message, ref bool handled)
@@ -113,7 +138,63 @@ public sealed class HotkeyService : IDisposable
         HotkeyPressed?.Invoke(this, name);
     }
 
-    private sealed record HotkeyDefinition(int Id, string Name, HotkeyModifiers Modifiers, uint VirtualKey);
+    private sealed record HotkeyDefinition(
+        int Id,
+        string SemanticName,
+        string DisplayName,
+        HotkeyModifiers Modifiers,
+        uint VirtualKey);
+}
+
+internal sealed record HotkeyGesture(HotkeyModifiers Modifiers, uint VirtualKey)
+{
+    public static bool TryParse(string? text, out HotkeyGesture? gesture)
+    {
+        gesture = null;
+        if (string.IsNullOrWhiteSpace(text))
+        {
+            return false;
+        }
+
+        var modifiers = HotkeyModifiers.NoRepeat;
+        uint virtualKey = 0;
+        foreach (var rawPart in text.Split('+', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
+        {
+            var part = rawPart.ToUpperInvariant();
+            switch (part)
+            {
+                case "CTRL" or "CONTROL": modifiers |= HotkeyModifiers.Control; continue;
+                case "ALT": modifiers |= HotkeyModifiers.Alt; continue;
+                case "SHIFT": modifiers |= HotkeyModifiers.Shift; continue;
+                case "WIN" or "WINDOWS": modifiers |= HotkeyModifiers.Windows; continue;
+                case "SPACE": virtualKey = 0x20; continue;
+            }
+
+            if (part.Length == 1 && char.IsLetterOrDigit(part[0]))
+            {
+                virtualKey = part[0];
+                continue;
+            }
+
+            if (part.Length is 2 or 3 && part[0] == 'F' &&
+                int.TryParse(part[1..], out var functionKey) && functionKey is >= 1 and <= 24)
+            {
+                virtualKey = (uint)(0x70 + functionKey - 1);
+                continue;
+            }
+
+            return false;
+        }
+
+        var hasModifier = (modifiers & ~HotkeyModifiers.NoRepeat) != 0;
+        if (!hasModifier || virtualKey == 0)
+        {
+            return false;
+        }
+
+        gesture = new HotkeyGesture(modifiers, virtualKey);
+        return true;
+    }
 }
 
 public sealed record HotkeyRegistration(string Name, bool IsRegistered);

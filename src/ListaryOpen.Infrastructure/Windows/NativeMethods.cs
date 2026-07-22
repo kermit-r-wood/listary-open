@@ -7,6 +7,7 @@ internal static partial class NativeMethods
     internal delegate bool EnumWindowsProc(IntPtr hWnd, IntPtr lParam);
 
     internal const uint GW_OWNER = 4;
+    internal const uint GA_ROOT = 2;
     internal const int InputKeyboard = 1;
     internal const uint KeyEventFKeyUp = 0x0002;
     internal const uint KeyEventFUnicode = 0x0004;
@@ -118,6 +119,9 @@ internal static partial class NativeMethods
 
     [LibraryImport("user32.dll")]
     internal static partial IntPtr GetParent(IntPtr hWnd);
+
+    [LibraryImport("user32.dll")]
+    internal static partial IntPtr GetAncestor(IntPtr hWnd, uint gaFlags);
 
     [LibraryImport("kernel32.dll")]
     internal static partial uint GetCurrentThreadId();

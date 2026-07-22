@@ -26,6 +26,18 @@
     <ProjectReference Include="..\..\src\ListaryOpen.App\ListaryOpen.App.csproj" />
     <ProjectReference Include="..\..\src\ListaryOpen.Indexer.Elevated\ListaryOpen.Indexer.Elevated.csproj" />
     <ProjectReference Include="..\..\src\ListaryOpen.Infrastructure\ListaryOpen.Infrastructure.csproj" />
+    <ProjectReference Include="..\ListaryOpen.DialogPlugin.TestFixture\ListaryOpen.DialogPlugin.TestFixture.csproj" />
   </ItemGroup>
+
+  <ItemGroup>
+    <None Include="..\ListaryOpen.DialogPlugin.TestFixture\dialog-plugin.json"
+          Link="plugin-fixture\dialog-plugin.json"
+          CopyToOutputDirectory="PreserveNewest" />
+  </ItemGroup>
+
+  <Target Name="CopyCompiledDialogPluginFixture" AfterTargets="Build">
+    <Copy SourceFiles="$(TargetDir)ListaryOpen.DialogPlugin.TestFixture.dll"
+          DestinationFolder="$(TargetDir)plugin-fixture" />
+  </Target>
 
 </Project>
