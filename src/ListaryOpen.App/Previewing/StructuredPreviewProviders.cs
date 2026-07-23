@@ -292,9 +292,63 @@ internal sealed class DocumentPreviewProvider : IFilePreviewProvider
 
     private static string NormalizeWhitespace(string value)
     {
-        value = Regex.Replace(value, @"[ \t]+", " ", RegexOptions.None, TimeSpan.FromMilliseconds(200));
-        return Regex.Replace(value, @"(?:\r?\n[ \t]*){3,}", Environment.NewLine + Environment.NewLine,
-            RegexOptions.None, TimeSpan.FromMilliseconds(200)).Trim();
+        var builder = new StringBuilder(value.Length);
+        var pendingSpaces = false;
+        var pendingNewLines = 0;
+        var previousWasCarriageReturn = false;
+
+        foreach (var character in value)
+        {
+            if (character is ' ' or '\t')
+            {
+                pendingSpaces = true;
+                previousWasCarriageReturn = false;
+                continue;
+            }
+
+            if (character == '\r')
+            {
+                pendingNewLines = Math.Min(2, pendingNewLines + 1);
+                pendingSpaces = false;
+                previousWasCarriageReturn = true;
+                continue;
+            }
+
+            if (character == '\n')
+            {
+                if (!previousWasCarriageReturn)
+                {
+                    pendingNewLines = Math.Min(2, pendingNewLines + 1);
+                }
+
+                pendingSpaces = false;
+                previousWasCarriageReturn = false;
+                continue;
+            }
+
+            previousWasCarriageReturn = false;
+
+            if (builder.Length > 0)
+            {
+                if (pendingNewLines > 0)
+                {
+                    for (var index = 0; index < pendingNewLines; index++)
+                    {
+                        builder.Append(Environment.NewLine);
+                    }
+                }
+                else if (pendingSpaces)
+                {
+                    builder.Append(' ');
+                }
+            }
+
+            pendingSpaces = false;
+            pendingNewLines = 0;
+            builder.Append(character);
+        }
+
+        return builder.ToString();
     }
 }
 
