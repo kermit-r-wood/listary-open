@@ -86,8 +86,9 @@ public sealed class E2eControlServerTests
         Assert.False(shutdownRequested);
 
         Assert.Equal("Ok", await ExchangeAsync($"{options.Nonce} Shutdown", reader, writer));
-        Assert.True(SpinWait.SpinUntil(() => shutdownRequested, TimeSpan.FromSeconds(1)));
-        Assert.False(injectedInputAllowed);
+        Assert.True(SpinWait.SpinUntil(
+            () => shutdownRequested && !injectedInputAllowed,
+            TimeSpan.FromSeconds(1)));
     }
 
     [Fact]
