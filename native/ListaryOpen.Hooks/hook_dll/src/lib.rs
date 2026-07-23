@@ -21,17 +21,14 @@ use windows_sys::Win32::System::Memory::{
     VirtualQuery, MEMORY_BASIC_INFORMATION, MEM_COMMIT, PAGE_GUARD, PAGE_NOACCESS,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    CallNextHookEx, EnumChildWindows, GetClassNameW, GetDlgCtrlID, GetWindowTextLengthW,
+    CallNextHookEx, GetClassNameW, GetWindowTextLengthW,
     GetWindowTextW, GetWindowThreadProcessId, PostThreadMessageW, SendMessageW,
     SetWindowsHookExW, UnhookWindowsHookEx, CWPSTRUCT, HHOOK, WH_GETMESSAGE, WM_COPYDATA,
-    WM_KEYDOWN, WM_KEYUP, WM_NULL, WM_SETTEXT,
+    WM_NULL,
 };
 
-const ADDRESS_BAR_EDIT_CONTROL_ID: i32 = 41477;
-const VK_RETURN_KEY: WPARAM = 0x0D;
 const BFFM_SETSELECTIONW: u32 = 0x0400 + 103;
 const BFFM_GETSELECTIONW: u32 = 0x0400 + 102;
-const CDM_GETFOLDERPATH: u32 = 0x0400 + 102;
 const FOLDER_PATH_BUFFER_LEN: usize = 32_768;
 const CLSCTX_INPROC_SERVER: u32 = 0x1;
 const SIGDN_FILESYSPATH: u32 = 0x8005_8000;
@@ -2128,7 +2125,7 @@ fn is_supported_dialog(hwnd: HWND) -> bool {
     is_supported_dialog_from_probe(
         class_name(hwnd),
         || window_text(hwnd),
-        || has_address_control(hwnd),
+        || false,
     )
 }
 
@@ -2153,45 +2150,6 @@ where
 
 fn is_supported_dialog_shape(class_name: &str, _title: &str, _has_address_control: bool) -> bool {
     class_name == DIALOG_CLASS
-}
-
-fn has_address_control(hwnd: HWND) -> bool {
-    find_file_dialog_for_window(hwnd).is_some() || find_navigation_edit_control(hwnd).is_some()
-}
-
-struct AddressControlSearch {
-    found_hwnd: HWND,
-}
-
-fn find_navigation_edit_control(hwnd: HWND) -> Option<HWND> {
-    let mut search = AddressControlSearch {
-        found_hwnd: std::ptr::null_mut(),
-    };
-    unsafe {
-        EnumChildWindows(
-            hwnd,
-            Some(enum_address_edit_control_proc),
-            (&mut search as *mut AddressControlSearch) as LPARAM,
-        );
-    }
-    (!search.found_hwnd.is_null()).then_some(search.found_hwnd)
-}
-
-unsafe extern "system" fn enum_address_edit_control_proc(hwnd: HWND, l_param: LPARAM) -> BOOL {
-    if l_param == 0 {
-        return TRUE;
-    }
-    if unsafe { GetDlgCtrlID(hwnd) } != ADDRESS_BAR_EDIT_CONTROL_ID {
-        return TRUE;
-    }
-    let Some(class_name) = class_name(hwnd) else {
-        return TRUE;
-    };
-    if class_name.eq_ignore_ascii_case("Edit") {
-        unsafe { (*(l_param as *mut AddressControlSearch)).found_hwnd = hwnd };
-        return 0;
-    }
-    TRUE
 }
 
 fn is_legacy_browse_for_folder_dialog(class_name: &str, title: &str) -> bool {
@@ -2445,7 +2403,7 @@ fn decode_jump_copydata_payload(dw_data: usize, bytes: &[u8]) -> Option<JumpComm
 
 fn navigate_dialog_to_folder(hwnd: HWND, folder_path: &str) -> JumpAckStatus {
     let Some(dialog) = find_file_dialog_for_window(hwnd) else {
-        return navigate_standard_dialog_address_to_folder(hwnd, folder_path);
+        return navigate_browse_for_folder_dialog_to_folder(hwnd, folder_path);
     };
     let wide_path = to_wide_null(folder_path);
     let mut shell_item = std::ptr::null_mut();
@@ -2475,37 +2433,6 @@ fn navigate_dialog_to_folder(hwnd: HWND, folder_path: &str) -> JumpAckStatus {
     // sentinel in the target folder to verify the actual navigation outcome.
     let _deferred_readback = verify_file_dialog_folder(dialog as *mut c_void, folder_path);
     JumpAckStatus::Success
-}
-
-fn navigate_standard_dialog_address_to_folder(hwnd: HWND, folder_path: &str) -> JumpAckStatus {
-    let Some(path_edit) = find_navigation_edit_control(hwnd) else {
-        return navigate_browse_for_folder_dialog_to_folder(hwnd, folder_path);
-    };
-    let wide_path = to_wide_null(folder_path);
-    if unsafe { SendMessageW(path_edit, WM_SETTEXT, 0, wide_path.as_ptr() as LPARAM) } == 0 {
-        return JumpAckStatus::Failed;
-    }
-    unsafe {
-        SendMessageW(path_edit, WM_KEYDOWN, VK_RETURN_KEY, 0);
-        SendMessageW(path_edit, WM_KEYUP, VK_RETURN_KEY, 0);
-    }
-    let current_folder = current_standard_dialog_folder(hwnd);
-    jump_status_for_verified_folder(current_folder.as_deref(), folder_path)
-}
-
-fn current_standard_dialog_folder(hwnd: HWND) -> Option<String> {
-    let mut folder_path = vec![0u16; FOLDER_PATH_BUFFER_LEN];
-    let result = unsafe {
-        SendMessageW(
-            hwnd,
-            CDM_GETFOLDERPATH,
-            folder_path.len(),
-            folder_path.as_mut_ptr() as LPARAM,
-        )
-    };
-    (result > 0)
-        .then(|| wide_null_to_string(&folder_path))
-        .filter(|path| !path.is_empty())
 }
 
 fn verify_file_dialog_folder(dialog: *mut c_void, target_folder: &str) -> JumpAckStatus {
