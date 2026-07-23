@@ -803,7 +803,7 @@ public sealed class SearchPanelViewModelTests
         await Task.Delay(TimeSpan.FromMilliseconds(35));
         Assert.Empty(index.ObservedQueries);
 
-        await Task.Delay(TimeSpan.FromMilliseconds(90));
+        await index.WaitForSearchCountAsync(1);
         var query = Assert.Single(index.ObservedQueries);
         Assert.Equal("invoice", query.NormalizedText);
     }
