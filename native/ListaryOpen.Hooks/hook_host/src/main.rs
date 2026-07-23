@@ -54,7 +54,7 @@ use windows_sys::Win32::System::Threading::{
 use windows_sys::Win32::UI::Accessibility::{SetWinEventHook, UnhookWinEvent, HWINEVENTHOOK};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     ChangeWindowMessageFilterEx, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW,
-    EnumChildWindows, EnumWindows, GetAncestor, GetClassNameW, GetDlgCtrlID, GetForegroundWindow,
+    EnumWindows, GetAncestor, GetClassNameW, GetForegroundWindow,
     GetMessageW, GetWindowLongPtrW, GetWindowTextLengthW, GetWindowTextW, GetWindowThreadProcessId,
     IsWindow, IsWindowVisible, MsgWaitForMultipleObjectsEx, PeekMessageW, PostMessageW,
     PostQuitMessage, PostThreadMessageW, RegisterClassW, SendMessageTimeoutW, SetWindowLongPtrW,
@@ -81,7 +81,6 @@ const ACK_STARTUP_SHUTDOWN_GRACE: Duration = Duration::from_millis(100);
 const WM_LISTARY_ACK_CLOSE: u32 = WM_APP + 0x4C4F;
 const PIPE_REJECT_REMOTE_CLIENTS: u32 = 0x0000_0008;
 const PRELOAD_HOOK_DLL_EXPORT: &[u8] = b"ListaryOpenPreloadHookProc\0";
-const ADDRESS_BAR_EDIT_CONTROL_ID: i32 = 41477;
 
 #[repr(C)]
 struct FileTime {
@@ -1996,44 +1995,11 @@ fn is_supported_dialog_window(hwnd: HWND) -> bool {
         return false;
     };
 
-    is_supported_dialog_shape(&class_name) && has_file_dialog_content(hwnd)
+    is_supported_dialog_shape(&class_name)
 }
 
 fn is_supported_dialog_shape(class_name: &str) -> bool {
     class_name == DIALOG_CLASS
-}
-
-fn is_file_dialog_content_class(class_name: &str) -> bool {
-    matches!(class_name, "DirectUIHWND" | "SHELLDLL_DefView")
-}
-
-fn is_file_dialog_content_control(class_name: &str, control_id: i32) -> bool {
-    is_file_dialog_content_class(class_name)
-        || (control_id == ADDRESS_BAR_EDIT_CONTROL_ID && class_name.eq_ignore_ascii_case("Edit"))
-}
-
-fn has_file_dialog_content(hwnd: HWND) -> bool {
-    let mut found = false;
-    unsafe {
-        EnumChildWindows(
-            hwnd,
-            Some(find_file_dialog_content),
-            (&mut found as *mut bool) as LPARAM,
-        );
-    }
-    found
-}
-
-unsafe extern "system" fn find_file_dialog_content(hwnd: HWND, l_param: LPARAM) -> BOOL {
-    let found = unsafe { &mut *(l_param as *mut bool) };
-    if class_name(hwnd).is_some_and(|class_name| {
-        is_file_dialog_content_control(&class_name, unsafe { GetDlgCtrlID(hwnd) })
-    }) {
-        *found = true;
-        return FALSE;
-    }
-
-    TRUE
 }
 
 fn unsupported_foreground_window_message() -> Option<String> {
@@ -2121,7 +2087,7 @@ fn observed_dialog(hwnd: HWND) -> Option<ObservedDialog> {
     }
 
     let class_name = String::from_utf16_lossy(&class_buffer[..class_len as usize]);
-    if !is_supported_dialog_shape(&class_name) || !has_file_dialog_content(hwnd) {
+    if !is_supported_dialog_shape(&class_name) {
         return None;
     }
 
@@ -4206,20 +4172,6 @@ mod tests {
     #[test]
     fn supported_dialog_shape_rejects_non_dialog_class() {
         assert!(!is_supported_dialog_shape("Chrome_WidgetWin_1"));
-    }
-
-    #[test]
-    fn file_dialog_content_classes_reject_generic_dialog_controls() {
-        assert!(is_file_dialog_content_control("DirectUIHWND", 0));
-        assert!(is_file_dialog_content_control("SHELLDLL_DefView", 0));
-        assert!(is_file_dialog_content_control(
-            "Edit",
-            ADDRESS_BAR_EDIT_CONTROL_ID
-        ));
-        assert!(!is_file_dialog_content_control("Button", 1));
-        assert!(!is_file_dialog_content_control("Static", 0));
-        assert!(!is_file_dialog_content_control("Edit", 1001));
-        assert!(!is_file_dialog_content_control("SysListView32", 0));
     }
 
     #[test]
