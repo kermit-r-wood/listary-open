@@ -189,7 +189,7 @@ $nativeRoot = Join-Path $repositoryRoot "native\ListaryOpen.Hooks"
 
 if (-not $SkipRestore) {
     Invoke-LoggedCommand -Name "Restore solution" -FilePath "dotnet" `
-        -Arguments @("restore", $solutionPath, "-r", "win-x64") `
+        -Arguments @("restore", $solutionPath, "-r", "win-x64", "-p:Configuration=Release") `
         -WorkingDirectory $repositoryRoot `
         -LogPath (Join-Path $ResultsDirectory "restore-solution.log")
     Invoke-LoggedCommand -Name "Restore desktop integration tests" -FilePath "dotnet" `
@@ -197,7 +197,7 @@ if (-not $SkipRestore) {
         -WorkingDirectory $repositoryRoot `
         -LogPath (Join-Path $ResultsDirectory "restore-integration.log")
     Invoke-LoggedCommand -Name "Restore visual acceptance tests" -FilePath "dotnet" `
-        -Arguments @("restore", $visualTests, "-r", "win-x64") `
+        -Arguments @("restore", $visualTests, "-r", "win-x64", "-p:Configuration=Release") `
         -WorkingDirectory $repositoryRoot `
         -LogPath (Join-Path $ResultsDirectory "restore-visual.log")
 }
