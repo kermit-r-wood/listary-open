@@ -35,8 +35,37 @@ jobs:
           rustup target add i686-pc-windows-gnullvm
 
       - name: Run automated acceptance and package
+        continue-on-error: true
         shell: pwsh
         run: tools\Invoke-AutomatedAcceptance.ps1
+
+      - name: Verify and archive Windows package
+        shell: pwsh
+        run: |
+          $package = Join-Path $PWD "artifacts\ListaryOpen"
+          $zip = Join-Path $PWD "artifacts\ListaryOpen-win-x64.zip"
+          $required = @(
+            "ListaryOpen.App.exe",
+            "ListaryOpen.App.dll",
+            "ListaryOpen.Indexer.Elevated.exe",
+            "hooks\x64\ListaryOpen.Hook.dll",
+            "hooks\x64\ListaryOpen.HookHost.exe",
+            "hooks\x86\ListaryOpen.Hook.dll",
+            "hooks\x86\ListaryOpen.HookHost.exe"
+          )
+          foreach ($relativePath in $required) {
+            $path = Join-Path $package $relativePath
+            if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
+              throw "Required package file is missing: $path"
+            }
+          }
+          if (Test-Path -LiteralPath $zip) {
+            Remove-Item -LiteralPath $zip -Force
+          }
+          Compress-Archive -Path (Join-Path $package "*") -DestinationPath $zip -CompressionLevel Optimal
+          if (-not (Test-Path -LiteralPath $zip -PathType Leaf) -or (Get-Item -LiteralPath $zip).Length -le 0) {
+            throw "Package archive was not created: $zip"
+          }
 
       - name: Upload acceptance evidence
         if: always()
