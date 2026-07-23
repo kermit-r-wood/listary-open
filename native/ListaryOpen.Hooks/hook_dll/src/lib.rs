@@ -2151,16 +2151,8 @@ where
     is_supported_dialog_shape(&class_name, &title(), has_address_control())
 }
 
-fn is_supported_dialog_shape(class_name: &str, title: &str, has_address_control: bool) -> bool {
+fn is_supported_dialog_shape(class_name: &str, _title: &str, _has_address_control: bool) -> bool {
     class_name == DIALOG_CLASS
-        && (has_address_control || title_contains_supported_dialog_keyword(title))
-}
-
-fn title_contains_supported_dialog_keyword(title: &str) -> bool {
-    let title = title.to_ascii_lowercase();
-    ["open", "upload", "choose", "folder"]
-        .iter()
-        .any(|keyword| title.contains(keyword))
 }
 
 fn has_address_control(hwnd: HWND) -> bool {
@@ -2909,8 +2901,8 @@ mod tests {
     }
 
     #[test]
-    fn supported_dialog_shape_rejects_unknown_or_non_dialog_shapes() {
-        assert!(!is_supported_dialog_shape("#32770", "Properties", false));
+    fn supported_dialog_shape_rejects_non_dialog_classes() {
+        assert!(is_supported_dialog_shape("#32770", "Properties", false));
         assert!(!is_supported_dialog_shape(
             "MozillaWindowClass",
             "File Upload",
