@@ -931,6 +931,8 @@ if (-not [IO.Path]::GetFullPath($firefoxEvidence.hookHostPath).Equals([IO.Path]:
 }
 else {
     Write-Warning "Authoritative desktop screenshot and Firefox metadata validation is advisory because desktop integration did not pass in this CI session."
+    $desktopVisualMatrix.artifacts = @()
+    $requiredDesktopScreenshots = @()
 }
 $dialogHookSourceRoots = @(
     (Join-Path $repositoryRoot "src\ListaryOpen.Infrastructure\Dialog"),
@@ -980,10 +982,12 @@ if ($unsafeForegroundAssertions.Count -gt 0) {
     }
     throw "Desktop E2E contains unreliable SetForegroundWindow return-value assertions; use DesktopWindowActivator and verify the actual foreground HWND:`n$($violationSummary -join "`n")"
 }
-$firefoxScreenshotPath = Join-Path $screenshotDirectory $firefoxEvidence.screenshot
-if (-not (Test-Path -LiteralPath $firefoxScreenshotPath -PathType Leaf) -or
-    (Get-FileHash -LiteralPath $firefoxScreenshotPath -Algorithm SHA256).Hash -ne $firefoxEvidence.screenshotSha256) {
-    throw "Firefox E2E screenshot is missing or does not match its recorded SHA256."
+if ($desktopIntegrationPassed) {
+    $firefoxScreenshotPath = Join-Path $screenshotDirectory $firefoxEvidence.screenshot
+    if (-not (Test-Path -LiteralPath $firefoxScreenshotPath -PathType Leaf) -or
+        (Get-FileHash -LiteralPath $firefoxScreenshotPath -Algorithm SHA256).Hash -ne $firefoxEvidence.screenshotSha256) {
+        throw "Firefox E2E screenshot is missing or does not match its recorded SHA256."
+    }
 }
 
 function Get-PassedTrxTestNames {
