@@ -27,14 +27,14 @@ internal sealed class ShellPreviewHost : HwndHost
             return false;
         }
 
-        var handlerId = FindPreviewHandler(path);
-        if (handlerId is null)
-        {
-            return false;
-        }
-
         try
         {
+            var handlerId = FindPreviewHandler(path);
+            if (handlerId is null)
+            {
+                return false;
+            }
+
             var handlerType = Type.GetTypeFromCLSID(handlerId.Value, throwOnError: false);
             _previewHandlerObject = handlerType is null ? null : Activator.CreateInstance(handlerType);
             _previewHandler = _previewHandlerObject as IPreviewHandler;
@@ -49,7 +49,9 @@ internal sealed class ShellPreviewHost : HwndHost
             Marshal.ThrowExceptionForHR(_previewHandler.DoPreview());
             return true;
         }
-        catch (Exception exception) when (exception is COMException or InvalidCastException or InvalidOperationException or UnauthorizedAccessException)
+        catch (Exception exception) when (exception is COMException or InvalidCastException or InvalidOperationException or
+            UnauthorizedAccessException or NotSupportedException or System.Security.SecurityException or
+            System.Reflection.TargetInvocationException)
         {
             ClearPreview();
             return false;

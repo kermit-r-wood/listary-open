@@ -31,6 +31,8 @@ The desktop suite directly verifies real global-hotkey delivery, Explorer/Task M
   - Confirm long names and parent paths trim without overlapping badges.
   - Press Enter, Esc, Ctrl+Enter, and Ctrl+C and confirm existing behavior is unchanged.
   - AUTOMATED VISUAL PASS: empty/results/preview, light/dark, and Chinese search states are captured and checked; interactive hotkey feel remains an optional manual check.
+  - Preview UTF-8, UTF-16, GBK, extensionless text, Markdown, HTML, EML, SVG, ZIP/TAR/GZip, PDF, DOCX/XLSX/PPTX, ODF, EPUB, WAV/MP3/FLAC, EXE/DLL, and TTF/OTF samples.
+  - Rapidly move through mixed results and confirm canceled previews never replace the current selection; corrupt and locked files must degrade without closing or freezing search.
 - [ ] Verify dialog/quick-switch search panel mode UI.
   - Confirm the Quick Switch search bar stays attached below a supported dialog without stealing focus.
   - Press Ctrl+G and confirm it jumps directly without expanding the search results.

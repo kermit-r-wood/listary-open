@@ -85,10 +85,17 @@
     },
     {
       "id": "search-preview",
-      "requirement": "The preview pane renders supported metadata and images inside a finite uniformly scaled surface.",
+      "requirement": "The preview pane safely renders bounded text, images, fonts, archives, documents, PDF and media metadata with cancellable provider fallback.",
       "evidence": [
         { "suite": "dotnet", "testNameContains": "SearchPanelContainsCollapsiblePreviewPane" },
         { "suite": "dotnet", "testNameContains": "ImagePreviewUsesAFiniteUniformSurfaceInsteadOfANativeSizeScroller" },
+        { "suite": "dotnet", "testNameContains": "TextDecoderRecognizesBomlessUtf16AndGbk" },
+        { "suite": "dotnet", "testNameContains": "ArchiveProviderListsZipEntriesWithoutExtractingThem" },
+        { "suite": "dotnet", "testNameContains": "DocumentProviderExtractsTextFromOpenXmlPackages" },
+        { "suite": "dotnet", "testNameContains": "PdfProviderReturnsSafeMetadataWhenNativePreviewIsUnavailable" },
+        { "suite": "dotnet", "testNameContains": "SvgProviderBlocksExternalResourcesAndReportsStructure" },
+        { "suite": "dotnet", "testNameContains": "MediaProviderReadsWaveMetadata" },
+        { "suite": "dotnet", "testNameContains": "CoordinatorCachesCompletedPreviewResults" },
         { "suite": "dotnet", "testNameContains": "UiResourcesAndWindowsLoadOnStaThread" },
         { "suite": "visual", "testNameContains": "ProductionWindowsRenderVisualAcceptanceMatrix", "screenshot": "14-search-results-preview-light-en.png" },
         { "suite": "visual", "testNameContains": "ProductionWindowsRenderVisualAcceptanceMatrix", "screenshot": "15-search-results-dark-zh.png" },
