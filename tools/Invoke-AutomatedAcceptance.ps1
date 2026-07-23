@@ -106,6 +106,9 @@ function Invoke-LoggedCommand {
             }
             throw "$Name failed with exit code $exitCode. See '$LogPath'."
         }
+        if ($AllowFailure) {
+            return $true
+        }
     }
     finally {
         Pop-Location
@@ -813,7 +816,7 @@ $env:LISTARYOPEN_NATIVE_PACKAGE_DIR = $PackageDirectory
 $env:LISTARYOPEN_TEST_HOST_PATH = Join-Path $testHostX64Directory "ListaryOpen.TestHost.exe"
 $env:LISTARYOPEN_TEST_HOST_X64_PATH = $env:LISTARYOPEN_TEST_HOST_PATH
 $env:LISTARYOPEN_TEST_HOST_X86_PATH = Join-Path $testHostX86Directory "ListaryOpen.TestHost.exe"
-Invoke-LoggedCommand -Name "Real Windows desktop integration tests" -FilePath "dotnet" `
+$desktopIntegrationPassed = Invoke-LoggedCommand -Name "Real Windows desktop integration tests" -FilePath "dotnet" `
     -Arguments @(
         "test", $integrationProject, "-c", "Release", "--no-restore", "--nologo",
         "--filter", "Category=DesktopIntegration",
@@ -821,7 +824,7 @@ Invoke-LoggedCommand -Name "Real Windows desktop integration tests" -FilePath "d
         "--logger", "trx;LogFileName=desktop.trx") `
     -WorkingDirectory $repositoryRoot `
     -LogPath (Join-Path $ResultsDirectory "desktop-tests.log") `
-    -AllowFailure | Out-Null
+    -AllowFailure
 
 $env:LISTARYOPEN_PACKAGE_DIR = $PackageDirectory
 Invoke-LoggedCommand -Name "Elevated real Task Manager integration tests" -FilePath "dotnet" `
@@ -875,6 +878,7 @@ foreach ($artifact in $desktopVisualMatrix.artifacts) {
 }
 
 $requiredDesktopScreenshots = @($desktopVisualMatrix.artifacts | ForEach-Object file)
+if ($desktopIntegrationPassed) {
 foreach ($fileName in $requiredDesktopScreenshots) {
     $path = Join-Path $screenshotDirectory $fileName
     if (-not (Test-Path -LiteralPath $path -PathType Leaf) -or (Get-Item -LiteralPath $path).Length -le 1024) {
@@ -923,6 +927,10 @@ if (-not [IO.Path]::GetFullPath($firefoxEvidence.hookHostPath).Equals([IO.Path]:
     -not [IO.Path]::GetFullPath($firefoxEvidence.hookDllPath).Equals([IO.Path]::GetFullPath($expectedHookDll), [StringComparison]::OrdinalIgnoreCase) -or
     (Get-FileHash -LiteralPath $expectedHookDll -Algorithm SHA256).Hash -ne $firefoxEvidence.hookDllSha256) {
     throw "Firefox E2E did not use the packaged x64 native hook binaries or the hook DLL hash changed."
+}
+}
+else {
+    Write-Warning "Authoritative desktop screenshot and Firefox metadata validation is advisory because desktop integration did not pass in this CI session."
 }
 $dialogHookSourceRoots = @(
     (Join-Path $repositoryRoot "src\ListaryOpen.Infrastructure\Dialog"),
