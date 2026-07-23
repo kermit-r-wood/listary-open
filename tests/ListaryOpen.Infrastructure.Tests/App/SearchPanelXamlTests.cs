@@ -62,6 +62,19 @@ public sealed class SearchPanelXamlTests
         Assert.Contains("<Setter Property=\"CaretBrush\" Value=\"{DynamicResource Brush.Accent}\" />", xaml);
     }
 
+    [Fact]
+    public void BorderlessSearchWindowsApplyNativeRoundedCorners()
+    {
+        var searchPanel = File.ReadAllText(GetRepositoryPath("src", "ListaryOpen.App", "SearchPanel.xaml.cs"));
+        var taskManagerSearch = File.ReadAllText(GetRepositoryPath("src", "ListaryOpen.App", "TaskManagerSearchWindow.xaml.cs"));
+        var nativeCorner = File.ReadAllText(GetRepositoryPath("src", "ListaryOpen.App", "NativeWindowCorner.cs"));
+
+        Assert.Contains("NativeWindowCorner.ApplyRounded(this);", searchPanel);
+        Assert.Contains("NativeWindowCorner.ApplyRounded(this);", taskManagerSearch);
+        Assert.Contains("DwmWindowCornerPreferenceRound = 2", nativeCorner);
+        Assert.Contains("DwmSetWindowAttribute", nativeCorner);
+    }
+
     private static string GetRepositoryPath(params string[] segments)
     {
         return Path.GetFullPath(Path.Combine(

@@ -268,7 +268,7 @@ public partial class App : Application
         LocalizationManager.Initialize();
         LocalizationManager.Apply(settings.Language);
         _fallbackIndexProvider = new FallbackIndexProvider();
-        _elevatedIndexerClient = new ElevatedIndexerClient();
+        _elevatedIndexerClient = CreateElevatedIndexerClient(appDataPaths);
         var ntfsFastIndexingEnabled = EnableNtfsFastIndexingOnStartup(_elevatedIndexerClient);
         _ntfsIndexProvider = new NtfsIndexProvider(_elevatedIndexerClient);
         _volumeIndexer = new VolumeIndexer(new IIndexProvider[]
@@ -696,9 +696,13 @@ public partial class App : Application
             try
             {
                 var normalizedRoot = Path.TrimEndingDirectorySeparator(Path.GetFullPath(root));
+                var rootPrefix = normalizedRoot.EndsWith(Path.DirectorySeparatorChar) ||
+                    normalizedRoot.EndsWith(Path.AltDirectorySeparatorChar)
+                        ? normalizedRoot
+                        : normalizedRoot + Path.DirectorySeparatorChar;
                 if (string.Equals(normalizedPath, normalizedRoot, StringComparison.OrdinalIgnoreCase) ||
                     normalizedPath.StartsWith(
-                        normalizedRoot + Path.DirectorySeparatorChar,
+                        rootPrefix,
                         StringComparison.OrdinalIgnoreCase))
                 {
                     return true;
@@ -729,6 +733,14 @@ public partial class App : Application
 
         requestReindex();
         return true;
+    }
+
+    internal static ElevatedIndexerClient CreateElevatedIndexerClient(AppDataPaths paths)
+    {
+        ArgumentNullException.ThrowIfNull(paths);
+        return new ElevatedIndexerClient(Path.Combine(
+            paths.ProgramDirectory,
+            "ListaryOpen.Indexer.Elevated.exe"));
     }
 
     internal static bool EnableNtfsFastIndexingOnStartup(ElevatedIndexerClient? client)

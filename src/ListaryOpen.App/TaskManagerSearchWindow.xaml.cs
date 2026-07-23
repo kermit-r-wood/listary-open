@@ -354,6 +354,12 @@ public partial class TaskManagerSearchWindow : Window
     private void LocalizationManager_LanguageChanged(object? sender, EventArgs e) =>
         ViewModel.RefreshLocalization();
 
+    protected override void OnSourceInitialized(EventArgs e)
+    {
+        base.OnSourceInitialized(e);
+        NativeWindowCorner.ApplyRounded(this);
+    }
+
     [DllImport("user32.dll")]
     private static extern IntPtr GetForegroundWindow();
 }

@@ -331,6 +331,7 @@ public partial class SearchPanel : Window
         StatusRow.Height = new GridLength(0);
         ShowActivated = true;
         Show();
+        NativeWindowCorner.ApplyRounded(this);
         PositionCompactGlobalSearch();
         Activate();
         FocusQueryAtEnd();
@@ -388,6 +389,12 @@ public partial class SearchPanel : Window
         QueryRow.Margin = new Thickness(0, 0, 0, 14);
         ModeHeaderRow.Height = GridLength.Auto;
         StatusRow.Height = GridLength.Auto;
+    }
+
+    protected override void OnSourceInitialized(EventArgs e)
+    {
+        base.OnSourceInitialized(e);
+        NativeWindowCorner.ApplyRounded(this);
     }
 
     private void QueueResultsLayoutUpdate()

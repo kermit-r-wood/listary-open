@@ -1,4 +1,5 @@
 using ListaryOpen.App;
+using ListaryOpen.Infrastructure.AppData;
 using ListaryOpen.Infrastructure.Indexing;
 using WpfApp = ListaryOpen.App.App;
 
@@ -83,6 +84,40 @@ public sealed class AppIndexRootTests
         var roots = WpfApp.CreateIndexRoots(new[] { child, parent, child });
 
         Assert.Equal(Path.GetFullPath(parent), Assert.Single(roots).Path);
+    }
+
+    [Fact]
+    public void CreateIndexRootsTreatsDriveRootAsParentOfEveryLocationOnDrive()
+    {
+        var driveRoot = Path.GetPathRoot(Environment.SystemDirectory)!;
+        var descendant = Path.Combine(driveRoot, "ProgramData", "Microsoft", "Windows", "Start Menu");
+
+        var roots = WpfApp.CreateIndexRoots([descendant, driveRoot]);
+
+        Assert.Equal(driveRoot, Assert.Single(roots).Path);
+        Assert.True(WpfApp.IsPathWithinAnyRoot(descendant, [driveRoot]));
+    }
+
+    [Fact]
+    public void ElevatedIndexerClientUsesHelperBundleFromProgramDirectory()
+    {
+        var programDirectory = Path.Combine(Path.GetTempPath(), "listary-open-" + Guid.NewGuid());
+        Directory.CreateDirectory(programDirectory);
+
+        try
+        {
+            _ = CreateUsableHelperBundle(programDirectory);
+            var paths = AppDataPaths.CreateUnderProgramDirectory(programDirectory);
+
+            var client = WpfApp.CreateElevatedIndexerClient(paths);
+
+            Assert.True(WpfApp.EnableNtfsFastIndexingOnStartup(client));
+            Assert.True(client.IsAvailable);
+        }
+        finally
+        {
+            Directory.Delete(programDirectory, recursive: true);
+        }
     }
 
     [Fact]
