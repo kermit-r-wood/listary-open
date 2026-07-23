@@ -35,9 +35,8 @@ jobs:
           rustup target add i686-pc-windows-gnullvm
 
       - name: Run automated acceptance and package
-        continue-on-error: true
         shell: pwsh
-        run: tools\Invoke-AutomatedAcceptance.ps1
+        run: tools\Invoke-AutomatedAcceptance.ps1 -SkipDesktopE2E
 
       - name: Verify and archive Windows package
         shell: pwsh

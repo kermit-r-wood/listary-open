@@ -2,7 +2,8 @@
 param(
     [string]$PackageDirectory = "",
     [string]$ResultsDirectory = "",
-    [switch]$SkipRestore
+    [switch]$SkipRestore,
+    [switch]$SkipDesktopE2E
 )
 
 $ErrorActionPreference = "Stop"
@@ -21,7 +22,8 @@ $zipPath = Join-Path $artifactsRoot "ListaryOpen-win-x64.zip"
 
 $windowsIdentity = [Security.Principal.WindowsIdentity]::GetCurrent()
 $windowsPrincipal = [Security.Principal.WindowsPrincipal]::new($windowsIdentity)
-if (-not $windowsPrincipal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
+if (-not $SkipDesktopE2E -and
+    -not $windowsPrincipal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
     $windowsIdentity.Dispose()
     throw "Complete acceptance requires an elevated runner for real Task Manager and packaged-app black-box E2E. Start PowerShell as administrator."
 }
@@ -318,6 +320,20 @@ foreach ($relativePath in @(
     if ((Get-PeMachine -Path $path) -ne 0x014c) {
         throw "Expected I386 PE machine for '$relativePath'."
     }
+}
+
+if ($SkipDesktopE2E) {
+    Compress-Archive -Path (Join-Path $PackageDirectory "*") -DestinationPath $zipPath -Force
+    [pscustomobject]@{
+        SchemaVersion = 1
+        GeneratedAtUtc = [DateTimeOffset]::UtcNow
+        DesktopE2ESkipped = $true
+        Reason = "Desktop E2E requires an interactive elevated Windows session and optional third-party applications such as Firefox."
+        PackagePath = $zipPath
+        PackageSha256 = (Get-FileHash -LiteralPath $zipPath -Algorithm SHA256).Hash
+    } | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $ResultsDirectory "ci-package-report.json") -Encoding utf8
+    Write-Host "CI package validation completed without desktop E2E: $zipPath"
+    return
 }
 
 if (-not ("ListaryOpenAcceptance.NativeProcessProbe" -as [type])) {
@@ -816,15 +832,15 @@ $env:LISTARYOPEN_NATIVE_PACKAGE_DIR = $PackageDirectory
 $env:LISTARYOPEN_TEST_HOST_PATH = Join-Path $testHostX64Directory "ListaryOpen.TestHost.exe"
 $env:LISTARYOPEN_TEST_HOST_X64_PATH = $env:LISTARYOPEN_TEST_HOST_PATH
 $env:LISTARYOPEN_TEST_HOST_X86_PATH = Join-Path $testHostX86Directory "ListaryOpen.TestHost.exe"
-$desktopIntegrationPassed = Invoke-LoggedCommand -Name "Real Windows desktop integration tests" -FilePath "dotnet" `
+Invoke-LoggedCommand -Name "Real Windows desktop integration tests" -FilePath "dotnet" `
     -Arguments @(
         "test", $integrationProject, "-c", "Release", "--no-restore", "--nologo",
         "--filter", "Category=DesktopIntegration",
         "--results-directory", $ResultsDirectory,
         "--logger", "trx;LogFileName=desktop.trx") `
     -WorkingDirectory $repositoryRoot `
-    -LogPath (Join-Path $ResultsDirectory "desktop-tests.log") `
-    -AllowFailure
+    -LogPath (Join-Path $ResultsDirectory "desktop-tests.log")
+$desktopIntegrationPassed = $true
 
 $env:LISTARYOPEN_PACKAGE_DIR = $PackageDirectory
 Invoke-LoggedCommand -Name "Elevated real Task Manager integration tests" -FilePath "dotnet" `
@@ -842,8 +858,7 @@ Invoke-LoggedCommand -Name "Elevated packaged-app black-box E2E" -FilePath "dotn
         "--results-directory", $ResultsDirectory,
         "--logger", "trx;LogFileName=packaged-blackbox.trx") `
     -WorkingDirectory $repositoryRoot `
-    -LogPath (Join-Path $ResultsDirectory "packaged-blackbox-tests.log") `
-    -AllowFailure | Out-Null
+    -LogPath (Join-Path $ResultsDirectory "packaged-blackbox-tests.log")
 
 $nativeModuleUnloadAuditPath = Join-Path $ResultsDirectory "native-module-unload-audit.json"
 $globalNativeModuleUnloadAudit = Invoke-FinalNativeModuleUnloadAudit `
