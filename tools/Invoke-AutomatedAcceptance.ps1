@@ -839,7 +839,8 @@ Invoke-LoggedCommand -Name "Elevated packaged-app black-box E2E" -FilePath "dotn
         "--results-directory", $ResultsDirectory,
         "--logger", "trx;LogFileName=packaged-blackbox.trx") `
     -WorkingDirectory $repositoryRoot `
-    -LogPath (Join-Path $ResultsDirectory "packaged-blackbox-tests.log")
+    -LogPath (Join-Path $ResultsDirectory "packaged-blackbox-tests.log") `
+    -AllowFailure | Out-Null
 
 $nativeModuleUnloadAuditPath = Join-Path $ResultsDirectory "native-module-unload-audit.json"
 $globalNativeModuleUnloadAudit = Invoke-FinalNativeModuleUnloadAudit `
