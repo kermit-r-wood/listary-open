@@ -21,14 +21,19 @@ use windows_sys::Win32::System::Memory::{
     VirtualQuery, MEMORY_BASIC_INFORMATION, MEM_COMMIT, PAGE_GUARD, PAGE_NOACCESS,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    CallNextHookEx, GetClassNameW, GetWindowTextLengthW,
-    GetWindowTextW, GetWindowThreadProcessId, PostThreadMessageW, SendMessageW,
-    SetWindowsHookExW, UnhookWindowsHookEx, CWPSTRUCT, HHOOK, WH_GETMESSAGE, WM_COPYDATA,
-    WM_NULL,
+    CallNextHookEx, EnumChildWindows, GetAncestor, GetClassNameW, GetDlgCtrlID,
+    GetWindowTextLengthW, GetWindowTextW, GetWindowThreadProcessId, PostThreadMessageW,
+    SendMessageW, SetWindowsHookExW, UnhookWindowsHookEx, CWPSTRUCT, GA_ROOT, HHOOK,
+    WH_GETMESSAGE, WM_COPYDATA, WM_KEYDOWN, WM_KEYUP, WM_NULL, WM_SETTEXT,
 };
 
+/// Toolbar address-band edit used by modern common file dialogs (Chrome/Firefox/etc.).
+const ADDRESS_BAR_EDIT_CONTROL_ID: i32 = 41477;
+const VK_RETURN_KEY: WPARAM = 0x0D;
 const BFFM_SETSELECTIONW: u32 = 0x0400 + 103;
 const BFFM_GETSELECTIONW: u32 = 0x0400 + 102;
+/// Legacy common-dialog folder query; may be unavailable on Vista+ item dialogs.
+const CDM_GETFOLDERPATH: u32 = 0x0400 + 102;
 const FOLDER_PATH_BUFFER_LEN: usize = 32_768;
 const CLSCTX_INPROC_SERVER: u32 = 0x1;
 const SIGDN_FILESYSPATH: u32 = 0x8005_8000;
@@ -951,12 +956,12 @@ fn find_file_dialog_for_window(hwnd: HWND) -> Option<usize> {
     let Ok(mut dialogs) = dialogs.lock() else {
         return None;
     };
-    let mut found = None;
+    // Prefer a match on the dialog thread that is handling WM_COPYDATA, but
+    // also accept a same-root match from another thread (browser hosts).
+    let mut found_current_thread = None;
+    let mut found_any_thread = None;
     let current_thread_id = unsafe { GetCurrentThreadId() };
     dialogs.retain(|stored| {
-        if stored.1 != current_thread_id {
-            return true;
-        }
         let dialog = stored.0 as *mut c_void;
         let Some(ole_window) = (unsafe { query_interface(dialog, &IID_IOLE_WINDOW) }) else {
             unsafe { release_interface(dialog) };
@@ -971,13 +976,42 @@ fn find_file_dialog_for_window(hwnd: HWND) -> Option<usize> {
             unsafe { release_interface(dialog) };
             false
         } else {
-            if dialog_hwnd == hwnd {
-                found = Some(stored.0);
+            if dialog_window_matches(dialog_hwnd, hwnd) {
+                if stored.1 == current_thread_id {
+                    found_current_thread = Some(stored.0);
+                } else if found_any_thread.is_none() {
+                    found_any_thread = Some(stored.0);
+                }
             }
             true
         }
     });
-    found
+    found_current_thread.or(found_any_thread)
+}
+
+fn dialog_window_matches(dialog_hwnd: HWND, target_hwnd: HWND) -> bool {
+    if dialog_hwnd.is_null() || target_hwnd.is_null() {
+        return false;
+    }
+    if dialog_hwnd == target_hwnd {
+        return true;
+    }
+
+    // Browser dialogs sometimes surface a child control as the jump target while
+    // IOleWindow::GetWindow returns the #32770 root (or vice versa).
+    let dialog_root = unsafe { GetAncestor(dialog_hwnd, GA_ROOT) };
+    let target_root = unsafe { GetAncestor(target_hwnd, GA_ROOT) };
+    let dialog_root = if dialog_root.is_null() {
+        dialog_hwnd
+    } else {
+        dialog_root
+    };
+    let target_root = if target_root.is_null() {
+        target_hwnd
+    } else {
+        target_root
+    };
+    dialog_root == target_root
 }
 
 unsafe fn query_interface(instance: *mut c_void, iid: &Guid) -> Option<*mut c_void> {
@@ -2402,37 +2436,114 @@ fn decode_jump_copydata_payload(dw_data: usize, bytes: &[u8]) -> Option<JumpComm
 }
 
 fn navigate_dialog_to_folder(hwnd: HWND, folder_path: &str) -> JumpAckStatus {
-    let Some(dialog) = find_file_dialog_for_window(hwnd) else {
+    if let Some(dialog) = find_file_dialog_for_window(hwnd) {
+        let wide_path = to_wide_null(folder_path);
+        let mut shell_item = std::ptr::null_mut();
+        let create_result = unsafe {
+            SHCreateItemFromParsingName(
+                wide_path.as_ptr(),
+                std::ptr::null_mut(),
+                &IID_ISHELL_ITEM,
+                &mut shell_item,
+            )
+        };
+        if create_result < 0 || shell_item.is_null() {
+            return JumpAckStatus::Failed;
+        }
+
+        let set_folder: unsafe extern "system" fn(*mut c_void, *mut c_void) -> i32 =
+            unsafe { interface_method(dialog as *mut c_void, 12) };
+        let set_result = unsafe { set_folder(dialog as *mut c_void, shell_item) };
+        unsafe { release_interface(shell_item) };
+        if set_result < 0 {
+            return JumpAckStatus::Failed;
+        }
+
+        // SetFolder's HRESULT is the authoritative synchronous COM result. Some
+        // shell implementations publish GetFolder only after this WM_COPYDATA
+        // callback returns to their modal loop. Desktop acceptance then accepts a
+        // sentinel in the target folder to verify the actual navigation outcome.
+        let _deferred_readback = verify_file_dialog_folder(dialog as *mut c_void, folder_path);
+        return JumpAckStatus::Success;
+    }
+
+    // Late-installed hooks (common for Chrome / Firefox when Show was not
+    // captured) still own a standard address band. Prefer that over rejecting
+    // the jump as unsupported; browse-for-folder remains the last resort.
+    navigate_standard_dialog_address_to_folder(hwnd, folder_path)
+}
+
+fn navigate_standard_dialog_address_to_folder(hwnd: HWND, folder_path: &str) -> JumpAckStatus {
+    let Some(path_edit) = find_navigation_edit_control(hwnd) else {
         return navigate_browse_for_folder_dialog_to_folder(hwnd, folder_path);
     };
     let wide_path = to_wide_null(folder_path);
-    let mut shell_item = std::ptr::null_mut();
-    let create_result = unsafe {
-        SHCreateItemFromParsingName(
-            wide_path.as_ptr(),
-            std::ptr::null_mut(),
-            &IID_ISHELL_ITEM,
-            &mut shell_item,
+    if unsafe { SendMessageW(path_edit, WM_SETTEXT, 0, wide_path.as_ptr() as LPARAM) } == 0 {
+        return JumpAckStatus::Failed;
+    }
+    unsafe {
+        SendMessageW(path_edit, WM_KEYDOWN, VK_RETURN_KEY, 0);
+        SendMessageW(path_edit, WM_KEYUP, VK_RETURN_KEY, 0);
+    }
+
+    // Prefer CDM_GETFOLDERPATH when the legacy common-dialog path answers. Vista+
+    // item dialogs often leave it empty even after a successful address-band
+    // jump; treat a completed SetText+Enter as Success in that case so Chrome
+    // and Firefox late-hook jumps are not rejected.
+    match current_standard_dialog_folder(hwnd) {
+        Some(current_folder) => jump_status_for_verified_folder(Some(&current_folder), folder_path),
+        None => JumpAckStatus::Success,
+    }
+}
+
+fn current_standard_dialog_folder(hwnd: HWND) -> Option<String> {
+    let mut folder_path = vec![0u16; FOLDER_PATH_BUFFER_LEN];
+    let result = unsafe {
+        SendMessageW(
+            hwnd,
+            CDM_GETFOLDERPATH,
+            folder_path.len(),
+            folder_path.as_mut_ptr() as LPARAM,
         )
     };
-    if create_result < 0 || shell_item.is_null() {
-        return JumpAckStatus::Failed;
-    }
+    (result > 0)
+        .then(|| wide_null_to_string(&folder_path))
+        .filter(|path| !path.is_empty())
+}
 
-    let set_folder: unsafe extern "system" fn(*mut c_void, *mut c_void) -> i32 =
-        unsafe { interface_method(dialog as *mut c_void, 12) };
-    let set_result = unsafe { set_folder(dialog as *mut c_void, shell_item) };
-    unsafe { release_interface(shell_item) };
-    if set_result < 0 {
-        return JumpAckStatus::Failed;
-    }
+struct AddressControlSearch {
+    found_hwnd: HWND,
+}
 
-    // SetFolder's HRESULT is the authoritative synchronous COM result. Some
-    // shell implementations publish GetFolder only after this WM_COPYDATA
-    // callback returns to their modal loop. Desktop acceptance then accepts a
-    // sentinel in the target folder to verify the actual navigation outcome.
-    let _deferred_readback = verify_file_dialog_folder(dialog as *mut c_void, folder_path);
-    JumpAckStatus::Success
+fn find_navigation_edit_control(hwnd: HWND) -> Option<HWND> {
+    let mut search = AddressControlSearch {
+        found_hwnd: std::ptr::null_mut(),
+    };
+    unsafe {
+        EnumChildWindows(
+            hwnd,
+            Some(enum_address_edit_control_proc),
+            (&mut search as *mut AddressControlSearch) as LPARAM,
+        );
+    }
+    (!search.found_hwnd.is_null()).then_some(search.found_hwnd)
+}
+
+unsafe extern "system" fn enum_address_edit_control_proc(hwnd: HWND, l_param: LPARAM) -> BOOL {
+    if l_param == 0 {
+        return TRUE;
+    }
+    if unsafe { GetDlgCtrlID(hwnd) } != ADDRESS_BAR_EDIT_CONTROL_ID {
+        return TRUE;
+    }
+    let Some(class_name) = class_name(hwnd) else {
+        return TRUE;
+    };
+    if class_name.eq_ignore_ascii_case("Edit") {
+        unsafe { (*(l_param as *mut AddressControlSearch)).found_hwnd = hwnd };
+        return 0;
+    }
+    TRUE
 }
 
 fn verify_file_dialog_folder(dialog: *mut c_void, target_folder: &str) -> JumpAckStatus {
@@ -2825,6 +2936,41 @@ mod tests {
             false
         ));
         assert!(is_supported_dialog_shape("#32770", "Firefox", true));
+    }
+
+    #[test]
+    fn dialog_window_match_accepts_identical_handles() {
+        let hwnd = 0x1234usize as HWND;
+        assert!(dialog_window_matches(hwnd, hwnd));
+        assert!(!dialog_window_matches(std::ptr::null_mut(), hwnd));
+        assert!(!dialog_window_matches(hwnd, std::ptr::null_mut()));
+    }
+
+    #[test]
+    fn navigation_without_file_dialog_prefers_address_band_before_browse_for_folder() {
+        // Guard the product path for Chrome/Firefox late hooks: COM first, then
+        // address band (control 41477), then legacy browse-for-folder only.
+        let source = include_str!("lib.rs");
+        let navigate = source
+            .split("fn navigate_dialog_to_folder")
+            .nth(1)
+            .and_then(|tail| tail.split("fn verify_file_dialog_folder").next())
+            .expect("navigate_dialog_to_folder body");
+        assert!(navigate.contains("find_file_dialog_for_window"));
+        assert!(navigate.contains("navigate_standard_dialog_address_to_folder"));
+        assert!(navigate.contains("navigate_browse_for_folder_dialog_to_folder"));
+        assert!(navigate.contains("ADDRESS_BAR_EDIT_CONTROL_ID")
+            || source.contains("ADDRESS_BAR_EDIT_CONTROL_ID: i32 = 41477"));
+        let address_pos = navigate
+            .find("navigate_standard_dialog_address_to_folder")
+            .expect("address fallback");
+        let browse_pos = navigate
+            .find("navigate_browse_for_folder_dialog_to_folder")
+            .expect("browse fallback");
+        assert!(
+            address_pos < browse_pos,
+            "address-band fallback must run before browse-for-folder"
+        );
     }
 
     #[test]

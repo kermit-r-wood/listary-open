@@ -928,9 +928,10 @@ impl HookState {
                     &self.preload_confirmed_threads,
                 ) || has_confirmed_spawn_proof(thread.process_id);
                 let callwnd_delivered = confirm_hook_thread_delivery(thread.thread_id);
-                // Precapture proof is required for the direct COM path, but a
-                // late-installed hook is still valid for the safe address-bar
-                // fallback. Confirm the target hook from delivery itself.
+                // Precapture proof is ideal for the direct COM path. A
+                // late-installed hook is still valid: the DLL falls back to the
+                // standard address-band edit (Chrome/Firefox) when Show was not
+                // captured. Confirm the target hook from delivery itself.
                 let ready = if has_precapture_proof {
                     target_hook_ready_after_preload(true, callwnd_delivered)
                 } else {
