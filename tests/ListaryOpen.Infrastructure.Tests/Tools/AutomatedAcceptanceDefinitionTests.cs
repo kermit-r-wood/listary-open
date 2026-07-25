@@ -21,6 +21,7 @@ public sealed class AutomatedAcceptanceDefinitionTests
             "settings-language-save",
             "settings-drive-roots",
             "indexing-fast-uac",
+            "indexing-elevated-real-helper",
             "github-release-check",
             "search-pinyin-multilingual",
             "search-preview",
@@ -42,7 +43,7 @@ public sealed class AutomatedAcceptanceDefinitionTests
             "package-windows-distributable");
 
         var supportedSuites = new HashSet<string>(
-            ["dotnet", "desktop", "elevatedDesktop", "packagedBlackbox", "native", "visual", "package"],
+            ["dotnet", "desktop", "elevatedDesktop", "elevatedIndexer", "packagedBlackbox", "native", "visual", "package"],
             StringComparer.Ordinal);
         foreach (var group in groups)
         {
@@ -78,7 +79,9 @@ public sealed class AutomatedAcceptanceDefinitionTests
         Assert.Contains("i686-pc-windows-gnullvm", script, StringComparison.Ordinal);
         Assert.Contains("Category=DesktopIntegration", script, StringComparison.Ordinal);
         Assert.Contains("Category=ElevatedDesktopIntegration", script, StringComparison.Ordinal);
+        Assert.Contains("Category=ElevatedIndexerIntegration", script, StringComparison.Ordinal);
         Assert.Contains("Category=ElevatedPackagedBlackboxE2E", script, StringComparison.Ordinal);
+        Assert.Contains("elevated-indexer.trx", script, StringComparison.Ordinal);
         Assert.Contains("Category=VisualAcceptance", script, StringComparison.Ordinal);
         Assert.Contains("Get-PassedTrxTestNames", script, StringComparison.Ordinal);
         Assert.Contains("$ErrorActionPreference = \"Continue\"", script, StringComparison.Ordinal);

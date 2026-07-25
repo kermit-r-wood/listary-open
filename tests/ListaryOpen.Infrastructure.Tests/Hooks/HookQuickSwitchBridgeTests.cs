@@ -29,7 +29,9 @@ public sealed class HookQuickSwitchBridgeTests
                 [HookArchitecture.X86] = x86HealthClient
             },
             hookFiles.Paths,
-            processFactory);
+            processFactory,
+            session: null,
+            requiresElevationToLaunchHosts: () => true);
         var statuses = new List<HookQuickSwitchStatus>();
         bridge.StatusChanged += (_, status) => statuses.Add(status);
 
@@ -45,6 +47,8 @@ public sealed class HookQuickSwitchBridgeTests
         Assert.Equal(3, x86HealthClient.ProbeCount);
         var start = Assert.Single(processFactory.Starts);
         Assert.Equal(hookFiles.ForArchitecture(HookArchitecture.X64).HostExePath, start.StartInfo.FileName);
+        Assert.True(start.StartInfo.UseShellExecute);
+        Assert.Equal("runas", start.StartInfo.Verb);
         Assert.Equal(
             new[]
             {
@@ -60,6 +64,40 @@ public sealed class HookQuickSwitchBridgeTests
                 hookFiles.ForArchitecture(HookArchitecture.X86).HookDllPath
             },
             start.StartInfo.ArgumentList);
+    }
+
+    [Fact]
+    public async Task EnableSkipsRunAsWhenParentProcessIsAlreadyElevated()
+    {
+        using var hookFiles = HookFileFixture.Create();
+        hookFiles.CreateHostAndDll(HookArchitecture.X64);
+        hookFiles.CreateHostAndDll(HookArchitecture.X86);
+        var processFactory = new RecordingHookHostProcessFactory(startResult: new Process());
+        var x64HealthClient = new SequenceHealthProbeHookClient(
+            new HookJumpResult(HookJumpStatus.HostUnavailable, "No host."),
+            HookJumpResult.Success("Hook host healthy."));
+        var x86HealthClient = new SequenceHealthProbeHookClient(
+            new HookJumpResult(HookJumpStatus.HostUnavailable, "No host."),
+            HookJumpResult.Success("Hook host healthy."));
+        var bridge = new HookQuickSwitchBridge(
+            HookQuickSwitchStatus.Disabled(),
+            new Dictionary<HookArchitecture, IHookIpcClient>
+            {
+                [HookArchitecture.X64] = x64HealthClient,
+                [HookArchitecture.X86] = x86HealthClient
+            },
+            hookFiles.Paths,
+            processFactory,
+            session: null,
+            requiresElevationToLaunchHosts: () => false);
+
+        await bridge.EnableAsync(CancellationToken.None);
+
+        var start = Assert.Single(processFactory.Starts);
+        Assert.False(start.StartInfo.UseShellExecute);
+        Assert.Equal(string.Empty, start.StartInfo.Verb);
+        Assert.True(bridge.Status.X64.HostRunning);
+        Assert.True(bridge.Status.X86.HostRunning);
     }
 
     [Fact]

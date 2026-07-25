@@ -131,6 +131,7 @@ public partial class App : Application
         _indexingCancellation.CancelActive();
         _shutdownCancellation.Cancel();
         _continuousIndexing?.Dispose();
+        _elevatedIndexerClient?.Dispose();
 
         if (_indexingCoordinator is not null)
         {

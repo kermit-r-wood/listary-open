@@ -14,7 +14,6 @@ namespace ListaryOpen.Indexer.Elevated.Ntfs;
 /// </summary>
 internal sealed class NtfsMftScanner
 {
-    private const int MaxMftBytesInMemory = 768 * 1024 * 1024;
     /// <summary>Stream chunk size: multiple of typical 1 KiB records, keeps parse locality high.</summary>
     private const int MftStreamChunkBytes = 4 * 1024 * 1024;
     private const ulong RootDirectoryRecordNumber = 5;
@@ -105,13 +104,13 @@ internal sealed class NtfsMftScanner
                     return false;
                 }
 
-                if (volumeData.MftValidDataLength <= 0
-                    || volumeData.MftValidDataLength > MaxMftBytesInMemory)
+                if (volumeData.MftValidDataLength <= 0)
                 {
-                    error = "NTFS $MFT size is outside the supported in-memory range.";
+                    error = "NTFS $MFT valid data length is invalid.";
                     return false;
                 }
 
+                // Large $MFT images are streamed in chunks; size alone is not a disqualifier.
                 return true;
             }
             finally
@@ -452,12 +451,8 @@ internal sealed class NtfsMftScanner
             };
         }
 
-        if (validDataLength > MaxMftBytesInMemory)
-        {
-            throw new InvalidDataException(
-                $"NTFS $MFT is too large to scan ({validDataLength} bytes).");
-        }
-
+        // Stream $MFT data runs; peak memory is dominated by the parsed record map,
+        // not the raw $MFT image size.
         var estimatedRecords = (int)Math.Min(validDataLength / Math.Max(bytesPerRecord, 1), int.MaxValue);
         var parsedByRecord = new Dictionary<ulong, NtfsMftParsedRecord>(Math.Max(16, estimatedRecords / 2));
         long bytesConsumed = 0;

@@ -1,4 +1,5 @@
 using System.Diagnostics;
+using System.Security.Principal;
 
 namespace ListaryOpen.Infrastructure.Hooks;
 
@@ -18,6 +19,7 @@ public sealed class HookQuickSwitchBridge : IHookQuickSwitchBridge
     private readonly HookHostPaths? _hostPaths;
     private readonly HookHostProcessFactory _processFactory;
     private readonly HookHostSession? _session;
+    private readonly Func<bool> _requiresElevationToLaunchHosts;
     private readonly SemaphoreSlim _enableGate = new(1, 1);
     private readonly object _hostProcessGate = new();
     private readonly Dictionary<HookArchitecture, Process> _hostProcesses = new();
@@ -35,7 +37,8 @@ public sealed class HookQuickSwitchBridge : IHookQuickSwitchBridge
         IReadOnlyDictionary<HookArchitecture, IHookIpcClient> clients,
         HookHostPaths? hostPaths,
         HookHostProcessFactory? processFactory,
-        HookHostSession? session = null)
+        HookHostSession? session = null,
+        Func<bool>? requiresElevationToLaunchHosts = null)
     {
         ArgumentNullException.ThrowIfNull(initialStatus);
         ArgumentNullException.ThrowIfNull(clients);
@@ -52,6 +55,9 @@ public sealed class HookQuickSwitchBridge : IHookQuickSwitchBridge
         _hostPaths = hostPaths;
         _processFactory = processFactory ?? new HookHostProcessFactory();
         _session = session;
+        // When the UI process is already elevated (e.g. requireAdministrator), child
+        // hosts inherit admin rights — a second UAC runas prompt is unnecessary.
+        _requiresElevationToLaunchHosts = requiresElevationToLaunchHosts ?? IsElevationRequiredToLaunchHosts;
     }
 
     public HookQuickSwitchStatus Status { get; private set; }
@@ -353,7 +359,7 @@ public sealed class HookQuickSwitchBridge : IHookQuickSwitchBridge
                 paths.HostExePath,
                 GetPipeName(architecture),
                 paths.HookDllPath,
-                elevated: true,
+                elevated: _requiresElevationToLaunchHosts(),
                 parentProcessId: _session?.ParentProcessId,
                 secret: _session?.Secret);
             var process = _processFactory.Start(startInfo);
@@ -472,7 +478,7 @@ public sealed class HookQuickSwitchBridge : IHookQuickSwitchBridge
                 x64Paths.HostExePath,
                 GetPipeName(HookArchitecture.X64),
                 x64Paths.HookDllPath,
-                elevated: true,
+                elevated: _requiresElevationToLaunchHosts(),
                 new[]
                 {
                     new HookHostLaunchRequest(
@@ -702,6 +708,20 @@ public sealed class HookQuickSwitchBridge : IHookQuickSwitchBridge
         _processFactory.Terminate(process);
         process = null;
         return false;
+    }
+
+    internal static bool IsElevationRequiredToLaunchHosts()
+    {
+        try
+        {
+            using var identity = WindowsIdentity.GetCurrent();
+            var principal = new WindowsPrincipal(identity);
+            return !principal.IsInRole(WindowsBuiltInRole.Administrator);
+        }
+        catch (Exception exception) when (exception is SystemException or System.Security.SecurityException)
+        {
+            return true;
+        }
     }
 
     private bool IsDisposed()

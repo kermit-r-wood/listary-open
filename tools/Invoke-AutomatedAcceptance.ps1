@@ -851,6 +851,14 @@ Invoke-LoggedCommand -Name "Elevated real Task Manager integration tests" -FileP
         "--logger", "trx;LogFileName=elevated-desktop.trx") `
     -WorkingDirectory $repositoryRoot `
     -LogPath (Join-Path $ResultsDirectory "elevated-desktop-tests.log")
+Invoke-LoggedCommand -Name "Elevated NTFS indexer integration tests" -FilePath "dotnet" `
+    -Arguments @(
+        "test", $integrationProject, "-c", "Release", "--no-restore", "--nologo",
+        "--filter", "Category=ElevatedIndexerIntegration",
+        "--results-directory", $ResultsDirectory,
+        "--logger", "trx;LogFileName=elevated-indexer.trx") `
+    -WorkingDirectory $repositoryRoot `
+    -LogPath (Join-Path $ResultsDirectory "elevated-indexer-tests.log")
 Invoke-LoggedCommand -Name "Elevated packaged-app black-box E2E" -FilePath "dotnet" `
     -Arguments @(
         "test", $integrationProject, "-c", "Release", "--no-restore", "--nologo",
@@ -1057,11 +1065,14 @@ $desktopTestNames = @(Get-PassedTrxTestNames -Paths @((Join-Path $ResultsDirecto
 $desktopTestIdentities = @(Get-PassedTrxTestIdentities -Path (Join-Path $ResultsDirectory "desktop.trx"))
 $elevatedDesktopTestNames = @(Get-PassedTrxTestNames -Paths @((Join-Path $ResultsDirectory "elevated-desktop.trx")))
 $elevatedDesktopTestIdentities = @(Get-PassedTrxTestIdentities -Path (Join-Path $ResultsDirectory "elevated-desktop.trx"))
+$elevatedIndexerTestNames = @(Get-PassedTrxTestNames -Paths @((Join-Path $ResultsDirectory "elevated-indexer.trx")))
+$elevatedIndexerTestIdentities = @(Get-PassedTrxTestIdentities -Path (Join-Path $ResultsDirectory "elevated-indexer.trx"))
 $packagedBlackboxTestNames = @(Get-PassedTrxTestNames -Paths @((Join-Path $ResultsDirectory "packaged-blackbox.trx")))
 $packagedBlackboxTestIdentities = @(Get-PassedTrxTestIdentities -Path (Join-Path $ResultsDirectory "packaged-blackbox.trx"))
 $integrationTestIdentitiesBySuite = @{
     desktop = $desktopTestIdentities
     elevatedDesktop = $elevatedDesktopTestIdentities
+    elevatedIndexer = $elevatedIndexerTestIdentities
     packagedBlackbox = $packagedBlackboxTestIdentities
 }
 $visualTestNames = @(Get-PassedTrxTestNames -Paths @((Join-Path $ResultsDirectory "visual.trx")))
@@ -1447,6 +1458,11 @@ foreach ($feature in $coverage.featureGroups) {
                     [string]::Equals($_.Method, $evidence.testNameContains, [StringComparison]::Ordinal)
                 }).Count -gt 0
             }
+            "elevatedIndexer" {
+                @($elevatedIndexerTestIdentities | Where-Object {
+                    [string]::Equals($_.Method, $evidence.testNameContains, [StringComparison]::Ordinal)
+                }).Count -gt 0
+            }
             "packagedBlackbox" {
                 @($packagedBlackboxTestIdentities | Where-Object {
                     [string]::Equals($_.Method, $evidence.testNameContains, [StringComparison]::Ordinal)
@@ -1601,6 +1617,7 @@ $testCounters = [ordered]@{
     Visual = Get-TrxCounters (Join-Path $ResultsDirectory "visual.trx")
     Desktop = Get-TrxCounters (Join-Path $ResultsDirectory "desktop.trx")
     ElevatedDesktop = Get-TrxCounters (Join-Path $ResultsDirectory "elevated-desktop.trx")
+    ElevatedIndexer = Get-TrxCounters (Join-Path $ResultsDirectory "elevated-indexer.trx")
     PackagedBlackbox = Get-TrxCounters (Join-Path $ResultsDirectory "packaged-blackbox.trx")
 }
 foreach ($suite in $testCounters.GetEnumerator()) {
@@ -1745,6 +1762,7 @@ $report = [pscustomobject]@{
         Visual = $testCounters.Visual
         Desktop = $testCounters.Desktop
         ElevatedDesktop = $testCounters.ElevatedDesktop
+        ElevatedIndexer = $testCounters.ElevatedIndexer
         PackagedBlackbox = $testCounters.PackagedBlackbox
         NativeX64 = "Passed"
         NativeX86 = "Passed"
@@ -1780,6 +1798,7 @@ $markdown = @(
     "- Visual evidence: $($report.ScreenshotFiles.Count) screenshots ($($expectedVisualMatrix.screenshots.Count) product-window states + $($desktopVisualMatrix.artifacts.Count) authoritative desktop states)",
     "- Real desktop tests: $($report.Tests.Desktop.Passed)/$($report.Tests.Desktop.Total)",
     "- Elevated desktop tests: $($report.Tests.ElevatedDesktop.Passed)/$($report.Tests.ElevatedDesktop.Total)",
+    "- Elevated indexer tests: $($report.Tests.ElevatedIndexer.Passed)/$($report.Tests.ElevatedIndexer.Total)",
     "- Packaged black-box tests: $($report.Tests.PackagedBlackbox.Passed)/$($report.Tests.PackagedBlackbox.Total)",
     "- Native hook suites: x64 passed; x86 passed",
     "- Native unload after authenticated shutdown: Explorer passed; Task Manager passed; Firefox passed",

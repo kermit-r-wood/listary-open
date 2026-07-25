@@ -64,6 +64,25 @@ internal static class ElevatedIndexerProcessStartInfoFactory
         return startInfo;
     }
 
+    public static ProcessStartInfo CreateUacWorker(string helperPath, string pipeName)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(helperPath);
+        ArgumentException.ThrowIfNullOrWhiteSpace(pipeName);
+
+        var startInfo = new ProcessStartInfo
+        {
+            FileName = helperPath,
+            UseShellExecute = true,
+            Verb = "runas",
+            CreateNoWindow = true
+        };
+
+        startInfo.ArgumentList.Add("worker");
+        startInfo.ArgumentList.Add("--pipe");
+        startInfo.ArgumentList.Add(pipeName);
+        return startInfo;
+    }
+
     public static ProcessStartInfo CreateUacFile(
         string helperPath,
         string rootPath,

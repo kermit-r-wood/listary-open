@@ -44,6 +44,21 @@ public sealed class ElevatedIndexerProcessStartInfoFactoryTests
     }
 
     [Fact]
+    public void CreateUacWorkerUsesRunAsAndPipeArguments()
+    {
+        var startInfo = ElevatedIndexerProcessStartInfoFactory.CreateUacWorker(
+            "C:\\Tools\\ListaryOpen.Indexer.Elevated.exe",
+            "listary-open-indexer-test");
+
+        Assert.Equal("C:\\Tools\\ListaryOpen.Indexer.Elevated.exe", startInfo.FileName);
+        Assert.True(startInfo.UseShellExecute);
+        Assert.Equal("runas", startInfo.Verb);
+        Assert.Equal(
+            new[] { "worker", "--pipe", "listary-open-indexer-test" },
+            startInfo.ArgumentList);
+    }
+
+    [Fact]
     public void CreateRedirectedJournalStateFileUsesJournalStateCommand()
     {
         var startInfo = ElevatedIndexerProcessStartInfoFactory.CreateRedirectedJournalStateFile(

@@ -110,6 +110,32 @@ public sealed class RecentAndPreviewFeatureTests
     }
 
     [Fact]
+    public void CompactGlobalSearchHeightReservesRoomForImagePreview()
+    {
+        // Without preview, a single hit stays compact.
+        var withoutPreview = SearchPanel.CalculateCompactGlobalSearchOuterHeight(
+            resultCount: 1,
+            filtersVisible: true,
+            previewVisible: false);
+        Assert.True(withoutPreview < 220, $"Expected slim compact height, got {withoutPreview}.");
+
+        // With preview, body must be tall enough for the image surface (not just the file name row).
+        var withPreview = SearchPanel.CalculateCompactGlobalSearchOuterHeight(
+            resultCount: 1,
+            filtersVisible: true,
+            previewVisible: true);
+        Assert.True(withPreview >= 360, $"Expected preview-capable height, got {withPreview}.");
+        Assert.True(withPreview > withoutPreview);
+
+        // Empty query stays short even if the preview column is open.
+        var empty = SearchPanel.CalculateCompactGlobalSearchOuterHeight(
+            resultCount: 0,
+            filtersVisible: true,
+            previewVisible: true);
+        Assert.True(empty < 160, $"Expected empty compact height, got {empty}.");
+    }
+
+    [Fact]
     public async Task SqliteSearchAppliesTypeAndDateFiltersBeforePaging()
     {
         var directory = Directory.CreateTempSubdirectory("ListaryOpenFilter");

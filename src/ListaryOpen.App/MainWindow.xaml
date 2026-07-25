@@ -6,12 +6,18 @@
         AutomationProperties.AutomationId="SettingsWindow"
         Icon="{StaticResource ListaryOpenIcon}"
         Height="650" Width="900" MinHeight="560" MinWidth="760"
-        Background="{DynamicResource Brush.AppBackground}"
+        WindowStyle="None"
+        ResizeMode="CanResize"
+        AllowsTransparency="True"
+        Background="Transparent"
         Foreground="{DynamicResource Brush.TextPrimary}"
         UseLayoutRounding="True"
         SnapsToDevicePixels="True"
         TextOptions.TextFormattingMode="Display"
-        WindowStartupLocation="CenterScreen">
+        WindowStartupLocation="CenterScreen"
+        PreviewMouseLeftButtonDown="MainWindow_PreviewMouseLeftButtonDown"
+        StateChanged="MainWindow_StateChanged"
+        SourceInitialized="MainWindow_SourceInitialized">
     <Window.Resources>
         <BooleanToVisibilityConverter x:Key="BooleanToVisibilityConverter" />
         <converters:SettingsOptionDisplayConverter x:Key="SettingsOptionDisplayConverter" />
@@ -93,9 +99,132 @@
             <Setter Property="Margin" Value="32,28" />
             <Setter Property="HorizontalAlignment" Value="Stretch" />
         </Style>
+        <Style x:Key="SettingsCaptionButtonStyle" TargetType="Button">
+            <Setter Property="Width" Value="46" />
+            <Setter Property="Height" Value="32" />
+            <Setter Property="Background" Value="Transparent" />
+            <Setter Property="BorderThickness" Value="0" />
+            <Setter Property="Foreground" Value="{DynamicResource Brush.TextSecondary}" />
+            <Setter Property="FontFamily" Value="Segoe MDL2 Assets" />
+            <Setter Property="FontSize" Value="10" />
+            <Setter Property="Cursor" Value="Hand" />
+            <Setter Property="Template">
+                <Setter.Value>
+                    <ControlTemplate TargetType="Button">
+                        <Border x:Name="CaptionButtonChrome"
+                                Background="{TemplateBinding Background}"
+                                CornerRadius="6">
+                            <ContentPresenter HorizontalAlignment="Center" VerticalAlignment="Center" />
+                        </Border>
+                        <ControlTemplate.Triggers>
+                            <Trigger Property="IsMouseOver" Value="True">
+                                <Setter TargetName="CaptionButtonChrome" Property="Background" Value="{DynamicResource Brush.SurfaceMuted}" />
+                            </Trigger>
+                            <Trigger Property="IsPressed" Value="True">
+                                <Setter TargetName="CaptionButtonChrome" Property="Background" Value="{DynamicResource Brush.Selection}" />
+                            </Trigger>
+                        </ControlTemplate.Triggers>
+                    </ControlTemplate>
+                </Setter.Value>
+            </Setter>
+        </Style>
+        <Style x:Key="SettingsCloseCaptionButtonStyle" TargetType="Button" BasedOn="{StaticResource SettingsCaptionButtonStyle}">
+            <Setter Property="Template">
+                <Setter.Value>
+                    <ControlTemplate TargetType="Button">
+                        <Border x:Name="CaptionButtonChrome"
+                                Background="{TemplateBinding Background}"
+                                CornerRadius="6">
+                            <ContentPresenter HorizontalAlignment="Center" VerticalAlignment="Center" />
+                        </Border>
+                        <ControlTemplate.Triggers>
+                            <Trigger Property="IsMouseOver" Value="True">
+                                <Setter TargetName="CaptionButtonChrome" Property="Background" Value="#E81123" />
+                                <Setter Property="Foreground" Value="White" />
+                            </Trigger>
+                            <Trigger Property="IsPressed" Value="True">
+                                <Setter TargetName="CaptionButtonChrome" Property="Background" Value="#C50F1F" />
+                                <Setter Property="Foreground" Value="White" />
+                            </Trigger>
+                        </ControlTemplate.Triggers>
+                    </ControlTemplate>
+                </Setter.Value>
+            </Setter>
+        </Style>
     </Window.Resources>
 
-    <Grid x:Name="SettingsContentRoot">
+    <!-- Anti-aliased chrome: WPF CornerRadius (not SetWindowRgn) so Win10 corners stay smooth. -->
+    <Border x:Name="WindowChromeBorder"
+            Margin="10"
+            Background="{DynamicResource Brush.AppBackground}"
+            BorderBrush="{DynamicResource Brush.Border}"
+            BorderThickness="1"
+            CornerRadius="12"
+            SnapsToDevicePixels="False"
+            UseLayoutRounding="False">
+        <Border.Effect>
+            <DropShadowEffect BlurRadius="18"
+                              ShadowDepth="3"
+                              Direction="270"
+                              Opacity="0.22"
+                              Color="#50000000"
+                              RenderingBias="Quality" />
+        </Border.Effect>
+        <Grid>
+            <Grid.RowDefinitions>
+                <RowDefinition Height="40" />
+                <RowDefinition Height="*" />
+            </Grid.RowDefinitions>
+
+            <Border x:Name="SettingsTitleBar"
+                    Grid.Row="0"
+                    Background="{DynamicResource Brush.SurfaceMuted}"
+                    BorderBrush="{DynamicResource Brush.Border}"
+                    BorderThickness="0,0,0,1"
+                    CornerRadius="12,12,0,0"
+                    MouseLeftButtonDown="SettingsTitleBar_MouseLeftButtonDown">
+                <Grid Margin="14,0,6,0">
+                    <Grid.ColumnDefinitions>
+                        <ColumnDefinition Width="Auto" />
+                        <ColumnDefinition Width="*" />
+                        <ColumnDefinition Width="Auto" />
+                    </Grid.ColumnDefinitions>
+                    <StackPanel Orientation="Horizontal" VerticalAlignment="Center">
+                        <Image Source="{StaticResource ListaryOpenIcon}"
+                               Width="16"
+                               Height="16"
+                               Margin="0,0,8,0"
+                               RenderOptions.BitmapScalingMode="HighQuality" />
+                        <TextBlock Text="{Binding RelativeSource={RelativeSource AncestorType=Window}, Path=Title}"
+                                   VerticalAlignment="Center"
+                                   FontSize="13"
+                                   FontWeight="SemiBold"
+                                   Foreground="{DynamicResource Brush.TextPrimary}" />
+                    </StackPanel>
+                    <StackPanel Grid.Column="2" Orientation="Horizontal" VerticalAlignment="Center">
+                        <Button x:Name="MinimizeButton"
+                                Content="&#xE921;"
+                                Style="{StaticResource SettingsCaptionButtonStyle}"
+                                Click="MinimizeButton_Click"
+                                ToolTip="Minimize"
+                                AutomationProperties.AutomationId="SettingsMinimizeButton" />
+                        <Button x:Name="MaximizeButton"
+                                Content="&#xE922;"
+                                Style="{StaticResource SettingsCaptionButtonStyle}"
+                                Click="MaximizeButton_Click"
+                                ToolTip="Maximize"
+                                AutomationProperties.AutomationId="SettingsMaximizeButton" />
+                        <Button x:Name="CloseButton"
+                                Content="&#xE8BB;"
+                                Style="{StaticResource SettingsCloseCaptionButtonStyle}"
+                                Click="CloseButton_Click"
+                                ToolTip="Close"
+                                AutomationProperties.AutomationId="SettingsCloseButton" />
+                    </StackPanel>
+                </Grid>
+            </Border>
+
+            <Grid x:Name="SettingsContentRoot" Grid.Row="1">
         <Grid.ColumnDefinitions>
             <ColumnDefinition Width="180" />
             <ColumnDefinition Width="*" />
@@ -313,5 +442,7 @@
                 </StackPanel></ScrollViewer>
             </TabItem>
         </TabControl>
-    </Grid>
+            </Grid>
+        </Grid>
+    </Border>
 </Window>

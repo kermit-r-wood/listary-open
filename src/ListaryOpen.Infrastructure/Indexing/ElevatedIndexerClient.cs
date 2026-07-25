@@ -76,7 +76,7 @@ public sealed class DisabledElevatedIndexerClient : IElevatedIndexerClient
     }
 }
 
-public sealed class ElevatedIndexerClient : IElevatedIndexerClient
+public sealed class ElevatedIndexerClient : IElevatedIndexerClient, IDisposable
 {
     private static readonly TimeSpan ProcessCleanupTimeout = TimeSpan.FromSeconds(2);
     private const string HelperExecutableName = "ListaryOpen.Indexer.Elevated.exe";
@@ -90,7 +90,11 @@ public sealed class ElevatedIndexerClient : IElevatedIndexerClient
     private readonly Func<bool> _isProcessElevated;
     private readonly Func<bool>? _isUacElevationEnabledOverride;
     private readonly string _indexerTempDirectory;
+    private readonly bool _useStickyUacWorker;
+    private readonly object _uacSessionGate = new();
+    private ElevatedIndexerUacSession? _uacSession;
     private bool _uacElevationEnabled;
+    private bool _disposed;
 
     public ElevatedIndexerClient()
         : this(
@@ -99,7 +103,8 @@ public sealed class ElevatedIndexerClient : IElevatedIndexerClient
             CreateElevatedProcess,
             IsCurrentProcessElevated,
             null,
-            AppDataPaths.CreateDefault().IndexerTempDirectory)
+            AppDataPaths.CreateDefault().IndexerTempDirectory,
+            useStickyUacWorker: true)
     {
     }
 
@@ -110,7 +115,8 @@ public sealed class ElevatedIndexerClient : IElevatedIndexerClient
             CreateElevatedProcess,
             IsCurrentProcessElevated,
             null,
-            AppDataPaths.CreateDefault().IndexerTempDirectory)
+            AppDataPaths.CreateDefault().IndexerTempDirectory,
+            useStickyUacWorker: true)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(helperPath);
     }
@@ -122,7 +128,8 @@ public sealed class ElevatedIndexerClient : IElevatedIndexerClient
             CreateElevatedProcess,
             isProcessElevated,
             null,
-            AppDataPaths.CreateDefault().IndexerTempDirectory)
+            AppDataPaths.CreateDefault().IndexerTempDirectory,
+            useStickyUacWorker: true)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(helperPath);
     }
@@ -136,7 +143,8 @@ public sealed class ElevatedIndexerClient : IElevatedIndexerClient
             CreateElevatedProcess,
             () => true,
             null,
-            AppDataPaths.CreateDefault().IndexerTempDirectory)
+            AppDataPaths.CreateDefault().IndexerTempDirectory,
+            useStickyUacWorker: false)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(helperPath);
     }
@@ -151,7 +159,8 @@ public sealed class ElevatedIndexerClient : IElevatedIndexerClient
             CreateElevatedProcess,
             isProcessElevated,
             null,
-            AppDataPaths.CreateDefault().IndexerTempDirectory)
+            AppDataPaths.CreateDefault().IndexerTempDirectory,
+            useStickyUacWorker: false)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(helperPath);
     }
@@ -169,7 +178,8 @@ public sealed class ElevatedIndexerClient : IElevatedIndexerClient
             WrapFileProcess(createElevatedProcess),
             isProcessElevated,
             isUacElevationEnabled,
-            indexerTempDirectory ?? AppDataPaths.CreateDefault().IndexerTempDirectory)
+            indexerTempDirectory ?? AppDataPaths.CreateDefault().IndexerTempDirectory,
+            useStickyUacWorker: false)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(helperPath);
     }
@@ -180,7 +190,8 @@ public sealed class ElevatedIndexerClient : IElevatedIndexerClient
         Func<HelperFileCommand, string, string, ulong, long, long, string, string, IElevatedIndexerProcess> createElevatedProcess,
         Func<bool> isProcessElevated,
         Func<bool>? isUacElevationEnabled,
-        string indexerTempDirectory)
+        string indexerTempDirectory,
+        bool useStickyUacWorker)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(indexerTempDirectory);
 
@@ -190,6 +201,25 @@ public sealed class ElevatedIndexerClient : IElevatedIndexerClient
         _isProcessElevated = isProcessElevated ?? throw new ArgumentNullException(nameof(isProcessElevated));
         _isUacElevationEnabledOverride = isUacElevationEnabled;
         _indexerTempDirectory = Path.GetFullPath(indexerTempDirectory);
+        _useStickyUacWorker = useStickyUacWorker;
+    }
+
+    public void Dispose()
+    {
+        if (_disposed)
+        {
+            return;
+        }
+
+        _disposed = true;
+        ElevatedIndexerUacSession? session;
+        lock (_uacSessionGate)
+        {
+            session = _uacSession;
+            _uacSession = null;
+        }
+
+        session?.Dispose();
     }
 
     public bool UacElevationEnabled => IsUacElevationEnabled();
@@ -329,6 +359,29 @@ public sealed class ElevatedIndexerClient : IElevatedIndexerClient
 
         try
         {
+            if (launchMode == HelperLaunchMode.UacFile && _useStickyUacWorker)
+            {
+                completionTask = RunViaStickyUacWorkerAsync(
+                    HelperFileCommand.Scan,
+                    helperPath,
+                    rootPath,
+                    expectedUsnJournalId: 0,
+                    startUsn: 0,
+                    endUsn: 0,
+                    outputPath,
+                    errorPath,
+                    cancellationToken);
+
+                await foreach (var record in TailBinaryOutputRecordsAsync(outputPath, completionTask, cancellationToken)
+                                   .ConfigureAwait(false))
+                {
+                    yield return record;
+                }
+
+                await completionTask.ConfigureAwait(false);
+                yield break;
+            }
+
             process = launchMode == HelperLaunchMode.UacFile
                 ? _createElevatedProcess(
                     HelperFileCommand.Scan,
@@ -395,6 +448,22 @@ public sealed class ElevatedIndexerClient : IElevatedIndexerClient
         HelperLaunchMode launchMode,
         CancellationToken cancellationToken)
     {
+        if (launchMode == HelperLaunchMode.UacFile && _useStickyUacWorker)
+        {
+            await RunViaStickyUacWorkerAsync(
+                    command,
+                    helperPath,
+                    rootPath,
+                    expectedUsnJournalId,
+                    startUsn,
+                    endUsn,
+                    outputPath,
+                    errorPath,
+                    cancellationToken)
+                .ConfigureAwait(false);
+            return;
+        }
+
         using var process = launchMode == HelperLaunchMode.UacFile
             ? _createElevatedProcess(command, helperPath, rootPath, expectedUsnJournalId, startUsn, endUsn, outputPath, errorPath)
             : _createFileProcess(command, helperPath, rootPath, expectedUsnJournalId, startUsn, endUsn, outputPath, errorPath);
@@ -411,6 +480,47 @@ public sealed class ElevatedIndexerClient : IElevatedIndexerClient
             await CleanupCanceledProcessAsync(process, stdoutTask: null, stderrTask: null).ConfigureAwait(false);
             throw;
         }
+    }
+
+    private async Task RunViaStickyUacWorkerAsync(
+        HelperFileCommand command,
+        string helperPath,
+        string rootPath,
+        ulong expectedUsnJournalId,
+        long startUsn,
+        long endUsn,
+        string outputPath,
+        string errorPath,
+        CancellationToken cancellationToken)
+    {
+        ObjectDisposedException.ThrowIf(_disposed, this);
+
+        var commandName = command switch
+        {
+            HelperFileCommand.Scan => "scan-to-file",
+            HelperFileCommand.JournalState => "journal-state-to-file",
+            HelperFileCommand.JournalChanges => "read-journal-to-file",
+            _ => throw new NotSupportedException($"Unsupported helper command: {command}.")
+        };
+
+        ElevatedIndexerUacSession session;
+        lock (_uacSessionGate)
+        {
+            ObjectDisposedException.ThrowIf(_disposed, this);
+            _uacSession ??= new ElevatedIndexerUacSession(helperPath);
+            session = _uacSession;
+        }
+
+        await session.RunCommandAsync(
+                commandName,
+                rootPath,
+                outputPath,
+                errorPath,
+                expectedUsnJournalId,
+                startUsn,
+                endUsn,
+                cancellationToken)
+            .ConfigureAwait(false);
     }
 
     private static void StartHelperProcess(
@@ -1389,19 +1499,6 @@ public sealed class ElevatedIndexerClient : IElevatedIndexerClient
             : 0;
     }
 
-    private sealed class ElevatedIndexerException : InvalidOperationException
-    {
-        public ElevatedIndexerException(string message)
-            : base(message)
-        {
-        }
-
-        public ElevatedIndexerException(string message, Exception innerException)
-            : base(message, innerException)
-        {
-        }
-    }
-
     private static void TryKill(IElevatedIndexerProcess process)
     {
         try
@@ -1455,6 +1552,19 @@ public sealed class ElevatedIndexerClient : IElevatedIndexerClient
         {
             _process.Dispose();
         }
+    }
+}
+
+internal sealed class ElevatedIndexerException : InvalidOperationException
+{
+    public ElevatedIndexerException(string message)
+        : base(message)
+    {
+    }
+
+    public ElevatedIndexerException(string message, Exception innerException)
+        : base(message, innerException)
+    {
     }
 }
 

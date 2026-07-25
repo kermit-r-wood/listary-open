@@ -17,6 +17,10 @@ public partial class SearchPanel : Window
 {
     private const double CompactSearchHeight = 52;
     private const double CompactSearchWithFiltersHeight = 106;
+    /// <summary>Minimum body height so the compact preview can show an image, not only the file name.</summary>
+    private const double CompactPreviewMinBodyHeight = 240;
+    private const double CompactResultRowHeight = 62;
+    private const double CompactSearchMaxBodyHeight = 620;
     private readonly IExplorerSelectionService _explorerSelectionService;
     private IntPtr _explorerSearchWindow;
     private string? _explorerSearchFolder;
@@ -362,16 +366,40 @@ public partial class SearchPanel : Window
             return;
         }
 
-        var visibleResultCount = Math.Min(8, ViewModel.Results.Count);
-        var baseHeight = ShouldShowSearchFilters()
-            ? CompactSearchWithFiltersHeight
-            : CompactSearchHeight;
-        var chromeMargin = 20;
-        Height = visibleResultCount == 0
-            ? baseHeight + chromeMargin
-            : Math.Min(620 + chromeMargin, baseHeight + chromeMargin + (visibleResultCount * 62));
+        const double chromeMargin = 20;
+        var previewVisible = PreviewPane.Visibility == Visibility.Visible;
+        Height = CalculateCompactGlobalSearchOuterHeight(
+            ViewModel.Results.Count,
+            ShouldShowSearchFilters(),
+            previewVisible,
+            chromeMargin);
         // Keep the user's dragged placement; only re-clamp so growth stays on-screen.
         PositionCompactGlobalSearch();
+    }
+
+    /// <summary>
+    /// Compact global search used to size height as query+filters+one result row (~168px).
+    /// With the preview column open that crushed the image surface to ~0 height, so PNG/JPG
+    /// previews looked blank. Reserve a minimum body when preview is visible.
+    /// </summary>
+    internal static double CalculateCompactGlobalSearchOuterHeight(
+        int resultCount,
+        bool filtersVisible,
+        bool previewVisible,
+        double chromeMargin = 20)
+    {
+        var baseHeight = filtersVisible ? CompactSearchWithFiltersHeight : CompactSearchHeight;
+        if (resultCount <= 0)
+        {
+            return baseHeight + chromeMargin;
+        }
+
+        var resultsHeight = Math.Min(8, resultCount) * CompactResultRowHeight;
+        var bodyHeight = previewVisible
+            ? Math.Max(resultsHeight, CompactPreviewMinBodyHeight)
+            : resultsHeight;
+        bodyHeight = Math.Min(CompactSearchMaxBodyHeight, bodyHeight);
+        return baseHeight + chromeMargin + bodyHeight;
     }
 
     private void PositionCompactGlobalSearch()

@@ -80,10 +80,73 @@ public partial class MainWindow : Window
         InitializeComponent();
         DataContext = viewModel;
         LocalizationManager.LanguageChanged += LocalizationManager_LanguageChanged;
+        ApplyRoundedChromeForWindowState();
     }
 
     private void LocalizationManager_LanguageChanged(object? sender, EventArgs e) =>
         _viewModel.RefreshLocalization();
+
+    private void MainWindow_SourceInitialized(object? sender, EventArgs e) =>
+        NativeWindowCorner.ClearRoundedChrome(this);
+
+    private void MainWindow_StateChanged(object? sender, EventArgs e) =>
+        ApplyRoundedChromeForWindowState();
+
+    private void MainWindow_PreviewMouseLeftButtonDown(object sender, MouseButtonEventArgs e) =>
+        BorderlessWindowInteraction.TryBeginDrag(this, e);
+
+    private void SettingsTitleBar_MouseLeftButtonDown(object sender, MouseButtonEventArgs e)
+    {
+        if (e.ClickCount == 2)
+        {
+            ToggleMaximized();
+            e.Handled = true;
+            return;
+        }
+
+        BorderlessWindowInteraction.TryBeginDrag(this, e);
+    }
+
+    private void MinimizeButton_Click(object sender, RoutedEventArgs e) =>
+        WindowState = WindowState.Minimized;
+
+    private void MaximizeButton_Click(object sender, RoutedEventArgs e) =>
+        ToggleMaximized();
+
+    private void CloseButton_Click(object sender, RoutedEventArgs e) =>
+        Close();
+
+    private void ToggleMaximized() =>
+        WindowState = WindowState == WindowState.Maximized
+            ? WindowState.Normal
+            : WindowState.Maximized;
+
+    private void ApplyRoundedChromeForWindowState()
+    {
+        if (WindowChromeBorder is null || MaximizeButton is null || SettingsTitleBar is null)
+        {
+            return;
+        }
+
+        if (WindowState == WindowState.Maximized)
+        {
+            WindowChromeBorder.Margin = new Thickness(0);
+            WindowChromeBorder.CornerRadius = new CornerRadius(0);
+            SettingsTitleBar.CornerRadius = new CornerRadius(0);
+            MaximizeButton.Content = "\uE923"; // ChromeRestore
+            MaximizeButton.ToolTip = "Restore";
+        }
+        else
+        {
+            WindowChromeBorder.Margin = new Thickness(10);
+            WindowChromeBorder.CornerRadius = new CornerRadius(12);
+            SettingsTitleBar.CornerRadius = new CornerRadius(12, 12, 0, 0);
+            MaximizeButton.Content = "\uE922"; // ChromeMaximize
+            MaximizeButton.ToolTip = "Maximize";
+        }
+
+        NativeWindowCorner.ClearRoundedChrome(this);
+    }
 
     protected override void OnClosed(EventArgs e)
     {

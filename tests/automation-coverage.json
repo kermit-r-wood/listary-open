@@ -37,7 +37,10 @@
       "evidence": [
         { "suite": "dotnet", "testNameContains": "DefaultAppManifestRequestsAdministratorOnceAtStartup" },
         { "suite": "dotnet", "testNameContains": "EnableNtfsFastIndexingOnStartupEnablesClientWithoutRequestingImmediateReindex" },
-        { "suite": "dotnet", "testNameContains": "EnableNtfsFastIndexingOnStartupDoesNotEnableUacWhenProcessIsNotElevated" }
+        { "suite": "dotnet", "testNameContains": "EnableNtfsFastIndexingOnStartupDoesNotEnableUacWhenProcessIsNotElevated" },
+        { "suite": "dotnet", "testNameContains": "EnableSkipsRunAsWhenParentProcessIsAlreadyElevated" },
+        { "suite": "dotnet", "testNameContains": "CreateUacWorkerIsSingleElevationEntryPointForIndexerSession" },
+        { "suite": "dotnet", "testNameContains": "StickyUacSessionStartsWorkerOnlyOnceForMultipleCommands" }
       ]
     },
     {
@@ -47,7 +50,18 @@
         { "suite": "dotnet", "testNameContains": "SelectProviderPrefersNtfsForReadyNtfsVolume" },
         { "suite": "dotnet", "testNameContains": "ScanAsyncReturnsFilesAndFolders" },
         { "suite": "dotnet", "testNameContains": "CreateAndDeleteHintsUpdateSearchIndex" },
-        { "suite": "dotnet", "testNameContains": "ApplyUsnJournalChangesDeletesUpsertsAndSavesCheckpointAtomically" }
+        { "suite": "dotnet", "testNameContains": "ApplyUsnJournalChangesDeletesUpsertsAndSavesCheckpointAtomically" },
+        { "suite": "dotnet", "testNameContains": "CreateFileRecordsSkipsUnreadableMetadataEvenInStrictMode" }
+      ]
+    },
+    {
+      "id": "indexing-elevated-real-helper",
+      "requirement": "On an already-elevated runner the packaged NTFS helper journals and streams scan records without Consent UI automation and without aborting on protected system files.",
+      "evidence": [
+        { "suite": "elevatedIndexer", "testNameContains": "ElevatedHelperQueriesJournalStateForSystemVolume" },
+        { "suite": "elevatedIndexer", "testNameContains": "ElevatedHelperScansWithoutAbortingOnProtectedSystemFiles" },
+        { "suite": "elevatedIndexer", "testNameContains": "ElevatedClientRunsJournalAndScanInRedirectedModeWithoutUacWorker" },
+        { "suite": "elevatedIndexer", "testNameContains": "ElevatedHelperProcessWritesJournalStateFileWithExitCodeZero" }
       ]
     },
     {

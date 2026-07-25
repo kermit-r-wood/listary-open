@@ -100,13 +100,12 @@ internal static class NtfsUsnRecordProjector
                 continue;
             }
 
+            // Even in "strict" mode, skip inaccessible/in-use paths instead of aborting the
+            // whole volume scan. Files such as WMI ETW realtime logs under
+            // %SystemRoot%\System32\LogFiles\WMI\RtBackup are routinely unreadable even when
+            // the helper is elevated; failing the scan forces a slow directory fallback.
             if (!metadataReader.TryRead(fullPath, entry.IsDirectory, cancellationToken, out var metadata))
             {
-                if (failOnSkippedRecords)
-                {
-                    throw new IOException($"NTFS record metadata could not be read for {fullPath}.");
-                }
-
                 continue;
             }
 

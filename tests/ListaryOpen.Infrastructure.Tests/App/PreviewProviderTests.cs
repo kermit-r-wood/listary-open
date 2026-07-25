@@ -121,6 +121,34 @@ public sealed class PreviewProviderTests
     }
 
     [Fact]
+    public async Task RasterImageProviderLoadsPngAsImageContent()
+    {
+        var directory = Directory.CreateTempSubdirectory("ListaryOpenImagePreview");
+        try
+        {
+            var path = Path.Combine(directory.FullName, "sample.png");
+            // 1x1 PNG
+            await File.WriteAllBytesAsync(
+                path,
+                Convert.FromBase64String(
+                    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg=="));
+
+            var preview = await new RasterImagePreviewProvider()
+                .LoadAsync(Context(path), CancellationToken.None);
+
+            Assert.NotNull(preview);
+            Assert.Equal(PreviewContentKind.Image, preview!.Kind);
+            Assert.NotNull(preview.Image);
+            Assert.True(preview.Image!.PixelWidth >= 1);
+            Assert.True(preview.Image.PixelHeight >= 1);
+        }
+        finally
+        {
+            directory.Delete(recursive: true);
+        }
+    }
+
+    [Fact]
     public async Task CoordinatorCachesCompletedPreviewResults()
     {
         using var temporary = new TemporaryFile("cache.test");

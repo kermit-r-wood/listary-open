@@ -68,6 +68,23 @@ public sealed class SettingsXamlTests
         Assert.Contains("HasReleaseUrl", xaml);
     }
 
+    [Fact]
+    public void SettingsWindowUsesWpfAntiAliasedRoundedChrome()
+    {
+        var xaml = File.ReadAllText(GetRepositoryPath("src", "ListaryOpen.App", "MainWindow.xaml"));
+        var code = File.ReadAllText(GetRepositoryPath("src", "ListaryOpen.App", "MainWindow.xaml.cs"));
+
+        // Per-pixel alpha + Border.CornerRadius (not SetWindowRgn) keeps Win10 corners smooth.
+        Assert.Contains("WindowStyle=\"None\"", xaml, StringComparison.Ordinal);
+        Assert.Contains("AllowsTransparency=\"True\"", xaml, StringComparison.Ordinal);
+        Assert.Contains("Background=\"Transparent\"", xaml, StringComparison.Ordinal);
+        Assert.Contains("x:Name=\"WindowChromeBorder\"", xaml, StringComparison.Ordinal);
+        Assert.Contains("CornerRadius=\"12\"", xaml, StringComparison.Ordinal);
+        Assert.Contains("x:Name=\"SettingsTitleBar\"", xaml, StringComparison.Ordinal);
+        Assert.Contains("NativeWindowCorner.ClearRoundedChrome", code, StringComparison.Ordinal);
+        Assert.DoesNotContain("NativeWindowCorner.ApplyRounded", code, StringComparison.Ordinal);
+    }
+
     private static string GetRepositoryPath(params string[] segments)
     {
         return Path.GetFullPath(Path.Combine(

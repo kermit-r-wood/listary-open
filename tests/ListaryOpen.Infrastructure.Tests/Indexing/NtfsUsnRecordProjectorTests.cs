@@ -291,25 +291,28 @@ public sealed class NtfsUsnRecordProjectorTests
     }
 
     [Fact]
-    public void CreateFileRecordsThrowsInStrictModeWhenMetadataCannotBeRead()
+    public void CreateFileRecordsSkipsUnreadableMetadataEvenInStrictMode()
     {
         var metadata = new StubMetadataReader();
         metadata.Add("C:\\Docs", isDirectory: true, sizeBytes: 0, Timestamp);
+        // Missing.txt is deliberately absent from the stub reader.
 
-        Assert.Throws<IOException>(() =>
-            NtfsUsnRecordProjector
-                .CreateFileRecords(
-                    "C:\\",
-                    "C:\\Docs",
-                    [
-                        new NtfsUsnEntry(5, 5, ".", IsDirectory: true),
-                        new NtfsUsnEntry(10, 5, "Docs", IsDirectory: true),
-                        new NtfsUsnEntry(11, 10, "Missing.txt", IsDirectory: false)
-                    ],
-                    metadata,
-                    CancellationToken.None,
-                    failOnSkippedRecords: true)
-                .ToList());
+        var records = NtfsUsnRecordProjector
+            .CreateFileRecords(
+                "C:\\",
+                "C:\\Docs",
+                [
+                    new NtfsUsnEntry(5, 5, ".", IsDirectory: true),
+                    new NtfsUsnEntry(10, 5, "Docs", IsDirectory: true),
+                    new NtfsUsnEntry(11, 10, "Missing.txt", IsDirectory: false)
+                ],
+                metadata,
+                CancellationToken.None,
+                failOnSkippedRecords: true)
+            .ToList();
+
+        var record = Assert.Single(records);
+        Assert.Equal("C:\\Docs", record.FullPath);
     }
 
     [Fact]
