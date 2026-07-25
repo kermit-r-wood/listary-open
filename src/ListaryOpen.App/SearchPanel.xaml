@@ -11,12 +11,15 @@
         MinWidth="760"
         MinHeight="420"
         WindowStartupLocation="CenterScreen"
+        WindowStyle="None"
+        ResizeMode="CanResize"
+        AllowsTransparency="True"
         Topmost="True"
         UseLayoutRounding="True"
         SnapsToDevicePixels="True"
         TextOptions.TextFormattingMode="Display"
         PreviewMouseLeftButtonDown="SearchPanel_PreviewMouseLeftButtonDown"
-        Background="{DynamicResource Brush.AppBackground}">
+        Background="Transparent">
     <Window.Resources>
         <converters:SearchMatchReasonDisplayConverter x:Key="SearchMatchReasonDisplayConverter" />
         <converters:ShortcutIndexConverter x:Key="ShortcutIndexConverter" />
@@ -27,7 +30,25 @@
         <converters:SettingsOptionDisplayConverter x:Key="SettingsOptionDisplayConverter" />
     </Window.Resources>
 
-    <Grid x:Name="SearchPanelRoot" Margin="18">
+    <!-- Anti-aliased chrome: WPF CornerRadius (not SetWindowRgn) so Win10 corners stay smooth.
+         Keep SnapsToDevicePixels off on this border — pixel snapping hardens the curve into jaggies. -->
+    <Border x:Name="WindowChromeBorder"
+            Margin="10"
+            Background="{DynamicResource Brush.AppBackground}"
+            BorderBrush="{DynamicResource Brush.Border}"
+            BorderThickness="1"
+            CornerRadius="12"
+            SnapsToDevicePixels="False"
+            UseLayoutRounding="False">
+        <Border.Effect>
+            <DropShadowEffect BlurRadius="18"
+                              ShadowDepth="3"
+                              Direction="270"
+                              Opacity="0.22"
+                              Color="#50000000"
+                              RenderingBias="Quality" />
+        </Border.Effect>
+        <Grid x:Name="SearchPanelRoot" Margin="18">
         <Grid.RowDefinitions>
             <RowDefinition x:Name="ModeHeaderRow" Height="Auto" />
             <RowDefinition Height="Auto" />
@@ -265,5 +286,6 @@
                    Visibility="{Binding IsQuickSwitchBarCollapsed, Converter={StaticResource InverseBooleanToVisibilityConverter}}"
                    Style="{StaticResource SearchStatusTextStyle}"
                    Text="{Binding StatusText}" />
-    </Grid>
+        </Grid>
+    </Border>
 </Window>

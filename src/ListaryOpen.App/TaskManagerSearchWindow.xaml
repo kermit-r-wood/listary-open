@@ -9,8 +9,10 @@
         ShowInTaskbar="False" Topmost="True"
         UseLayoutRounding="True" SnapsToDevicePixels="True"
         TextOptions.TextFormattingMode="Display"
+        PreviewMouseLeftButtonDown="TaskManagerSearchWindow_PreviewMouseLeftButtonDown"
         Background="{DynamicResource Brush.AppBackground}">
-    <Border Margin="1" Padding="14" CornerRadius="9"
+    <Border x:Name="TaskManagerChrome"
+            Margin="1" Padding="14" CornerRadius="9"
             Background="{DynamicResource Brush.Surface}"
             BorderBrush="{DynamicResource Brush.Border}" BorderThickness="1">
         <Grid>

@@ -26,6 +26,10 @@ public partial class SearchPanel : Window
     private bool _searchFiltersAllowed;
     private int _resultLayoutUpdateVersion;
     private bool _resultContextMenuOpen;
+    /// <summary>Last user-placed (or last applied) position for compact global search, in WPF DIPs.</summary>
+    private Point? _compactGlobalSearchPosition;
+    /// <summary>Ignore hide-on-deactivate while the panel is still being shown/focused.</summary>
+    private long _suppressDeactivateDismissUntilTick;
 
     public SearchPanel()
         : this(new SearchPanelViewModel(new EmptySearchIndex()))
@@ -276,6 +280,7 @@ public partial class SearchPanel : Window
         Topmost = true;
         ShowInTaskbar = true;
         ConfigurePresentation(compactQuickSwitch, collapsedBar: false);
+        SuppressDeactivateDismiss();
         ShowActivated = true;
         Show();
         if (anchorWindow != IntPtr.Zero)
@@ -287,7 +292,6 @@ public partial class SearchPanel : Window
             PositionAtWorkAreaCenter();
         }
 
-        ApplyBorderlessWindowChrome();
         Activate();
         QueryBox.Focus();
     }
@@ -299,16 +303,16 @@ public partial class SearchPanel : Window
         ResetExpandedSearchChrome();
         Topmost = true;
         ShowInTaskbar = false;
-        WindowStyle = WindowStyle.None;
         ResizeMode = ResizeMode.NoResize;
         MinWidth = 520;
         MinHeight = 280;
-        Width = 560;
-        Height = 360;
+        // Shadow margin around the chrome border.
+        Width = 560 + 20;
+        Height = 360 + 20;
+        SuppressDeactivateDismiss();
         ShowActivated = true;
         Show();
         PositionAtWindowBottomRight(explorerWindow);
-        ApplyBorderlessWindowChrome();
         Activate();
         FocusQueryAtEnd();
     }
@@ -319,25 +323,37 @@ public partial class SearchPanel : Window
         ConfigureSearchFilters(visible: true);
         Topmost = true;
         ShowInTaskbar = false;
-        WindowStyle = WindowStyle.None;
         ResizeMode = ResizeMode.NoResize;
         MinWidth = 0;
         MinHeight = 0;
         var workArea = SystemParameters.WorkArea;
-        Width = Math.Min(1080, Math.Max(720, workArea.Width - 48));
-        Height = ShouldShowSearchFilters() ? CompactSearchWithFiltersHeight : CompactSearchHeight;
+        // Outer window is transparent; chrome border + shadow need a small margin.
+        var chromeMargin = 20;
+        Width = Math.Min(1080, Math.Max(720, workArea.Width - 48)) + chromeMargin;
+        Height = (ShouldShowSearchFilters() ? CompactSearchWithFiltersHeight : CompactSearchHeight) + chromeMargin;
         SearchPanelRoot.Margin = new Thickness(0);
-        SetResourceReference(BackgroundProperty, "Brush.Surface");
+        WindowChromeBorder.Margin = new Thickness(10);
+        WindowChromeBorder.CornerRadius = new CornerRadius(12);
+        WindowChromeBorder.BorderThickness = new Thickness(1);
+        WindowChromeBorder.SetResourceReference(Border.BackgroundProperty, "Brush.Surface");
+        WindowChromeBorder.SetResourceReference(Border.BorderBrushProperty, "Brush.Border");
         QueryRow.Margin = new Thickness(0);
         ModeHeaderRow.Height = new GridLength(0);
         StatusRow.Height = new GridLength(0);
+        // Avoid double chrome: input bar sits flush inside the outer rounded surface.
+        SearchInputChrome.CornerRadius = new CornerRadius(12);
+        SearchInputChrome.BorderThickness = new Thickness(0);
+        SearchInputChrome.Effect = null;
+        SuppressDeactivateDismiss();
         ShowActivated = true;
         Show();
         PositionCompactGlobalSearch();
-        ApplyBorderlessWindowChrome();
         Activate();
         FocusQueryAtEnd();
     }
+
+    private void SuppressDeactivateDismiss(int milliseconds = 500) =>
+        _suppressDeactivateDismissUntilTick = Environment.TickCount64 + milliseconds;
 
     private void UpdateCompactGlobalSearchSize()
     {
@@ -350,17 +366,39 @@ public partial class SearchPanel : Window
         var baseHeight = ShouldShowSearchFilters()
             ? CompactSearchWithFiltersHeight
             : CompactSearchHeight;
+        var chromeMargin = 20;
         Height = visibleResultCount == 0
-            ? baseHeight
-            : Math.Min(620, baseHeight + (visibleResultCount * 62));
+            ? baseHeight + chromeMargin
+            : Math.Min(620 + chromeMargin, baseHeight + chromeMargin + (visibleResultCount * 62));
+        // Keep the user's dragged placement; only re-clamp so growth stays on-screen.
         PositionCompactGlobalSearch();
     }
 
     private void PositionCompactGlobalSearch()
     {
         var workArea = SystemParameters.WorkArea;
-        Left = workArea.Left + Math.Max(0, (workArea.Width - Width) / 2);
-        Top = workArea.Top + Math.Max(24, workArea.Height * 0.1);
+        var position = CalculateCompactGlobalSearchPosition(
+            Width,
+            Height,
+            workArea.Left,
+            workArea.Top,
+            workArea.Right,
+            workArea.Bottom,
+            _compactGlobalSearchPosition);
+        Left = position.X;
+        Top = position.Y;
+        // Persist the applied (possibly clamped) placement for the next open.
+        _compactGlobalSearchPosition = position;
+    }
+
+    private void RememberCompactGlobalSearchPosition()
+    {
+        if (!_isCompactGlobalSearch)
+        {
+            return;
+        }
+
+        _compactGlobalSearchPosition = new Point(Left, Top);
     }
 
     private void FocusQueryAtEnd()
@@ -375,19 +413,27 @@ public partial class SearchPanel : Window
         ConfigurePreviewPane(visible: !compactQuickSwitch && !ViewModel.IsFolderSelectionMode);
         ConfigureSearchFilters(visible: !compactQuickSwitch && !ViewModel.IsFolderSelectionMode);
         ResetExpandedSearchChrome();
-        WindowStyle = compactQuickSwitch ? WindowStyle.None : WindowStyle.SingleBorderWindow;
+        // Always borderless + transparent so CornerRadius stays anti-aliased on Win10.
         ResizeMode = compactQuickSwitch ? ResizeMode.NoResize : ResizeMode.CanResize;
-        MinWidth = compactQuickSwitch ? 510 : ViewModel.IsFolderSelectionMode ? 620 : 760;
+        var chromeMargin = 20;
+        MinWidth = (compactQuickSwitch ? 510 : ViewModel.IsFolderSelectionMode ? 620 : 760) + chromeMargin;
         var quickSwitchHeight = ViewModel.Results.Count > 0 ? 330 : 140;
-        MinHeight = compactQuickSwitch ? (collapsedBar ? 88 : 120) : 360;
-        Width = compactQuickSwitch ? 510 : ViewModel.IsFolderSelectionMode ? 760 : 1080;
-        Height = compactQuickSwitch ? (collapsedBar ? 88 : quickSwitchHeight) : 560;
+        MinHeight = (compactQuickSwitch ? (collapsedBar ? 88 : 120) : 360) + chromeMargin;
+        Width = (compactQuickSwitch ? 510 : ViewModel.IsFolderSelectionMode ? 760 : 1080) + chromeMargin;
+        Height = (compactQuickSwitch ? (collapsedBar ? 88 : quickSwitchHeight) : 560) + chromeMargin;
     }
 
     private void ResetExpandedSearchChrome()
     {
         SearchPanelRoot.Margin = new Thickness(18);
-        SetResourceReference(BackgroundProperty, "Brush.AppBackground");
+        WindowChromeBorder.Margin = new Thickness(10);
+        WindowChromeBorder.CornerRadius = new CornerRadius(12);
+        WindowChromeBorder.BorderThickness = new Thickness(1);
+        WindowChromeBorder.SetResourceReference(Border.BackgroundProperty, "Brush.AppBackground");
+        WindowChromeBorder.SetResourceReference(Border.BorderBrushProperty, "Brush.Border");
+        SearchInputChrome.ClearValue(Border.CornerRadiusProperty);
+        SearchInputChrome.ClearValue(Border.BorderThicknessProperty);
+        SearchInputChrome.ClearValue(UIElement.EffectProperty);
         QueryRow.Margin = new Thickness(0, 0, 0, 14);
         ModeHeaderRow.Height = GridLength.Auto;
         StatusRow.Height = GridLength.Auto;
@@ -396,27 +442,8 @@ public partial class SearchPanel : Window
     protected override void OnSourceInitialized(EventArgs e)
     {
         base.OnSourceInitialized(e);
-        ApplyBorderlessWindowChrome();
-    }
-
-    protected override void OnRenderSizeChanged(SizeChangedInfo sizeInfo)
-    {
-        base.OnRenderSizeChanged(sizeInfo);
-        if (IsVisible && WindowStyle == WindowStyle.None)
-        {
-            ApplyBorderlessWindowChrome();
-        }
-    }
-
-    private void ApplyBorderlessWindowChrome()
-    {
-        if (WindowStyle != WindowStyle.None)
-        {
-            NativeWindowCorner.ApplyRounded(this, radiusDip: 0);
-            return;
-        }
-
-        NativeWindowCorner.ApplyRounded(this, NativeWindowCorner.DefaultRadiusDip);
+        // Transparent WPF chrome is anti-aliased; clear any legacy hard window region.
+        NativeWindowCorner.ClearRoundedChrome(this);
     }
 
     private void QueueResultsLayoutUpdate()
@@ -635,6 +662,37 @@ public partial class SearchPanel : Window
             Math.Clamp(workAreaTop + (workAreaBottom - workAreaTop - panelHeight) / 2, workAreaTop, maximumTop));
     }
 
+    /// <summary>
+    /// Compact global search: restore a remembered placement when present, otherwise center
+    /// in the work area (both axes). Always clamps so the panel stays on-screen.
+    /// </summary>
+    internal static Point CalculateCompactGlobalSearchPosition(
+        double panelWidth,
+        double panelHeight,
+        double workAreaLeft,
+        double workAreaTop,
+        double workAreaRight,
+        double workAreaBottom,
+        Point? rememberedPosition)
+    {
+        if (rememberedPosition is { } remembered)
+        {
+            var maximumLeft = Math.Max(workAreaLeft, workAreaRight - panelWidth);
+            var maximumTop = Math.Max(workAreaTop, workAreaBottom - panelHeight);
+            return new Point(
+                Math.Clamp(remembered.X, workAreaLeft, maximumLeft),
+                Math.Clamp(remembered.Y, workAreaTop, maximumTop));
+        }
+
+        return CalculateCenteredPosition(
+            panelWidth,
+            panelHeight,
+            workAreaLeft,
+            workAreaTop,
+            workAreaRight,
+            workAreaBottom);
+    }
+
     internal static double CalculateCenteredLeft(
         double anchorLeft,
         double anchorWidth,
@@ -695,6 +753,25 @@ public partial class SearchPanel : Window
     protected override void OnDeactivated(EventArgs e)
     {
         base.OnDeactivated(e);
+        if (Environment.TickCount64 < _suppressDeactivateDismissUntilTick)
+        {
+            if (IsVisible)
+            {
+                Topmost = true;
+                Activate();
+                if (ViewModel.IsExplorerTypeSearchMode || _isCompactGlobalSearch)
+                {
+                    FocusQueryAtEnd();
+                }
+                else
+                {
+                    QueryBox.Focus();
+                }
+            }
+
+            return;
+        }
+
         if (!ViewModel.IsExplorerTypeSearchMode &&
             _explorerSearchWindow == IntPtr.Zero &&
             !_resultContextMenuOpen)
@@ -702,6 +779,11 @@ public partial class SearchPanel : Window
             Topmost = false;
             Dispatcher.BeginInvoke(new Action(() =>
             {
+                if (Environment.TickCount64 < _suppressDeactivateDismissUntilTick)
+                {
+                    return;
+                }
+
                 if (IsVisible && !IsActive && !ViewModel.IsExplorerTypeSearchMode)
                 {
                     Hide();
@@ -717,6 +799,11 @@ public partial class SearchPanel : Window
 
         Dispatcher.BeginInvoke(new Action(() =>
         {
+            if (Environment.TickCount64 < _suppressDeactivateDismissUntilTick)
+            {
+                return;
+            }
+
             var overlayWindow = new System.Windows.Interop.WindowInteropHelper(this).Handle;
             if (ShouldDismissExplorerSearchAfterDeactivation(
                     IsVisible,
@@ -881,51 +968,11 @@ public partial class SearchPanel : Window
     private void SearchPanel_PreviewMouseLeftButtonDown(object sender, MouseButtonEventArgs e)
     {
         CloseResultContextMenu();
-        if (!ShouldBeginWindowDrag(e))
+        if (BorderlessWindowInteraction.TryBeginDrag(this, e))
         {
-            return;
-        }
-
-        try
-        {
-            DragMove();
-        }
-        catch (InvalidOperationException)
-        {
-            // Window may not be ready to drag (e.g. during close).
+            RememberCompactGlobalSearchPosition();
         }
     }
-
-    internal static bool ShouldBeginWindowDrag(MouseButtonEventArgs e)
-    {
-        ArgumentNullException.ThrowIfNull(e);
-        if (e.ChangedButton != MouseButton.Left || e.LeftButton != MouseButtonState.Pressed)
-        {
-            return false;
-        }
-
-        return !IsDragBlockedSource(e.OriginalSource as DependencyObject);
-    }
-
-    internal static bool IsDragBlockedSource(DependencyObject? source)
-    {
-        for (var current = source; current is not null; current = GetParent(current))
-        {
-            if (current is TextBoxBase or PasswordBox or ButtonBase or ComboBox or ListBoxItem
-                or Selector or ScrollBar or Thumb or MenuBase or MenuItem or Slider
-                or DataGrid or Calendar or DatePicker)
-            {
-                return true;
-            }
-        }
-
-        return false;
-    }
-
-    private static DependencyObject? GetParent(DependencyObject current) =>
-        current is Visual or System.Windows.Media.Media3D.Visual3D
-            ? VisualTreeHelper.GetParent(current)
-            : LogicalTreeHelper.GetParent(current);
 
     private void ResultsList_PreviewMouseRightButtonDown(object sender, MouseButtonEventArgs e)
     {

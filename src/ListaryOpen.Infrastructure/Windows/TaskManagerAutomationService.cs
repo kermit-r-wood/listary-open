@@ -86,16 +86,11 @@ public sealed class TaskManagerAutomationService : ITaskManagerAutomationService
                 return false;
             }
 
+            // Only treat real text entry as native search. Matching names/automation ids
+            // that merely contain "search" false-positives on Task Manager chrome and
+            // prevents our overlay from opening when focus is on the process list.
             var controlType = focused.Current.ControlType;
-            if (controlType == ControlType.Edit || controlType == ControlType.Document)
-            {
-                return true;
-            }
-
-            var automationId = focused.Current.AutomationId ?? string.Empty;
-            var name = focused.Current.Name ?? string.Empty;
-            return automationId.Contains("search", StringComparison.OrdinalIgnoreCase)
-                || name.Contains("search", StringComparison.OrdinalIgnoreCase);
+            return controlType == ControlType.Edit || controlType == ControlType.Document;
         }
         catch (Exception exception) when (IsExpectedAutomationException(exception))
         {

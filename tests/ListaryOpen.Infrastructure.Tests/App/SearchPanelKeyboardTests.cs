@@ -6,25 +6,35 @@ namespace ListaryOpen.Infrastructure.Tests.App;
 public sealed class SearchPanelKeyboardTests
 {
     [Fact]
-    public void QuickSwitchStaysExpandedWhenItsAttachedDialogRetainsForegroundFocus()
+    public void QuickSwitchStaysExpandedWhenDialogOrBarRetainsForegroundFocus()
     {
         var dialogWindow = new IntPtr(123);
+        var barWindow = new IntPtr(789);
 
         Assert.True(QuickSwitchBarWindow.ShouldKeepDialogSearchExpandedAfterDeactivation(
             isAttached: true,
             isExpanded: true,
             foregroundWindow: dialogWindow,
-            anchorWindow: dialogWindow));
+            anchorWindow: dialogWindow,
+            quickSwitchWindow: barWindow));
+        Assert.True(QuickSwitchBarWindow.ShouldKeepDialogSearchExpandedAfterDeactivation(
+            isAttached: true,
+            isExpanded: true,
+            foregroundWindow: barWindow,
+            anchorWindow: dialogWindow,
+            quickSwitchWindow: barWindow));
         Assert.False(QuickSwitchBarWindow.ShouldKeepDialogSearchExpandedAfterDeactivation(
             isAttached: true,
             isExpanded: true,
             foregroundWindow: new IntPtr(456),
-            anchorWindow: dialogWindow));
+            anchorWindow: dialogWindow,
+            quickSwitchWindow: barWindow));
         Assert.False(QuickSwitchBarWindow.ShouldKeepDialogSearchExpandedAfterDeactivation(
             isAttached: true,
             isExpanded: false,
             foregroundWindow: dialogWindow,
-            anchorWindow: dialogWindow));
+            anchorWindow: dialogWindow,
+            quickSwitchWindow: barWindow));
     }
 
     [Fact]
@@ -204,5 +214,53 @@ public sealed class SearchPanelKeyboardTests
     public void PointerHitTestUsesExclusiveRightAndBottomEdges(int x, int y, bool expected)
     {
         Assert.Equal(expected, SearchPanel.IsPointInsideBounds(x, y, 100, 100, 300, 250));
+    }
+
+    [Fact]
+    public void CompactGlobalSearchDefaultsToWorkAreaCenterWhenNoRememberedPosition()
+    {
+        var position = SearchPanel.CalculateCompactGlobalSearchPosition(
+            panelWidth: 800,
+            panelHeight: 72,
+            workAreaLeft: 0,
+            workAreaTop: 0,
+            workAreaRight: 1920,
+            workAreaBottom: 1080,
+            rememberedPosition: null);
+
+        Assert.Equal(560, position.X);
+        Assert.Equal(504, position.Y);
+    }
+
+    [Fact]
+    public void CompactGlobalSearchRestoresRememberedPositionWhenOnScreen()
+    {
+        var position = SearchPanel.CalculateCompactGlobalSearchPosition(
+            panelWidth: 800,
+            panelHeight: 72,
+            workAreaLeft: 0,
+            workAreaTop: 0,
+            workAreaRight: 1920,
+            workAreaBottom: 1080,
+            rememberedPosition: new System.Windows.Point(120, 240));
+
+        Assert.Equal(120, position.X);
+        Assert.Equal(240, position.Y);
+    }
+
+    [Fact]
+    public void CompactGlobalSearchClampsRememberedPositionToWorkArea()
+    {
+        var position = SearchPanel.CalculateCompactGlobalSearchPosition(
+            panelWidth: 800,
+            panelHeight: 200,
+            workAreaLeft: 0,
+            workAreaTop: 0,
+            workAreaRight: 1920,
+            workAreaBottom: 1080,
+            rememberedPosition: new System.Windows.Point(3000, 2000));
+
+        Assert.Equal(1120, position.X);
+        Assert.Equal(880, position.Y);
     }
 }

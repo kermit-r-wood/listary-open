@@ -104,8 +104,8 @@ public sealed class ExplorerTypeSearchTests
     [Theory]
     [InlineData(GlobalTextInputHost.Dialog, true)]
     [InlineData(GlobalTextInputHost.Explorer, false)]
-    [InlineData(GlobalTextInputHost.TaskManager, false)]
-    public void DialogTextIsConsumedBeforeItCanModifyTheNativeFilePicker(
+    [InlineData(GlobalTextInputHost.TaskManager, true)]
+    public void DialogAndTaskManagerConsumeTextBeforeNativeUiCanStealFocus(
         GlobalTextInputHost host,
         bool expected)
     {
@@ -237,12 +237,28 @@ public sealed class ExplorerTypeSearchTests
     }
 
     [Fact]
-    public void BackgroundOrDifferentExplorerWindowDoesNotTriggerSearch()
+    public void CapturedExplorerWindowHandleTriggersSearchEvenIfSnapshotForegroundMoved()
     {
+        // Key was captured for window 42; by the time the snapshot is read another
+        // Explorer may be marked foreground. Still open search for the typed window.
         var input = new GlobalTextInputEventArgs("r", new IntPtr(42), "DirectUIHWND");
         var provider = new FixedWindowProvider(
             new QuickSwitchFolderCandidate("C:\\Projects", "Explorer", new IntPtr(41), true),
             new QuickSwitchFolderCandidate("C:\\Docs", "Explorer", new IntPtr(42), false));
+
+        var request = WpfApp.TryCreateExplorerTypeSearchRequest(input, provider);
+
+        Assert.NotNull(request);
+        Assert.Equal("C:\\Docs", request!.CurrentFolder);
+        Assert.Equal(new IntPtr(42), request.ExplorerWindow);
+    }
+
+    [Fact]
+    public void UnrelatedExplorerWindowDoesNotTriggerSearch()
+    {
+        var input = new GlobalTextInputEventArgs("r", new IntPtr(42), "DirectUIHWND");
+        var provider = new FixedWindowProvider(
+            new QuickSwitchFolderCandidate("C:\\Projects", "Explorer", new IntPtr(41), true));
 
         Assert.Null(WpfApp.TryCreateExplorerTypeSearchRequest(input, provider));
     }

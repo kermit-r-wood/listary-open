@@ -24,6 +24,7 @@ public partial class QuickSwitchBarWindow : Window
     private double _lastAnchorDpiScale;
     private bool _hasCachedPosition;
     private bool _repositionInvalidated = true;
+    private long _suppressCollapseUntilTick;
 
     internal event EventHandler? AttachmentChanged;
 
@@ -289,6 +290,8 @@ public partial class QuickSwitchBarWindow : Window
         Topmost = true;
         ViewModel.SetQuickSwitchBarCollapsed(false);
         InvalidateReposition();
+        // Expanding steals focus from the dialog; don't collapse mid-activation.
+        _suppressCollapseUntilTick = Environment.TickCount64 + 500;
         ShowActivated = true;
         Activate();
         QuickSwitchQueryBox.Focus();
@@ -367,11 +370,25 @@ public partial class QuickSwitchBarWindow : Window
             return;
         }
 
+        if (Environment.TickCount64 < _suppressCollapseUntilTick)
+        {
+            Topmost = true;
+            if (IsDialogSearchExpanded)
+            {
+                Activate();
+                QuickSwitchQueryBox.Focus();
+            }
+
+            return;
+        }
+
+        var foreground = GetForegroundWindow();
         if (ShouldKeepDialogSearchExpandedAfterDeactivation(
                 IsAttached,
                 IsDialogSearchExpanded,
-                GetForegroundWindow(),
-                _anchorWindow))
+                foreground,
+                _anchorWindow,
+                _windowHandle))
         {
             Topmost = true;
             return;
@@ -646,10 +663,13 @@ public partial class QuickSwitchBarWindow : Window
         bool isAttached,
         bool isExpanded,
         IntPtr foregroundWindow,
-        IntPtr anchorWindow) =>
+        IntPtr anchorWindow,
+        IntPtr quickSwitchWindow = default) =>
         isAttached
         && isExpanded
-        && GlobalTextInputService.IsConfiguredDialogInputWindow(foregroundWindow, anchorWindow);
+        && foregroundWindow != IntPtr.Zero
+        && (foregroundWindow == quickSwitchWindow
+            || GlobalTextInputService.IsConfiguredDialogInputWindow(foregroundWindow, anchorWindow));
 
     internal static bool ShouldKeepAttachedBarTopmostAfterDeactivation(bool isAttached) => isAttached;
 

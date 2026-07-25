@@ -63,15 +63,33 @@ public sealed class SearchPanelXamlTests
     }
 
     [Fact]
-    public void BorderlessSearchWindowsApplyNativeRoundedCorners()
+    public void SearchPanelUsesWpfAntiAliasedRoundedChrome()
     {
+        var searchXaml = File.ReadAllText(GetRepositoryPath("src", "ListaryOpen.App", "SearchPanel.xaml"));
         var searchPanel = File.ReadAllText(GetRepositoryPath("src", "ListaryOpen.App", "SearchPanel.xaml.cs"));
+        var nativeCorner = File.ReadAllText(GetRepositoryPath("src", "ListaryOpen.App", "NativeWindowCorner.cs"));
+
+        // Per-pixel alpha + Border.CornerRadius (not SetWindowRgn) keeps Win10 corners smooth.
+        Assert.Contains("AllowsTransparency=\"True\"", searchXaml, StringComparison.Ordinal);
+        Assert.Contains("Background=\"Transparent\"", searchXaml, StringComparison.Ordinal);
+        Assert.Contains("x:Name=\"WindowChromeBorder\"", searchXaml, StringComparison.Ordinal);
+        Assert.Contains("CornerRadius=\"12\"", searchXaml, StringComparison.Ordinal);
+        Assert.Contains("SnapsToDevicePixels=\"False\"", searchXaml, StringComparison.Ordinal);
+        Assert.Contains("NativeWindowCorner.ClearRoundedChrome", searchPanel, StringComparison.Ordinal);
+        Assert.DoesNotContain("NativeWindowCorner.ApplyRounded", searchPanel);
+        Assert.Contains("ClearRoundedChrome", nativeCorner, StringComparison.Ordinal);
+        Assert.Contains("AllowsTransparency", nativeCorner, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void TaskManagerSearchStillAppliesNativeRoundedCorners()
+    {
         var taskManagerSearch = File.ReadAllText(GetRepositoryPath("src", "ListaryOpen.App", "TaskManagerSearchWindow.xaml.cs"));
         var nativeCorner = File.ReadAllText(GetRepositoryPath("src", "ListaryOpen.App", "NativeWindowCorner.cs"));
 
-        Assert.Contains("ApplyBorderlessWindowChrome()", searchPanel);
-        Assert.Contains("NativeWindowCorner.ApplyRounded", searchPanel);
-        Assert.Contains("NativeWindowCorner.ApplyRounded(this);", taskManagerSearch);
+        Assert.Contains("ApplyBorderlessWindowChrome()", taskManagerSearch);
+        Assert.Contains("NativeWindowCorner.ApplyRounded", taskManagerSearch);
+        Assert.Contains("OnRenderSizeChanged", taskManagerSearch);
         Assert.Contains("DwmWindowCornerPreferenceRound = 2", nativeCorner);
         Assert.Contains("DwmSetWindowAttribute", nativeCorner);
         Assert.Contains("CreateRoundRectRgn", nativeCorner);
@@ -79,15 +97,36 @@ public sealed class SearchPanelXamlTests
     }
 
     [Fact]
-    public void SearchPanelSupportsMouseDragOnNonInteractiveChrome()
+    public void BorderlessOverlayWindowsSupportMouseDragOnNonInteractiveChrome()
     {
         var searchPanel = File.ReadAllText(GetRepositoryPath("src", "ListaryOpen.App", "SearchPanel.xaml.cs"));
-        var xaml = File.ReadAllText(GetRepositoryPath("src", "ListaryOpen.App", "SearchPanel.xaml"));
+        var searchXaml = File.ReadAllText(GetRepositoryPath("src", "ListaryOpen.App", "SearchPanel.xaml"));
+        var taskManagerXaml = File.ReadAllText(GetRepositoryPath("src", "ListaryOpen.App", "TaskManagerSearchWindow.xaml"));
+        var taskManager = File.ReadAllText(GetRepositoryPath("src", "ListaryOpen.App", "TaskManagerSearchWindow.xaml.cs"));
+        var interaction = File.ReadAllText(GetRepositoryPath("src", "ListaryOpen.App", "BorderlessWindowInteraction.cs"));
 
-        Assert.Contains("PreviewMouseLeftButtonDown=\"SearchPanel_PreviewMouseLeftButtonDown\"", xaml);
-        Assert.Contains("DragMove()", searchPanel);
-        Assert.Contains("ShouldBeginWindowDrag", searchPanel);
-        Assert.Contains("IsDragBlockedSource", searchPanel);
+        Assert.Contains("PreviewMouseLeftButtonDown=\"SearchPanel_PreviewMouseLeftButtonDown\"", searchXaml);
+        Assert.Contains("BorderlessWindowInteraction.TryBeginDrag", searchPanel);
+        Assert.Contains("RememberCompactGlobalSearchPosition", searchPanel);
+        Assert.Contains("CalculateCompactGlobalSearchPosition", searchPanel);
+        Assert.Contains("SuppressDeactivateDismiss", searchPanel);
+        Assert.Contains("_suppressDeactivateDismissUntilTick", searchPanel);
+        Assert.Contains("PreviewMouseLeftButtonDown=\"TaskManagerSearchWindow_PreviewMouseLeftButtonDown\"", taskManagerXaml);
+        Assert.Contains("BorderlessWindowInteraction.TryBeginDrag", taskManager);
+        Assert.Contains("DragMove()", interaction);
+        Assert.Contains("ShouldBeginWindowDrag", interaction);
+        Assert.Contains("IsDragBlockedSource", interaction);
+    }
+
+    [Fact]
+    public void QuickSwitchBarUsesTransparentRoundedChromeWithoutFreeDrag()
+    {
+        // Anchored under dialogs: WPF transparency + CornerRadius (not free drag).
+        var xaml = File.ReadAllText(GetRepositoryPath("src", "ListaryOpen.App", "QuickSwitchBarWindow.xaml"));
+        Assert.Contains("AllowsTransparency=\"True\"", xaml);
+        Assert.Contains("Background=\"Transparent\"", xaml);
+        Assert.Contains("CornerRadius=", xaml);
+        Assert.DoesNotContain("DragMove", File.ReadAllText(GetRepositoryPath("src", "ListaryOpen.App", "QuickSwitchBarWindow.xaml.cs")));
     }
 
     private static string GetRepositoryPath(params string[] segments)

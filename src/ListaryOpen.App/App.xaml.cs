@@ -1089,7 +1089,12 @@ public partial class App : Application
             return;
         }
 
-        input.Handled = ShouldConsumeGlobalTextInput(input.Host);
+        // Swallow only when the native host would race us (dialog / Task Manager) or an
+        // overlay is already open. Explorer first-key is NOT swallowed here: activation is
+        // deferred on shell observation, so consuming early would drop keys if observation
+        // misses the folder snapshot.
+        input.Handled = ShouldConsumeGlobalTextInput(input.Host)
+            || _globalTextInputService?.CaptureOverlayInput == true;
 
         var scheduleDrain = false;
         lock (_globalTextInputQueueGate)
@@ -1108,8 +1113,14 @@ public partial class App : Application
         }
     }
 
+    /// <summary>
+    /// Swallow keys only for hosts that immediately steal focus into a native edit
+    /// (dialog filename box, Task Manager filter). Explorer is excluded: type-to-search
+    /// activates after shell observation, and the key must not be lost if that misses.
+    /// Follow-up keys while an overlay is open are still swallowed via CaptureOverlayInput.
+    /// </summary>
     internal static bool ShouldConsumeGlobalTextInput(GlobalTextInputHost host) =>
-        host == GlobalTextInputHost.Dialog;
+        host is GlobalTextInputHost.Dialog or GlobalTextInputHost.TaskManager;
 
     private void DrainGlobalTextInputQueue()
     {
@@ -1506,14 +1517,22 @@ public partial class App : Application
             return;
         }
 
+        // Fast path: open immediately from the latest shell snapshot so typing feels instant.
+        // Fall back to a forced observation only when the window is not in the snapshot yet.
+        if (TryActivateExplorerTypeSearch(input))
+        {
+            return;
+        }
+
         QueueExplorerActivationAfterRefresh(input);
     }
 
     private void HandleTaskManagerTextInput(GlobalTextInputEventArgs input)
     {
+        // Trust the hook-time focused class. A deferred UIA FocusedElement probe can
+        // false-positive on Task Manager chrome (names containing "search") and abort show.
         if (string.IsNullOrWhiteSpace(input.Text) ||
-            GlobalTextInputService.IsTextEntryControlClass(input.FocusedControlClass) ||
-            TaskManagerAutomationService.IsNativeTextInputFocused(input.ForegroundWindow))
+            GlobalTextInputService.IsTextEntryControlClass(input.FocusedControlClass))
         {
             return;
         }
@@ -1597,7 +1616,10 @@ public partial class App : Application
         }
     }
 
-    private void ActivateOrAppendExplorerTypeSearchFromSnapshot(GlobalTextInputEventArgs input)
+    private void ActivateOrAppendExplorerTypeSearchFromSnapshot(GlobalTextInputEventArgs input) =>
+        _ = TryActivateExplorerTypeSearch(input);
+
+    private bool TryActivateExplorerTypeSearch(GlobalTextInputEventArgs input)
     {
         var searchPanel = _searchPanel;
         if (ShouldAppendExplorerTypeSearchInput(
@@ -1606,31 +1628,28 @@ public partial class App : Application
                 searchPanel?.IsVisible == true && searchPanel.IsExplorerTypeSearchActive))
         {
             searchPanel!.AppendExplorerSearchText(input.Text);
-            return;
+            return true;
         }
 
         var request = TryCreateExplorerTypeSearchRequest(input, _explorerTracker);
-        if (request is not null)
+        if (request is null || searchPanel is null)
         {
-            if (searchPanel is null)
-            {
-                return;
-            }
-
-            if (_taskManagerSearchWindow?.IsTaskManagerSearchActive == true)
-            {
-                _taskManagerSearchWindow.DismissSearch();
-            }
-
-            _lastExplorerTypeSearchWindow = request.ExplorerWindow;
-            searchPanel.ActivateExplorerSearch(
-                request.InitialQuery,
-                request.CurrentFolder,
-                request.ExplorerWindow);
-            _explorerNavigationCapture.Activate(request.ExplorerWindow);
-            RefreshOverlayInputCapture();
-            return;
+            return false;
         }
+
+        if (_taskManagerSearchWindow?.IsTaskManagerSearchActive == true)
+        {
+            _taskManagerSearchWindow.DismissSearch();
+        }
+
+        _lastExplorerTypeSearchWindow = request.ExplorerWindow;
+        searchPanel.ActivateExplorerSearch(
+            request.InitialQuery,
+            request.CurrentFolder,
+            request.ExplorerWindow);
+        _explorerNavigationCapture.Activate(request.ExplorerWindow);
+        RefreshOverlayInputCapture();
+        return true;
     }
 
     private void OnExplorerSearchSessionEnded(object? sender, EventArgs e)
@@ -1776,11 +1795,13 @@ public partial class App : Application
         }
 
         var provider = explorerWindowProvider;
+        // Match the window captured at keypress time. Do not require IsForeground on the
+        // later snapshot — observation can complete after focus has already moved (or after
+        // our overlay started activating), which previously dropped type-to-search entirely.
         var candidate = provider
             .GetFolderCandidates()
             .FirstOrDefault(item =>
-                item.IsForeground
-                && item.WindowHandle == input.ForegroundWindow
+                item.WindowHandle == input.ForegroundWindow
                 && !string.IsNullOrWhiteSpace(item.FolderPath));
         return candidate is null
             ? null

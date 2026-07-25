@@ -17,6 +17,8 @@ public partial class TaskManagerSearchWindow : Window
     private CancellationTokenSource? _snapshotCancellation;
     private IntPtr _taskManagerWindow;
     private int _activationVersion;
+    /// <summary>Ignore deactivation dismissals while the overlay is still being shown/focused.</summary>
+    private long _suppressDeactivateDismissUntilTick;
 
     public TaskManagerSearchWindow()
         : this(new TaskManagerAutomationService())
@@ -54,11 +56,16 @@ public partial class TaskManagerSearchWindow : Window
         var version = Interlocked.Increment(ref _activationVersion);
         _taskManagerWindow = taskManagerWindow;
         ViewModel.QueryText = initialQuery;
+        // Show/Activate briefly fights Task Manager for focus; don't dismiss mid-activation.
+        _suppressDeactivateDismissUntilTick = Environment.TickCount64 + 500;
         ShowActivated = true;
         Show();
         PositionAtWindowBottomRight(taskManagerWindow);
+        ApplyBorderlessWindowChrome();
         Activate();
         FocusQueryAtEnd();
+        // Keep Topmost so the overlay stays above elevated Task Manager chrome.
+        Topmost = true;
 
         try
         {
@@ -235,7 +242,10 @@ public partial class TaskManagerSearchWindow : Window
 
     private void PositionAtWindowBottomRight(IntPtr anchorWindow)
     {
-        var workArea = SystemParameters.WorkArea;
+        var dpi = VisualTreeHelper.GetDpi(this);
+        var dpiX = dpi.DpiScaleX;
+        var dpiY = dpi.DpiScaleY;
+        var workArea = GetAnchorWorkArea(anchorWindow, dpiX, dpiY);
         if (!VisibleWindowBounds.TryGet(anchorWindow, out var rectangle))
         {
             Left = workArea.Right - Width - 12;
@@ -243,10 +253,18 @@ public partial class TaskManagerSearchWindow : Window
             return;
         }
 
-        var dpi = VisualTreeHelper.GetDpi(this).DpiScaleX;
-        Left = Math.Clamp(rectangle.Right / dpi - Width - 12, workArea.Left, workArea.Right - Width);
-        Top = Math.Clamp(rectangle.Bottom / dpi - Height - 12, workArea.Top, workArea.Bottom - Height);
+        Left = Math.Clamp(rectangle.Right / dpiX - Width - 12, workArea.Left, Math.Max(workArea.Left, workArea.Right - Width));
+        Top = Math.Clamp(rectangle.Bottom / dpiY - Height - 12, workArea.Top, Math.Max(workArea.Top, workArea.Bottom - Height));
     }
+
+    private static Rect GetAnchorWorkArea(IntPtr anchorWindow, double dpiScaleX, double dpiScaleY) =>
+        VisibleWindowBounds.TryGetMonitorWorkArea(anchorWindow, out var physicalWorkArea)
+            ? new Rect(
+                physicalWorkArea.Left / dpiScaleX,
+                physicalWorkArea.Top / dpiScaleY,
+                (physicalWorkArea.Right - physicalWorkArea.Left) / dpiScaleX,
+                (physicalWorkArea.Bottom - physicalWorkArea.Top) / dpiScaleY)
+            : SystemParameters.WorkArea;
 
     private void HandlePreviewKeyDown(object sender, KeyEventArgs e)
     {
@@ -297,6 +315,18 @@ public partial class TaskManagerSearchWindow : Window
         base.OnDeactivated(e);
         Dispatcher.BeginInvoke(new Action(() =>
         {
+            if (Environment.TickCount64 < _suppressDeactivateDismissUntilTick)
+            {
+                // Re-assert focus while the overlay is still activating.
+                if (IsVisible && _taskManagerWindow != IntPtr.Zero)
+                {
+                    Activate();
+                    FocusQueryAtEnd();
+                }
+
+                return;
+            }
+
             var overlayWindow = new WindowInteropHelper(this).Handle;
             if (ShouldDismissAfterDeactivation(
                     IsVisible,
@@ -362,8 +392,23 @@ public partial class TaskManagerSearchWindow : Window
     protected override void OnSourceInitialized(EventArgs e)
     {
         base.OnSourceInitialized(e);
-        NativeWindowCorner.ApplyRounded(this);
+        ApplyBorderlessWindowChrome();
     }
+
+    protected override void OnRenderSizeChanged(SizeChangedInfo sizeInfo)
+    {
+        base.OnRenderSizeChanged(sizeInfo);
+        if (IsVisible)
+        {
+            ApplyBorderlessWindowChrome();
+        }
+    }
+
+    private void TaskManagerSearchWindow_PreviewMouseLeftButtonDown(object sender, MouseButtonEventArgs e) =>
+        _ = BorderlessWindowInteraction.TryBeginDrag(this, e);
+
+    private void ApplyBorderlessWindowChrome() =>
+        NativeWindowCorner.ApplyRounded(this, radiusDip: 9);
 
     [DllImport("user32.dll")]
     private static extern IntPtr GetForegroundWindow();
