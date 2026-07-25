@@ -788,23 +788,39 @@ public sealed class VisualAcceptanceTests
 
     private static void AssertCompactSearchHasNoOuterBackgroundBand(SearchPanel panel)
     {
+        // Compact mode uses transparent outer chrome + a rounded Surface border so Win10
+        // corners stay anti-aliased (no hard SetWindowRgn). Shadow margin is 20 DIPs.
         var root = Assert.IsType<Grid>(panel.FindName("SearchPanelRoot"));
         Assert.Equal(new Thickness(0), root.Margin);
-        Assert.Equal(52, panel.Height);
-        Assert.Same(panel.FindResource("Brush.Surface"), panel.Background);
+        Assert.Equal(72, panel.Height);
+        Assert.Equal(System.Windows.Media.Brushes.Transparent, panel.Background);
+
+        var chrome = Assert.IsType<Border>(panel.FindName("WindowChromeBorder"));
+        Assert.Equal(new Thickness(10), chrome.Margin);
+        Assert.Equal(new CornerRadius(12), chrome.CornerRadius);
+        Assert.Same(panel.FindResource("Brush.Surface"), chrome.Background);
+
+        // Input bar sits flush inside the outer rounded surface (no double chrome band).
+        var inputChrome = Assert.IsType<Border>(panel.FindName("SearchInputChrome"));
+        Assert.Equal(new CornerRadius(12), inputChrome.CornerRadius);
+        Assert.Equal(new Thickness(0), inputChrome.BorderThickness);
 
         panel.UpdateLayout();
+        // Sample inside the chrome face (past shadow margin), not the transparent edge.
         var width = (int)Math.Ceiling(panel.ActualWidth);
         var height = (int)Math.Ceiling(panel.ActualHeight);
+        Assert.True(width > 40 && height > 40);
         var bitmap = new RenderTargetBitmap(width, height, 96, 96, PixelFormats.Pbgra32);
         bitmap.Render(panel);
         var pixels = new byte[width * height * 4];
         bitmap.CopyPixels(pixels, width * 4, 0);
-        var edgeOffset = ((height / 2) * width + 4) * 4;
-        var centerOffset = ((height / 2) * width + (width / 2)) * 4;
-        var distance = Math.Abs(pixels[edgeOffset] - pixels[centerOffset]) +
-            Math.Abs(pixels[edgeOffset + 1] - pixels[centerOffset + 1]) +
-            Math.Abs(pixels[edgeOffset + 2] - pixels[centerOffset + 2]);
+        var insetX = Math.Min(width / 2, 24);
+        var midY = height / 2;
+        var nearChromeEdge = ((midY * width) + insetX) * 4;
+        var centerOffset = ((midY * width) + (width / 2)) * 4;
+        var distance = Math.Abs(pixels[nearChromeEdge] - pixels[centerOffset]) +
+            Math.Abs(pixels[nearChromeEdge + 1] - pixels[centerOffset + 1]) +
+            Math.Abs(pixels[nearChromeEdge + 2] - pixels[centerOffset + 2]);
         Assert.InRange(distance, 0, 8);
     }
 
