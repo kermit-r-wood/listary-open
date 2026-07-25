@@ -69,10 +69,25 @@ public sealed class SearchPanelXamlTests
         var taskManagerSearch = File.ReadAllText(GetRepositoryPath("src", "ListaryOpen.App", "TaskManagerSearchWindow.xaml.cs"));
         var nativeCorner = File.ReadAllText(GetRepositoryPath("src", "ListaryOpen.App", "NativeWindowCorner.cs"));
 
-        Assert.Contains("NativeWindowCorner.ApplyRounded(this);", searchPanel);
+        Assert.Contains("ApplyBorderlessWindowChrome()", searchPanel);
+        Assert.Contains("NativeWindowCorner.ApplyRounded", searchPanel);
         Assert.Contains("NativeWindowCorner.ApplyRounded(this);", taskManagerSearch);
         Assert.Contains("DwmWindowCornerPreferenceRound = 2", nativeCorner);
         Assert.Contains("DwmSetWindowAttribute", nativeCorner);
+        Assert.Contains("CreateRoundRectRgn", nativeCorner);
+        Assert.Contains("SetWindowRgn", nativeCorner);
+    }
+
+    [Fact]
+    public void SearchPanelSupportsMouseDragOnNonInteractiveChrome()
+    {
+        var searchPanel = File.ReadAllText(GetRepositoryPath("src", "ListaryOpen.App", "SearchPanel.xaml.cs"));
+        var xaml = File.ReadAllText(GetRepositoryPath("src", "ListaryOpen.App", "SearchPanel.xaml"));
+
+        Assert.Contains("PreviewMouseLeftButtonDown=\"SearchPanel_PreviewMouseLeftButtonDown\"", xaml);
+        Assert.Contains("DragMove()", searchPanel);
+        Assert.Contains("ShouldBeginWindowDrag", searchPanel);
+        Assert.Contains("IsDragBlockedSource", searchPanel);
     }
 
     private static string GetRepositoryPath(params string[] segments)

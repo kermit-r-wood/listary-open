@@ -287,6 +287,7 @@ public partial class SearchPanel : Window
             PositionAtWorkAreaCenter();
         }
 
+        ApplyBorderlessWindowChrome();
         Activate();
         QueryBox.Focus();
     }
@@ -307,6 +308,7 @@ public partial class SearchPanel : Window
         ShowActivated = true;
         Show();
         PositionAtWindowBottomRight(explorerWindow);
+        ApplyBorderlessWindowChrome();
         Activate();
         FocusQueryAtEnd();
     }
@@ -331,8 +333,8 @@ public partial class SearchPanel : Window
         StatusRow.Height = new GridLength(0);
         ShowActivated = true;
         Show();
-        NativeWindowCorner.ApplyRounded(this);
         PositionCompactGlobalSearch();
+        ApplyBorderlessWindowChrome();
         Activate();
         FocusQueryAtEnd();
     }
@@ -394,7 +396,27 @@ public partial class SearchPanel : Window
     protected override void OnSourceInitialized(EventArgs e)
     {
         base.OnSourceInitialized(e);
-        NativeWindowCorner.ApplyRounded(this);
+        ApplyBorderlessWindowChrome();
+    }
+
+    protected override void OnRenderSizeChanged(SizeChangedInfo sizeInfo)
+    {
+        base.OnRenderSizeChanged(sizeInfo);
+        if (IsVisible && WindowStyle == WindowStyle.None)
+        {
+            ApplyBorderlessWindowChrome();
+        }
+    }
+
+    private void ApplyBorderlessWindowChrome()
+    {
+        if (WindowStyle != WindowStyle.None)
+        {
+            NativeWindowCorner.ApplyRounded(this, radiusDip: 0);
+            return;
+        }
+
+        NativeWindowCorner.ApplyRounded(this, NativeWindowCorner.DefaultRadiusDip);
     }
 
     private void QueueResultsLayoutUpdate()
@@ -856,8 +878,54 @@ public partial class SearchPanel : Window
     private void ResultsList_PreviewMouseLeftButtonDown(object sender, MouseButtonEventArgs e) =>
         CloseResultContextMenu();
 
-    private void SearchPanel_PreviewMouseLeftButtonDown(object sender, MouseButtonEventArgs e) =>
+    private void SearchPanel_PreviewMouseLeftButtonDown(object sender, MouseButtonEventArgs e)
+    {
         CloseResultContextMenu();
+        if (!ShouldBeginWindowDrag(e))
+        {
+            return;
+        }
+
+        try
+        {
+            DragMove();
+        }
+        catch (InvalidOperationException)
+        {
+            // Window may not be ready to drag (e.g. during close).
+        }
+    }
+
+    internal static bool ShouldBeginWindowDrag(MouseButtonEventArgs e)
+    {
+        ArgumentNullException.ThrowIfNull(e);
+        if (e.ChangedButton != MouseButton.Left || e.LeftButton != MouseButtonState.Pressed)
+        {
+            return false;
+        }
+
+        return !IsDragBlockedSource(e.OriginalSource as DependencyObject);
+    }
+
+    internal static bool IsDragBlockedSource(DependencyObject? source)
+    {
+        for (var current = source; current is not null; current = GetParent(current))
+        {
+            if (current is TextBoxBase or PasswordBox or ButtonBase or ComboBox or ListBoxItem
+                or Selector or ScrollBar or Thumb or MenuBase or MenuItem or Slider
+                or DataGrid or Calendar or DatePicker)
+            {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    private static DependencyObject? GetParent(DependencyObject current) =>
+        current is Visual or System.Windows.Media.Media3D.Visual3D
+            ? VisualTreeHelper.GetParent(current)
+            : LogicalTreeHelper.GetParent(current);
 
     private void ResultsList_PreviewMouseRightButtonDown(object sender, MouseButtonEventArgs e)
     {
