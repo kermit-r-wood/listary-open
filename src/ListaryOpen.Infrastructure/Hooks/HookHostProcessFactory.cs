@@ -36,7 +36,11 @@ public sealed record HookHostLaunchRequest
 
 public class HookHostProcessFactory
 {
-    private static readonly TimeSpan TerminationTimeout = TimeSpan.FromSeconds(5);
+    /// <summary>
+    /// Short wait for graceful host exit. On timeout we detach without killing so
+    /// native vtable restore can still finish after the parent process exits.
+    /// </summary>
+    private static readonly TimeSpan TerminationTimeout = TimeSpan.FromSeconds(1.5);
 
     public virtual ProcessStartInfo CreateStartInfo(
         string hostExePath,
@@ -114,15 +118,25 @@ public class HookHostProcessFactory
 
     public virtual void Terminate(Process process)
     {
-        TerminateCore(process, waitForGracefulExit: false);
+        TerminateCore(process, waitForGracefulExit: false, TerminationTimeout);
     }
 
     public virtual void WaitForGracefulExitOrTerminate(Process process)
     {
-        TerminateCore(process, waitForGracefulExit: true);
+        WaitForGracefulExitOrTerminate(process, TerminationTimeout);
     }
 
-    private void TerminateCore(Process process, bool waitForGracefulExit)
+    public virtual void WaitForGracefulExitOrTerminate(Process process, TimeSpan timeout)
+    {
+        if (timeout < TimeSpan.Zero)
+        {
+            throw new ArgumentOutOfRangeException(nameof(timeout));
+        }
+
+        TerminateCore(process, waitForGracefulExit: true, timeout);
+    }
+
+    private void TerminateCore(Process process, bool waitForGracefulExit, TimeSpan timeout)
     {
         ArgumentNullException.ThrowIfNull(process);
 
@@ -137,7 +151,12 @@ public class HookHostProcessFactory
                     // would bypass native vtable restoration and hook rundown.
                     // The host also monitors its parent and will finish cleanup
                     // after the app exits, so timeout means detach, never kill.
-                    _ = process.WaitForExit(checked((int)TerminationTimeout.TotalMilliseconds));
+                    var waitMs = (int)Math.Clamp(timeout.TotalMilliseconds, 0, int.MaxValue);
+                    if (waitMs > 0)
+                    {
+                        _ = process.WaitForExit(waitMs);
+                    }
+
                     return;
                 }
 

@@ -25,7 +25,13 @@ public sealed record IndexingStatus(
 
 public sealed class IndexingCoordinator
 {
-    private const int DefaultBatchSize = 500;
+    /// <summary>Larger batches reduce SQLite transaction overhead on full scans.</summary>
+    private const int DefaultBatchSize = 2_000;
+
+    /// <summary>Yield to the scheduler every N flushed batches so UI stays responsive.</summary>
+    private const int BatchesBetweenYield = 4;
+
+    private static readonly TimeSpan BatchYieldDelay = TimeSpan.FromMilliseconds(1);
 
     private readonly SqliteSearchIndex _index;
     private readonly VolumeIndexer _volumeIndexer;
@@ -78,8 +84,24 @@ public sealed class IndexingCoordinator
             indexedCount,
             totalRoots: roots.Count);
 
+        // Defer FTS trigger maintenance until the whole run finishes so bulk
+        // upserts do not pay per-row FTS insert/delete costs.
+        var bulkStarted = false;
         try
         {
+            if (roots.Count > 0)
+            {
+                try
+                {
+                    await _index.BeginBulkIndexingAsync(cancellationToken).ConfigureAwait(false);
+                    bulkStarted = true;
+                }
+                catch (ObjectDisposedException)
+                {
+                    // Index already disposed; per-root work records Failed statuses without throwing.
+                }
+            }
+
             for (var rootIndex = 0; rootIndex < roots.Count; rootIndex++)
             {
                 cancellationToken.ThrowIfCancellationRequested();
@@ -174,6 +196,24 @@ public sealed class IndexingCoordinator
                 currentRootNumber,
                 roots.Count);
             throw;
+        }
+        finally
+        {
+            if (bulkStarted)
+            {
+                try
+                {
+                    // Prefer completing FTS rebuild even after cancel so the next
+                    // search does not keep a permanently disabled FTS index.
+                    await _index
+                        .EndBulkIndexingAsync(CancellationToken.None)
+                        .ConfigureAwait(false);
+                }
+                catch (Exception exception) when (exception is not OutOfMemoryException)
+                {
+                    Trace.TraceWarning("Failed to finalize bulk FTS rebuild: {0}", exception.Message);
+                }
+            }
         }
     }
 
@@ -595,6 +635,7 @@ public sealed class IndexingCoordinator
         var indexedCount = 0;
         var lastReportedCount = -1;
         var nextProgressReportAt = 0L;
+        var flushedBatchCount = 0;
         var batch = new List<FileRecord>(_batchSize);
         IAsyncEnumerator<FileRecord> enumerator;
 
@@ -650,6 +691,12 @@ public sealed class IndexingCoordinator
                     var reportedWriting = ReportWritingIfDue(force: false);
                     indexedCount += await FlushBatchAsync(batch, indexGeneration, cancellationToken).ConfigureAwait(false);
                     ReportScanningIfDue(force: reportedWriting);
+                    flushedBatchCount++;
+                    if (flushedBatchCount % BatchesBetweenYield == 0)
+                    {
+                        // Brief pause so interactive threads can run during multi-million-file scans.
+                        await Task.Delay(BatchYieldDelay, cancellationToken).ConfigureAwait(false);
+                    }
                 }
             }
         }

@@ -39,6 +39,7 @@ public sealed class SqliteSearchIndex : ISearchIndex, IAsyncDisposable
     private volatile bool _ftsReady;
     private volatile bool _preferredRootIndexReady;
     private bool _disposed;
+    private bool _bulkIndexing;
 
     private SqliteSearchIndex(
         SqliteConnection connection,
@@ -160,7 +161,8 @@ public sealed class SqliteSearchIndex : ISearchIndex, IAsyncDisposable
                 using var command = CreateUpsertCommand(transaction);
                 foreach (var record in records)
                 {
-                    await ExecuteUpsertAsync(command, record, DefaultIndexGeneration, cancellationToken).ConfigureAwait(false);
+                    cancellationToken.ThrowIfCancellationRequested();
+                    ExecuteUpsert(command, record, DefaultIndexGeneration);
                 }
 
                 await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
@@ -261,9 +263,11 @@ public sealed class SqliteSearchIndex : ISearchIndex, IAsyncDisposable
             try
             {
                 using var command = CreateUpsertCommand(transaction);
+                // Sync ExecuteNonQuery avoids per-row async state machines on bulk scans.
                 foreach (var record in records)
                 {
-                    await ExecuteUpsertAsync(command, record, indexGeneration, cancellationToken).ConfigureAwait(false);
+                    cancellationToken.ThrowIfCancellationRequested();
+                    ExecuteUpsert(command, record, indexGeneration);
                 }
 
                 await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
@@ -277,6 +281,100 @@ public sealed class SqliteSearchIndex : ISearchIndex, IAsyncDisposable
         finally
         {
             _connectionGate.Release();
+        }
+    }
+
+    /// <summary>
+    /// Drops FTS maintenance triggers for the duration of a full indexing run.
+    /// Call <see cref="EndBulkIndexingAsync"/> to rebuild FTS and restore triggers.
+    /// </summary>
+    internal async Task BeginBulkIndexingAsync(CancellationToken cancellationToken)
+    {
+        await _connectionGate.WaitAsync(cancellationToken).ConfigureAwait(false);
+        try
+        {
+            ThrowIfDisposed();
+            if (_bulkIndexing)
+            {
+                return;
+            }
+
+            await DropFtsTriggersAsync(_connection, cancellationToken).ConfigureAwait(false);
+            await WriteMetadataAsync(
+                    _connection,
+                    FtsStateMetadataKey,
+                    FtsStateBuilding,
+                    transaction: null,
+                    cancellationToken)
+                .ConfigureAwait(false);
+            _ftsReady = false;
+            _bulkIndexing = true;
+        }
+        finally
+        {
+            _connectionGate.Release();
+        }
+    }
+
+    /// <summary>
+    /// Rebuilds the FTS index once and restores triggers after bulk upserts.
+    /// </summary>
+    internal async Task EndBulkIndexingAsync(CancellationToken cancellationToken)
+    {
+        if (!_bulkIndexing)
+        {
+            return;
+        }
+
+        try
+        {
+            await _connectionGate.WaitAsync(cancellationToken).ConfigureAwait(false);
+        }
+        catch (ObjectDisposedException)
+        {
+            _bulkIndexing = false;
+            return;
+        }
+
+        try
+        {
+            if (_disposed || !_bulkIndexing)
+            {
+                _bulkIndexing = false;
+                return;
+            }
+
+            await EnsureFtsTriggersAsync(_connection, cancellationToken).ConfigureAwait(false);
+
+            using (var buildCommand = _connection.CreateCommand())
+            {
+                buildCommand.CommandText = "insert into files_fts_v1(files_fts_v1) values('rebuild');";
+                await buildCommand.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+            }
+
+            await WriteMetadataAsync(
+                    _connection,
+                    FtsStateMetadataKey,
+                    FtsStateReady,
+                    transaction: null,
+                    cancellationToken)
+                .ConfigureAwait(false);
+            _ftsReady = true;
+            _bulkIndexing = false;
+        }
+        catch (ObjectDisposedException)
+        {
+            _bulkIndexing = false;
+        }
+        finally
+        {
+            try
+            {
+                _connectionGate.Release();
+            }
+            catch (ObjectDisposedException)
+            {
+            }
         }
     }
 
@@ -689,6 +787,15 @@ public sealed class SqliteSearchIndex : ISearchIndex, IAsyncDisposable
         }
     }
 
+    /// <summary>
+    /// Maximum time to wait for FTS/index maintenance before closing connections on dispose.
+    /// Exit must not block on a multi-minute FTS rebuild.
+    /// </summary>
+    internal static readonly TimeSpan DisposeMaintenanceTimeout = TimeSpan.FromSeconds(1);
+
+    /// <summary>Maximum time to wait for connection gates before force-closing on dispose.</summary>
+    internal static readonly TimeSpan DisposeGateTimeout = TimeSpan.FromMilliseconds(750);
+
     public async ValueTask DisposeAsync()
     {
         if (_disposed)
@@ -697,31 +804,96 @@ public sealed class SqliteSearchIndex : ISearchIndex, IAsyncDisposable
         }
 
         _lifetimeCancellation.Cancel();
-        await Task.WhenAll(_ftsBuildTask, _performanceIndexBuildTask).ConfigureAwait(false);
-        await _searchConnectionGate.WaitAsync().ConfigureAwait(false);
+
+        // Background FTS rebuild / preferred-root index can run for a long time and
+        // do not always honor cancellation inside SQLite. Bound the wait so app exit
+        // stays responsive; connections are closed either way.
         try
         {
-            await _connectionGate.WaitAsync().ConfigureAwait(false);
-            try
-            {
-                if (_disposed)
-                {
-                    return;
-                }
+            await Task.WhenAll(_ftsBuildTask, _performanceIndexBuildTask)
+                .WaitAsync(DisposeMaintenanceTimeout)
+                .ConfigureAwait(false);
+        }
+        catch (TimeoutException)
+        {
+        }
+        catch (OperationCanceledException)
+        {
+        }
+        catch (Exception exception) when (exception is not OutOfMemoryException)
+        {
+            Trace.TraceWarning("Index background maintenance ended with error during dispose: {0}", exception.Message);
+        }
 
-                _disposed = true;
-                await _searchConnection.DisposeAsync().ConfigureAwait(false);
-                await _connection.DisposeAsync().ConfigureAwait(false);
-                _lifetimeCancellation.Dispose();
-            }
-            finally
+        var searchGateHeld = false;
+        var connectionGateHeld = false;
+        try
+        {
+            searchGateHeld = await _searchConnectionGate
+                .WaitAsync(DisposeGateTimeout)
+                .ConfigureAwait(false);
+            if (searchGateHeld)
             {
-                _connectionGate.Release();
+                connectionGateHeld = await _connectionGate
+                    .WaitAsync(DisposeGateTimeout)
+                    .ConfigureAwait(false);
             }
+
+            await CloseConnectionsBestEffortAsync().ConfigureAwait(false);
         }
         finally
         {
-            _searchConnectionGate.Release();
+            if (connectionGateHeld)
+            {
+                _connectionGate.Release();
+            }
+
+            if (searchGateHeld)
+            {
+                _searchConnectionGate.Release();
+            }
+
+            // If a long SQLite rebuild still held a gate, force-close so process exit
+            // does not hang waiting for exclusive ownership.
+            if (!_disposed)
+            {
+                await CloseConnectionsBestEffortAsync().ConfigureAwait(false);
+            }
+        }
+    }
+
+    private async Task CloseConnectionsBestEffortAsync()
+    {
+        if (_disposed)
+        {
+            return;
+        }
+
+        _disposed = true;
+        try
+        {
+            await _searchConnection.DisposeAsync().ConfigureAwait(false);
+        }
+        catch (Exception exception) when (exception is not OutOfMemoryException)
+        {
+            Trace.TraceWarning("Search connection dispose failed: {0}", exception.Message);
+        }
+
+        try
+        {
+            await _connection.DisposeAsync().ConfigureAwait(false);
+        }
+        catch (Exception exception) when (exception is not OutOfMemoryException)
+        {
+            Trace.TraceWarning("Write connection dispose failed: {0}", exception.Message);
+        }
+
+        try
+        {
+            _lifetimeCancellation.Dispose();
+        }
+        catch (ObjectDisposedException)
+        {
         }
     }
 
@@ -868,31 +1040,11 @@ public sealed class SqliteSearchIndex : ISearchIndex, IAsyncDisposable
                     content = 'files',
                     content_rowid = 'rowid'
                 );
-
-                create trigger if not exists files_fts_v1_insert after insert on files begin
-                    insert into files_fts_v1(rowid, name, parent_path, search_text)
-                    values (new.rowid, new.name, new.parent_path, new.search_text);
-                end;
-
-                create trigger if not exists files_fts_v1_delete after delete on files begin
-                    insert into files_fts_v1(files_fts_v1, rowid, name, parent_path, search_text)
-                    values ('delete', old.rowid, old.name, old.parent_path, old.search_text);
-                end;
-
-                create trigger if not exists files_fts_v1_update
-                after update of name, parent_path, search_text on files
-                when old.name <> new.name
-                  or old.parent_path <> new.parent_path
-                  or old.search_text <> new.search_text
-                begin
-                    insert into files_fts_v1(files_fts_v1, rowid, name, parent_path, search_text)
-                    values ('delete', old.rowid, old.name, old.parent_path, old.search_text);
-                    insert into files_fts_v1(rowid, name, parent_path, search_text)
-                    values (new.rowid, new.name, new.parent_path, new.search_text);
-                end;
                 """;
             await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
         }
+
+        await EnsureFtsTriggersAsync(connection, cancellationToken).ConfigureAwait(false);
 
         var state = await ReadMetadataStringAsync(
             connection,
@@ -1411,6 +1563,16 @@ public sealed class SqliteSearchIndex : ISearchIndex, IAsyncDisposable
         long indexGeneration,
         CancellationToken cancellationToken)
     {
+        cancellationToken.ThrowIfCancellationRequested();
+        ExecuteUpsert(command, record, indexGeneration);
+        await Task.CompletedTask.ConfigureAwait(false);
+    }
+
+    private static void ExecuteUpsert(
+        SqliteCommand command,
+        FileRecord record,
+        long indexGeneration)
+    {
         ArgumentNullException.ThrowIfNull(record);
 
         command.Parameters[0].Value = record.FullPath;
@@ -1423,6 +1585,50 @@ public sealed class SqliteSearchIndex : ISearchIndex, IAsyncDisposable
         command.Parameters[7].Value = FormatDateTime(record.LastWriteTime);
         command.Parameters[8].Value = indexGeneration;
         command.Parameters[9].Value = unchecked((long)record.FileReferenceNumber);
+        command.ExecuteNonQuery();
+    }
+
+    private static async Task DropFtsTriggersAsync(
+        SqliteConnection connection,
+        CancellationToken cancellationToken)
+    {
+        using var command = connection.CreateCommand();
+        command.CommandText = """
+            drop trigger if exists files_fts_v1_insert;
+            drop trigger if exists files_fts_v1_delete;
+            drop trigger if exists files_fts_v1_update;
+            """;
+        await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+    }
+
+    private static async Task EnsureFtsTriggersAsync(
+        SqliteConnection connection,
+        CancellationToken cancellationToken)
+    {
+        using var command = connection.CreateCommand();
+        command.CommandText = """
+            create trigger if not exists files_fts_v1_insert after insert on files begin
+                insert into files_fts_v1(rowid, name, parent_path, search_text)
+                values (new.rowid, new.name, new.parent_path, new.search_text);
+            end;
+
+            create trigger if not exists files_fts_v1_delete after delete on files begin
+                insert into files_fts_v1(files_fts_v1, rowid, name, parent_path, search_text)
+                values ('delete', old.rowid, old.name, old.parent_path, old.search_text);
+            end;
+
+            create trigger if not exists files_fts_v1_update
+            after update of name, parent_path, search_text on files
+            when old.name <> new.name
+              or old.parent_path <> new.parent_path
+              or old.search_text <> new.search_text
+            begin
+                insert into files_fts_v1(files_fts_v1, rowid, name, parent_path, search_text)
+                values ('delete', old.rowid, old.name, old.parent_path, old.search_text);
+                insert into files_fts_v1(rowid, name, parent_path, search_text)
+                values (new.rowid, new.name, new.parent_path, new.search_text);
+            end;
+            """;
         await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
     }
 

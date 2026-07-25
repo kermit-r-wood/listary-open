@@ -6,7 +6,11 @@ public sealed class HookQuickSwitchBridge : IHookQuickSwitchBridge
 {
     private static readonly TimeSpan HostStartupProbeInterval = TimeSpan.FromMilliseconds(50);
     private static readonly TimeSpan HostStartupTimeout = TimeSpan.FromSeconds(2);
-    private static readonly TimeSpan HostShutdownTimeout = TimeSpan.FromSeconds(5);
+    /// <summary>
+    /// Bounded graceful shutdown so app exit does not stall on hung UI threads.
+    /// Hosts also watch the parent process and finish cleanup after detach.
+    /// </summary>
+    private static readonly TimeSpan HostShutdownTimeout = TimeSpan.FromSeconds(1.5);
     public const string X64PipeName = "listary-open-hook-x64";
     public const string X86PipeName = "listary-open-hook-x86";
 
@@ -240,6 +244,9 @@ public sealed class HookQuickSwitchBridge : IHookQuickSwitchBridge
         {
             if (gracefulShutdownAccepted)
             {
+                // Bounded wait (see HookHostProcessFactory.TerminationTimeout). On
+                // timeout the host is detached, not killed, so native cleanup can
+                // finish after the parent process exits.
                 _processFactory.WaitForGracefulExitOrTerminate(process);
             }
             else

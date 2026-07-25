@@ -35,6 +35,40 @@ public sealed class SqliteSearchIndexTests
     }
 
     [Fact]
+    public async Task BulkIndexingDefersFtsTriggersAndRebuildsAtEnd()
+    {
+        var dbPath = CreateTempDbPath();
+        try
+        {
+            await using var index = await SqliteSearchIndex.OpenAsync(dbPath, CancellationToken.None);
+            await index.WaitForBackgroundMaintenanceAsync();
+
+            await index.BeginBulkIndexingAsync(CancellationToken.None);
+            var generation = await index.BeginIndexingRunAsync(CancellationToken.None);
+            await index.UpsertManyAsync(
+                new[]
+                {
+                    FileRecord.Create(@"C:\Docs\BulkAlpha.txt", false, 10, DateTimeOffset.UtcNow),
+                    FileRecord.Create(@"C:\Docs\BulkBeta.txt", false, 10, DateTimeOffset.UtcNow)
+                },
+                generation,
+                CancellationToken.None);
+
+            // During bulk mode FTS triggers are dropped; search still works via exact/name paths.
+            await index.EndBulkIndexingAsync(CancellationToken.None);
+
+            var results = await index.SearchAsync(
+                new SearchQuery("BulkAlpha", SearchMode.FilesAndFolders),
+                CancellationToken.None);
+            Assert.Contains(results, item => item.Record.Name.Equals("BulkAlpha.txt", StringComparison.OrdinalIgnoreCase));
+        }
+        finally
+        {
+            DeleteIfExists(dbPath);
+        }
+    }
+
+    [Fact]
     public async Task OpenRejectsDatabaseCreatedByNewerApplication()
     {
         var dbPath = CreateTempDbPath();

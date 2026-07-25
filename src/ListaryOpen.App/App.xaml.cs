@@ -981,11 +981,27 @@ public partial class App : Application
         }
     }
 
+    /// <summary>
+    /// Bound how long exit waits for in-flight indexing so a full MFT scan or
+    /// elevated helper cleanup cannot freeze tray exit.
+    /// </summary>
+    internal static readonly TimeSpan IndexingShutdownTimeout = TimeSpan.FromSeconds(3);
+
     private void WaitForIndexingTasks()
     {
         try
         {
-            _indexingTasks.WaitForCompletionAsync().GetAwaiter().GetResult();
+            _indexingTasks
+                .WaitForCompletionAsync()
+                .WaitAsync(IndexingShutdownTimeout)
+                .GetAwaiter()
+                .GetResult();
+        }
+        catch (TimeoutException)
+        {
+            Trace.TraceWarning(
+                "Timed out after {0} ms waiting for indexing tasks during shutdown.",
+                IndexingShutdownTimeout.TotalMilliseconds);
         }
         catch (Exception exception)
         {
@@ -997,6 +1013,7 @@ public partial class App : Application
     {
         try
         {
+            // DisposeAsync itself is time-bounded (FTS maintenance + connection gates).
             _searchIndex?.DisposeAsync().AsTask().GetAwaiter().GetResult();
         }
         catch (Exception exception)
@@ -2428,7 +2445,26 @@ internal static class BackgroundIndexingTaskStarter
         ArgumentNullException.ThrowIfNull(tracker);
         ArgumentNullException.ThrowIfNull(work);
 
-        tracker.Track(Task.Run(() => work(cancellationToken)));
+        tracker.Track(Task.Run(async () =>
+        {
+            var previousPriority = Thread.CurrentThread.Priority;
+            try
+            {
+                // Keep UI/input threads at Normal; only the indexing worker yields.
+                Thread.CurrentThread.Priority = ThreadPriority.BelowNormal;
+                await work(cancellationToken).ConfigureAwait(false);
+            }
+            finally
+            {
+                try
+                {
+                    Thread.CurrentThread.Priority = previousPriority;
+                }
+                catch (ThreadStateException)
+                {
+                }
+            }
+        }));
     }
 }
 
@@ -2541,6 +2577,9 @@ internal sealed class BackgroundIndexingTaskTracker
             await Task.WhenAll(tasks).ConfigureAwait(false);
         }
     }
+
+    public Task WaitForCompletionAsync(TimeSpan timeout) =>
+        WaitForCompletionAsync().WaitAsync(timeout);
 
     private async Task RemoveWhenCompleteAsync(Task task)
     {

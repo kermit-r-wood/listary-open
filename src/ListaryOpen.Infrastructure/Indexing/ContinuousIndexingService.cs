@@ -107,6 +107,8 @@ public sealed class ContinuousIndexingService : IDisposable
     private const int QueueCapacity = 4096;
     private const int ApplyBatchSize = 500;
     private static readonly TimeSpan DefaultDebounce = TimeSpan.FromMilliseconds(300);
+    /// <summary>Do not block app exit on a stuck apply batch forever.</summary>
+    internal static readonly TimeSpan DisposeWorkerTimeout = TimeSpan.FromSeconds(2);
 
     private readonly object _watcherGate = new();
     private readonly Channel<FileChangeHint> _hints;
@@ -243,9 +245,17 @@ public sealed class ContinuousIndexingService : IDisposable
         _baselineReady.TrySetResult();
         try
         {
-            _worker.GetAwaiter().GetResult();
+            if (!_worker.Wait(DisposeWorkerTimeout))
+            {
+                Trace.TraceWarning(
+                    "Continuous indexing worker did not exit within {0} ms during dispose.",
+                    DisposeWorkerTimeout.TotalMilliseconds);
+            }
         }
         catch (OperationCanceledException)
+        {
+        }
+        catch (AggregateException exception) when (exception.InnerExceptions.All(static e => e is OperationCanceledException))
         {
         }
         finally

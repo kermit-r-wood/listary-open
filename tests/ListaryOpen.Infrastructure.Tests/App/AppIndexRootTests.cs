@@ -42,6 +42,22 @@ public sealed class AppIndexRootTests
     }
 
     [Fact]
+    public async Task BackgroundIndexingTaskTrackerTimesOutWhenWorkDoesNotFinish()
+    {
+        var tracker = new BackgroundIndexingTaskTracker();
+        var neverRelease = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        tracker.Track(Task.Run(async () => await neverRelease.Task));
+
+        var waitTask = tracker.WaitForCompletionAsync(TimeSpan.FromMilliseconds(100));
+        await Assert.ThrowsAsync<TimeoutException>(async () => await waitTask);
+
+        // Unblock the orphan so the test process can exit cleanly.
+        neverRelease.SetResult();
+        await tracker.WaitForCompletionAsync().WaitAsync(TimeSpan.FromSeconds(5));
+    }
+
+    [Fact]
     public async Task BackgroundIndexingTaskStarterRunsWorkOffCallerSynchronizationContext()
     {
         var tracker = new BackgroundIndexingTaskTracker();

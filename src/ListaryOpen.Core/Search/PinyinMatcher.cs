@@ -52,13 +52,18 @@ public static class PinyinMatcher
         }
 
         var normalized = value.Trim().ToLowerInvariant();
+        // Fast path: pure ASCII needs no TinyPinyin/AnyAscii work (common on full-path indexing).
+        if (ClassifyTransliterationNeed(normalized) == TransliterationNeed.None)
+        {
+            return string.Empty;
+        }
+
         return CreateSearchAliases(normalized, CreateCandidateForms(normalized));
     }
 
     private static string CreateSearchAliases(string normalized, CandidateForms forms)
     {
-        var builder = new StringBuilder(normalized);
-        builder.Clear();
+        var builder = new StringBuilder(normalized.Length);
         if (!string.Equals(forms.Pinyin, normalized, StringComparison.Ordinal))
         {
             builder.Append(forms.Pinyin);
@@ -85,6 +90,32 @@ public static class PinyinMatcher
             return new CandidateForms(candidate, candidate);
         }
 
+        var need = ClassifyTransliterationNeed(candidate);
+        if (need == TransliterationNeed.None)
+        {
+            return new CandidateForms(candidate, candidate);
+        }
+
+        // Non-CJK multilingual text (e.g. Cyrillic): AnyAscii only, skip TinyPinyin.
+        if (need == TransliterationNeed.MultilingualOnly)
+        {
+            if (Mode != SearchTransliterationMode.Multilingual)
+            {
+                return new CandidateForms(candidate, candidate);
+            }
+
+            var multilingualOnly = candidate.Transliterate()
+                .ToLowerInvariant()
+                .Replace(" ", string.Empty, StringComparison.Ordinal);
+            if (string.Equals(multilingualOnly, candidate, StringComparison.Ordinal) ||
+                string.IsNullOrEmpty(multilingualOnly))
+            {
+                return new CandidateForms(candidate, candidate);
+            }
+
+            return new CandidateForms(multilingualOnly, multilingualOnly);
+        }
+
         var pinyin = PinyinHelper.GetPinyin(candidate, string.Empty).ToLowerInvariant();
         var initials = PinyinHelper.GetPinyinInitials(candidate).ToLowerInvariant();
         if (Mode == SearchTransliterationMode.Multilingual)
@@ -100,12 +131,50 @@ public static class PinyinMatcher
         return new CandidateForms(pinyin, initials);
     }
 
+    /// <summary>
+    /// Classifies whether a string needs expensive transliteration work.
+    /// Pure ASCII is the common indexing case and must stay free of TinyPinyin/AnyAscii.
+    /// </summary>
+    public static TransliterationNeed ClassifyTransliterationNeed(string value)
+    {
+        var need = TransliterationNeed.None;
+        foreach (var ch in value)
+        {
+            if (IsCjkIdeograph(ch))
+            {
+                return TransliterationNeed.Chinese;
+            }
+
+            if (ch > 127)
+            {
+                need = TransliterationNeed.MultilingualOnly;
+            }
+        }
+
+        return need;
+    }
+
+    /// <summary>
+    /// CJK Unified Ideographs + Extension A + compatibility ideographs (BMP).
+    /// </summary>
+    public static bool IsCjkIdeograph(char ch) =>
+        ch is (>= '\u3400' and <= '\u4DBF')
+            or (>= '\u4E00' and <= '\u9FFF')
+            or (>= '\uF900' and <= '\uFAFF');
+
     internal static double Score(string query, CandidateForms forms)
     {
         var pinyinScore = FuzzyMatcher.Score(query, forms.Pinyin);
         return string.Equals(forms.Initials, forms.Pinyin, StringComparison.Ordinal)
             ? pinyinScore
             : Math.Max(pinyinScore, FuzzyMatcher.Score(query, forms.Initials));
+    }
+
+    public enum TransliterationNeed
+    {
+        None,
+        MultilingualOnly,
+        Chinese
     }
 
     internal readonly record struct CandidateForms(string Pinyin, string Initials);

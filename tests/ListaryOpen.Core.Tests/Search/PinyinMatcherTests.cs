@@ -87,4 +87,31 @@ public sealed class PinyinMatcherTests
     {
         Assert.Equal(0, PinyinMatcher.Score(query!, candidate!));
     }
+
+    [Theory]
+    [InlineData("invoice.docx")]
+    [InlineData(@"C:\Users\paul\Documents\readme.txt")]
+    [InlineData("C:/Projects/src/main.cs")]
+    public void AsciiPathsSkipTransliterationWork(string path)
+    {
+        Assert.Equal(PinyinMatcher.TransliterationNeed.None, PinyinMatcher.ClassifyTransliterationNeed(path));
+        Assert.Equal(string.Empty, PinyinMatcher.CreateSearchAliases(path));
+    }
+
+    [Fact]
+    public void ChinesePathsAreClassifiedAsChinese()
+    {
+        Assert.Equal(
+            PinyinMatcher.TransliterationNeed.Chinese,
+            PinyinMatcher.ClassifyTransliterationNeed(@"C:\文档\合同.docx"));
+        Assert.Contains("hetong", PinyinMatcher.CreateSearchAliases(@"C:\文档\合同.docx"), StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void NonAsciiNonChinesePathsUseMultilingualOnlyClassification()
+    {
+        Assert.Equal(
+            PinyinMatcher.TransliterationNeed.MultilingualOnly,
+            PinyinMatcher.ClassifyTransliterationNeed("звезда.txt"));
+    }
 }

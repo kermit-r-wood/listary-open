@@ -155,9 +155,12 @@ internal sealed class PerformanceMetricsFileSink : IDisposable
         _pendingMetrics.Writer.TryComplete();
         try
         {
-            _writerTask.GetAwaiter().GetResult();
+            if (!_writerTask.Wait(TimeSpan.FromSeconds(1)))
+            {
+                Trace.TraceWarning("Timed out flushing performance metrics during dispose.");
+            }
         }
-        catch (Exception exception) when (exception is IOException or ObjectDisposedException)
+        catch (Exception exception) when (exception is IOException or ObjectDisposedException or AggregateException)
         {
             Trace.TraceWarning("Could not close performance metrics: {0}", exception.Message);
         }

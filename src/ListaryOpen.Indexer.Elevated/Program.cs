@@ -1,6 +1,10 @@
+using System.Diagnostics;
 using System.Text.Json;
 using ListaryOpen.Indexer.Elevated;
 using ListaryOpen.Indexer.Elevated.Ntfs;
+
+// Prefer not to contend with interactive UI while scanning MFT / USN.
+TryLowerProcessPriority();
 
 if (args.Length == 2 && args[0] == "scan")
 {
@@ -27,6 +31,21 @@ Console.Error.WriteLine("Usage: ListaryOpen.Indexer.Elevated scan-to-file <root>
 Console.Error.WriteLine("Usage: ListaryOpen.Indexer.Elevated journal-state-to-file <root> <state-path> <error-path>");
 Console.Error.WriteLine("Usage: ListaryOpen.Indexer.Elevated read-journal-to-file <root> <expected-journal-id> <start-usn> <end-usn> <changes-path> <error-path>");
 return 2;
+
+static void TryLowerProcessPriority()
+{
+    try
+    {
+        using var process = Process.GetCurrentProcess();
+        process.PriorityClass = ProcessPriorityClass.BelowNormal;
+    }
+    catch (Exception exception) when (exception is InvalidOperationException
+                                          or PlatformNotSupportedException
+                                          or System.ComponentModel.Win32Exception)
+    {
+        // Best-effort only; indexing still works at the default priority.
+    }
+}
 
 static async Task<int> ScanToConsoleAsync(string root)
 {
