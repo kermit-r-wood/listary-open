@@ -2,6 +2,7 @@ using System.ComponentModel;
 using System.Diagnostics;
 using System.IO;
 using System.Runtime.CompilerServices;
+using System.Windows;
 using ListaryOpen.App.Search;
 using ListaryOpen.Core.Indexing;
 using ListaryOpen.Core.Search;
@@ -539,6 +540,53 @@ public sealed class SearchPanelViewModel : INotifyPropertyChanged
         {
             Trace.TraceError(exception.ToString());
             StatusText = $"Could not copy {path}: {exception.Message}";
+        }
+    }
+
+    public async Task<bool> DeleteSelectedAsync(bool confirm = true)
+    {
+        var selected = TryGetCurrentSelectedResult();
+        if (selected is null)
+        {
+            return false;
+        }
+
+        var path = selected.Record.FullPath;
+        if (confirm)
+        {
+            var kind = selected.Record.IsDirectory ? "folder" : "file";
+            var result = MessageBox.Show(
+                $"Move this {kind} to the Recycle Bin?\n\n{path}",
+                "Delete",
+                MessageBoxButton.YesNo,
+                MessageBoxImage.Warning,
+                MessageBoxResult.No);
+            if (result != MessageBoxResult.Yes)
+            {
+                StatusText = "Delete cancelled.";
+                return false;
+            }
+        }
+
+        try
+        {
+            await _activationService.DeleteAsync(path, selected.Record.IsDirectory, allowUndo: true);
+            await _index.DeleteAsync(path, CancellationToken.None);
+            var remaining = Results.Where(item => !ReferenceEquals(item, selected)).ToArray();
+            PublishResults(remaining);
+            if (ReferenceEquals(SelectedResult, selected) || SelectedResult is null)
+            {
+                SelectedResult = remaining.FirstOrDefault();
+            }
+
+            StatusText = $"Deleted {path}";
+            return true;
+        }
+        catch (Exception exception) when (IsExpectedActivationException(exception) || exception is IOException)
+        {
+            Trace.TraceError(exception.ToString());
+            StatusText = $"Could not delete {path}: {exception.Message}";
+            return false;
         }
     }
 
@@ -1205,8 +1253,7 @@ public sealed class SearchPanelViewModel : INotifyPropertyChanged
             return false;
         }
 
-        if (query.Parsed.PathTerms.Any(term =>
-                !record.FullPath.Contains(term, StringComparison.OrdinalIgnoreCase)))
+        if (query.Parsed.PathTerms.Any(term => !PathSegmentMatcher.Matches(record.FullPath, term)))
         {
             return false;
         }

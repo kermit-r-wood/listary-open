@@ -1,5 +1,6 @@
 using ListaryOpen.Core.Indexing;
 using ListaryOpen.Indexer.Elevated;
+using ListaryOpen.Infrastructure.Indexing.Ntfs;
 using System.Text;
 
 namespace ListaryOpen.Infrastructure.Tests.Indexing;
@@ -32,10 +33,10 @@ public sealed class ElevatedIndexerRecordWriterTests
             var lines = await File.ReadAllLinesAsync(outputPath);
             Assert.Equal(2, lines.Length);
             Assert.Equal(
-                "{\"fullPath\":\"C:\\\\Docs\\\\Report.txt\",\"isDirectory\":false,\"sizeBytes\":42,\"lastWriteTime\":\"2026-07-04T01:02:03+00:00\"}",
+                "{\"fullPath\":\"C:\\\\Docs\\\\Report.txt\",\"isDirectory\":false,\"sizeBytes\":42,\"lastWriteTime\":\"2026-07-04T01:02:03+00:00\",\"fileReferenceNumber\":\"0\"}",
                 lines[0]);
             Assert.Equal(
-                "{\"fullPath\":\"C:\\\\Docs\\\\Archive\",\"isDirectory\":true,\"sizeBytes\":0,\"lastWriteTime\":\"2026-07-04T01:03:00+00:00\"}",
+                "{\"fullPath\":\"C:\\\\Docs\\\\Archive\",\"isDirectory\":true,\"sizeBytes\":0,\"lastWriteTime\":\"2026-07-04T01:03:00+00:00\",\"fileReferenceNumber\":\"0\"}",
                 lines[1]);
         }
         finally
@@ -44,6 +45,61 @@ public sealed class ElevatedIndexerRecordWriterTests
             {
                 File.Delete(outputPath);
             }
+        }
+    }
+
+    [Fact]
+    public async Task WriteJournalChangesFileAsyncStampsFileReferenceOnUpsertFileRenameAndHardLinkResync()
+    {
+        var tempDirectory = ElevatedIndexerOutputPathValidator.GetTrustedTempDirectory();
+        Directory.CreateDirectory(tempDirectory);
+        var outputPath = Path.Combine(tempDirectory, "listary-open-indexer-journal-" + Guid.NewGuid() + ".jsonl");
+
+        try
+        {
+            var now = new DateTimeOffset(2026, 7, 4, 1, 2, 3, TimeSpan.Zero);
+            var upsert = UsnJournalChange.Upsert(
+                FileRecord.Create(@"C:\Docs\a.txt", false, 10, now, fileReferenceNumber: 42));
+            var rename = UsnJournalChange.FileRename(
+                @"C:\Docs\old.txt",
+                FileRecord.Create(@"C:\Docs\new.txt", false, 11, now, fileReferenceNumber: 43));
+            var resync = UsnJournalChange.HardLinkResync(
+                77,
+                new[]
+                {
+                    FileRecord.Create(@"C:\Docs\a1.txt", false, 10, now, fileReferenceNumber: 77)
+                });
+
+            await ElevatedIndexerRecordWriter.WriteJournalChangesFileAsync(
+                EnumerateChanges(upsert, rename, resync),
+                outputPath,
+                CancellationToken.None);
+
+            var lines = await File.ReadAllLinesAsync(outputPath);
+            Assert.Equal(3, lines.Length);
+            Assert.Contains("\"kind\":\"upsert\"", lines[0], StringComparison.Ordinal);
+            Assert.Contains("\"fileReferenceNumber\":\"42\"", lines[0], StringComparison.Ordinal);
+            Assert.Contains("\"kind\":\"fileRename\"", lines[1], StringComparison.Ordinal);
+            Assert.Contains("\"fileReferenceNumber\":\"43\"", lines[1], StringComparison.Ordinal);
+            Assert.Contains("\"kind\":\"hardLinkResync\"", lines[2], StringComparison.Ordinal);
+            Assert.Contains("\"fileReferenceNumber\":\"77\"", lines[2], StringComparison.Ordinal);
+            Assert.Contains("\"fullPath\":\"C:\\\\Docs\\\\a1.txt\"", lines[2], StringComparison.Ordinal);
+        }
+        finally
+        {
+            if (File.Exists(outputPath))
+            {
+                File.Delete(outputPath);
+            }
+        }
+    }
+
+    private static async IAsyncEnumerable<UsnJournalChange> EnumerateChanges(params UsnJournalChange[] changes)
+    {
+        foreach (var change in changes)
+        {
+            await Task.Yield();
+            yield return change;
         }
     }
 

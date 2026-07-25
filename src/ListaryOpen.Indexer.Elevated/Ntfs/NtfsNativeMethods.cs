@@ -7,6 +7,8 @@ internal static class NtfsNativeMethods
     internal const uint FsctlEnumUsnData = 0x000900b3;
     internal const uint FsctlReadUsnJournal = 0x000900bb;
     internal const uint FsctlQueryUsnJournal = 0x000900f4;
+    internal const uint FsctlGetNtfsVolumeData = 0x00090064;
+    internal const uint FsctlGetNtfsFileRecord = 0x00090068;
 
     internal const uint GenericRead = 0x80000000;
     internal const uint FileShareRead = 0x00000001;
@@ -14,7 +16,9 @@ internal static class NtfsNativeMethods
     internal const uint FileShareDelete = 0x00000004;
     internal const uint OpenExisting = 3;
     internal const uint FileFlagBackupSemantics = 0x02000000;
+    internal const uint FileFlagNoBuffering = 0x20000000;
     internal const int ErrorHandleEof = 38;
+    internal const uint FileBegin = 0;
 
     internal static readonly IntPtr InvalidHandleValue = new(-1);
 
@@ -28,14 +32,26 @@ internal static class NtfsNativeMethods
         uint dwFlagsAndAttributes,
         IntPtr hTemplateFile);
 
-    [DllImport("kernel32.dll", SetLastError = true)]
+    [DllImport("kernel32.dll", EntryPoint = "DeviceIoControl", SetLastError = true)]
     [return: MarshalAs(UnmanagedType.Bool)]
-    internal static extern bool DeviceIoControl(
+    internal static extern bool DeviceIoControlQueryUsnJournal(
         IntPtr hDevice,
         uint dwIoControlCode,
         IntPtr lpInBuffer,
         int nInBufferSize,
         out UsnJournalDataV0 lpOutBuffer,
+        int nOutBufferSize,
+        out int lpBytesReturned,
+        IntPtr lpOverlapped);
+
+    [DllImport("kernel32.dll", EntryPoint = "DeviceIoControl", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    internal static extern bool DeviceIoControlGetNtfsVolumeData(
+        IntPtr hDevice,
+        uint dwIoControlCode,
+        IntPtr lpInBuffer,
+        int nInBufferSize,
+        out NtfsVolumeDataBuffer lpOutBuffer,
         int nOutBufferSize,
         out int lpBytesReturned,
         IntPtr lpOverlapped);
@@ -66,6 +82,18 @@ internal static class NtfsNativeMethods
 
     [DllImport("kernel32.dll", SetLastError = true)]
     [return: MarshalAs(UnmanagedType.Bool)]
+    internal static extern bool DeviceIoControl(
+        IntPtr hDevice,
+        uint dwIoControlCode,
+        ref NtfsFileRecordInputBuffer lpInBuffer,
+        int nInBufferSize,
+        [Out] byte[] lpOutBuffer,
+        int nOutBufferSize,
+        out int lpBytesReturned,
+        IntPtr lpOverlapped);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
     internal static extern bool CloseHandle(IntPtr hObject);
 
     [DllImport("kernel32.dll", SetLastError = true)]
@@ -73,6 +101,23 @@ internal static class NtfsNativeMethods
     internal static extern bool GetFileInformationByHandle(
         IntPtr hFile,
         out ByHandleFileInformation lpFileInformation);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    internal static extern bool ReadFile(
+        IntPtr hFile,
+        byte[] lpBuffer,
+        int nNumberOfBytesToRead,
+        out int lpNumberOfBytesRead,
+        IntPtr lpOverlapped);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    internal static extern bool SetFilePointerEx(
+        IntPtr hFile,
+        long liDistanceToMove,
+        out long lpNewFilePointer,
+        uint dwMoveMethod);
 
     [StructLayout(LayoutKind.Sequential)]
     internal struct MftEnumDataV0
@@ -148,5 +193,30 @@ internal static class NtfsNativeMethods
         public uint LowDateTime;
 
         public uint HighDateTime;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    internal struct NtfsVolumeDataBuffer
+    {
+        public long VolumeSerialNumber;
+        public long NumberSectors;
+        public long TotalClusters;
+        public long FreeClusters;
+        public long TotalReserved;
+        public uint BytesPerSector;
+        public uint BytesPerCluster;
+        public uint BytesPerFileRecordSegment;
+        public uint ClustersPerFileRecordSegment;
+        public long MftValidDataLength;
+        public long MftStartLcn;
+        public long Mft2StartLcn;
+        public long MftZoneStart;
+        public long MftZoneEnd;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    internal struct NtfsFileRecordInputBuffer
+    {
+        public long FileReferenceNumber;
     }
 }

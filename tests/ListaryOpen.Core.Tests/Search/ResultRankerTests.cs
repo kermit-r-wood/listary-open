@@ -226,6 +226,69 @@ public sealed class ResultRankerTests
     }
 
     [Fact]
+    public void RankBoostsStartMenuShortcutWhenTextTierMatches()
+    {
+        var now = new DateTimeOffset(2026, 7, 3, 1, 0, 0, TimeSpan.Zero);
+        var app = FileRecord.Create(
+            @"C:\ProgramData\Microsoft\Windows\Start Menu\Programs\Code.lnk",
+            false,
+            1,
+            now);
+        var file = FileRecord.Create(@"C:\Docs\code-notes.txt", false, 1, now);
+
+        var ranked = ResultRanker.Rank(
+            new SearchQuery("code", SearchMode.FilesAndFolders),
+            new[] { file, app },
+            Array.Empty<UsageRecord>(),
+            Array.Empty<string>());
+
+        Assert.Equal(2, ranked.Count);
+        // Both are name-substring tier; app soft-boost wins among equal text quality.
+        Assert.Equal(app.FullPath, ranked[0].Record.FullPath);
+    }
+
+    [Fact]
+    public void RankDoesNotLetWeakAppBeatExactNonAppName()
+    {
+        var now = new DateTimeOffset(2026, 7, 3, 1, 0, 0, TimeSpan.Zero);
+        var exactFile = FileRecord.Create(@"C:\Docs\report.pdf", false, 1, now);
+        var weakApp = FileRecord.Create(
+            @"C:\ProgramData\Microsoft\Windows\Start Menu\Programs\Report Tool.lnk",
+            false,
+            1,
+            now);
+
+        var ranked = ResultRanker.Rank(
+            new SearchQuery("report.pdf", SearchMode.FilesAndFolders),
+            new[] { weakApp, exactFile },
+            Array.Empty<UsageRecord>(),
+            Array.Empty<string>());
+
+        Assert.Equal(exactFile.FullPath, ranked[0].Record.FullPath);
+    }
+
+    [Fact]
+    public void RankFiltersToApplicationsWhenAppOperatorPresent()
+    {
+        var now = new DateTimeOffset(2026, 7, 3, 1, 0, 0, TimeSpan.Zero);
+        var app = FileRecord.Create(
+            @"C:\ProgramData\Microsoft\Windows\Start Menu\Programs\Code.lnk",
+            false,
+            1,
+            now);
+        var file = FileRecord.Create(@"C:\Docs\code-notes.txt", false, 1, now);
+
+        var ranked = ResultRanker.Rank(
+            new SearchQuery("app: code", SearchMode.FilesAndFolders),
+            new[] { file, app },
+            Array.Empty<UsageRecord>(),
+            Array.Empty<string>());
+
+        var result = Assert.Single(ranked);
+        Assert.Equal(app.FullPath, result.Record.FullPath);
+    }
+
+    [Fact]
     public void RankUsesPinyinScore()
     {
         var now = new DateTimeOffset(2026, 7, 3, 1, 0, 0, TimeSpan.Zero);
@@ -242,6 +305,65 @@ public sealed class ResultRankerTests
 
         var result = Assert.Single(ranked);
         Assert.Equal("C:\\Docs\\发票2026.xlsx", result.Record.FullPath);
+    }
+
+    [Fact]
+    public void RankUsesTwoCharacterPinyinInitials()
+    {
+        var now = new DateTimeOffset(2026, 7, 3, 1, 0, 0, TimeSpan.Zero);
+        var records = new[]
+        {
+            FileRecord.Create("C:\\Docs\\合同.docx", false, 1, now),
+            FileRecord.Create("C:\\Docs\\other.txt", false, 1, now)
+        };
+
+        var ranked = ResultRanker.Rank(
+            new SearchQuery("ht", SearchMode.FilesAndFolders),
+            records,
+            Array.Empty<UsageRecord>(),
+            Array.Empty<string>());
+
+        Assert.Contains(ranked, item => item.Record.Name == "合同.docx");
+        Assert.Equal("pinyin", ranked.First(item => item.Record.Name == "合同.docx").MatchReason);
+    }
+
+    [Fact]
+    public void RankPrefersShortPinyinOverLatinSubstringNoise()
+    {
+        var now = new DateTimeOffset(2026, 7, 3, 1, 0, 0, TimeSpan.Zero);
+        var records = new[]
+        {
+            FileRecord.Create("C:\\Docs\\whitelist.txt", false, 1, now),
+            FileRecord.Create("C:\\Docs\\height.md", false, 1, now),
+            FileRecord.Create("C:\\Docs\\photo.jpg", false, 1, now),
+            FileRecord.Create("C:\\Docs\\合同.docx", false, 1, now)
+        };
+
+        var ranked = ResultRanker.Rank(
+            new SearchQuery("ht", SearchMode.FilesAndFolders),
+            records,
+            Array.Empty<UsageRecord>(),
+            Array.Empty<string>());
+
+        Assert.Equal("合同.docx", ranked[0].Record.Name);
+        Assert.Equal("pinyin", ranked[0].MatchReason);
+    }
+
+    [Fact]
+    public void RankPrefersPathSegmentMatchOverUnrelatedNameFuzzy()
+    {
+        var now = new DateTimeOffset(2026, 7, 3, 1, 0, 0, TimeSpan.Zero);
+        var pathHit = FileRecord.Create("C:\\Projects\\中大成赢\\notes.txt", false, 1, now);
+        var nameNoise = FileRecord.Create("C:\\Other\\xyz.txt", false, 1, now);
+
+        var ranked = ResultRanker.Rank(
+            new SearchQuery(@"Projects\中大", SearchMode.FilesAndFolders),
+            new[] { nameNoise, pathHit },
+            Array.Empty<UsageRecord>(),
+            Array.Empty<string>());
+
+        Assert.Equal(pathHit.FullPath, ranked[0].Record.FullPath);
+        Assert.Equal("path-segment", ranked[0].MatchReason);
     }
 
     [Fact]

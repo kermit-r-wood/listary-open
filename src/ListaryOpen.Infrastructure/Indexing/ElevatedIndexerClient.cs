@@ -674,7 +674,8 @@ public sealed class ElevatedIndexerClient : IElevatedIndexerClient
                 dto.FullPath!,
                 dto.IsDirectory.GetValueOrDefault(),
                 dto.SizeBytes.GetValueOrDefault(),
-                dto.LastWriteTime.GetValueOrDefault());
+                dto.LastWriteTime.GetValueOrDefault(),
+                ParseFileReference(dto.FileReferenceNumber));
         }
         catch (Exception exception) when (exception is JsonException
                                           or InvalidDataException
@@ -795,7 +796,8 @@ public sealed class ElevatedIndexerClient : IElevatedIndexerClient
                     dto.FullPath ?? throw new InvalidDataException("Upsert change is missing full path."),
                     dto.IsDirectory ?? throw new InvalidDataException("Upsert change is missing directory flag."),
                     dto.SizeBytes ?? throw new InvalidDataException("Upsert change is missing size."),
-                    dto.LastWriteTime ?? throw new InvalidDataException("Upsert change is missing last write time."))),
+                    dto.LastWriteTime ?? throw new InvalidDataException("Upsert change is missing last write time."),
+                    ParseFileReference(dto.FileReferenceNumber))),
                 "delete" => UsnJournalChange.Delete(
                     dto.FullPath ?? throw new InvalidDataException("Delete change is missing full path.")),
                 "fileRename" => UsnJournalChange.FileRename(
@@ -804,8 +806,17 @@ public sealed class ElevatedIndexerClient : IElevatedIndexerClient
                         dto.FullPath ?? throw new InvalidDataException("File rename change is missing full path."),
                         dto.IsDirectory ?? throw new InvalidDataException("File rename change is missing directory flag."),
                         dto.SizeBytes ?? throw new InvalidDataException("File rename change is missing size."),
-                        dto.LastWriteTime ?? throw new InvalidDataException("File rename change is missing last write time."))),
+                        dto.LastWriteTime ?? throw new InvalidDataException("File rename change is missing last write time."),
+                        ParseFileReference(dto.FileReferenceNumber))),
                 "directoryRenameOrMove" => UsnJournalChange.DirectoryRenameOrMove(),
+                "hardLinkResync" => UsnJournalChange.HardLinkResync(
+                    ParseFileReference(dto.FileReferenceNumber),
+                    (dto.LiveRecords ?? Array.Empty<UsnJournalLiveRecordDto>()).Select(live => FileRecord.Create(
+                        live.FullPath ?? throw new InvalidDataException("Hard-link live record is missing full path."),
+                        live.IsDirectory ?? throw new InvalidDataException("Hard-link live record is missing directory flag."),
+                        live.SizeBytes ?? throw new InvalidDataException("Hard-link live record is missing size."),
+                        live.LastWriteTime ?? throw new InvalidDataException("Hard-link live record is missing last write time."),
+                        ParseFileReference(live.FileReferenceNumber))).ToArray()),
                 _ => throw new InvalidDataException($"Unsupported journal change kind: {dto.Kind}.")
             };
         }
@@ -1173,6 +1184,9 @@ public sealed class ElevatedIndexerClient : IElevatedIndexerClient
 
         [JsonPropertyName("lastWriteTime")]
         public DateTimeOffset? LastWriteTime { get; init; }
+
+        [JsonPropertyName("fileReferenceNumber")]
+        public string? FileReferenceNumber { get; init; }
     }
 
     private sealed class UsnJournalStateDto
@@ -1206,6 +1220,42 @@ public sealed class ElevatedIndexerClient : IElevatedIndexerClient
 
         [JsonPropertyName("lastWriteTime")]
         public DateTimeOffset? LastWriteTime { get; init; }
+
+        [JsonPropertyName("fileReferenceNumber")]
+        public string? FileReferenceNumber { get; init; }
+
+        [JsonPropertyName("liveRecords")]
+        public UsnJournalLiveRecordDto[]? LiveRecords { get; init; }
+    }
+
+    private sealed class UsnJournalLiveRecordDto
+    {
+        [JsonPropertyName("fullPath")]
+        public string? FullPath { get; init; }
+
+        [JsonPropertyName("isDirectory")]
+        public bool? IsDirectory { get; init; }
+
+        [JsonPropertyName("sizeBytes")]
+        public long? SizeBytes { get; init; }
+
+        [JsonPropertyName("lastWriteTime")]
+        public DateTimeOffset? LastWriteTime { get; init; }
+
+        [JsonPropertyName("fileReferenceNumber")]
+        public string? FileReferenceNumber { get; init; }
+    }
+
+    private static ulong ParseFileReference(string? value)
+    {
+        if (string.IsNullOrWhiteSpace(value))
+        {
+            return 0;
+        }
+
+        return ulong.TryParse(value, System.Globalization.NumberStyles.Integer, System.Globalization.CultureInfo.InvariantCulture, out var parsed)
+            ? parsed
+            : 0;
     }
 
     private sealed class ElevatedIndexerException : InvalidOperationException

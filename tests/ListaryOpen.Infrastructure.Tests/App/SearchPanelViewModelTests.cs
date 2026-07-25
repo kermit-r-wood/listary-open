@@ -1551,6 +1551,14 @@ public sealed class SearchPanelViewModelTests
         {
             CopiedPaths.Add(path);
         }
+
+        public List<string> DeletedPaths { get; } = new();
+
+        public Task DeleteAsync(string path, bool isDirectory, bool allowUndo = true)
+        {
+            DeletedPaths.Add(path);
+            return Task.CompletedTask;
+        }
     }
 
     private sealed class RecordingDialogFolderActivation

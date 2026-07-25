@@ -492,6 +492,67 @@ public sealed class SqliteSearchIndexTests
     }
 
     [Fact]
+    public async Task SearchORsMultipleIncludeExtensions()
+    {
+        var dbPath = CreateTempDbPath();
+
+        try
+        {
+            await using (var index = await SqliteSearchIndex.OpenAsync(dbPath, CancellationToken.None))
+            {
+                await index.UpsertManyAsync(new[]
+                {
+                    FileRecord.Create("C:\\Docs\\Report.pdf", false, 10, DateTimeOffset.UtcNow),
+                    FileRecord.Create("C:\\Docs\\Report.docx", false, 10, DateTimeOffset.UtcNow),
+                    FileRecord.Create("C:\\Docs\\Report.txt", false, 10, DateTimeOffset.UtcNow)
+                }, CancellationToken.None);
+
+                var results = await index.SearchAsync(
+                    new SearchQuery("report ext:pdf ext:docx", SearchMode.FilesAndFolders),
+                    CancellationToken.None);
+
+                Assert.Equal(2, results.Count);
+                Assert.Contains(results, item => item.Record.Name.Equals("Report.pdf", StringComparison.OrdinalIgnoreCase));
+                Assert.Contains(results, item => item.Record.Name.Equals("Report.docx", StringComparison.OrdinalIgnoreCase));
+            }
+        }
+        finally
+        {
+            DeleteIfExists(dbPath);
+        }
+    }
+
+    [Fact]
+    public async Task SearchORsCommaSeparatedIncludeExtensions()
+    {
+        var dbPath = CreateTempDbPath();
+
+        try
+        {
+            await using (var index = await SqliteSearchIndex.OpenAsync(dbPath, CancellationToken.None))
+            {
+                await index.UpsertManyAsync(new[]
+                {
+                    FileRecord.Create("C:\\Docs\\Shot.png", false, 10, DateTimeOffset.UtcNow),
+                    FileRecord.Create("C:\\Docs\\Shot.jpg", false, 10, DateTimeOffset.UtcNow),
+                    FileRecord.Create("C:\\Docs\\Shot.gif", false, 10, DateTimeOffset.UtcNow)
+                }, CancellationToken.None);
+
+                var results = await index.SearchAsync(
+                    new SearchQuery("shot ext:png,jpg", SearchMode.FilesAndFolders),
+                    CancellationToken.None);
+
+                Assert.Equal(2, results.Count);
+                Assert.DoesNotContain(results, item => item.Record.Name.EndsWith(".gif", StringComparison.OrdinalIgnoreCase));
+            }
+        }
+        finally
+        {
+            DeleteIfExists(dbPath);
+        }
+    }
+
+    [Fact]
     public async Task SearchSupportsPureExtensionExclusion()
     {
         var dbPath = CreateTempDbPath();
@@ -1487,12 +1548,86 @@ public sealed class SqliteSearchIndexTests
     }
 
     [Fact]
-    public void SearchSkipsExpensiveFuzzyCandidatePassesForOneOrTwoCharacterQueries()
+    public void SearchEnablesExpensiveFuzzyFromTwoCharacterQueries()
     {
         Assert.False(SqliteSearchIndex.UsesExpensiveFuzzyCandidatesForTests(new SearchQuery("a", SearchMode.FilesAndFolders)));
         Assert.False(SqliteSearchIndex.UsesExpensiveFuzzyCandidatesForTests(new SearchQuery("ext:txt a", SearchMode.FilesAndFolders)));
-        Assert.False(SqliteSearchIndex.UsesExpensiveFuzzyCandidatesForTests(new SearchQuery("ab", SearchMode.FilesAndFolders)));
+        Assert.True(SqliteSearchIndex.UsesExpensiveFuzzyCandidatesForTests(new SearchQuery("ab", SearchMode.FilesAndFolders)));
         Assert.True(SqliteSearchIndex.UsesExpensiveFuzzyCandidatesForTests(new SearchQuery("abc", SearchMode.FilesAndFolders)));
+        Assert.True(SqliteSearchIndex.ShouldUseShortAliasCandidatesForTests(new SearchQuery("ht", SearchMode.FilesAndFolders)));
+        Assert.False(SqliteSearchIndex.ShouldUseShortAliasCandidatesForTests(new SearchQuery("abc", SearchMode.FilesAndFolders)));
+    }
+
+    [Fact]
+    public async Task SearchFindsChineseFileByTwoCharacterPinyinInitials()
+    {
+        var dbPath = CreateTempDbPath();
+        try
+        {
+            await using (var index = await SqliteSearchIndex.OpenAsync(dbPath, CancellationToken.None))
+            {
+                // Many filler rows so exact name-range for "ht" cannot luck into the Chinese file.
+                var fillers = Enumerable.Range(0, 300)
+                    .Select(i => FileRecord.Create($"C:\\Docs\\filler-{i:D4}.txt", false, 10, DateTimeOffset.UtcNow))
+                    .ToArray();
+                await index.UpsertManyAsync(fillers, CancellationToken.None);
+                // Latin substring noise that used to outrank pinyin initials.
+                await index.UpsertManyAsync(new[]
+                {
+                    FileRecord.Create("C:\\Docs\\whitelist.txt", false, 10, DateTimeOffset.UtcNow),
+                    FileRecord.Create("C:\\Docs\\height.md", false, 10, DateTimeOffset.UtcNow),
+                    FileRecord.Create("C:\\Docs\\photo.jpg", false, 10, DateTimeOffset.UtcNow)
+                }, CancellationToken.None);
+                await index.UpsertAsync(
+                    FileRecord.Create("C:\\Docs\\合同.docx", false, 10, DateTimeOffset.UtcNow),
+                    CancellationToken.None);
+                await index.WaitForBackgroundMaintenanceAsync();
+
+                var results = await index.SearchAsync(
+                    new SearchQuery("ht", SearchMode.FilesAndFolders, limit: 20),
+                    CancellationToken.None);
+
+                Assert.Contains(results, item => item.Record.Name == "合同.docx");
+                Assert.Equal("合同.docx", results[0].Record.Name);
+            }
+        }
+        finally
+        {
+            DeleteIfExists(dbPath);
+        }
+    }
+
+    [Fact]
+    public async Task SearchMatchesMultiSegmentPathFilter()
+    {
+        var dbPath = CreateTempDbPath();
+        try
+        {
+            await using (var index = await SqliteSearchIndex.OpenAsync(dbPath, CancellationToken.None))
+            {
+                await index.UpsertManyAsync(new[]
+                {
+                    FileRecord.Create("C:\\Projects\\中大成赢\\门房图纸.cad", false, 10, DateTimeOffset.UtcNow),
+                    FileRecord.Create("C:\\Other\\门房图纸.cad", false, 10, DateTimeOffset.UtcNow),
+                    FileRecord.Create("C:\\Projects\\unrelated\\readme.txt", false, 10, DateTimeOffset.UtcNow)
+                }, CancellationToken.None);
+                await index.WaitForBackgroundMaintenanceAsync();
+
+                var results = await index.SearchAsync(
+                    new SearchQuery(@"path:Projects\中大 图纸", SearchMode.FilesAndFolders),
+                    CancellationToken.None);
+
+                // path:Projects\中大 requires both segments; ranking text "图纸" matches name.
+                // Parse: path:Projects\中大 is one token if no space... Actually "path:Projects\中大 图纸"
+                // tokenizes to path:Projects\中大 and term 图纸
+                var hit = Assert.Single(results);
+                Assert.Equal("C:\\Projects\\中大成赢\\门房图纸.cad", hit.Record.FullPath);
+            }
+        }
+        finally
+        {
+            DeleteIfExists(dbPath);
+        }
     }
 
     [Fact]

@@ -29,7 +29,8 @@ internal static class ElevatedIndexerRecordWriter
                     record.FullPath,
                     record.IsDirectory,
                     record.SizeBytes,
-                    record.LastWriteTime
+                    record.LastWriteTime,
+                    fileReferenceNumber = record.FileReferenceNumber.ToString(System.Globalization.CultureInfo.InvariantCulture)
                 },
                 JsonOptions.Default);
 
@@ -125,7 +126,8 @@ internal static class ElevatedIndexerRecordWriter
                 change.Record!.FullPath,
                 change.Record.IsDirectory,
                 change.Record.SizeBytes,
-                change.Record.LastWriteTime
+                change.Record.LastWriteTime,
+                fileReferenceNumber = change.Record.FileReferenceNumber.ToString(System.Globalization.CultureInfo.InvariantCulture)
             },
             UsnJournalChangeKind.Delete => new
             {
@@ -139,11 +141,25 @@ internal static class ElevatedIndexerRecordWriter
                 change.Record!.FullPath,
                 change.Record.IsDirectory,
                 change.Record.SizeBytes,
-                change.Record.LastWriteTime
+                change.Record.LastWriteTime,
+                fileReferenceNumber = change.Record.FileReferenceNumber.ToString(System.Globalization.CultureInfo.InvariantCulture)
             },
             UsnJournalChangeKind.DirectoryRenameOrMove => new
             {
                 kind = "directoryRenameOrMove"
+            },
+            UsnJournalChangeKind.HardLinkResync => new
+            {
+                kind = "hardLinkResync",
+                fileReferenceNumber = change.FileReferenceNumber.ToString(System.Globalization.CultureInfo.InvariantCulture),
+                liveRecords = (change.LiveHardLinkRecords ?? Array.Empty<FileRecord>()).Select(record => new
+                {
+                    record.FullPath,
+                    record.IsDirectory,
+                    record.SizeBytes,
+                    record.LastWriteTime,
+                    fileReferenceNumber = record.FileReferenceNumber.ToString(System.Globalization.CultureInfo.InvariantCulture)
+                }).ToArray()
             },
             _ => throw new NotSupportedException($"Unsupported journal change kind: {change.Kind}.")
         };

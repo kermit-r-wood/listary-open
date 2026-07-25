@@ -792,6 +792,11 @@ public partial class SearchPanel : Window
 
         if (e.Key == Key.Enter && isControlPressed)
         {
+            if (ImeInputGuard.ShouldDeferEnterToIme(Keyboard.FocusedElement as DependencyObject))
+            {
+                return;
+            }
+
             e.Handled = true;
             _ = RunInteractionAsync(ViewModel, viewModel => viewModel.RevealSelectedAsync());
             return;
@@ -799,6 +804,12 @@ public partial class SearchPanel : Window
 
         if (e.Key == Key.Enter)
         {
+            // Let IME consume Enter while composing (e.g. Chinese candidate confirm).
+            if (ImeInputGuard.ShouldDeferEnterToIme(Keyboard.FocusedElement as DependencyObject))
+            {
+                return;
+            }
+
             e.Handled = true;
             _ = ActivateSelectedFromQuickSwitchAsync();
             return;
@@ -962,6 +973,12 @@ public partial class SearchPanel : Window
                 viewModel.CopySelectedPath();
                 return Task.CompletedTask;
             });
+    }
+
+    private void DeleteResultMenuItem_Click(object sender, RoutedEventArgs e)
+    {
+        CloseResultContextMenu();
+        _ = RunInteractionAsync(ViewModel, viewModel => viewModel.DeleteSelectedAsync(confirm: true));
     }
 
     internal static bool ShouldCopySelectedResultPath(bool focusIsQueryBox, bool focusIsTextInput)

@@ -8,14 +8,17 @@ public enum UsnJournalChangeKind
     Upsert,
     Delete,
     FileRename,
-    DirectoryRenameOrMove
+    DirectoryRenameOrMove,
+    HardLinkResync
 }
 
 public sealed record UsnJournalChange(
     UsnJournalChangeKind Kind,
     FileRecord? Record,
     string? FullPath,
-    string? OldFullPath)
+    string? OldFullPath,
+    ulong FileReferenceNumber = 0,
+    IReadOnlyList<FileRecord>? LiveHardLinkRecords = null)
 {
     public static UsnJournalChange Upsert(FileRecord record)
     {
@@ -38,18 +41,44 @@ public sealed record UsnJournalChange(
 
     public static UsnJournalChange DirectoryRenameOrMove()
         => new(UsnJournalChangeKind.DirectoryRenameOrMove, null, null, null);
+
+    /// <summary>
+    /// Replaces all indexed names for an MFT file reference with the live hard-link set.
+    /// </summary>
+    public static UsnJournalChange HardLinkResync(ulong fileReferenceNumber, IReadOnlyList<FileRecord> liveRecords)
+    {
+        if (fileReferenceNumber == 0)
+        {
+            throw new ArgumentOutOfRangeException(nameof(fileReferenceNumber));
+        }
+
+        ArgumentNullException.ThrowIfNull(liveRecords);
+        var stamped = liveRecords
+            .Select(record => record.WithFileReferenceNumber(fileReferenceNumber))
+            .ToArray();
+        return new UsnJournalChange(
+            UsnJournalChangeKind.HardLinkResync,
+            Record: null,
+            FullPath: null,
+            OldFullPath: null,
+            fileReferenceNumber,
+            stamped);
+    }
 }
 
 public enum UsnJournalIndexChangeKind
 {
     Upsert,
-    Delete
+    Delete,
+    HardLinkResync
 }
 
 public sealed record UsnJournalIndexChange(
     UsnJournalIndexChangeKind Kind,
     FileRecord? Record,
-    string? FullPath)
+    string? FullPath,
+    ulong FileReferenceNumber = 0,
+    IReadOnlyList<FileRecord>? LiveHardLinkRecords = null)
 {
     public static UsnJournalIndexChange Upsert(FileRecord record)
     {
@@ -61,6 +90,17 @@ public sealed record UsnJournalIndexChange(
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(fullPath);
         return new UsnJournalIndexChange(UsnJournalIndexChangeKind.Delete, null, fullPath);
+    }
+
+    public static UsnJournalIndexChange HardLinkResync(ulong fileReferenceNumber, IReadOnlyList<FileRecord> liveRecords)
+    {
+        ArgumentNullException.ThrowIfNull(liveRecords);
+        return new UsnJournalIndexChange(
+            UsnJournalIndexChangeKind.HardLinkResync,
+            null,
+            null,
+            fileReferenceNumber,
+            liveRecords);
     }
 }
 
@@ -138,6 +178,16 @@ public static class UsnJournalChangeApplier
                         indexChanges.Add(UsnJournalIndexChange.Upsert(change.Record!));
                     }
                     break;
+
+                case UsnJournalChangeKind.HardLinkResync:
+                {
+                    var live = (change.LiveHardLinkRecords ?? Array.Empty<FileRecord>())
+                        .Where(recordFilter)
+                        .Select(record => record.WithFileReferenceNumber(change.FileReferenceNumber))
+                        .ToArray();
+                    indexChanges.Add(UsnJournalIndexChange.HardLinkResync(change.FileReferenceNumber, live));
+                    break;
+                }
 
                 case UsnJournalChangeKind.DirectoryRenameOrMove:
                     throw new InvalidOperationException("Directory rename changes must request a full rescan.");

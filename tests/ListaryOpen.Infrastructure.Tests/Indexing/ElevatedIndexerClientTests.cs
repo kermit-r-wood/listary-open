@@ -2,8 +2,11 @@ using System.ComponentModel;
 using System.Diagnostics;
 using System.Text;
 using ListaryOpen.Core.Indexing;
+using ListaryOpen.Core.Search;
+using ListaryOpen.Indexer.Elevated;
 using ListaryOpen.Infrastructure.Indexing;
 using ListaryOpen.Infrastructure.Indexing.Ntfs;
+using ListaryOpen.Infrastructure.Search;
 
 namespace ListaryOpen.Infrastructure.Tests.Indexing;
 
@@ -580,7 +583,7 @@ public sealed class ElevatedIndexerClientTests
             var output = string.Join(
                 Environment.NewLine,
                 "{\"kind\":\"delete\",\"fullPath\":\"C:\\\\Docs\\\\OldName.txt\"}",
-                "{\"kind\":\"upsert\",\"fullPath\":\"C:\\\\Docs\\\\NewName.txt\",\"isDirectory\":false,\"sizeBytes\":42,\"lastWriteTime\":\"2026-07-09T00:00:00+00:00\"}",
+                "{\"kind\":\"upsert\",\"fullPath\":\"C:\\\\Docs\\\\NewName.txt\",\"isDirectory\":false,\"sizeBytes\":42,\"lastWriteTime\":\"2026-07-09T00:00:00+00:00\",\"fileReferenceNumber\":\"99\"}",
                 "{\"kind\":\"directoryRenameOrMove\"}");
             var client = new ElevatedIndexerClient(
                 helperPath,
@@ -609,12 +612,155 @@ public sealed class ElevatedIndexerClientTests
                     Assert.Equal(UsnJournalChangeKind.Upsert, change.Kind);
                     Assert.Equal("C:\\Docs\\NewName.txt", change.Record!.FullPath);
                     Assert.Equal(42, change.Record.SizeBytes);
+                    Assert.Equal(99ul, change.Record.FileReferenceNumber);
                 },
                 change => Assert.Equal(UsnJournalChangeKind.DirectoryRenameOrMove, change.Kind));
         }
         finally
         {
             Directory.Delete(tempDirectory, recursive: true);
+        }
+    }
+
+    [Fact]
+    public async Task WriteJournalThenParseThenApplyRemovesFrnZeroHardLinkGhost()
+    {
+        // Elevated writer → client parse → index apply on the real incremental hard-link path:
+        // FRN=0 USN upserts, then HARD_LINK_CHANGE resync+delete JSONL.
+        var tempDirectory = Path.Combine(Path.GetTempPath(), "listary-open-" + Guid.NewGuid());
+        Directory.CreateDirectory(tempDirectory);
+        var dbPath = Path.Combine(tempDirectory, "index.db");
+        var trustedTemp = ElevatedIndexerOutputPathValidator.GetTrustedTempDirectory();
+        Directory.CreateDirectory(trustedTemp);
+        var journalPath = Path.Combine(
+            trustedTemp,
+            "listary-open-indexer-journal-rt-" + Guid.NewGuid() + ".jsonl");
+
+        try
+        {
+            const ulong frn = 88;
+            var now = new DateTimeOffset(2026, 7, 20, 12, 0, 0, TimeSpan.Zero);
+
+            await using var index = await SqliteSearchIndex.OpenAsync(dbPath, CancellationToken.None);
+            await index.UpsertManyAsync(
+                new[]
+                {
+                    FileRecord.Create(@"C:\Docs\a.txt", false, 10, now, fileReferenceNumber: 0),
+                    FileRecord.Create(@"C:\Docs\a1.txt", false, 10, now, fileReferenceNumber: 0),
+                    FileRecord.Create(@"C:\Docs\other.txt", false, 10, now, fileReferenceNumber: 0)
+                },
+                CancellationToken.None);
+
+            var produced = new UsnJournalChange[]
+            {
+                UsnJournalChange.HardLinkResync(
+                    frn,
+                    new[] { FileRecord.Create(@"C:\Docs\a1.txt", false, 10, now, frn) }),
+                UsnJournalChange.Delete(@"C:\Docs\a.txt")
+            };
+
+            await ElevatedIndexerRecordWriter.WriteJournalChangesFileAsync(
+                EnumerateJournal(produced),
+                journalPath,
+                CancellationToken.None);
+
+            var written = await File.ReadAllTextAsync(journalPath);
+            Assert.Contains("\"fileReferenceNumber\":\"88\"", written, StringComparison.Ordinal);
+            Assert.Contains("\"kind\":\"hardLinkResync\"", written, StringComparison.Ordinal);
+
+            var helperPath = CreateUsableHelperBundle(tempDirectory);
+            var client = new ElevatedIndexerClient(
+                helperPath,
+                (_, _, outputPath, errorPath) => new FileWritingElevatedIndexerProcess(
+                    outputPath,
+                    errorPath,
+                    written,
+                    error: string.Empty,
+                    exitCode: 0));
+
+            var parsed = new List<UsnJournalChange>();
+            await foreach (var change in client.ReadJournalChangesAsync(
+                               new IndexRoot("C:\\Docs"),
+                               9,
+                               100,
+                               200,
+                               CancellationToken.None))
+            {
+                parsed.Add(change);
+            }
+
+            Assert.Equal(2, parsed.Count);
+            Assert.Equal(UsnJournalChangeKind.HardLinkResync, parsed[0].Kind);
+            Assert.Equal(frn, parsed[0].FileReferenceNumber);
+            Assert.Equal(frn, Assert.Single(parsed[0].LiveHardLinkRecords!).FileReferenceNumber);
+            Assert.Equal(UsnJournalChangeKind.Delete, parsed[1].Kind);
+            Assert.Equal(@"C:\Docs\a.txt", parsed[1].FullPath);
+
+            var checkpoint = new UsnJournalCheckpoint(
+                VolumeRoot: @"C:\",
+                FileSystemName: "NTFS",
+                UsnJournalId: 1,
+                NextUsn: 300,
+                RulesVersion: 1,
+                LastFullScanAt: now);
+
+            var apply = await UsnJournalChangeApplier.ApplyAsync(
+                index,
+                parsed,
+                checkpoint,
+                CancellationToken.None);
+            Assert.False(apply.RequiresFullRescan);
+
+            var results = await index.SearchAsync(
+                new SearchQuery("a", SearchMode.FilesAndFolders),
+                CancellationToken.None);
+            Assert.Contains(
+                results,
+                item => item.Record.FullPath.Equals(@"C:\Docs\a1.txt", StringComparison.OrdinalIgnoreCase));
+            Assert.DoesNotContain(
+                results,
+                item => item.Record.FullPath.Equals(@"C:\Docs\a.txt", StringComparison.OrdinalIgnoreCase));
+
+            // FRN stamped: empty resync purges remaining live name by file_reference.
+            await UsnJournalChangeApplier.ApplyAsync(
+                index,
+                new[] { UsnJournalChange.HardLinkResync(frn, Array.Empty<FileRecord>()) },
+                checkpoint with { NextUsn = 301 },
+                CancellationToken.None);
+            var after = await index.SearchAsync(
+                new SearchQuery("a1", SearchMode.FilesAndFolders),
+                CancellationToken.None);
+            Assert.DoesNotContain(
+                after,
+                item => item.Record.FullPath.Equals(@"C:\Docs\a1.txt", StringComparison.OrdinalIgnoreCase));
+        }
+        finally
+        {
+            try
+            {
+                if (File.Exists(journalPath))
+                {
+                    File.Delete(journalPath);
+                }
+            }
+            catch
+            {
+                // ignore
+            }
+
+            if (Directory.Exists(tempDirectory))
+            {
+                Directory.Delete(tempDirectory, recursive: true);
+            }
+        }
+    }
+
+    private static async IAsyncEnumerable<UsnJournalChange> EnumerateJournal(params UsnJournalChange[] changes)
+    {
+        foreach (var change in changes)
+        {
+            await Task.Yield();
+            yield return change;
         }
     }
 

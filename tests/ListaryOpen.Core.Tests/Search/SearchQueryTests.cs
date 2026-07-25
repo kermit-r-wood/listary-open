@@ -42,6 +42,27 @@ public sealed class SearchQueryTests
     }
 
     [Fact]
+    public void ParsedQueryReadsMultipleExtensionOperatorsAsOrList()
+    {
+        var query = new SearchQuery("report ext:pdf ext:docx", SearchMode.FilesAndFolders);
+
+        Assert.Equal(new[] { "report" }, query.Parsed.Terms);
+        Assert.Equal(new[] { "pdf", "docx" }, query.Parsed.Extensions);
+    }
+
+    [Theory]
+    [InlineData("ext:pdf,docx", new[] { "pdf", "docx" })]
+    [InlineData("ext:pdf;docx", new[] { "pdf", "docx" })]
+    [InlineData("ext:pdf|png", new[] { "pdf", "png" })]
+    [InlineData("ext:.Pdf,.DOCX", new[] { "pdf", "docx" })]
+    public void ParsedQuerySplitsCommaSeparatedExtensions(string text, string[] expected)
+    {
+        var query = new SearchQuery(text, SearchMode.FilesAndFolders);
+
+        Assert.Equal(expected, query.Parsed.Extensions);
+    }
+
+    [Fact]
     public void ParsedQueryReadsFolderFilter()
     {
         var query = new SearchQuery("folder: report", SearchMode.FilesAndFolders);
@@ -58,6 +79,16 @@ public sealed class SearchQueryTests
         Assert.True(query.Parsed.FileOnly);
         Assert.Equal(SearchMode.FilesAndFolders, query.EffectiveMode);
         Assert.Equal(new[] { "report" }, query.Parsed.Terms);
+    }
+
+    [Fact]
+    public void ParsedQueryReadsAppFilter()
+    {
+        var query = new SearchQuery("app: code", SearchMode.FilesAndFolders);
+
+        Assert.True(query.Parsed.ApplicationsOnly);
+        Assert.True(query.Parsed.FileOnly);
+        Assert.Equal(new[] { "code" }, query.Parsed.Terms);
     }
 
     [Theory]

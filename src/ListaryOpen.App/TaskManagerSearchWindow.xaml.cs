@@ -263,6 +263,11 @@ public partial class TaskManagerSearchWindow : Window
                 FocusQueryAtEnd();
                 return;
             case TaskManagerSearchKeyAction.Confirm:
+                if (ImeInputGuard.ShouldDeferEnterToIme(Keyboard.FocusedElement as DependencyObject))
+                {
+                    return;
+                }
+
                 e.Handled = true;
                 ConfirmSelection();
                 return;

@@ -13,8 +13,8 @@ namespace ListaryOpen.Infrastructure.Search;
 
 public sealed class SqliteSearchIndex : ISearchIndex, IAsyncDisposable
 {
-    internal const int CurrentSchemaVersion = 2;
-    internal const long CurrentIndexContentVersion = 3;
+    internal const int CurrentSchemaVersion = 3;
+    internal const long CurrentIndexContentVersion = 4;
 
     private const int FallbackCandidateLimit = 200;
     private const int CandidateLimitMultiplier = 20;
@@ -615,6 +615,16 @@ public sealed class SqliteSearchIndex : ISearchIndex, IAsyncDisposable
                                 cancellationToken).ConfigureAwait(false);
                             break;
 
+                        case UsnJournalIndexChangeKind.HardLinkResync:
+                            await ExecuteHardLinkResyncAsync(
+                                upsertCommand,
+                                transaction,
+                                change.FileReferenceNumber,
+                                change.LiveHardLinkRecords ?? Array.Empty<FileRecord>(),
+                                indexGeneration,
+                                cancellationToken).ConfigureAwait(false);
+                            break;
+
                         default:
                             throw new NotSupportedException($"Unsupported USN index change kind: {change.Kind}.");
                     }
@@ -728,7 +738,8 @@ public sealed class SqliteSearchIndex : ISearchIndex, IAsyncDisposable
                 is_directory integer not null check(is_directory in (0, 1)),
                 size_bytes integer not null check(size_bytes >= 0),
                 last_write_time text not null,
-                index_generation integer not null default 0 check(index_generation >= 0)
+                index_generation integer not null default 0 check(index_generation >= 0),
+                file_reference integer not null default 0 check(file_reference >= 0)
             );
 
             create table if not exists usage(
@@ -774,6 +785,9 @@ public sealed class SqliteSearchIndex : ISearchIndex, IAsyncDisposable
                     break;
                 case 2:
                     await RemoveObsoleteIndexesAsync(connection, cancellationToken).ConfigureAwait(false);
+                    break;
+                case 3:
+                    await MigrateToSchemaVersion3Async(connection, cancellationToken).ConfigureAwait(false);
                     break;
                 default:
                     throw new InvalidOperationException($"Missing index migration for schema version {schemaVersion + 1}.");
@@ -1347,7 +1361,8 @@ public sealed class SqliteSearchIndex : ISearchIndex, IAsyncDisposable
                 is_directory,
                 size_bytes,
                 last_write_time,
-                index_generation
+                index_generation,
+                file_reference
             )
             values (
                 $full_path,
@@ -1358,7 +1373,8 @@ public sealed class SqliteSearchIndex : ISearchIndex, IAsyncDisposable
                 $is_directory,
                 $size_bytes,
                 $last_write_time,
-                $index_generation
+                $index_generation,
+                $file_reference
             )
             on conflict(path_key) do update set
                 full_path = excluded.full_path,
@@ -1368,7 +1384,11 @@ public sealed class SqliteSearchIndex : ISearchIndex, IAsyncDisposable
                 is_directory = excluded.is_directory,
                 size_bytes = excluded.size_bytes,
                 last_write_time = excluded.last_write_time,
-                index_generation = excluded.index_generation;
+                index_generation = excluded.index_generation,
+                file_reference = case
+                    when excluded.file_reference > 0 then excluded.file_reference
+                    else files.file_reference
+                end;
             """;
 
         command.Parameters.Add("$full_path", SqliteType.Text);
@@ -1380,6 +1400,7 @@ public sealed class SqliteSearchIndex : ISearchIndex, IAsyncDisposable
         command.Parameters.Add("$size_bytes", SqliteType.Integer);
         command.Parameters.Add("$last_write_time", SqliteType.Text);
         command.Parameters.Add("$index_generation", SqliteType.Integer);
+        command.Parameters.Add("$file_reference", SqliteType.Integer);
         command.Prepare();
         return command;
     }
@@ -1401,7 +1422,110 @@ public sealed class SqliteSearchIndex : ISearchIndex, IAsyncDisposable
         command.Parameters[6].Value = record.SizeBytes;
         command.Parameters[7].Value = FormatDateTime(record.LastWriteTime);
         command.Parameters[8].Value = indexGeneration;
+        command.Parameters[9].Value = unchecked((long)record.FileReferenceNumber);
         await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+    }
+
+    private static async Task MigrateToSchemaVersion3Async(
+        SqliteConnection connection,
+        CancellationToken cancellationToken)
+    {
+        if (!await HasColumnAsync(connection, "files", "file_reference", cancellationToken).ConfigureAwait(false))
+        {
+            using var addColumn = connection.CreateCommand();
+            addColumn.CommandText =
+                "alter table files add column file_reference integer not null default 0 check(file_reference >= 0);";
+            await addColumn.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+        }
+
+        using var indexCommand = connection.CreateCommand();
+        indexCommand.CommandText = """
+            create index if not exists ix_files_file_reference
+                on files(file_reference)
+                where file_reference > 0;
+            """;
+        await indexCommand.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+    }
+
+    private static async Task ExecuteHardLinkResyncAsync(
+        SqliteCommand upsertCommand,
+        SqliteTransaction transaction,
+        ulong fileReferenceNumber,
+        IReadOnlyList<FileRecord> liveRecords,
+        long indexGeneration,
+        CancellationToken cancellationToken)
+    {
+        if (fileReferenceNumber == 0)
+        {
+            throw new ArgumentOutOfRangeException(nameof(fileReferenceNumber));
+        }
+
+        // Upsert live hard-link names stamped with this FRN, then purge any other
+        // indexed path that already carries the same file_reference. FRN=0 legacy
+        // rows (pre-stamp USN upserts) are removed by companion Delete(usnPath)
+        // changes emitted by the elevated journal producer when the USN name is
+        // not in the live set.
+        var liveKeys = new HashSet<string>(StringComparer.Ordinal);
+        foreach (var record in liveRecords)
+        {
+            var stamped = record.WithFileReferenceNumber(fileReferenceNumber);
+            liveKeys.Add(stamped.PathKey);
+            await ExecuteUpsertAsync(upsertCommand, stamped, indexGeneration, cancellationToken)
+                .ConfigureAwait(false);
+        }
+
+        var volumeRoots = liveRecords
+            .Select(record => Path.GetPathRoot(record.FullPath))
+            .Where(root => !string.IsNullOrWhiteSpace(root))
+            .Select(root => root!.ToUpperInvariant())
+            .Distinct(StringComparer.Ordinal)
+            .ToArray();
+
+        using var selectCommand = transaction.Connection!.CreateCommand();
+        selectCommand.Transaction = transaction;
+        selectCommand.CommandText = """
+            select path_key, full_path
+            from files
+            where file_reference = $file_reference;
+            """;
+        selectCommand.Parameters.AddWithValue("$file_reference", unchecked((long)fileReferenceNumber));
+
+        var stalePaths = new List<string>();
+        await using (var reader = await selectCommand.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false))
+        {
+            while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
+            {
+                var pathKey = reader.GetString(0);
+                var fullPath = reader.GetString(1);
+                if (liveKeys.Contains(pathKey))
+                {
+                    continue;
+                }
+
+                // FRNs are volume-scoped. When live records identify volume roots,
+                // only purge stale names under those roots (empty live set => purge all FRN matches).
+                if (volumeRoots.Length > 0)
+                {
+                    var root = Path.GetPathRoot(fullPath)?.ToUpperInvariant() ?? string.Empty;
+                    if (!volumeRoots.Contains(root, StringComparer.Ordinal))
+                    {
+                        continue;
+                    }
+                }
+
+                stalePaths.Add(fullPath);
+            }
+        }
+
+        using var deleteCommand = transaction.Connection.CreateCommand();
+        deleteCommand.Transaction = transaction;
+        deleteCommand.CommandText = "delete from files where path_key = $path_key;";
+        deleteCommand.Parameters.Add("$path_key", SqliteType.Text);
+        deleteCommand.Prepare();
+        foreach (var path in stalePaths)
+        {
+            await ExecuteDeleteAsync(deleteCommand, path, cancellationToken).ConfigureAwait(false);
+        }
     }
 
     private static async Task RemoveObsoleteIndexesAsync(
@@ -1513,8 +1637,20 @@ public sealed class SqliteSearchIndex : ISearchIndex, IAsyncDisposable
             await AddExactCandidatesAsync(query, candidateLimit, records, cancellationToken).ConfigureAwait(false);
         }
 
+        // Short queries (1-2 chars): always pull alias candidates even if exact prefix already
+        // filled the display limit (ASCII ht* names must not starve 合同 / initials "ht").
         cancellationToken.ThrowIfCancellationRequested();
-        if (useExpensiveFuzzy && records.Count < query.Limit)
+        if (ShouldUseShortAliasCandidates(query))
+        {
+            using (PerformanceMetrics.MeasureStage("candidates.short_alias"))
+            {
+                await AddShortAliasCandidatesAsync(query, candidateLimit, records, cancellationToken)
+                    .ConfigureAwait(false);
+            }
+        }
+
+        cancellationToken.ThrowIfCancellationRequested();
+        if (useExpensiveFuzzy && (records.Count < query.Limit || ShouldUseShortAliasCandidates(query)))
         {
             using (PerformanceMetrics.MeasureStage("candidates.fts"))
             {
@@ -1542,8 +1678,21 @@ public sealed class SqliteSearchIndex : ISearchIndex, IAsyncDisposable
     internal static bool UsesExpensiveFuzzyCandidatesForTests(SearchQuery query)
         => UsesExpensiveFuzzyCandidates(query);
 
+    internal static bool ShouldUseShortAliasCandidatesForTests(SearchQuery query)
+        => ShouldUseShortAliasCandidates(query);
+
+    /// <summary>
+    /// FTS/fuzzy candidate expansion is enabled from length 2 so short pinyin initials
+    /// (e.g. "ht" for 合同) can retrieve rows; length-1 stays exact/short-alias only.
+    /// </summary>
     private static bool UsesExpensiveFuzzyCandidates(SearchQuery query)
-        => NormalizeSearchText(query.NormalizedText).Length >= 3;
+        => NormalizeSearchText(query.NormalizedText).Length >= 2;
+
+    private static bool ShouldUseShortAliasCandidates(SearchQuery query)
+    {
+        var length = NormalizeSearchText(query.NormalizedText).Length;
+        return length is >= 1 and <= 2;
+    }
 
     private async Task AddExactCandidatesAsync(
         SearchQuery query,
@@ -1749,13 +1898,58 @@ public sealed class SqliteSearchIndex : ISearchIndex, IAsyncDisposable
 
     private static string CreateFtsMatchQuery(SearchQuery query)
     {
+        // Include length-2 terms so short pinyin initials participate in FTS.
         var terms = query.Parsed.Phrases
             .Concat(query.Parsed.Terms)
             .Select(NormalizeSearchText)
-            .Where(term => term.Length >= 3)
+            .Where(term => term.Length >= 2)
             .Select(term => $"\"{term.Replace("\"", "\"\"")}\"")
             .ToArray();
         return terms.Length == 0 ? string.Empty : string.Join(" AND ", terms);
+    }
+
+    private async Task AddShortAliasCandidatesAsync(
+        SearchQuery query,
+        int candidateLimit,
+        IDictionary<string, FileRecord> records,
+        CancellationToken cancellationToken)
+    {
+        var normalizedQuery = NormalizeSearchText(query.NormalizedText);
+        if (normalizedQuery.Length is < 1 or > 2)
+        {
+            return;
+        }
+
+        var directoryFilter = CreateDirectoryFilter(query, "files.");
+        using var command = _searchConnection.CreateCommand();
+        var parsedFilter = CreateParsedFilter(query, command, "files.");
+        // Match precomputed pinyin/initials in search_text (space-separated aliases).
+        command.CommandText = $"""
+            select
+                files.full_path,
+                files.is_directory,
+                files.size_bytes,
+                files.last_write_time
+            from files
+            where (
+                files.search_text like $alias_contains escape '\'
+                or lower(files.name) like $name_contains escape '\'
+              ){directoryFilter}{parsedFilter}
+            order by
+                length(files.name),
+                files.name collate nocase,
+                files.name,
+                length(files.full_path),
+                files.full_path
+            limit $limit;
+            """;
+        var escaped = EscapeLike(normalizedQuery);
+        // Substring match covers initials embedded in tokens (e.g. "ht.docx") and standalone aliases.
+        command.Parameters.AddWithValue("$alias_contains", "%" + escaped + "%");
+        command.Parameters.AddWithValue("$name_contains", "%" + escaped + "%");
+        command.Parameters.AddWithValue("$limit", candidateLimit);
+
+        await AddRecordsAsync(command, records, cancellationToken).ConfigureAwait(false);
     }
 
     private static bool MatchesParsedFilters(SearchQuery query, FileRecord record)
@@ -1787,19 +1981,19 @@ public sealed class SqliteSearchIndex : ISearchIndex, IAsyncDisposable
         }
 
         if (query.Parsed.Extensions.Count > 0 &&
-            !query.Parsed.Extensions.Contains(GetExtension(record), StringComparer.OrdinalIgnoreCase))
+            !ExtensionMatchesAny(record.Name, query.Parsed.Extensions))
         {
             return false;
         }
 
-        if (query.Parsed.ExcludedExtensions.Contains(GetExtension(record), StringComparer.OrdinalIgnoreCase))
+        if (ExtensionMatchesAny(record.Name, query.Parsed.ExcludedExtensions))
         {
             return false;
         }
 
         foreach (var term in query.Parsed.PathTerms)
         {
-            if (!ContainsIgnoreCase(record.FullPath, term))
+            if (!PathSegmentMatcher.Matches(record.FullPath, term))
             {
                 return false;
             }
@@ -1874,8 +2068,9 @@ public sealed class SqliteSearchIndex : ISearchIndex, IAsyncDisposable
             clauses.Add($"julianday({tablePrefix}last_write_time) >= julianday($quick_modified_after)");
         }
 
-        AddLikeFilters(clauses, command, query.Parsed.Extensions, $"lower({tablePrefix}name)", "include_ext", include: true, extension: true);
-        AddLikeFilters(clauses, command, query.Parsed.ExcludedExtensions, $"lower({tablePrefix}name)", "exclude_ext", include: false, extension: true);
+        // Include extensions are OR'd (any match). Exclude extensions are AND'd (must match none).
+        AddExtensionFilters(clauses, command, query.Parsed.Extensions, $"lower({tablePrefix}name)", "include_ext", include: true);
+        AddExtensionFilters(clauses, command, query.Parsed.ExcludedExtensions, $"lower({tablePrefix}name)", "exclude_ext", include: false);
         AddSearchTextFilters(clauses, command, query.Parsed.PathTerms, tablePrefix, "path", include: true);
         AddSearchTextFilters(clauses, command, query.Parsed.Phrases, tablePrefix, "phrase", include: true);
         AddSearchTextFilters(clauses, command, query.Parsed.ExcludedTerms, tablePrefix, "exclude", include: false);
@@ -1883,15 +2078,19 @@ public sealed class SqliteSearchIndex : ISearchIndex, IAsyncDisposable
         return clauses.Count == 0 ? string.Empty : " and " + string.Join(" and ", clauses);
     }
 
-    private static void AddLikeFilters(
+    /// <summary>
+    /// Include extensions: (name like %.pdf OR name like %.docx).
+    /// Exclude extensions: name not like %.tmp AND name not like %.bak.
+    /// </summary>
+    private static void AddExtensionFilters(
         ICollection<string> clauses,
         SqliteCommand command,
         IReadOnlyList<string> values,
         string column,
         string namePrefix,
-        bool include,
-        bool extension)
+        bool include)
     {
+        var extensionClauses = new List<string>();
         for (var index = 0; index < values.Count; index++)
         {
             var value = NormalizeSearchText(values[index]);
@@ -1901,11 +2100,28 @@ public sealed class SqliteSearchIndex : ISearchIndex, IAsyncDisposable
             }
 
             var parameterName = $"${namePrefix}_{index}";
-            var pattern = extension
-                ? $"%.{EscapeLike(value)}"
-                : $"%{EscapeLike(value)}%";
-            clauses.Add($"{column} {(include ? string.Empty : "not ")}like {parameterName} escape '\\'");
+            var pattern = $"%.{EscapeLike(value)}";
+            extensionClauses.Add(include
+                ? $"{column} like {parameterName} escape '\\'"
+                : $"{column} not like {parameterName} escape '\\'");
             command.Parameters.AddWithValue(parameterName, pattern);
+        }
+
+        if (extensionClauses.Count == 0)
+        {
+            return;
+        }
+
+        if (include)
+        {
+            clauses.Add("(" + string.Join(" or ", extensionClauses) + ")");
+        }
+        else
+        {
+            foreach (var clause in extensionClauses)
+            {
+                clauses.Add(clause);
+            }
         }
     }
 
@@ -1925,18 +2141,66 @@ public sealed class SqliteSearchIndex : ISearchIndex, IAsyncDisposable
                 continue;
             }
 
-            var parameterName = $"${namePrefix}_{index}";
-            var pattern = $"%{EscapeLike(value)}%";
+            // Multi-segment path: path:foo\bar → each segment must appear (SQL AND of LIKEs).
+            // Ordered segment checks happen in MatchesParsedFilters via PathSegmentMatcher.
+            if (include && namePrefix == "path" && value.IndexOfAny(['\\', '/']) >= 0)
+            {
+                var segments = PathSegmentMatcher.SplitSegments(value);
+                if (segments.Count > 1)
+                {
+                    var segmentClauses = new List<string>();
+                    for (var segmentIndex = 0; segmentIndex < segments.Count; segmentIndex++)
+                    {
+                        var parameterName = $"${namePrefix}_{index}_{segmentIndex}";
+                        var pattern = $"%{EscapeLike(segments[segmentIndex])}%";
+                        segmentClauses.Add(
+                            $"(lower({tablePrefix}full_path) like {parameterName} escape '\\' or {tablePrefix}search_text like {parameterName} escape '\\')");
+                        command.Parameters.AddWithValue(parameterName, pattern);
+                    }
+
+                    clauses.Add("(" + string.Join(" and ", segmentClauses) + ")");
+                    continue;
+                }
+            }
+
+            var singleParameterName = $"${namePrefix}_{index}";
+            var singlePattern = $"%{EscapeLike(value)}%";
             clauses.Add(include
-                ? $"(lower({tablePrefix}full_path) like {parameterName} escape '\\' or {tablePrefix}search_text like {parameterName} escape '\\')"
-                : $"(lower({tablePrefix}full_path) not like {parameterName} escape '\\' and {tablePrefix}search_text not like {parameterName} escape '\\')");
-            command.Parameters.AddWithValue(parameterName, pattern);
+                ? $"(lower({tablePrefix}full_path) like {singleParameterName} escape '\\' or {tablePrefix}search_text like {singleParameterName} escape '\\')"
+                : $"(lower({tablePrefix}full_path) not like {singleParameterName} escape '\\' and {tablePrefix}search_text not like {singleParameterName} escape '\\')");
+            command.Parameters.AddWithValue(singleParameterName, singlePattern);
         }
     }
 
     private static string GetExtension(FileRecord record)
     {
         return Path.GetExtension(record.Name).TrimStart('.');
+    }
+
+    /// <summary>
+    /// Aligns with SQL LIKE '%.ext' intent, including compound extensions (tar.gz).
+    /// </summary>
+    private static bool ExtensionMatchesAny(string fileName, IReadOnlyList<string> extensions)
+    {
+        if (extensions.Count == 0 || string.IsNullOrWhiteSpace(fileName))
+        {
+            return false;
+        }
+
+        foreach (var extension in extensions)
+        {
+            if (string.IsNullOrWhiteSpace(extension))
+            {
+                continue;
+            }
+
+            if (fileName.EndsWith("." + extension, StringComparison.OrdinalIgnoreCase))
+            {
+                return true;
+            }
+        }
+
+        return false;
     }
 
     private static bool ContainsIgnoreCase(string value, string term)

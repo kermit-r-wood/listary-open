@@ -20,6 +20,7 @@ public sealed class NtfsUsnJournalReader
     private const uint UsnReasonBasicInfoChange = 0x0000_8000;
     private const uint UsnReasonRenameOldName = 0x0000_1000;
     private const uint UsnReasonRenameNewName = 0x0000_2000;
+    private const uint UsnReasonHardLinkChange = 0x0001_0000;
     private const uint UsnReasonClose = 0x8000_0000;
     private const uint UsnReasonUpsertMask = UsnReasonDataOverwrite
         | UsnReasonDataExtend
@@ -36,6 +37,33 @@ public sealed class NtfsUsnJournalReader
     private const int UsnBufferLength = 1024 * 1024;
 
     public async IAsyncEnumerable<FileRecord> EnumerateVolumeAsync(
+        string volumeRoot,
+        [EnumeratorCancellation] CancellationToken cancellationToken)
+    {
+        // Prefer full MFT enumeration: includes every hard-link FILE_NAME and avoids
+        // per-file CreateFile metadata lookups. Fall back to FSCTL_ENUM_USN_DATA on failure.
+        // Probe first so we never yield inside a try/catch (illegal for iterators).
+        if (NtfsMftScanner.TryValidateVolume(volumeRoot, out _))
+        {
+            var mftScanner = new NtfsMftScanner();
+            await foreach (var record in mftScanner
+                               .EnumerateVolumeAsync(volumeRoot, volumeRoot, cancellationToken)
+                               .ConfigureAwait(false))
+            {
+                yield return record;
+            }
+
+            yield break;
+        }
+
+        await foreach (var record in EnumerateVolumeViaUsnEnumAsync(volumeRoot, cancellationToken)
+                           .ConfigureAwait(false))
+        {
+            yield return record;
+        }
+    }
+
+    private async IAsyncEnumerable<FileRecord> EnumerateVolumeViaUsnEnumAsync(
         string volumeRoot,
         [EnumeratorCancellation] CancellationToken cancellationToken)
     {
@@ -160,19 +188,21 @@ public sealed class NtfsUsnJournalReader
             var directories = ReadDirectoryEntries(handle, journalData, cancellationToken);
             var metadataReader = new NtfsFileMetadataReader();
             var resolvedPaths = new Dictionary<ulong, string>();
+            var volumeGeometry = TryQueryVolumeGeometry(handle);
 
             foreach (var entry in EnumerateJournalEntries(handle, journalData, startUsn, endUsn, cancellationToken))
             {
                 cancellationToken.ThrowIfCancellationRequested();
-                var change = CreateJournalChange(
-                    scanRoot,
-                    entry,
-                    directories,
-                    resolvedPaths,
-                    metadataReader,
-                    volumeRootFileReferenceNumber,
-                    cancellationToken);
-                if (change is not null)
+                foreach (var change in CreateJournalChanges(
+                             handle,
+                             volumeGeometry,
+                             scanRoot,
+                             entry,
+                             directories,
+                             resolvedPaths,
+                             metadataReader,
+                             volumeRootFileReferenceNumber,
+                             cancellationToken))
                 {
                     yield return change;
                 }
@@ -194,7 +224,8 @@ public sealed class NtfsUsnJournalReader
         {
             if (entry.IsDirectory)
             {
-                entries[entry.FileReferenceNumber] = entry;
+                // Key by MFT segment (low 48 bits) so parent lookups match projector masking.
+                entries[entry.FileReferenceNumber & 0x0000_FFFF_FFFF_FFFFUL] = entry;
             }
         }
 
@@ -351,7 +382,9 @@ public sealed class NtfsUsnJournalReader
         }
     }
 
-    private static UsnJournalChange? CreateJournalChange(
+    private static IEnumerable<UsnJournalChange> CreateJournalChanges(
+        IntPtr volumeHandle,
+        VolumeGeometry? volumeGeometry,
         NtfsScanRoot scanRoot,
         NtfsUsnEntry entry,
         IReadOnlyDictionary<ulong, NtfsUsnEntry> directoriesByReferenceNumber,
@@ -362,12 +395,33 @@ public sealed class NtfsUsnJournalReader
     {
         if (entry.IsDirectory && (HasAnyReason(entry, UsnReasonDeleteMask | UsnReasonRenameNewName)))
         {
-            return UsnJournalChange.DirectoryRenameOrMove();
+            yield return UsnJournalChange.DirectoryRenameOrMove();
+            yield break;
         }
 
         if (IsAmbiguousJournalChange(entry))
         {
-            return UsnJournalChange.DirectoryRenameOrMove();
+            yield return UsnJournalChange.DirectoryRenameOrMove();
+            yield break;
+        }
+
+        // Hard-link create/delete does not emit FILE_DELETE for the removed name.
+        // Re-sync all current names for the file reference from the live MFT record.
+        if (!entry.IsDirectory && HasAnyReason(entry, UsnReasonHardLinkChange))
+        {
+            foreach (var change in CreateHardLinkJournalChanges(
+                         volumeHandle,
+                         volumeGeometry,
+                         scanRoot,
+                         entry,
+                         directoriesByReferenceNumber,
+                         resolvedPaths,
+                         volumeRootFileReferenceNumber))
+            {
+                yield return change;
+            }
+
+            yield break;
         }
 
         if (!NtfsUsnRecordProjector.TryResolvePath(
@@ -379,31 +433,172 @@ public sealed class NtfsUsnJournalReader
                 volumeRootFileReferenceNumber,
                 out var fullPath))
         {
-            return UsnJournalChange.DirectoryRenameOrMove();
+            yield return UsnJournalChange.DirectoryRenameOrMove();
+            yield break;
         }
 
         if (!NtfsUsnRecordProjector.IsRequestedRootOrDescendant(fullPath, scanRoot.RequestedRoot))
         {
-            return null;
+            yield break;
         }
 
         if (HasAnyReason(entry, UsnReasonDeleteMask))
         {
-            return UsnJournalChange.Delete(fullPath);
+            yield return UsnJournalChange.Delete(fullPath);
+            yield break;
         }
 
         if (!HasAnyReason(entry, UsnReasonUpsertMask))
         {
-            return null;
+            yield break;
         }
 
         if (!metadataReader.TryRead(fullPath, entry.IsDirectory, cancellationToken, out var metadata))
         {
-            return UsnJournalChange.DirectoryRenameOrMove();
+            yield return UsnJournalChange.DirectoryRenameOrMove();
+            yield break;
         }
 
-        return UsnJournalChange.Upsert(
-            FileRecord.Create(fullPath, entry.IsDirectory, metadata.SizeBytes, metadata.LastWriteTime));
+        var segment = entry.FileReferenceNumber & 0x0000_FFFF_FFFF_FFFFUL;
+        yield return UsnJournalChange.Upsert(
+            FileRecord.Create(
+                fullPath,
+                entry.IsDirectory,
+                metadata.SizeBytes,
+                metadata.LastWriteTime,
+                segment));
+    }
+
+    internal static IEnumerable<UsnJournalChange> CreateHardLinkJournalChanges(
+        IntPtr volumeHandle,
+        VolumeGeometry? volumeGeometry,
+        NtfsScanRoot scanRoot,
+        NtfsUsnEntry entry,
+        IReadOnlyDictionary<ulong, NtfsUsnEntry> directoriesByReferenceNumber,
+        IDictionary<ulong, string> resolvedPaths,
+        ulong volumeRootFileReferenceNumber)
+    {
+        var segment = entry.FileReferenceNumber & 0x0000_FFFF_FFFF_FFFFUL;
+        string? usnPath = null;
+        if (NtfsUsnRecordProjector.TryResolvePath(
+                entry,
+                scanRoot.VolumeRoot,
+                directoriesByReferenceNumber,
+                resolvedPaths,
+                new HashSet<ulong>(),
+                volumeRootFileReferenceNumber,
+                out var resolvedUsnPath))
+        {
+            usnPath = resolvedUsnPath;
+        }
+
+        if (volumeGeometry is null
+            || !NtfsHardLinkResolver.TryGetFileNames(
+                volumeHandle,
+                entry.FileReferenceNumber,
+                volumeGeometry.BytesPerFileRecordSegment,
+                volumeGeometry.BytesPerSector,
+                out var fileNames,
+                out var isDirectory,
+                out var sizeBytes,
+                out var lastWriteTime))
+        {
+            // Record gone (last link removed) or geometry unavailable.
+            if (usnPath is not null
+                && NtfsUsnRecordProjector.IsRequestedRootOrDescendant(usnPath, scanRoot.RequestedRoot))
+            {
+                // Empty live set: resync deletes all indexed names for this FRN plus the USN path.
+                yield return UsnJournalChange.HardLinkResync(segment, Array.Empty<FileRecord>());
+                yield return UsnJournalChange.Delete(usnPath);
+            }
+            else if (usnPath is null)
+            {
+                // Cannot map the changed name and cannot read the live record — force rescan.
+                yield return UsnJournalChange.DirectoryRenameOrMove();
+            }
+
+            yield break;
+        }
+
+        var liveRecords = new List<FileRecord>();
+        foreach (var fileName in fileNames)
+        {
+            var linkEntry = new NtfsUsnEntry(
+                entry.FileReferenceNumber,
+                fileName.ParentFileReferenceNumber,
+                fileName.Name,
+                isDirectory);
+
+            if (!NtfsUsnRecordProjector.TryResolvePath(
+                    linkEntry,
+                    scanRoot.VolumeRoot,
+                    directoriesByReferenceNumber,
+                    resolvedPaths,
+                    new HashSet<ulong>(),
+                    volumeRootFileReferenceNumber,
+                    out var fullPath))
+            {
+                continue;
+            }
+
+            if (!NtfsUsnRecordProjector.IsRequestedRootOrDescendant(fullPath, scanRoot.RequestedRoot))
+            {
+                continue;
+            }
+
+            liveRecords.Add(FileRecord.Create(
+                fullPath,
+                isDirectory,
+                sizeBytes,
+                lastWriteTime,
+                segment));
+        }
+
+        // Single resync applies live names and purges any other indexed paths for this FRN.
+        yield return UsnJournalChange.HardLinkResync(segment, liveRecords);
+
+        // Also path-delete the USN-reported name when it is no longer live (covers FRN=0
+        // rows that HardLinkResync cannot find by file_reference alone).
+        if (usnPath is not null
+            && !liveRecords.Any(record =>
+                string.Equals(record.FullPath, usnPath, StringComparison.OrdinalIgnoreCase))
+            && NtfsUsnRecordProjector.IsRequestedRootOrDescendant(usnPath, scanRoot.RequestedRoot))
+        {
+            yield return UsnJournalChange.Delete(usnPath);
+        }
+    }
+
+    internal sealed record VolumeGeometry(int BytesPerSector, int BytesPerFileRecordSegment);
+
+    private static VolumeGeometry? TryQueryVolumeGeometry(IntPtr handle)
+    {
+        try
+        {
+            var size = Marshal.SizeOf<NtfsNativeMethods.NtfsVolumeDataBuffer>();
+            var success = NtfsNativeMethods.DeviceIoControlGetNtfsVolumeData(
+                handle,
+                NtfsNativeMethods.FsctlGetNtfsVolumeData,
+                IntPtr.Zero,
+                0,
+                out var volumeData,
+                size,
+                out _,
+                IntPtr.Zero);
+            if (!success
+                || volumeData.BytesPerSector == 0
+                || volumeData.BytesPerFileRecordSegment == 0)
+            {
+                return null;
+            }
+
+            return new VolumeGeometry(
+                (int)volumeData.BytesPerSector,
+                (int)volumeData.BytesPerFileRecordSegment);
+        }
+        catch (Exception)
+        {
+            return null;
+        }
     }
 
     private static bool HasAnyReason(NtfsUsnEntry entry, uint reasonMask)
@@ -429,7 +624,7 @@ public sealed class NtfsUsnJournalReader
     private static NtfsNativeMethods.UsnJournalDataV0 QueryJournal(IntPtr handle)
     {
         var journalDataSize = Marshal.SizeOf<NtfsNativeMethods.UsnJournalDataV0>();
-        var success = NtfsNativeMethods.DeviceIoControl(
+        var success = NtfsNativeMethods.DeviceIoControlQueryUsnJournal(
             handle,
             NtfsNativeMethods.FsctlQueryUsnJournal,
             IntPtr.Zero,

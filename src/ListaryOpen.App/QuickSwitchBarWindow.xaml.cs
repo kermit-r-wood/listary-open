@@ -445,6 +445,11 @@ public partial class QuickSwitchBarWindow : Window
 
         if (e.Key == Key.Enter)
         {
+            if (ImeInputGuard.ShouldDeferEnterToIme(Keyboard.FocusedElement as DependencyObject))
+            {
+                return;
+            }
+
             e.Handled = true;
             _ = ActivateSelectedAsync();
         }

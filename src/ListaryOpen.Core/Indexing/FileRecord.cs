@@ -9,7 +9,8 @@ public sealed class FileRecord
         string parentPath,
         bool isDirectory,
         long sizeBytes,
-        DateTimeOffset lastWriteTime)
+        DateTimeOffset lastWriteTime,
+        ulong fileReferenceNumber)
     {
         FullPath = fullPath;
         PathKey = pathKey;
@@ -18,6 +19,7 @@ public sealed class FileRecord
         IsDirectory = isDirectory;
         SizeBytes = sizeBytes;
         LastWriteTime = lastWriteTime;
+        FileReferenceNumber = fileReferenceNumber;
     }
 
     public string FullPath { get; }
@@ -34,7 +36,15 @@ public sealed class FileRecord
 
     public DateTimeOffset LastWriteTime { get; }
 
-    public static FileRecord Create(string fullPath, bool isDirectory, long sizeBytes, DateTimeOffset lastWriteTime)
+    /// <summary>NTFS MFT segment reference (0 when unknown).</summary>
+    public ulong FileReferenceNumber { get; }
+
+    public static FileRecord Create(
+        string fullPath,
+        bool isDirectory,
+        long sizeBytes,
+        DateTimeOffset lastWriteTime,
+        ulong fileReferenceNumber = 0)
     {
         if (string.IsNullOrWhiteSpace(fullPath))
         {
@@ -59,6 +69,32 @@ public sealed class FileRecord
         var parent = isRoot ? string.Empty : Path.GetDirectoryName(normalized) ?? string.Empty;
         var pathKey = normalized.ToUpperInvariant();
 
-        return new FileRecord(normalized, pathKey, name, parent, isDirectory, sizeBytes, lastWriteTime);
+        return new FileRecord(
+            normalized,
+            pathKey,
+            name,
+            parent,
+            isDirectory,
+            sizeBytes,
+            lastWriteTime,
+            fileReferenceNumber);
+    }
+
+    public FileRecord WithFileReferenceNumber(ulong fileReferenceNumber)
+    {
+        if (fileReferenceNumber == FileReferenceNumber)
+        {
+            return this;
+        }
+
+        return new FileRecord(
+            FullPath,
+            PathKey,
+            Name,
+            ParentPath,
+            IsDirectory,
+            SizeBytes,
+            LastWriteTime,
+            fileReferenceNumber);
     }
 }

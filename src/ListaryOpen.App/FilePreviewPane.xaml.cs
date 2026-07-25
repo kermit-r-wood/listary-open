@@ -9,6 +9,9 @@ namespace ListaryOpen.App;
 
 public partial class FilePreviewPane : UserControl
 {
+    /// <summary>Hard ceiling for a single preview load (built-in providers + shell path).</summary>
+    internal static readonly TimeSpan PreviewTimeout = TimeSpan.FromSeconds(5);
+
     private readonly PreviewCoordinator _previewCoordinator = new();
     private CancellationTokenSource? _previewCancellation;
     private long _previewRequestId;
@@ -25,7 +28,10 @@ public partial class FilePreviewPane : UserControl
         _previewCancellation?.Cancel();
         _previewCancellation?.Dispose();
         _previewCancellation = new CancellationTokenSource();
-        var cancellationToken = _previewCancellation.Token;
+        var userCancellation = _previewCancellation.Token;
+        using var timeoutCts = CancellationTokenSource.CreateLinkedTokenSource(userCancellation);
+        timeoutCts.CancelAfter(PreviewTimeout);
+        var cancellationToken = timeoutCts.Token;
         ShellHost.ClearPreview();
         ResetContent();
 
@@ -64,26 +70,37 @@ public partial class FilePreviewPane : UserControl
             await PreviewCoordinator.WaitForSelectionAsync(cancellationToken);
             ThrowIfStale(requestId, cancellationToken);
 
-            if (PreviewCoordinator.ShouldPreferSystemPreview(context) && ShellHost.TryPreview(record.FullPath))
-            {
-                ThrowIfStale(requestId, cancellationToken);
-                PreviewSource.Text = LocalizationManager.Translate("Preview source: Windows system");
-                ShowOnly(ShellHost);
-                return;
-            }
-
+            // Prefer built-in providers first (cancellable/timeout-friendly), then shell handlers.
             var content = await _previewCoordinator.LoadAsync(context, cancellationToken);
             ThrowIfStale(requestId, cancellationToken);
             if (content is not null)
             {
-                ApplyContent(content);
+                ApplyContent(content, requestId);
                 return;
             }
 
-            EmptyMessage.Text = LocalizationManager.Translate("Preview is not available");
+            if (PreviewCoordinator.ShouldPreferSystemPreview(context)
+                && await TrySystemPreviewWithTimeoutAsync(record.FullPath, requestId, cancellationToken))
+            {
+                return;
+            }
+
+            if (requestId == Volatile.Read(ref _previewRequestId))
+            {
+                EmptyMessage.Text = LocalizationManager.Translate("Preview is not available");
+            }
+        }
+        catch (OperationCanceledException) when (userCancellation.IsCancellationRequested)
+        {
+            // User switched selection or closed pane — ignore.
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
         {
+            if (requestId == Volatile.Read(ref _previewRequestId))
+            {
+                ShellHost.ClearPreview();
+                EmptyMessage.Text = LocalizationManager.Translate("Preview timed out");
+            }
         }
         catch (Exception exception) when (exception is IOException or UnauthorizedAccessException or
             NotSupportedException or InvalidDataException or FormatException or
@@ -93,6 +110,43 @@ public partial class FilePreviewPane : UserControl
             {
                 EmptyMessage.Text = LocalizationManager.Translate("Could not load preview");
             }
+        }
+    }
+
+    private async Task<bool> TrySystemPreviewWithTimeoutAsync(
+        string fullPath,
+        long requestId,
+        CancellationToken cancellationToken)
+    {
+        // Shell DoPreview is synchronous COM; race against the shared deadline token so a
+        // hung handler does not keep the pane in "Loading…" forever after CancelAfter fires.
+        var previewTask = Dispatcher.InvokeAsync(
+            () => ShellHost.TryPreview(fullPath),
+            System.Windows.Threading.DispatcherPriority.Background).Task;
+
+        try
+        {
+            var success = await previewTask.WaitAsync(cancellationToken).ConfigureAwait(true);
+            ThrowIfStale(requestId, cancellationToken);
+            if (!success)
+            {
+                return false;
+            }
+
+            if (requestId != Volatile.Read(ref _previewRequestId))
+            {
+                ShellHost.ClearPreview();
+                return false;
+            }
+
+            PreviewSource.Text = LocalizationManager.Translate("Preview source: Windows system");
+            ShowOnly(ShellHost);
+            return true;
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            ShellHost.ClearPreview();
+            throw;
         }
     }
 
@@ -129,8 +183,13 @@ public partial class FilePreviewPane : UserControl
         EmptyPreview.Visibility = Visibility.Collapsed;
     }
 
-    private void ApplyContent(PreviewContent content)
+    private void ApplyContent(PreviewContent content, long requestId)
     {
+        if (requestId != Volatile.Read(ref _previewRequestId))
+        {
+            return;
+        }
+
         PreviewSource.Text = string.Format(
             System.Globalization.CultureInfo.CurrentCulture,
             LocalizationManager.Translate("Preview source: {0}"),

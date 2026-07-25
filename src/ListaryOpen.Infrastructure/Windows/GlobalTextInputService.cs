@@ -416,7 +416,8 @@ public sealed class GlobalTextInputService : IDisposable
 
                     else if (CaptureOverlayInput && !HasCommandModifier() && data.VirtualKey == VkReturn)
                     {
-                        if (RaiseConfirmPressed())
+                        // Do not swallow Enter while IME is composing (candidate confirm).
+                        if (!ImeComposition.IsComposing() && RaiseConfirmPressed())
                         {
                             return new IntPtr(1);
                         }

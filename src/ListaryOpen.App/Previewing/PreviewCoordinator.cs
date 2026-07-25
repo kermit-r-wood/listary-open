@@ -6,6 +6,8 @@ internal sealed class PreviewCoordinator
 {
     private const int MaximumCachedItems = 32;
     private static readonly TimeSpan SelectionDebounce = TimeSpan.FromMilliseconds(150);
+    /// <summary>Default hard timeout for a single provider chain load.</summary>
+    internal static readonly TimeSpan DefaultLoadTimeout = TimeSpan.FromSeconds(5);
     private static readonly HashSet<string> SystemPreviewExtensions = new(StringComparer.OrdinalIgnoreCase)
     {
         ".3gp", ".7z", ".aac", ".avi", ".doc", ".docx", ".flac",
@@ -52,6 +54,8 @@ internal sealed class PreviewCoordinator
         PreviewContext context,
         CancellationToken cancellationToken)
     {
+        cancellationToken.ThrowIfCancellationRequested();
+
         var cacheKey = new PreviewCacheKey(
             context.FullPath,
             context.SizeBytes,
@@ -71,7 +75,11 @@ internal sealed class PreviewCoordinator
 
             try
             {
-                var content = await provider.LoadAsync(context, cancellationToken).ConfigureAwait(false);
+                // Bound each provider so non-cooperative loads cannot exceed the shared deadline.
+                var content = await provider
+                    .LoadAsync(context, cancellationToken)
+                    .WaitAsync(DefaultLoadTimeout, cancellationToken)
+                    .ConfigureAwait(false);
                 if (content is null)
                 {
                     continue;
@@ -79,6 +87,10 @@ internal sealed class PreviewCoordinator
 
                 AddToCache(cacheKey, content);
                 return content;
+            }
+            catch (TimeoutException)
+            {
+                // Provider exceeded hard cap; try next provider.
             }
             catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
             {

@@ -10,7 +10,8 @@ public sealed record ParsedSearchQuery(
     IReadOnlyList<string> ExcludedTerms,
     IReadOnlyList<string> ExcludedExtensions,
     bool FileOnly,
-    SearchMode? ModeOverride)
+    SearchMode? ModeOverride,
+    bool ApplicationsOnly = false)
 {
     public string RankingText
     {
@@ -31,6 +32,7 @@ public sealed record ParsedSearchQuery(
         var excludedTerms = new List<string>();
         var excludedExtensions = new List<string>();
         var fileOnly = false;
+        var applicationsOnly = false;
         SearchMode? modeOverride = null;
 
         foreach (var token in Tokenize(text))
@@ -52,12 +54,16 @@ public sealed record ParsedSearchQuery(
                 continue;
             }
 
-            if (TryReadOperator(value, "ext:", out var extension))
+            if (TryReadOperator(value, "ext:", out var extensionList))
             {
-                var normalizedExtension = NormalizeExtension(extension);
-                if (!string.IsNullOrWhiteSpace(normalizedExtension))
+                // Support: ext:pdf  |  ext:pdf,docx  |  ext:pdf;docx
+                foreach (var part in SplitExtensionList(extensionList))
                 {
-                    Add(excluded ? excludedExtensions : extensions, normalizedExtension);
+                    var normalizedExtension = NormalizeExtension(part);
+                    if (!string.IsNullOrWhiteSpace(normalizedExtension))
+                    {
+                        Add(excluded ? excludedExtensions : extensions, normalizedExtension);
+                    }
                 }
 
                 continue;
@@ -83,6 +89,14 @@ public sealed record ParsedSearchQuery(
                 continue;
             }
 
+            if (IsModeToken(value, "app:") || IsModeToken(value, "apps:"))
+            {
+                applicationsOnly = true;
+                fileOnly = true;
+                modeOverride = SearchMode.FilesAndFolders;
+                continue;
+            }
+
             Add(excluded ? excludedTerms : token.WasQuoted ? phrases : terms, NormalizeTerm(value));
         }
 
@@ -94,7 +108,8 @@ public sealed record ParsedSearchQuery(
             excludedTerms,
             excludedExtensions,
             fileOnly,
-            modeOverride);
+            modeOverride,
+            applicationsOnly);
     }
 
     private static IEnumerable<QueryToken> Tokenize(string text)
@@ -173,6 +188,22 @@ public sealed record ParsedSearchQuery(
     private static string NormalizeTerm(string value)
     {
         return value.Trim().ToLowerInvariant();
+    }
+
+    private static IEnumerable<string> SplitExtensionList(string value)
+    {
+        if (string.IsNullOrWhiteSpace(value))
+        {
+            yield break;
+        }
+
+        foreach (var part in value.Split([',', ';', '|'], StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
+        {
+            if (!string.IsNullOrWhiteSpace(part))
+            {
+                yield return part;
+            }
+        }
     }
 
     private static void Add(ICollection<string> values, string value)

@@ -44,6 +44,8 @@ public static class ResultRanker
             })
             .Where(record => (query.EffectiveMode == SearchMode.FilesAndFolders || record.IsDirectory)
                 && (!query.Parsed.FileOnly || !record.IsDirectory)
+                && (!query.Parsed.ApplicationsOnly
+                    || ApplicationPath.IsApplication(record.FullPath, record.IsDirectory))
                 && MatchesQuickFilters(query, record))
             .Select(record => RankRecord(query, record, usage, pinned, now))
             .Where(candidate => candidate.TextKey.IsMatch)
@@ -53,6 +55,10 @@ public static class ResultRanker
             .ThenBy(candidate => candidate.TextKey.Tier)
             .ThenByDescending(candidate => candidate.TextKey.Quality)
             .ThenBy(candidate => candidate.TextKey.LengthDifference)
+            // Soft app boost only after text quality (apps with same tier beat non-apps).
+            .ThenBy(candidate => ApplicationPath.IsApplication(
+                candidate.Result.Record.FullPath,
+                candidate.Result.Record.IsDirectory) ? 0 : 1)
             .ThenByDescending(candidate => candidate.IsPinned)
             .ThenByDescending(candidate => candidate.OpenCount)
             .ThenByDescending(candidate => candidate.Recency)
@@ -263,26 +269,50 @@ public static class ResultRanker
             return (new TextMatchKey(2, query.Length, name.Length - query.Length), "name-substring");
         }
 
+        // For short queries (pinyin initials), evaluate pinyin before fuzzy/substring burial
+        // so "ht" ranks 合同 above whitelist/height Latin substring noise.
+        var pinyinScore = 0d;
+        var initialsExact = false;
+        if (allowFuzzy)
+        {
+            pinyinForms ??= PinyinMatcher.CreateCandidateForms(record.Name);
+            pinyinScore = PinyinMatcher.Score(query, pinyinForms.Value);
+            initialsExact = pinyinForms.Value.Initials.Equals(query, StringComparison.OrdinalIgnoreCase)
+                || pinyinForms.Value.Initials.StartsWith(query + ".", StringComparison.OrdinalIgnoreCase)
+                || (" " + pinyinForms.Value.Initials + " ").Contains(" " + query + " ", StringComparison.OrdinalIgnoreCase)
+                || pinyinForms.Value.Pinyin.StartsWith(query, StringComparison.OrdinalIgnoreCase);
+        }
+
+        if (allowFuzzy && initialsExact && pinyinScore > 0 && query.Length <= 3)
+        {
+            // Strong short-pinyin hit: better than name-substring (tier 2) for short queries.
+            return (new TextMatchKey(1, 100 + pinyinScore, Math.Abs(name.Length - query.Length)), "pinyin");
+        }
+
         var nameScore = allowFuzzy ? FuzzyMatcher.Score(query, name) : 0;
         if (allowFuzzy && nameScore > 0)
         {
             return (new TextMatchKey(3, nameScore, Math.Abs(name.Length - query.Length)), "name-fuzzy");
         }
 
-        var pinyinScore = 0d;
-        if (allowFuzzy)
-        {
-            pinyinForms ??= PinyinMatcher.CreateCandidateForms(record.Name);
-            pinyinScore = PinyinMatcher.Score(query, pinyinForms.Value);
-        }
         if (allowFuzzy && pinyinScore > 0)
         {
             return (new TextMatchKey(4, pinyinScore, Math.Abs(name.Length - query.Length)), "pinyin");
         }
 
+        // Multi-segment path expressions (a\b or a/b) and plain path substrings.
+        var pathSegmentScore = PathSegmentMatcher.Score(record.FullPath, query);
+        if (pathSegmentScore > 0 && query.IndexOfAny(['\\', '/']) >= 0)
+        {
+            // Path-segment hits rank above generic fuzzy/pinyin noise (tier 2.5 → use tier 2 quality boost via tier 2).
+            return (new TextMatchKey(2, pathSegmentScore, Math.Abs(record.ParentPath.Length - query.Length)), "path-segment");
+        }
+
         var pathScore = allowFuzzy
-            ? FuzzyMatcher.Score(query, record.ParentPath)
-            : record.ParentPath.Contains(query, StringComparison.OrdinalIgnoreCase) ? query.Length : 0;
+            ? Math.Max(FuzzyMatcher.Score(query, record.ParentPath), pathSegmentScore)
+            : record.ParentPath.Contains(query, StringComparison.OrdinalIgnoreCase)
+                ? query.Length
+                : pathSegmentScore;
         return pathScore > 0
             ? (new TextMatchKey(5, pathScore, Math.Abs(record.ParentPath.Length - query.Length)), "path")
             : (TextMatchKey.NoMatch, "none");
