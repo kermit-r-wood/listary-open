@@ -320,7 +320,8 @@ public sealed class ElevatedIndexerClient : IElevatedIndexerClient
         [EnumeratorCancellation]
         CancellationToken cancellationToken)
     {
-        var outputPath = CreateTempIndexerFilePath(".jsonl");
+        // Binary frames for scan records (JSONL remains for journal state/changes).
+        var outputPath = CreateTempIndexerFilePath(".bin");
         var errorPath = CreateTempIndexerFilePath(".err");
         IElevatedIndexerProcess? process = null;
         Task? completionTask = null;
@@ -355,7 +356,7 @@ public sealed class ElevatedIndexerClient : IElevatedIndexerClient
                 errorPath,
                 cancellationToken);
 
-            await foreach (var record in TailOutputRecordsAsync(outputPath, completionTask, cancellationToken)
+            await foreach (var record in TailBinaryOutputRecordsAsync(outputPath, completionTask, cancellationToken)
                                .ConfigureAwait(false))
             {
                 yield return record;
@@ -484,6 +485,136 @@ public sealed class ElevatedIndexerClient : IElevatedIndexerClient
             var message = $"Elevated indexer helper '{helperPath}' failed while running: {exception.Message}";
             Trace.TraceError("Elevated indexer helper '{0}' failed while running: {1}", helperPath, exception);
             throw new ElevatedIndexerException(message, exception);
+        }
+    }
+
+    private static async IAsyncEnumerable<FileRecord> TailBinaryOutputRecordsAsync(
+        string path,
+        Task processCompletion,
+        [EnumeratorCancellation] CancellationToken cancellationToken)
+    {
+        const int bufferSize = 256 * 1024;
+        var bytes = ArrayPool<byte>.Shared.Rent(bufferSize);
+        var pending = ArrayPool<byte>.Shared.Rent(bufferSize);
+        var pendingLength = 0;
+        var decoded = new List<FileRecord>(256);
+        FileStream? stream = null;
+
+        try
+        {
+            while (true)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                var completionObservedBeforeRead = processCompletion.IsCompleted;
+
+                if (stream is null && File.Exists(path))
+                {
+                    try
+                    {
+                        stream = new FileStream(
+                            path,
+                            FileMode.Open,
+                            FileAccess.Read,
+                            FileShare.ReadWrite | FileShare.Delete,
+                            bufferSize,
+                            useAsync: true);
+                    }
+                    catch (FileNotFoundException)
+                    {
+                        // Helper has not created the output file yet.
+                    }
+                }
+
+                var readAny = false;
+                if (stream is not null)
+                {
+                    while (true)
+                    {
+                        var bytesRead = await stream
+                            .ReadAsync(bytes.AsMemory(0, bufferSize), cancellationToken)
+                            .ConfigureAwait(false);
+                        if (bytesRead == 0)
+                        {
+                            break;
+                        }
+
+                        readAny = true;
+                        EnsurePendingCapacity(ref pending, pendingLength, pendingLength + bytesRead);
+                        Buffer.BlockCopy(bytes, 0, pending, pendingLength, bytesRead);
+                        pendingLength += bytesRead;
+
+                        decoded.Clear();
+                        if (!ElevatedIndexerBinaryCodec.TryConsumeFrames(
+                                pending.AsSpan(0, pendingLength),
+                                decoded,
+                                out var consumed,
+                                out var corrupt))
+                        {
+                            if (corrupt)
+                            {
+                                throw new InvalidDataException(
+                                    "Elevated indexer binary stream contains a corrupt frame.");
+                            }
+                        }
+
+                        if (consumed > 0)
+                        {
+                            var remaining = pendingLength - consumed;
+                            if (remaining > 0)
+                            {
+                                Buffer.BlockCopy(pending, consumed, pending, 0, remaining);
+                            }
+
+                            pendingLength = remaining;
+                        }
+
+                        foreach (var record in decoded)
+                        {
+                            yield return record;
+                        }
+                    }
+                }
+
+                if (completionObservedBeforeRead)
+                {
+                    break;
+                }
+
+                if (!readAny)
+                {
+                    await Task.WhenAny(
+                            processCompletion,
+                            Task.Delay(TimeSpan.FromMilliseconds(25), cancellationToken))
+                        .ConfigureAwait(false);
+                }
+            }
+
+            if (pendingLength > 0)
+            {
+                decoded.Clear();
+                if (!ElevatedIndexerBinaryCodec.TryConsumeFrames(
+                        pending.AsSpan(0, pendingLength),
+                        decoded,
+                        out var consumed,
+                        out var corrupt)
+                    || corrupt
+                    || consumed != pendingLength)
+                {
+                    throw new InvalidDataException(
+                        "Elevated indexer binary stream ended with an incomplete or corrupt frame.");
+                }
+
+                foreach (var record in decoded)
+                {
+                    yield return record;
+                }
+            }
+        }
+        finally
+        {
+            stream?.Dispose();
+            ArrayPool<byte>.Shared.Return(bytes);
+            ArrayPool<byte>.Shared.Return(pending);
         }
     }
 

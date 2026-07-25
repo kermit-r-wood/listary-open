@@ -1,5 +1,6 @@
 using System.Globalization;
 using System.Runtime.CompilerServices;
+using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
 using ListaryOpen.Core.Indexing;
@@ -139,6 +140,103 @@ internal static class BenchmarkScenarios
         {
             TryDeleteFile(outputPath);
         }
+    }
+
+    /// <summary>
+    /// Profiles JSONL serialize+parse vs binary frame encode+decode for the same records.
+    /// Used to justify the scan-path binary IPC switch.
+    /// </summary>
+    public static Task<BenchmarkRun> MeasureTransportCodecAsync(
+        IReadOnlyList<FileRecord> records,
+        bool baseline,
+        int repeat,
+        CancellationToken cancellationToken)
+    {
+        var variant = baseline ? "jsonl-serialize-parse" : "binary-encode-decode";
+        return IndexingBenchmarkRunner.MeasureAsync(
+            "transport-codec",
+            variant,
+            repeat,
+            records.Count,
+            async stopwatch =>
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                long checksum = 0;
+                double? firstMs = null;
+
+                if (baseline)
+                {
+                    await using var stream = new MemoryStream();
+                    await using (var writer = new StreamWriter(stream, new UTF8Encoding(false), 64 * 1024, leaveOpen: true))
+                    {
+                        foreach (var record in records)
+                        {
+                            var line = JsonSerializer.Serialize(
+                                new
+                                {
+                                    record.FullPath,
+                                    record.IsDirectory,
+                                    record.SizeBytes,
+                                    record.LastWriteTime,
+                                    fileReferenceNumber = record.FileReferenceNumber.ToString(CultureInfo.InvariantCulture)
+                                },
+                                new JsonSerializerOptions(JsonSerializerDefaults.Web));
+                            await writer.WriteLineAsync(line).ConfigureAwait(false);
+                        }
+
+                        await writer.FlushAsync(cancellationToken).ConfigureAwait(false);
+                    }
+
+                    stream.Position = 0;
+                    using var reader = new StreamReader(stream, Encoding.UTF8);
+                    var index = 0;
+                    while (await reader.ReadLineAsync(cancellationToken).ConfigureAwait(false) is { } line)
+                    {
+                        if (string.IsNullOrWhiteSpace(line))
+                        {
+                            continue;
+                        }
+
+                        var dto = JsonSerializer.Deserialize<JsonElement>(line);
+                        var path = dto.GetProperty("fullPath").GetString() ?? string.Empty;
+                        checksum += path.Length + index;
+                        if (firstMs is null)
+                        {
+                            firstMs = stopwatch.Elapsed.TotalMilliseconds;
+                        }
+
+                        index++;
+                    }
+
+                    return new BenchmarkOutcome(index, checksum, firstMs);
+                }
+
+                await using (var stream = new MemoryStream())
+                {
+                    await ElevatedIndexerBinaryWriter
+                        .WriteRecordsAsync(EnumerateInlineAsync(records, cancellationToken), stream, cancellationToken)
+                        .ConfigureAwait(false);
+                    var bytes = stream.ToArray();
+                    var decoded = new List<FileRecord>(records.Count);
+                    if (!ElevatedIndexerBinaryCodec.TryConsumeFrames(bytes, decoded, out var consumed, out var corrupt)
+                        || corrupt
+                        || consumed != bytes.Length)
+                    {
+                        throw new InvalidDataException("Binary transport round-trip failed.");
+                    }
+
+                    for (var index = 0; index < decoded.Count; index++)
+                    {
+                        checksum += decoded[index].FullPath.Length + index;
+                        if (firstMs is null)
+                        {
+                            firstMs = stopwatch.Elapsed.TotalMilliseconds;
+                        }
+                    }
+
+                    return new BenchmarkOutcome(decoded.Count, checksum, firstMs);
+                }
+            });
     }
 
     public static Task<BenchmarkRun> MeasureHelperPipelineAsync(

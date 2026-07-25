@@ -6,8 +6,13 @@ internal static class ElevatedIndexerOutputPathValidator
 
     public static bool AreAllowed(string recordsPath, string errorPath)
     {
-        return IsAllowed(recordsPath, ".jsonl")
+        return (IsAllowed(recordsPath, ".jsonl") || IsAllowed(recordsPath, ".bin"))
             && IsAllowed(errorPath, ".err");
+    }
+
+    public static bool AreAllowedBinaryRecords(string recordsPath, string errorPath)
+    {
+        return IsAllowed(recordsPath, ".bin") && IsAllowed(errorPath, ".err");
     }
 
     public static bool IsAllowedErrorPath(string errorPath)

@@ -75,7 +75,9 @@ static async Task<int> ScanToConsoleAsync(string root)
 
 static async Task<int> ScanToFileAsync(string root, string recordsPath, string errorPath)
 {
-    if (!ElevatedIndexerOutputPathValidator.AreAllowed(recordsPath, errorPath))
+    // Prefer .bin for volume scans; accept .jsonl for legacy callers/tests.
+    if (!ElevatedIndexerOutputPathValidator.AreAllowed(recordsPath, errorPath)
+        && !ElevatedIndexerOutputPathValidator.AreAllowedBinaryRecords(recordsPath, errorPath))
     {
         return 2;
     }
@@ -89,11 +91,22 @@ static async Task<int> ScanToFileAsync(string root, string recordsPath, string e
     try
     {
         var reader = new NtfsUsnJournalReader();
-        await ElevatedIndexerRecordWriter.WriteFileAsync(
-                reader.EnumerateVolumeAsync(root, CancellationToken.None),
-                recordsPath,
-                CancellationToken.None)
-            .ConfigureAwait(false);
+        if (string.Equals(Path.GetExtension(recordsPath), ".bin", StringComparison.OrdinalIgnoreCase))
+        {
+            await ElevatedIndexerRecordWriter.WriteBinaryFileAsync(
+                    reader.EnumerateVolumeAsync(root, CancellationToken.None),
+                    recordsPath,
+                    CancellationToken.None)
+                .ConfigureAwait(false);
+        }
+        else
+        {
+            await ElevatedIndexerRecordWriter.WriteFileAsync(
+                    reader.EnumerateVolumeAsync(root, CancellationToken.None),
+                    recordsPath,
+                    CancellationToken.None)
+                .ConfigureAwait(false);
+        }
 
         return 0;
     }

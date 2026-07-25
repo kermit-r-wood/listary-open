@@ -247,7 +247,11 @@ public sealed class ElevatedIndexerClientTests
                     return new FileWritingElevatedIndexerProcess(
                         outputPath,
                         errorPath,
-                        "{\"fullPath\":\"C:\\\\Docs\\\\Elevated.txt\",\"isDirectory\":false,\"sizeBytes\":15,\"lastWriteTime\":\"2026-07-04T00:00:00+00:00\"}",
+                        EncodeBinaryRecords(FileRecord.Create(
+                            @"C:\Docs\Elevated.txt",
+                            false,
+                            15,
+                            new DateTimeOffset(2026, 7, 4, 0, 0, 0, TimeSpan.Zero))),
                         error: string.Empty,
                         exitCode: 0);
                 },
@@ -404,7 +408,7 @@ public sealed class ElevatedIndexerClientTests
     }
 
     [Fact]
-    public async Task ScanNtfsAsyncParsesJsonRecordsFromHelperOutput()
+    public async Task ScanNtfsAsyncParsesBinaryRecordsFromHelperOutput()
     {
         var tempDirectory = Path.Combine(Path.GetTempPath(), "listary-open-" + Guid.NewGuid());
         Directory.CreateDirectory(tempDirectory);
@@ -412,10 +416,17 @@ public sealed class ElevatedIndexerClientTests
         try
         {
             var helperPath = CreateUsableHelperBundle(tempDirectory);
-            var output = string.Join(
-                Environment.NewLine,
-                "{\"fullPath\":\"C:\\\\Docs\\\\Invoice.xlsx\",\"isDirectory\":false,\"sizeBytes\":12,\"lastWriteTime\":\"2026-07-03T00:00:00+00:00\"}",
-                "{\"fullPath\":\"C:\\\\Docs\\\\Projects\",\"isDirectory\":true,\"sizeBytes\":0,\"lastWriteTime\":\"2026-07-03T00:01:00+00:00\"}");
+            var output = EncodeBinaryRecords(
+                FileRecord.Create(
+                    @"C:\Docs\Invoice.xlsx",
+                    false,
+                    12,
+                    new DateTimeOffset(2026, 7, 3, 0, 0, 0, TimeSpan.Zero)),
+                FileRecord.Create(
+                    @"C:\Docs\Projects",
+                    true,
+                    0,
+                    new DateTimeOffset(2026, 7, 3, 0, 1, 0, TimeSpan.Zero)));
             var client = new ElevatedIndexerClient(
                 helperPath,
                 (_, _, outputPath, errorPath) => new FileWritingElevatedIndexerProcess(
@@ -451,24 +462,26 @@ public sealed class ElevatedIndexerClientTests
     }
 
     [Fact]
-    public async Task ScanNtfsAsyncParsesCrLfAndUtf8RecordAcrossTailBufferBoundaries()
+    public async Task ScanNtfsAsyncParsesManyBinaryFramesAcrossTailBufferBoundaries()
     {
         var tempDirectory = Path.Combine(Path.GetTempPath(), "listary-open-" + Guid.NewGuid());
         Directory.CreateDirectory(tempDirectory);
 
         try
         {
-            const int tailBufferSize = 64 * 1024;
-            const string prefix = "{\"padding\":\"";
-            var paddingLength = tailBufferSize - 1 - Encoding.UTF8.GetByteCount(prefix);
-            var firstLine = prefix
-                + new string('a', paddingLength)
-                + "项目\",\"fullPath\":\"C:\\\\Docs\\\\项目.txt\",\"isDirectory\":false,"
-                + "\"sizeBytes\":21,\"lastWriteTime\":\"2026-07-15T00:00:00+00:00\"}";
-            var secondLine =
-                "{\"fullPath\":\"C:\\\\Docs\\\\Second.txt\",\"isDirectory\":false,"
-                + "\"sizeBytes\":22,\"lastWriteTime\":\"2026-07-15T00:00:01+00:00\"}";
-            var output = firstLine + "\r\n" + secondLine;
+            // Enough records that total payload exceeds the 256 KiB tailer buffer.
+            var recordsIn = new List<FileRecord>(8_000);
+            for (var i = 0; i < 8_000; i++)
+            {
+                recordsIn.Add(FileRecord.Create(
+                    $@"C:\Docs\folder-medium-name\f-{i:D5}-项目-file.txt",
+                    false,
+                    i,
+                    new DateTimeOffset(2026, 7, 15, 0, 0, 0, TimeSpan.Zero).AddSeconds(i)));
+            }
+
+            var output = EncodeBinaryRecords(recordsIn.ToArray());
+            Assert.True(output.Length > 256 * 1024, $"payload was only {output.Length} bytes");
             var helperPath = CreateUsableHelperBundle(tempDirectory);
             var client = new ElevatedIndexerClient(
                 helperPath,
@@ -482,18 +495,9 @@ public sealed class ElevatedIndexerClientTests
             var records = await CollectAsync(
                 client.ScanNtfsAsync(new IndexRoot("C:\\Docs"), CancellationToken.None));
 
-            Assert.Collection(
-                records,
-                record =>
-                {
-                    Assert.Equal("C:\\Docs\\项目.txt", record.FullPath);
-                    Assert.Equal(21, record.SizeBytes);
-                },
-                record =>
-                {
-                    Assert.Equal("C:\\Docs\\Second.txt", record.FullPath);
-                    Assert.Equal(22, record.SizeBytes);
-                });
+            Assert.Equal(8_000, records.Count);
+            Assert.Equal(@"C:\Docs\folder-medium-name\f-00000-项目-file.txt", records[0].FullPath);
+            Assert.Equal(@"C:\Docs\folder-medium-name\f-07999-项目-file.txt", records[^1].FullPath);
         }
         finally
         {
@@ -809,12 +813,13 @@ public sealed class ElevatedIndexerClientTests
                 (_, _, outputPath, errorPath) => new FileWritingElevatedIndexerProcess(
                     outputPath,
                     errorPath,
-                    output: "{not-json}",
+                    outputBytes: Encoding.UTF8.GetBytes("not-a-binary-frame"),
                     error: string.Empty,
                     exitCode: 0));
 
-            await Assert.ThrowsAsync<InvalidDataException>(
+            var exception = await Assert.ThrowsAsync<InvalidDataException>(
                 () => CollectAsync(client.ScanNtfsAsync(new IndexRoot("C:\\Docs"), CancellationToken.None)));
+            Assert.Contains("corrupt", exception.Message, StringComparison.OrdinalIgnoreCase);
         }
         finally
         {
@@ -822,12 +827,8 @@ public sealed class ElevatedIndexerClientTests
         }
     }
 
-    [Theory]
-    [InlineData("{\"fullPath\":\"C:\\\\Docs\\\\Invoice.xlsx\",\"sizeBytes\":12,\"lastWriteTime\":\"2026-07-03T00:00:00+00:00\"}")]
-    [InlineData("{\"fullPath\":\"C:\\\\Docs\\\\Invoice.xlsx\",\"isDirectory\":false,\"lastWriteTime\":\"2026-07-03T00:00:00+00:00\"}")]
-    [InlineData("{\"fullPath\":\"C:\\\\Docs\\\\Invoice.xlsx\",\"isDirectory\":false,\"sizeBytes\":12}")]
-    public async Task ScanNtfsAsyncThrowsInvalidDataExceptionWithLineNumberWhenRequiredPrimitiveFieldIsMissing(
-        string stdout)
+    [Fact]
+    public async Task ScanNtfsAsyncThrowsInvalidDataExceptionWhenBinaryFrameIsTruncated()
     {
         var tempDirectory = Path.Combine(Path.GetTempPath(), "listary-open-" + Guid.NewGuid());
         Directory.CreateDirectory(tempDirectory);
@@ -835,19 +836,25 @@ public sealed class ElevatedIndexerClientTests
         try
         {
             var helperPath = CreateUsableHelperBundle(tempDirectory);
+            var full = EncodeBinaryRecords(FileRecord.Create(
+                @"C:\Docs\Invoice.xlsx",
+                false,
+                12,
+                new DateTimeOffset(2026, 7, 3, 0, 0, 0, TimeSpan.Zero)));
+            var truncated = full.AsSpan(0, full.Length / 2).ToArray();
             var client = new ElevatedIndexerClient(
                 helperPath,
                 (_, _, outputPath, errorPath) => new FileWritingElevatedIndexerProcess(
                     outputPath,
                     errorPath,
-                    output: stdout,
+                    outputBytes: truncated,
                     error: string.Empty,
                     exitCode: 0));
 
             var exception = await Assert.ThrowsAsync<InvalidDataException>(
                 () => CollectAsync(client.ScanNtfsAsync(new IndexRoot("C:\\Docs"), CancellationToken.None)));
 
-            Assert.Contains("line 1", exception.Message);
+            Assert.Contains("incomplete", exception.Message, StringComparison.OrdinalIgnoreCase);
         }
         finally
         {
@@ -990,11 +997,24 @@ public sealed class ElevatedIndexerClientTests
         }
     }
 
+    private static byte[] EncodeBinaryRecords(params FileRecord[] records)
+    {
+        using var stream = new MemoryStream();
+        foreach (var record in records)
+        {
+            var frame = new byte[ElevatedIndexerBinaryCodec.GetFrameSize(record.FullPath)];
+            Assert.True(ElevatedIndexerBinaryCodec.TryWriteFrame(frame, record, out _));
+            stream.Write(frame);
+        }
+
+        return stream.ToArray();
+    }
+
     private sealed class FileWritingElevatedIndexerProcess : IElevatedIndexerProcess
     {
         private readonly string _outputPath;
         private readonly string _errorPath;
-        private readonly string _output;
+        private readonly byte[] _outputBytes;
         private readonly string _error;
 
         public FileWritingElevatedIndexerProcess(
@@ -1003,10 +1023,20 @@ public sealed class ElevatedIndexerClientTests
             string output,
             string error,
             int exitCode)
+            : this(outputPath, errorPath, Encoding.UTF8.GetBytes(output), error, exitCode)
+        {
+        }
+
+        public FileWritingElevatedIndexerProcess(
+            string outputPath,
+            string errorPath,
+            byte[] outputBytes,
+            string error,
+            int exitCode)
         {
             _outputPath = outputPath;
             _errorPath = errorPath;
-            _output = output;
+            _outputBytes = outputBytes;
             _error = error;
             ExitCode = exitCode;
         }
@@ -1017,7 +1047,7 @@ public sealed class ElevatedIndexerClientTests
 
         public bool Start()
         {
-            File.WriteAllText(_outputPath, _output);
+            File.WriteAllBytes(_outputPath, _outputBytes);
             File.WriteAllText(_errorPath, _error);
             return true;
         }
@@ -1042,10 +1072,18 @@ public sealed class ElevatedIndexerClientTests
 
     private sealed class StreamingFileWritingElevatedIndexerProcess : IElevatedIndexerProcess
     {
-        private const string FirstRecord =
-            "{\"fullPath\":\"C:\\\\Docs\\\\First.txt\",\"isDirectory\":false,\"sizeBytes\":1,\"lastWriteTime\":\"2026-07-15T00:00:00+00:00\"}";
-        private const string SecondRecord =
-            "{\"fullPath\":\"C:\\\\Docs\\\\Second.txt\",\"isDirectory\":false,\"sizeBytes\":2,\"lastWriteTime\":\"2026-07-15T00:00:01+00:00\"}";
+        private static readonly byte[] FirstRecord = EncodeBinaryRecords(
+            FileRecord.Create(
+                @"C:\Docs\First.txt",
+                false,
+                1,
+                new DateTimeOffset(2026, 7, 15, 0, 0, 0, TimeSpan.Zero)));
+        private static readonly byte[] SecondRecord = EncodeBinaryRecords(
+            FileRecord.Create(
+                @"C:\Docs\Second.txt",
+                false,
+                2,
+                new DateTimeOffset(2026, 7, 15, 0, 0, 1, TimeSpan.Zero)));
 
         private readonly string _outputPath;
         private readonly string _errorPath;
@@ -1096,13 +1134,12 @@ public sealed class ElevatedIndexerClientTests
                     FileShare.Read,
                     bufferSize: 4096,
                     useAsync: true);
-                await using var writer = new StreamWriter(stream);
-                await writer.WriteLineAsync(FirstRecord);
-                await writer.FlushAsync();
+                await stream.WriteAsync(FirstRecord);
+                await stream.FlushAsync();
                 _firstRecordWritten.TrySetResult();
                 await _allowExit.Task;
-                await writer.WriteLineAsync(SecondRecord);
-                await writer.FlushAsync();
+                await stream.WriteAsync(SecondRecord);
+                await stream.FlushAsync();
                 await File.WriteAllTextAsync(_errorPath, string.Empty);
             }
             finally

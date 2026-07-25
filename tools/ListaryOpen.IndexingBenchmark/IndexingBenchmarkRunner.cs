@@ -135,6 +135,18 @@ internal static class IndexingBenchmarkRunner
         foreach (var baseline in variants)
         {
             AddIfCaptured(
+                await BenchmarkScenarios.MeasureTransportCodecAsync(
+                    records.Take(options.Records).ToArray(),
+                    baseline,
+                    repeat,
+                    cancellationToken),
+                capture,
+                runs);
+        }
+
+        foreach (var baseline in variants)
+        {
+            AddIfCaptured(
                 await BenchmarkScenarios.MeasureHelperPipelineAsync(
                     records.Take(options.PipelineRecords).ToArray(),
                     baseline,

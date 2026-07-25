@@ -1,13 +1,14 @@
 using System.Text.Json;
 using System.Text;
 using ListaryOpen.Core.Indexing;
+using ListaryOpen.Infrastructure.Indexing;
 using ListaryOpen.Infrastructure.Indexing.Ntfs;
 
 namespace ListaryOpen.Indexer.Elevated;
 
 internal static class ElevatedIndexerRecordWriter
 {
-    // Flush complete JSONL batches often enough for the non-elevated process to tail
+    // Flush complete batches often enough for the non-elevated process to tail
     // the file, without paying for a kernel write for every record.
     internal const int StreamingFlushRecordCount = 256;
     private const int StreamBufferSize = 64 * 1024;
@@ -53,6 +54,13 @@ internal static class ElevatedIndexerRecordWriter
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(outputPath);
 
+        // Scan production path uses .bin frames; .jsonl remains for journal/tests.
+        if (string.Equals(Path.GetExtension(outputPath), ".bin", StringComparison.OrdinalIgnoreCase))
+        {
+            await WriteBinaryFileAsync(records, outputPath, cancellationToken).ConfigureAwait(false);
+            return;
+        }
+
         await using var stream = ElevatedIndexerOutputPathValidator.CreateNewFile(outputPath, ".jsonl");
         await using var writer = new StreamWriter(
             stream,
@@ -60,6 +68,17 @@ internal static class ElevatedIndexerRecordWriter
             StreamBufferSize,
             leaveOpen: false);
         await WriteAsync(records, writer, cancellationToken).ConfigureAwait(false);
+    }
+
+    public static async Task WriteBinaryFileAsync(
+        IAsyncEnumerable<FileRecord> records,
+        string outputPath,
+        CancellationToken cancellationToken)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(outputPath);
+        await using var stream = ElevatedIndexerOutputPathValidator.CreateNewFile(outputPath, ".bin");
+        await ElevatedIndexerBinaryWriter.WriteRecordsAsync(records, stream, cancellationToken)
+            .ConfigureAwait(false);
     }
 
     public static async Task WriteJournalStateFileAsync(

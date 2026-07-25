@@ -7,12 +7,16 @@ using ListaryOpen.Infrastructure.Indexing;
 namespace ListaryOpen.Indexer.Elevated.Ntfs;
 
 /// <summary>
-/// Full MFT scanner: sequential $MFT read, all FILE_NAME attributes (hard links),
+/// Full MFT scanner: sequential $MFT stream parse, all FILE_NAME attributes (hard links),
 /// path expansion in memory, no per-file CreateFile for metadata.
+/// Raw MFT bytes are processed in chunks and discarded so peak memory tracks the
+/// parsed record map rather than the full raw $MFT image.
 /// </summary>
 internal sealed class NtfsMftScanner
 {
     private const int MaxMftBytesInMemory = 768 * 1024 * 1024;
+    /// <summary>Stream chunk size: multiple of typical 1 KiB records, keeps parse locality high.</summary>
+    private const int MftStreamChunkBytes = 4 * 1024 * 1024;
     private const ulong RootDirectoryRecordNumber = 5;
 
     private readonly record struct DirectoryNode(ulong ParentRecordNumber, string Name);
@@ -42,10 +46,10 @@ internal sealed class NtfsMftScanner
             var volumeData = QueryVolumeData(handle);
             ValidateVolumeData(volumeData);
 
-            var mftBytes = ReadEntireMft(handle, volumeData, cancellationToken);
-            foreach (var record in ProjectRecords(
-                         mftBytes,
-                         volumeData,
+            // Stream-parse $MFT into a lightweight record map without retaining raw bytes.
+            var parsedByRecord = StreamParseMftRecords(handle, volumeData, cancellationToken);
+            foreach (var record in ProjectParsedRecords(
+                         parsedByRecord,
                          scanRoot.VolumeRoot,
                          scanRoot.RequestedRoot,
                          rules,
@@ -126,6 +130,7 @@ internal sealed class NtfsMftScanner
         }
     }
 
+    /// <summary>Test helper: parse a contiguous in-memory $MFT image (non-streaming).</summary>
     internal static IEnumerable<FileRecord> ProjectRecords(
         byte[] mftBytes,
         NtfsNativeMethods.NtfsVolumeDataBuffer volumeData,
@@ -162,6 +167,24 @@ internal sealed class NtfsMftScanner
             parsedByRecord[parsed.RecordNumber] = parsed;
         }
 
+        foreach (var record in ProjectParsedRecords(
+                     parsedByRecord,
+                     volumeRoot,
+                     requestedRoot,
+                     exclusionRules,
+                     cancellationToken))
+        {
+            yield return record;
+        }
+    }
+
+    internal static IEnumerable<FileRecord> ProjectParsedRecords(
+        IReadOnlyDictionary<ulong, NtfsMftParsedRecord> parsedByRecord,
+        string volumeRoot,
+        string requestedRoot,
+        IndexExclusionRules exclusionRules,
+        CancellationToken cancellationToken)
+    {
         var directories = new Dictionary<ulong, DirectoryNode>(Math.Max(16, parsedByRecord.Count / 8));
         var links = new List<NameLink>(parsedByRecord.Count);
 
@@ -384,7 +407,11 @@ internal sealed class NtfsMftScanner
         }
     }
 
-    private static byte[] ReadEntireMft(
+    /// <summary>
+    /// Streams $MFT data runs in chunks, parsing FILE records into a map and discarding
+    /// raw bytes so peak memory is dominated by the parsed map rather than the full image.
+    /// </summary>
+    internal static Dictionary<ulong, NtfsMftParsedRecord> StreamParseMftRecords(
         IntPtr volumeHandle,
         NtfsNativeMethods.NtfsVolumeDataBuffer volumeData,
         CancellationToken cancellationToken)
@@ -397,7 +424,6 @@ internal sealed class NtfsMftScanner
             throw new InvalidDataException("NTFS volume geometry is invalid.");
         }
 
-        // Read $MFT record 0 from the start LCN to discover the full data runlist.
         var firstRecordOffset = volumeData.MftStartLcn * bytesPerCluster;
         var firstRecord = ReadVolumeBytes(volumeHandle, firstRecordOffset, bytesPerRecord, alignTo: bytesPerSector);
         if (!NtfsMftRecordParser.TryApplyUpdateSequence(firstRecord, bytesPerSector))
@@ -405,82 +431,176 @@ internal sealed class NtfsMftScanner
             throw new InvalidDataException("Failed to apply update sequence on $MFT record 0.");
         }
 
-        if (!NtfsMftDataRuns.TryGetUnnamedDataRuns(firstRecord, out var runs, out var validDataLength)
+        IReadOnlyList<NtfsDataRun> runs;
+        long validDataLength;
+        if (!NtfsMftDataRuns.TryGetUnnamedDataRuns(firstRecord, out runs, out validDataLength)
             || runs.Count == 0
             || validDataLength <= 0)
         {
-            // Fall back to contiguous MFT zone when runlist is unavailable.
             validDataLength = volumeData.MftValidDataLength;
             if (validDataLength <= 0)
             {
                 throw new InvalidDataException("NTFS $MFT valid data length is invalid.");
             }
 
-            if (validDataLength > MaxMftBytesInMemory)
+            runs = new[]
             {
-                throw new InvalidDataException(
-                    $"NTFS $MFT is too large to load into memory ({validDataLength} bytes).");
-            }
-
-            var contiguous = ReadVolumeBytes(
-                volumeHandle,
-                firstRecordOffset,
-                AlignUp((int)Math.Min(validDataLength, int.MaxValue), bytesPerSector),
-                alignTo: bytesPerSector);
-            if (contiguous.Length > validDataLength)
-            {
-                Array.Resize(ref contiguous, (int)validDataLength);
-            }
-
-            return contiguous;
+                new NtfsDataRun(
+                    volumeData.MftStartLcn,
+                    (validDataLength + bytesPerCluster - 1) / bytesPerCluster,
+                    IsSparse: false)
+            };
         }
 
         if (validDataLength > MaxMftBytesInMemory)
         {
             throw new InvalidDataException(
-                $"NTFS $MFT is too large to load into memory ({validDataLength} bytes).");
+                $"NTFS $MFT is too large to scan ({validDataLength} bytes).");
         }
 
-        var mftLength = (int)Math.Min(validDataLength, int.MaxValue);
-        var buffer = new byte[mftLength];
-        long written = 0;
+        var estimatedRecords = (int)Math.Min(validDataLength / Math.Max(bytesPerRecord, 1), int.MaxValue);
+        var parsedByRecord = new Dictionary<ulong, NtfsMftParsedRecord>(Math.Max(16, estimatedRecords / 2));
+        long bytesConsumed = 0;
+        ulong nextRecordNumber = 0;
+        var carry = Array.Empty<byte>();
+        var carryLength = 0;
+        var chunkSize = AlignUp(Math.Max(MftStreamChunkBytes, bytesPerRecord), bytesPerRecord);
+
         foreach (var run in runs)
         {
             cancellationToken.ThrowIfCancellationRequested();
-            var runBytes = run.ClusterCount * bytesPerCluster;
-            var remaining = mftLength - written;
-            if (remaining <= 0)
+            if (bytesConsumed >= validDataLength)
             {
                 break;
             }
 
-            var toCopy = (int)Math.Min(runBytes, remaining);
+            var runBytes = run.ClusterCount * bytesPerCluster;
+            var remainingValid = validDataLength - bytesConsumed;
+            var runReadable = (int)Math.Min(runBytes, remainingValid);
+            if (runReadable <= 0)
+            {
+                break;
+            }
+
             if (run.IsSparse)
             {
-                // Sparse runs contribute zeroes; buffer is already zeroed.
-                written += toCopy;
+                // Sparse $MFT runs are unexpected for in-use FILE records; skip zeros.
+                bytesConsumed += runReadable;
+                nextRecordNumber += (ulong)(runReadable / bytesPerRecord);
                 continue;
             }
 
-            var runOffset = run.StartLcn * bytesPerCluster;
-            var alignedReadLength = AlignUp(toCopy, bytesPerSector);
-            var chunk = ReadVolumeBytes(volumeHandle, runOffset, alignedReadLength, alignTo: bytesPerSector);
-            var copyLength = Math.Min(toCopy, chunk.Length);
-            Buffer.BlockCopy(chunk, 0, buffer, (int)written, copyLength);
-            written += copyLength;
+            long runFileOffset = 0;
+            while (runFileOffset < runReadable)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                var toRead = (int)Math.Min(chunkSize, runReadable - runFileOffset);
+                var absoluteOffset = (run.StartLcn * bytesPerCluster) + runFileOffset;
+                var chunk = ReadVolumeBytes(volumeHandle, absoluteOffset, toRead, alignTo: bytesPerSector);
+                var usable = Math.Min(toRead, chunk.Length);
+                if (usable <= 0)
+                {
+                    break;
+                }
+
+                // Merge with carry so records spanning chunk boundaries stay intact.
+                byte[] work;
+                int workLength;
+                if (carryLength == 0)
+                {
+                    work = chunk;
+                    workLength = usable;
+                }
+                else
+                {
+                    work = new byte[carryLength + usable];
+                    Buffer.BlockCopy(carry, 0, work, 0, carryLength);
+                    Buffer.BlockCopy(chunk, 0, work, carryLength, usable);
+                    workLength = carryLength + usable;
+                }
+
+                var completeBytes = workLength - (workLength % bytesPerRecord);
+                if (completeBytes > 0)
+                {
+                    ParseRecordChunk(
+                        work.AsSpan(0, completeBytes),
+                        bytesPerRecord,
+                        bytesPerSector,
+                        nextRecordNumber,
+                        parsedByRecord,
+                        cancellationToken);
+                    nextRecordNumber += (ulong)(completeBytes / bytesPerRecord);
+                }
+
+                var leftover = workLength - completeBytes;
+                if (leftover > 0)
+                {
+                    if (carry.Length < leftover)
+                    {
+                        carry = new byte[leftover];
+                    }
+
+                    Buffer.BlockCopy(work, completeBytes, carry, 0, leftover);
+                    carryLength = leftover;
+                }
+                else
+                {
+                    carryLength = 0;
+                }
+
+                bytesConsumed += usable;
+                runFileOffset += usable;
+            }
         }
 
-        if (written < bytesPerRecord)
+        if (carryLength >= bytesPerRecord)
         {
-            throw new InvalidDataException("NTFS $MFT read returned fewer bytes than one file record.");
+            var completeBytes = carryLength - (carryLength % bytesPerRecord);
+            ParseRecordChunk(
+                carry.AsSpan(0, completeBytes),
+                bytesPerRecord,
+                bytesPerSector,
+                nextRecordNumber,
+                parsedByRecord,
+                cancellationToken);
         }
 
-        if (written < mftLength)
+        if (parsedByRecord.Count == 0)
         {
-            Array.Resize(ref buffer, (int)written);
+            throw new InvalidDataException("NTFS $MFT stream parse produced no in-use records.");
         }
 
-        return buffer;
+        return parsedByRecord;
+    }
+
+    private static void ParseRecordChunk(
+        ReadOnlySpan<byte> chunk,
+        int bytesPerRecord,
+        int bytesPerSector,
+        ulong startingRecordNumber,
+        Dictionary<ulong, NtfsMftParsedRecord> parsedByRecord,
+        CancellationToken cancellationToken)
+    {
+        // One mutable copy per stream chunk so update-sequence can patch in place.
+        var mutable = chunk.ToArray();
+        var recordCount = mutable.Length / bytesPerRecord;
+        for (var index = 0; index < recordCount; index++)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            var recordSpan = mutable.AsSpan(index * bytesPerRecord, bytesPerRecord);
+            if (!NtfsMftRecordParser.TryApplyUpdateSequence(recordSpan, bytesPerSector))
+            {
+                continue;
+            }
+
+            var recordNumber = startingRecordNumber + (ulong)index;
+            if (!NtfsMftRecordParser.TryParse(recordSpan, recordNumber, out var parsed) || !parsed.InUse)
+            {
+                continue;
+            }
+
+            parsedByRecord[parsed.RecordNumber] = parsed;
+        }
     }
 
     private static byte[] ReadVolumeBytes(IntPtr volumeHandle, long absoluteOffset, int length, int alignTo)
