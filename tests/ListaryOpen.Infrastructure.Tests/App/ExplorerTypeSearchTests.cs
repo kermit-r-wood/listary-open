@@ -216,6 +216,30 @@ public sealed class ExplorerTypeSearchTests
     }
 
     [Theory]
+    [InlineData(GlobalTextInputHost.Explorer, 42, 42, 1000, 1100, true)]
+    [InlineData(GlobalTextInputHost.Explorer, 42, 42, 1000, 1750, true)]
+    [InlineData(GlobalTextInputHost.Explorer, 42, 42, 1000, 1751, false)]
+    [InlineData(GlobalTextInputHost.Explorer, 42, 41, 1000, 1100, false)]
+    [InlineData(GlobalTextInputHost.Dialog, 42, 42, 1000, 1100, false)]
+    public void RightClickMenuAcceleratorsAreNotCapturedAsExplorerTypeSearch(
+        GlobalTextInputHost host,
+        int foregroundWindow,
+        int rightClickWindow,
+        long rightClickTick,
+        long currentTick,
+        bool expected)
+    {
+        Assert.Equal(
+            expected,
+            GlobalTextInputService.ShouldSuppressTextAfterRightClick(
+                host,
+                new IntPtr(foregroundWindow),
+                rightClickTick,
+                new IntPtr(rightClickWindow),
+                currentTick));
+    }
+
+    [Theory]
     [InlineData(GlobalTextInputHost.Dialog, "Edit", 1148, true)]
     [InlineData(GlobalTextInputHost.Dialog, "Edit", 1152, true)]
     [InlineData(GlobalTextInputHost.Dialog, "Edit", 41477, false)]

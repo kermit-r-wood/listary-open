@@ -44,6 +44,7 @@ public sealed class IndexingCoordinatorTests
                 && status.Message.StartsWith("Writing ", StringComparison.Ordinal));
             Assert.Equal(2, statuses[^1].IndexedCount);
             Assert.Equal(IndexingRunState.Completed, statuses[^1].State);
+            Assert.Contains("compatibility scanning", statuses[^1].Message, StringComparison.OrdinalIgnoreCase);
         }
         finally
         {

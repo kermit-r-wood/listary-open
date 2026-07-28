@@ -153,6 +153,8 @@ public sealed class SearchPanelKeyboardTests
     [InlineData(1400, 800, 560, 360, 0, 0, 1920, 1080, 828, 428)]
     [InlineData(500, 400, 560, 360, 0, 0, 1920, 1080, 0, 28)]
     [InlineData(2200, 1100, 560, 360, 0, 0, 1920, 1080, 1360, 720)]
+    [InlineData(-100, 1000, 560, 360, -1920, 0, 0, 1040, -672, 628)]
+    [InlineData(1500, -100, 560, 360, 0, -1200, 1920, 0, 928, -472)]
     public void ExplorerSearchPanelIsPlacedAtBottomRightAndClampedToWorkArea(
         double anchorRight,
         double anchorBottom,

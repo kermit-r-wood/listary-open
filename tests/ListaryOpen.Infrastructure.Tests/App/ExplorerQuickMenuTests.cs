@@ -1,11 +1,31 @@
 using ListaryOpen.App;
 using ListaryOpen.Core.Settings;
+using ListaryOpen.Infrastructure.Windows;
 using System.Diagnostics;
 
 namespace ListaryOpen.Infrastructure.Tests.App;
 
 public sealed class ExplorerQuickMenuTests
 {
+    [Fact]
+    public void OpenFolderSnapshotKeepsOfflineAndCloudPathsWithoutProbingThem()
+    {
+        var offlineUnc = @"\\offline-nas\archive";
+        var cloudPlaceholder = @"C:\Users\Test\OneDrive\Online only";
+
+        var snapshot = ExplorerQuickMenu.CreateFolderSnapshot(new[]
+        {
+            new QuickSwitchFolderCandidate(offlineUnc, "Explorer", new IntPtr(1), false),
+            new QuickSwitchFolderCandidate(offlineUnc.ToUpperInvariant(), "Explorer", new IntPtr(2), true),
+            new QuickSwitchFolderCandidate(cloudPlaceholder, "Explorer", new IntPtr(3), false),
+            new QuickSwitchFolderCandidate(" ", "Explorer", new IntPtr(4), false)
+        });
+
+        Assert.Equal(2, snapshot.Count);
+        Assert.Equal(offlineUnc, snapshot[0].FolderPath);
+        Assert.Equal(cloudPlaceholder, snapshot[1].FolderPath);
+    }
+
     [Fact]
     public void PowerShellStartsInTheExplorerFolder()
     {

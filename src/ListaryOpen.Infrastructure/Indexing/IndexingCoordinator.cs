@@ -77,6 +77,7 @@ public sealed class IndexingCoordinator
         var hadFailures = false;
         var hadCancellations = false;
         var retainedStaleRecords = false;
+        var compatibilityScanRootCount = 0;
         long? indexGeneration = null;
         RaiseStatus(
             IndexingRunState.Indexing,
@@ -134,6 +135,10 @@ public sealed class IndexingCoordinator
                 {
                     indexGeneration ??= await _index.BeginIndexingRunAsync(cancellationToken).ConfigureAwait(false);
                     var provider = SelectProvider(root);
+                    if (!IsNtfsProvider(provider))
+                    {
+                        compatibilityScanRootCount++;
+                    }
                     RaiseStatus(
                         IndexingRunState.Indexing,
                         $"Scanning with {provider.Name}...",
@@ -182,6 +187,8 @@ public sealed class IndexingCoordinator
                     ? "Indexing canceled."
                     : retainedStaleRecords
                         ? "Indexing completed; stale records retained because pruning was skipped."
+                        : compatibilityScanRootCount > 0
+                            ? $"Indexing completed using compatibility scanning for {compatibilityScanRootCount} location(s)."
                         : "Indexing completed.";
 
             RaiseStatus(finalState, finalMessage, indexedCount, totalRoots: roots.Count);

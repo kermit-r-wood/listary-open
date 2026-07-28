@@ -18,6 +18,10 @@ The desktop suite directly verifies real global-hotkey delivery, Explorer/Task M
   - PASS: relevance tiers, 80 ms idle debounce, worker-thread search, stale-result rejection, batched UI publication, WAL, separate read/write connections, and FTS5 trigram retrieval are covered by automated tests.
   - PASS: the 1,502,401-row real index returned ordinary substring results in 5-13 ms and exact-name results in 5-16 ms through `SqliteSearchIndex` after warmup.
   - PASS: Quick Switch multi-Explorer candidate ordering, remembered-folder fallback, app routing helper, and folder-mode pinning are covered by unit tests.
+  - Add an online-only OneDrive folder and verify placeholder descendants appear in search without downloading file contents.
+  - Add a directory junction inside an indexed root and verify indexing neither follows the junction nor loops.
+  - Index a non-NTFS, removable, or network location and verify Settings reports compatibility scanning on completion.
+  - Make a child directory inaccessible and verify the run reports an incomplete/error state rather than silently claiming a complete index.
   - PASS: Firefox upload picker direct navigation is covered by the real native-hook E2E, which requires pre-Show hook loading, `IFileDialog.SetFolder`, visible target-folder evidence, and rejects fallback/automation paths.
   - PASS: `dotnet test tests\ListaryOpen.Infrastructure.Tests\ListaryOpen.Infrastructure.Tests.csproj --no-restore --nologo --filter "FullyQualifiedName~ListaryOpen.Infrastructure.Tests.App" -p:UseAppHost=false -p:BaseOutputPath=.test-ui-app-final\` passed with 111 tests.
   - PASS: `dotnet test ListaryOpen.sln --no-restore --nologo -p:UseAppHost=false -p:BaseOutputPath=.test-ui-solution-final\` passed with 60 Core tests and 411 Infrastructure tests.

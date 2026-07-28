@@ -131,10 +131,12 @@ public sealed class WpfSmokeTests
 
                 settingsNavigation.SelectedIndex = 1;
                 mainWindow.UpdateLayout();
-                var lightBackground = Assert.IsType<System.Windows.Media.SolidColorBrush>(mainWindow.Background).Color;
+                var lightBackground = Assert.IsType<System.Windows.Media.SolidColorBrush>(
+                    application.FindResource("Brush.AppBackground")).Color;
                 settingsViewModel.SelectedTheme = AppTheme.Dark;
                 mainWindow.UpdateLayout();
-                var darkBackground = Assert.IsType<System.Windows.Media.SolidColorBrush>(mainWindow.Background).Color;
+                var darkBackground = Assert.IsType<System.Windows.Media.SolidColorBrush>(
+                    application.FindResource("Brush.AppBackground")).Color;
                 Assert.NotEqual(lightBackground, darkBackground);
 
                 settingsViewModel.SavePreferencesCommand.Execute(null);

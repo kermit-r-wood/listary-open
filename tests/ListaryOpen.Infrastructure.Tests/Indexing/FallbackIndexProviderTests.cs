@@ -145,6 +145,21 @@ public sealed class FallbackIndexProviderTests
         Assert.False(FallbackIndexProvider.RootProbeIgnoresInaccessibleForTests);
     }
 
+    [Theory]
+    [InlineData(FileAttributes.Directory | FileAttributes.ReparsePoint, null, false)]
+    [InlineData(FileAttributes.Directory | FileAttributes.ReparsePoint, "", false)]
+    [InlineData(FileAttributes.Directory | FileAttributes.ReparsePoint, @"C:\Target", true)]
+    [InlineData(FileAttributes.Directory, @"C:\Target", false)]
+    public void CloudPlaceholderDirectoriesAreTraversedButLinksAreSkipped(
+        FileAttributes attributes,
+        string? linkTarget,
+        bool expected)
+    {
+        Assert.Equal(
+            expected,
+            FallbackIndexProvider.ShouldSkipReparseDirectory(attributes, linkTarget));
+    }
+
     [Fact]
     public void RootEnumerationFailureIsFatalAfterProbeSucceeds()
     {

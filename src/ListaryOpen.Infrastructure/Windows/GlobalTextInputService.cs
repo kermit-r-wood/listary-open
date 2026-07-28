@@ -221,6 +221,8 @@ public sealed class GlobalTextInputService : IDisposable
     private IntPtr _dialogInputWindow;
     private uint _lastLeftButtonTime;
     private NativePoint _lastLeftButtonPoint;
+    private long _lastRightButtonTick;
+    private IntPtr _lastRightButtonWindow;
 
     public GlobalTextInputService()
         : this(acceptInjectedInputForTesting: false)
@@ -459,6 +461,12 @@ public sealed class GlobalTextInputService : IDisposable
                             out var focusedControlId,
                             out var host)
                         && ShouldCaptureTextInput(host, focusedControlClass, focusedControlId)
+                        && !ShouldSuppressTextAfterRightClick(
+                            host,
+                            foregroundWindow,
+                            Interlocked.Read(ref _lastRightButtonTick),
+                            Interlocked.CompareExchange(ref _lastRightButtonWindow, IntPtr.Zero, IntPtr.Zero),
+                            Environment.TickCount64)
                         && TryTranslateText(
                             data.VirtualKey,
                             data.ScanCode,
@@ -492,6 +500,12 @@ public sealed class GlobalTextInputService : IDisposable
                 if (AcceptInjectedInputForTesting ||
                     (data.Flags & (LlmhfInjected | LlmhfLowerIlInjected)) == 0)
                 {
+                    if (message.ToInt64() == WmRightButtonDown)
+                    {
+                        Interlocked.Exchange(ref _lastRightButtonWindow, NativeMethods.GetForegroundWindow());
+                        Interlocked.Exchange(ref _lastRightButtonTick, Environment.TickCount64);
+                    }
+
                     if (CaptureOverlayInput)
                     {
                         PointerPressed?.Invoke(
@@ -802,6 +816,26 @@ public sealed class GlobalTextInputService : IDisposable
         }
 
         return !IsTextEntryControlClass(focusedControlClass);
+    }
+
+    internal static bool ShouldSuppressTextAfterRightClick(
+        GlobalTextInputHost host,
+        IntPtr foregroundWindow,
+        long lastRightButtonTick,
+        IntPtr lastRightButtonWindow,
+        long currentTick,
+        long suppressionMilliseconds = 750)
+    {
+        if (host != GlobalTextInputHost.Explorer ||
+            foregroundWindow == IntPtr.Zero ||
+            foregroundWindow != lastRightButtonWindow ||
+            lastRightButtonTick <= 0)
+        {
+            return false;
+        }
+
+        var elapsed = currentTick - lastRightButtonTick;
+        return elapsed >= 0 && elapsed <= suppressionMilliseconds;
     }
 
     private bool TryGetSupportedHost(IntPtr window, out GlobalTextInputHost host)

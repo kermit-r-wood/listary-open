@@ -150,7 +150,7 @@ internal sealed class ExplorerQuickMenu
                 break;
             case QuickMenuAction.OpenFolders:
                 var opened = CreateMenuItem(entry.Title, "\uE838");
-                foreach (var candidate in openFolders.Where(candidate => Directory.Exists(candidate.FolderPath)).DistinctBy(candidate => candidate.FolderPath, StringComparer.OrdinalIgnoreCase))
+                foreach (var candidate in CreateFolderSnapshot(openFolders))
                     AddFolderItem(opened, DisplayName(candidate.FolderPath), candidate.FolderPath);
                 opened.IsEnabled = opened.Items.Count > 0;
                 menu.Items.Add(opened);
@@ -357,10 +357,25 @@ internal sealed class ExplorerQuickMenu
 
     private void AddFolderItem(MenuItem parent, string header, string folder)
     {
-        if (!string.IsNullOrWhiteSpace(folder) && Directory.Exists(folder))
+        // Menu construction runs on the UI thread. Never probe the file system here:
+        // Directory.Exists can block for tens of seconds for offline UNC, NAS and
+        // cloud-placeholder paths. Keep the last observed snapshot responsive and
+        // report an error only if the user explicitly activates an unavailable item.
+        if (!string.IsNullOrWhiteSpace(folder))
         {
             parent.Items.Add(CreateActionItem(header, "\uE8B7", () => OpenFolder(folder)));
         }
+    }
+
+    internal static IReadOnlyList<QuickSwitchFolderCandidate> CreateFolderSnapshot(
+        IEnumerable<QuickSwitchFolderCandidate> candidates)
+    {
+        ArgumentNullException.ThrowIfNull(candidates);
+
+        return candidates
+            .Where(candidate => !string.IsNullOrWhiteSpace(candidate.FolderPath))
+            .DistinctBy(candidate => candidate.FolderPath, StringComparer.OrdinalIgnoreCase)
+            .ToArray();
     }
 
     private static MenuItem CreateMenuItem(string header, string glyph) => new()

@@ -225,7 +225,8 @@ public sealed class FallbackIndexProvider : IIndexProvider
         try
         {
             var info = new DirectoryInfo(path);
-            if (info.Attributes.HasFlag(FileAttributes.ReparsePoint))
+            var attributes = info.Attributes;
+            if (ShouldSkipReparseDirectory(attributes, GetLinkTargetWithoutTraversal(info)))
             {
                 return false;
             }
@@ -261,6 +262,31 @@ public sealed class FallbackIndexProvider : IIndexProvider
         return exception is IOException
             or UnauthorizedAccessException
             or SecurityException;
+    }
+
+    internal static bool ShouldSkipReparseDirectory(FileAttributes attributes, string? linkTarget)
+    {
+        // OneDrive and other Cloud Files providers mark placeholder directories as
+        // reparse points even though they are not links. Skipping every reparse
+        // directory therefore makes entire online-only trees disappear. Only skip
+        // reparse points that actually redirect traversal (junctions/symlinks);
+        // this still prevents cycles without hydrating placeholder file contents.
+        return attributes.HasFlag(FileAttributes.ReparsePoint) &&
+            !string.IsNullOrWhiteSpace(linkTarget);
+    }
+
+    private static string? GetLinkTargetWithoutTraversal(DirectoryInfo info)
+    {
+        try
+        {
+            return info.LinkTarget;
+        }
+        catch (Exception exception) when (IsExpectedFileSystemException(exception))
+        {
+            // If the target cannot be classified, preserve the previous cycle-safe
+            // behavior instead of risking traversal through a junction loop.
+            return "<unavailable>";
+        }
     }
 
     private static string NormalizePath(string path)
