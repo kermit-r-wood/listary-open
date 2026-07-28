@@ -9,10 +9,22 @@
   <ItemGroup>
     <None Remove="Assets\ListaryOpen.ico" />
     <Resource Include="Assets\ListaryOpen.ico" />
+    <Content Include="..\..\THIRD-PARTY-NOTICES.txt"
+             Link="THIRD-PARTY-NOTICES.txt"
+             CopyToOutputDirectory="PreserveNewest"
+             CopyToPublishDirectory="PreserveNewest" />
   </ItemGroup>
 
   <ItemGroup>
     <PackageReference Include="Hardcodet.NotifyIcon.Wpf" Version="2.0.1" />
+    <PackageReference Include="ExcelDataReader" Version="3.9.0" />
+    <PackageReference Include="K4os.Compression.LZ4.Streams" Version="1.3.8" />
+    <PackageReference Include="MsgReader" Version="6.1.0" />
+    <PackageReference Include="OpenMcdf" Version="3.1.4" />
+    <PackageReference Include="XstReader.Api" Version="1.0.6" />
+    <PackageReference Include="plist-cil" Version="2.3.1" />
+    <PackageReference Include="SharpCompress" Version="0.50.0" />
+    <PackageReference Include="bblanchon.PDFium.Win32" Version="152.0.7961" />
   </ItemGroup>
 
   <PropertyGroup>

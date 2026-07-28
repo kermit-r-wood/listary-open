@@ -66,14 +66,15 @@ internal sealed class ShellPreviewHost : HwndHost
             {
                 _previewHandler.Unload();
             }
-            catch (COMException)
+            catch (Exception)
             {
+                // Third-party handlers must never make selection changes or pane teardown fail.
             }
         }
 
         _previewHandler = null;
-        ReleaseComObject(ref _previewStream);
-        ReleaseComObject(ref _previewHandlerObject);
+        TryReleaseComObject(ref _previewStream);
+        TryReleaseComObject(ref _previewHandlerObject);
     }
 
     protected override HandleRef BuildWindowCore(HandleRef hwndParent)
@@ -188,6 +189,18 @@ internal sealed class ShellPreviewHost : HwndHost
         }
 
         value = null;
+    }
+
+    private static void TryReleaseComObject(ref object? value)
+    {
+        try
+        {
+            ReleaseComObject(ref value);
+        }
+        catch (Exception)
+        {
+            value = null;
+        }
     }
 
     [StructLayout(LayoutKind.Sequential)]

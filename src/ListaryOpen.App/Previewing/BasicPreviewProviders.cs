@@ -1,4 +1,5 @@
 using System.IO;
+using System.IO.Compression;
 using System.Net;
 using System.Text;
 using System.Text.RegularExpressions;
@@ -11,13 +12,8 @@ namespace ListaryOpen.App.Previewing;
 
 internal sealed class RasterImagePreviewProvider : IFilePreviewProvider
 {
-    private static readonly HashSet<string> Extensions = new(StringComparer.OrdinalIgnoreCase)
-    {
-        ".avif", ".bmp", ".gif", ".heic", ".heif", ".ico", ".jfif", ".jpeg", ".jpg",
-        ".png", ".tif", ".tiff", ".webp"
-    };
-
-    public bool CanPreview(PreviewContext context) => Extensions.Contains(context.Extension);
+    public bool CanPreview(PreviewContext context) =>
+        PreviewFormatRegistry.Supports(context.Extension, PreviewFallback.Raster);
 
     public async Task<PreviewContent?> LoadAsync(
         PreviewContext context,
@@ -45,15 +41,8 @@ internal sealed class RasterImagePreviewProvider : IFilePreviewProvider
 
 internal sealed class TextPreviewProvider : IFilePreviewProvider
 {
-    private static readonly HashSet<string> BinaryExtensions = new(StringComparer.OrdinalIgnoreCase)
-    {
-        ".7z", ".avi", ".class", ".db", ".dll", ".doc", ".docx", ".exe", ".flac", ".gif",
-        ".gz", ".ico", ".jpeg", ".jpg", ".mkv", ".mov", ".mp3", ".mp4", ".msi", ".odp",
-        ".ods", ".odt", ".ogg", ".pdf", ".png", ".ppt", ".pptx", ".rar", ".tar", ".tif",
-        ".tiff", ".ttf", ".wav", ".webm", ".webp", ".wmv", ".xls", ".xlsx", ".xz", ".zip"
-    };
-
-    public bool CanPreview(PreviewContext context) => !BinaryExtensions.Contains(context.Extension);
+    public bool CanPreview(PreviewContext context) =>
+        PreviewFormatRegistry.CanAttemptText(context.Extension);
 
     public async Task<PreviewContent?> LoadAsync(
         PreviewContext context,
@@ -67,15 +56,14 @@ internal sealed class TextPreviewProvider : IFilePreviewProvider
 
         var formatted = context.Extension.ToLowerInvariant() switch
         {
-            ".htm" or ".html" => ConvertHtmlToText(text),
-            ".eml" => FormatEmail(text),
+            ".htm" or ".html" or ".shtm" or ".shtml" or ".xht" or ".xhtml" => ConvertHtmlToText(text),
             ".md" or ".markdown" => ConvertMarkdownToText(text),
             _ => text
         };
         return PreviewContent.ForText("Built-in text", formatted);
     }
 
-    private static string ConvertHtmlToText(string html)
+    internal static string ConvertHtmlToText(string html)
     {
         var value = Regex.Replace(
             html,
@@ -96,38 +84,6 @@ internal sealed class TextPreviewProvider : IFilePreviewProvider
             RegexOptions.Singleline,
             TimeSpan.FromMilliseconds(200));
         return NormalizeBlankLines(WebUtility.HtmlDecode(value));
-    }
-
-    private static string FormatEmail(string value)
-    {
-        var separator = value.IndexOf("\r\n\r\n", StringComparison.Ordinal);
-        var separatorLength = 4;
-        if (separator < 0)
-        {
-            separator = value.IndexOf("\n\n", StringComparison.Ordinal);
-            separatorLength = 2;
-        }
-
-        if (separator < 0)
-        {
-            return value;
-        }
-
-        var selectedHeaders = value[..separator]
-            .Split(['\r', '\n'], StringSplitOptions.RemoveEmptyEntries)
-            .Where(line => line.StartsWith("From:", StringComparison.OrdinalIgnoreCase) ||
-                line.StartsWith("To:", StringComparison.OrdinalIgnoreCase) ||
-                line.StartsWith("Cc:", StringComparison.OrdinalIgnoreCase) ||
-                line.StartsWith("Date:", StringComparison.OrdinalIgnoreCase) ||
-                line.StartsWith("Subject:", StringComparison.OrdinalIgnoreCase));
-        var body = value[(separator + separatorLength)..];
-        if (body.Contains("<html", StringComparison.OrdinalIgnoreCase))
-        {
-            body = ConvertHtmlToText(body);
-        }
-
-        return string.Join(Environment.NewLine, selectedHeaders) +
-            Environment.NewLine + Environment.NewLine + body;
     }
 
     private static string ConvertMarkdownToText(string markdown)
@@ -303,13 +259,15 @@ internal static class PreviewTextReader
 internal sealed class SvgPreviewProvider : IFilePreviewProvider
 {
     public bool CanPreview(PreviewContext context) =>
-        context.Extension.Equals(".svg", StringComparison.OrdinalIgnoreCase);
+        PreviewFormatRegistry.Supports(context.Extension, PreviewFallback.Svg);
 
     public async Task<PreviewContent?> LoadAsync(
         PreviewContext context,
         CancellationToken cancellationToken)
     {
-        var source = await PreviewTextReader.ReadAsync(context.FullPath, cancellationToken).ConfigureAwait(false);
+        var source = context.Extension.Equals(".svgz", StringComparison.OrdinalIgnoreCase)
+            ? await ReadCompressedSvgAsync(context.FullPath, cancellationToken).ConfigureAwait(false)
+            : await PreviewTextReader.ReadAsync(context.FullPath, cancellationToken).ConfigureAwait(false);
         if (source is null)
         {
             return null;
@@ -355,16 +313,37 @@ internal sealed class SvgPreviewProvider : IFilePreviewProvider
             .ToString();
         return PreviewContent.ForText("Safe SVG", summary);
     }
+
+    private static async Task<string?> ReadCompressedSvgAsync(
+        string path,
+        CancellationToken cancellationToken)
+    {
+        await using var file = new FileStream(path, FileMode.Open, FileAccess.Read,
+            FileShare.ReadWrite | FileShare.Delete, 16_384, useAsync: true);
+        await using var gzip = new GZipStream(file, CompressionMode.Decompress);
+        var bytes = new byte[PreviewTextReader.MaximumBytes + 1];
+        var count = 0;
+        while (count < bytes.Length)
+        {
+            var read = await gzip.ReadAsync(bytes.AsMemory(count), cancellationToken).ConfigureAwait(false);
+            if (read == 0)
+            {
+                break;
+            }
+            count += read;
+        }
+        var length = Math.Min(count, PreviewTextReader.MaximumBytes);
+        var source = PreviewTextReader.Decode(bytes.AsSpan(0, length));
+        return source is null || count <= PreviewTextReader.MaximumBytes
+            ? source
+            : source + Environment.NewLine + "…";
+    }
 }
 
 internal sealed class FontPreviewProvider : IFilePreviewProvider
 {
-    private static readonly HashSet<string> Extensions = new(StringComparer.OrdinalIgnoreCase)
-    {
-        ".otf", ".ttc", ".ttf"
-    };
-
-    public bool CanPreview(PreviewContext context) => Extensions.Contains(context.Extension);
+    public bool CanPreview(PreviewContext context) =>
+        PreviewFormatRegistry.Supports(context.Extension, PreviewFallback.Font);
 
     public Task<PreviewContent?> LoadAsync(
         PreviewContext context,

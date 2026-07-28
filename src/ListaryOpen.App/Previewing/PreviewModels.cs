@@ -7,7 +7,8 @@ internal enum PreviewContentKind
 {
     Text,
     Image,
-    Font
+    Font,
+    Media
 }
 
 internal sealed record PreviewContent(
@@ -16,7 +17,8 @@ internal sealed record PreviewContent(
     string? Text = null,
     BitmapSource? Image = null,
     FontFamily? FontFamily = null,
-    string? Heading = null)
+    string? Heading = null,
+    string? MediaPath = null)
 {
     internal static PreviewContent ForText(string source, string text) =>
         new(PreviewContentKind.Text, source, Text: text);
@@ -26,6 +28,9 @@ internal sealed record PreviewContent(
 
     internal static PreviewContent ForFont(string source, FontFamily fontFamily, string heading) =>
         new(PreviewContentKind.Font, source, FontFamily: fontFamily, Heading: heading);
+
+    internal static PreviewContent ForMedia(string source, string path, string fallbackText) =>
+        new(PreviewContentKind.Media, source, Text: fallbackText, MediaPath: path);
 }
 
 internal sealed record PreviewContext(

@@ -53,6 +53,72 @@
                                        TextWrapping="Wrap" />
                         </StackPanel>
                     </Grid>
+                    <Grid x:Name="MediaPreviewSurface"
+                          Margin="8"
+                          Visibility="Collapsed">
+                        <Grid.RowDefinitions>
+                            <RowDefinition Height="*" />
+                            <RowDefinition Height="Auto" />
+                        </Grid.RowDefinitions>
+                        <Grid Background="#101010">
+                            <MediaElement x:Name="PreviewMedia"
+                                          AutomationProperties.AutomationId="PreviewMediaElement"
+                                          LoadedBehavior="Manual"
+                                          UnloadedBehavior="Manual"
+                                          ScrubbingEnabled="True"
+                                          Stretch="Uniform"
+                                          MediaOpened="PreviewMedia_MediaOpened"
+                                          MediaEnded="PreviewMedia_MediaEnded"
+                                          MediaFailed="PreviewMedia_MediaFailed" />
+                            <TextBlock x:Name="AudioPlaceholder"
+                                       HorizontalAlignment="Center"
+                                       VerticalAlignment="Center"
+                                       FontFamily="Segoe MDL2 Assets"
+                                       FontSize="56"
+                                       Foreground="{DynamicResource Brush.TextMuted}"
+                                       Text="&#xE8D6;"
+                                       Visibility="Collapsed" />
+                        </Grid>
+                        <Grid Grid.Row="1" Margin="0,8,0,0">
+                            <Grid.ColumnDefinitions>
+                                <ColumnDefinition Width="Auto" />
+                                <ColumnDefinition Width="*" />
+                                <ColumnDefinition Width="Auto" />
+                                <ColumnDefinition Width="Auto" />
+                            </Grid.ColumnDefinitions>
+                            <Button x:Name="MediaPlayPauseButton"
+                                    Width="32"
+                                    Height="28"
+                                    AutomationProperties.AutomationId="PreviewMediaPlayPause"
+                                    AutomationProperties.Name="Play or pause preview"
+                                    Click="MediaPlayPauseButton_Click"
+                                    Content="▶"
+                                    ToolTip="Play or pause" />
+                            <Slider x:Name="MediaPositionSlider"
+                                    Grid.Column="1"
+                                    Margin="8,0"
+                                    VerticalAlignment="Center"
+                                    AutomationProperties.AutomationId="PreviewMediaPosition"
+                                    PreviewMouseLeftButtonUp="MediaPositionSlider_PreviewMouseLeftButtonUp"
+                                    Minimum="0"
+                                    Maximum="1" />
+                            <TextBlock x:Name="MediaTimeText"
+                                       Grid.Column="2"
+                                       VerticalAlignment="Center"
+                                       Foreground="{DynamicResource Brush.TextMuted}"
+                                       Text="00:00 / 00:00" />
+                            <Button x:Name="MediaMuteButton"
+                                    Grid.Column="3"
+                                    Width="32"
+                                    Height="28"
+                                    Margin="8,0,0,0"
+                                    AutomationProperties.AutomationId="PreviewMediaMute"
+                                    AutomationProperties.Name="Mute preview"
+                                    Click="MediaMuteButton_Click"
+                                    Content="🔊"
+                                    ToolTip="Mute or unmute" />
+                        </Grid>
+                    </Grid>
                     <TextBox x:Name="PreviewText"
                              Padding="12"
                              BorderThickness="0"

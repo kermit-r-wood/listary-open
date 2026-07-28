@@ -39,4 +39,43 @@ public sealed class FilePreviewTimeoutTests
         await Assert.ThrowsAnyAsync<OperationCanceledException>(
             () => coordinator.LoadAsync(context, cts.Token));
     }
+
+    [Theory]
+    [InlineData("report.pdf")]
+    [InlineData("REPORT.DOCX")]
+    [InlineData("slides.pptx")]
+    [InlineData("sheet.xlsx")]
+    [InlineData("music.opus")]
+    [InlineData("camera.cr3")]
+    [InlineData("design.psd")]
+    [InlineData("archive.zip")]
+    public void RichAndCodecDependentFormatsPreferWindowsPreview(string fileName)
+    {
+        var context = new PreviewContext(
+            Path.Combine(@"C:\Preview", fileName),
+            fileName,
+            Path.GetExtension(fileName),
+            1,
+            DateTimeOffset.UtcNow);
+
+        Assert.True(PreviewCoordinator.ShouldPreferSystemPreview(context));
+    }
+
+    [Theory]
+    [InlineData("notes.txt")]
+    [InlineData("source.cs")]
+    [InlineData("settings.json")]
+    [InlineData("vector.svg")]
+    [InlineData("photo.png")]
+    public void DeterministicBuiltInFormatsDoNotRequireWindowsPreview(string fileName)
+    {
+        var context = new PreviewContext(
+            Path.Combine(@"C:\Preview", fileName),
+            fileName,
+            Path.GetExtension(fileName),
+            1,
+            DateTimeOffset.UtcNow);
+
+        Assert.False(PreviewCoordinator.ShouldPreferSystemPreview(context));
+    }
 }

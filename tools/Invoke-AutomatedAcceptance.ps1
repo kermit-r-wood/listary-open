@@ -195,6 +195,7 @@ $testHostProject = Join-Path $repositoryRoot "tests\ListaryOpen.TestHost\Listary
 $coreTests = Join-Path $repositoryRoot "tests\ListaryOpen.Core.Tests\ListaryOpen.Core.Tests.csproj"
 $infrastructureTests = Join-Path $repositoryRoot "tests\ListaryOpen.Infrastructure.Tests\ListaryOpen.Infrastructure.Tests.csproj"
 $appProject = Join-Path $repositoryRoot "src\ListaryOpen.App\ListaryOpen.App.csproj"
+$previewHostProject = Join-Path $repositoryRoot "src\ListaryOpen.PreviewHost\ListaryOpen.PreviewHost.csproj"
 $nativeRoot = Join-Path $repositoryRoot "native\ListaryOpen.Hooks"
 
 if (-not $SkipRestore) {
@@ -254,11 +255,23 @@ Invoke-LoggedCommand -Name "Publish win-x64 app with native hooks" -FilePath "do
     -WorkingDirectory $repositoryRoot `
     -LogPath (Join-Path $ResultsDirectory "publish.log")
 
+Invoke-LoggedCommand -Name "Publish isolated preview host" -FilePath "dotnet" `
+    -Arguments @(
+        "publish", $previewHostProject,
+        "-c", "Release", "-r", "win-x64", "--self-contained", "false", "--no-restore",
+        "-p:BuildNativeHooks=false", "-o", $PackageDirectory) `
+    -WorkingDirectory $repositoryRoot `
+    -LogPath (Join-Path $ResultsDirectory "publish-preview-host.log")
+
 $requiredArtifacts = @(
     "ListaryOpen.App.exe",
     "ListaryOpen.App.dll",
     "ListaryOpen.App.deps.json",
     "ListaryOpen.App.runtimeconfig.json",
+    "ListaryOpen.PreviewHost.exe",
+    "ListaryOpen.PreviewHost.dll",
+    "ListaryOpen.PreviewHost.deps.json",
+    "ListaryOpen.PreviewHost.runtimeconfig.json",
     "ListaryOpen.Core.dll",
     "ListaryOpen.Infrastructure.dll",
     "ListaryOpen.Indexer.Elevated.exe",
@@ -266,6 +279,25 @@ $requiredArtifacts = @(
     "ListaryOpen.Indexer.Elevated.deps.json",
     "ListaryOpen.Indexer.Elevated.runtimeconfig.json",
     "e_sqlite3.dll",
+    "MsgReader.dll",
+    "XstReader.Api.dll",
+    "OpenMcdf.dll",
+    "RtfPipe.dll",
+    "UtfUnknown.dll",
+    "Microsoft.IO.RecyclableMemoryStream.dll",
+    "Microsoft.Maui.Graphics.dll",
+    "Microsoft.Bcl.Cryptography.dll",
+    "System.Formats.Asn1.dll",
+    "System.Security.Cryptography.Pkcs.dll",
+    "SharpCompress.dll",
+    "ExcelDataReader.dll",
+    "K4os.Compression.LZ4.Streams.dll",
+    "K4os.Compression.LZ4.dll",
+    "K4os.Hash.xxHash.dll",
+    "System.IO.Pipelines.dll",
+    "plist-cil.dll",
+    "pdfium.dll",
+    "THIRD-PARTY-NOTICES.txt",
     "hooks/x64/ListaryOpen.HookHost.exe",
     "hooks/x64/ListaryOpen.Hook.dll",
     "hooks/x64/libunwind.dll",
@@ -302,8 +334,10 @@ function Get-PeMachine {
 
 foreach ($relativePath in @(
     "ListaryOpen.App.exe",
+    "ListaryOpen.PreviewHost.exe",
     "ListaryOpen.Indexer.Elevated.exe",
     "e_sqlite3.dll",
+    "pdfium.dll",
     "hooks/x64/ListaryOpen.HookHost.exe",
     "hooks/x64/ListaryOpen.Hook.dll",
     "hooks/x64/libunwind.dll")) {

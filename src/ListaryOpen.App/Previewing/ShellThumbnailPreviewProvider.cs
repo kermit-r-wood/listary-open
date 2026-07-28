@@ -11,14 +11,8 @@ internal sealed class ShellThumbnailPreviewProvider : IFilePreviewProvider
     private const uint ThumbnailOnly = 0x00000008;
     private const uint ResizeToFit = 0x00000020;
     private static readonly Guid ShellItemImageFactoryId = new("BCC18B79-BA16-442F-80C4-8A59C30C463B");
-    private static readonly HashSet<string> Extensions = new(StringComparer.OrdinalIgnoreCase)
-    {
-        ".3gp", ".avi", ".flac", ".heic", ".heif",
-        ".m4a", ".m4v", ".mkv", ".mov", ".mp3", ".mp4", ".mpeg", ".mpg", ".odp",
-        ".ogg", ".pdf", ".psd", ".raw", ".wav", ".webm", ".wmv"
-    };
-
-    public bool CanPreview(PreviewContext context) => Extensions.Contains(context.Extension);
+    public bool CanPreview(PreviewContext context) =>
+        PreviewFormatRegistry.Supports(context.Extension, PreviewFallback.ShellThumbnail);
 
     public async Task<PreviewContent?> LoadAsync(
         PreviewContext context,

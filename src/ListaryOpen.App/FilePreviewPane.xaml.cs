@@ -1,7 +1,9 @@
 using System.IO;
 using System.Windows;
 using System.Windows.Controls;
+using System.Windows.Input;
 using System.Windows.Media;
+using System.Windows.Threading;
 using ListaryOpen.App.Previewing;
 using ListaryOpen.Core.Indexing;
 
@@ -13,12 +15,18 @@ public partial class FilePreviewPane : UserControl
     internal static readonly TimeSpan PreviewTimeout = TimeSpan.FromSeconds(5);
 
     private readonly PreviewCoordinator _previewCoordinator = new();
+    private readonly DispatcherTimer _mediaTimer = new() { Interval = TimeSpan.FromMilliseconds(500) };
     private CancellationTokenSource? _previewCancellation;
     private long _previewRequestId;
+    private long _mediaRequestId;
+    private TimeSpan _mediaDuration;
+    private string? _mediaFallbackText;
+    private bool _mediaPlaying;
 
     public FilePreviewPane()
     {
         InitializeComponent();
+        _mediaTimer.Tick += MediaTimer_Tick;
         Unloaded += (_, _) => Clear();
     }
 
@@ -70,18 +78,20 @@ public partial class FilePreviewPane : UserControl
             await PreviewCoordinator.WaitForSelectionAsync(cancellationToken);
             ThrowIfStale(requestId, cancellationToken);
 
-            // Prefer built-in providers first (cancellable/timeout-friendly), then shell handlers.
+            // Rich Windows handlers preserve document layout, PDF pages and media controls.
+            // The built-in providers remain a deterministic, safe fallback when no matching
+            // handler is installed or a handler declines the file.
+            if (PreviewCoordinator.ShouldPreferSystemPreview(context)
+                && await TrySystemPreviewWithTimeoutAsync(record.FullPath, requestId, cancellationToken))
+            {
+                return;
+            }
+
             var content = await _previewCoordinator.LoadAsync(context, cancellationToken);
             ThrowIfStale(requestId, cancellationToken);
             if (content is not null)
             {
                 ApplyContent(content, requestId);
-                return;
-            }
-
-            if (PreviewCoordinator.ShouldPreferSystemPreview(context)
-                && await TrySystemPreviewWithTimeoutAsync(record.FullPath, requestId, cancellationToken))
-            {
                 return;
             }
 
@@ -162,6 +172,7 @@ public partial class FilePreviewPane : UserControl
 
     private void ResetContent()
     {
+        ResetMedia();
         PreviewImage.Source = null;
         PreviewText.Text = string.Empty;
         PreviewText.FontFamily = new FontFamily("Cascadia Mono, Consolas");
@@ -169,6 +180,7 @@ public partial class FilePreviewPane : UserControl
         FontPreviewSample.FontFamily = new FontFamily("Segoe UI");
         ImagePreviewSurface.Visibility = Visibility.Collapsed;
         FontPreviewSurface.Visibility = Visibility.Collapsed;
+        MediaPreviewSurface.Visibility = Visibility.Collapsed;
         PreviewText.Visibility = Visibility.Collapsed;
         ShellHost.Visibility = Visibility.Collapsed;
         EmptyPreview.Visibility = Visibility.Visible;
@@ -178,6 +190,7 @@ public partial class FilePreviewPane : UserControl
     {
         ImagePreviewSurface.Visibility = ReferenceEquals(element, ImagePreviewSurface) ? Visibility.Visible : Visibility.Collapsed;
         FontPreviewSurface.Visibility = ReferenceEquals(element, FontPreviewSurface) ? Visibility.Visible : Visibility.Collapsed;
+        MediaPreviewSurface.Visibility = ReferenceEquals(element, MediaPreviewSurface) ? Visibility.Visible : Visibility.Collapsed;
         PreviewText.Visibility = ReferenceEquals(element, PreviewText) ? Visibility.Visible : Visibility.Collapsed;
         ShellHost.Visibility = ReferenceEquals(element, ShellHost) ? Visibility.Visible : Visibility.Collapsed;
         EmptyPreview.Visibility = Visibility.Collapsed;
@@ -205,11 +218,160 @@ public partial class FilePreviewPane : UserControl
                 FontPreviewSample.FontFamily = content.FontFamily;
                 ShowOnly(FontPreviewSurface);
                 break;
+            case PreviewContentKind.Media when content.MediaPath is not null:
+                _mediaRequestId = requestId;
+                _mediaFallbackText = content.Text;
+                PreviewMedia.Source = new Uri(content.MediaPath, UriKind.Absolute);
+                MediaPlayPauseButton.Content = "▶";
+                MediaMuteButton.Content = "🔊";
+                MediaTimeText.Text = "00:00 / 00:00";
+                ShowOnly(MediaPreviewSurface);
+                break;
             default:
                 PreviewText.Text = content.Text ?? string.Empty;
                 ShowOnly(PreviewText);
                 break;
         }
+    }
+
+    private void PreviewMedia_MediaOpened(object sender, RoutedEventArgs e)
+    {
+        if (_mediaRequestId != Volatile.Read(ref _previewRequestId) ||
+            MediaPreviewSurface.Visibility != Visibility.Visible)
+        {
+            ResetMedia();
+            return;
+        }
+
+        _mediaDuration = PreviewMedia.NaturalDuration.HasTimeSpan
+            ? PreviewMedia.NaturalDuration.TimeSpan
+            : TimeSpan.Zero;
+        MediaPositionSlider.Maximum = Math.Max(1, _mediaDuration.TotalSeconds);
+        AudioPlaceholder.Visibility = PreviewMedia.NaturalVideoWidth == 0
+            ? Visibility.Visible
+            : Visibility.Collapsed;
+        UpdateMediaPosition();
+    }
+
+    private void PreviewMedia_MediaEnded(object sender, RoutedEventArgs e)
+    {
+        _mediaPlaying = false;
+        _mediaTimer.Stop();
+        PreviewMedia.Position = TimeSpan.Zero;
+        MediaPlayPauseButton.Content = "▶";
+        UpdateMediaPosition();
+    }
+
+    private void PreviewMedia_MediaFailed(object sender, ExceptionRoutedEventArgs e)
+    {
+        if (_mediaRequestId != Volatile.Read(ref _previewRequestId))
+        {
+            return;
+        }
+
+        var fallbackText = _mediaFallbackText ?? "The installed Windows media codecs could not open this file.";
+        ResetMedia();
+        PreviewText.Text = fallbackText;
+        PreviewSource.Text = string.Format(
+            System.Globalization.CultureInfo.CurrentCulture,
+            LocalizationManager.Translate("Preview source: {0}"),
+            LocalizationManager.Translate("Media metadata"));
+        ShowOnly(PreviewText);
+    }
+
+    private void MediaPlayPauseButton_Click(object sender, RoutedEventArgs e)
+    {
+        if (PreviewMedia.Source is null)
+        {
+            return;
+        }
+
+        if (_mediaPlaying)
+        {
+            PreviewMedia.Pause();
+            _mediaTimer.Stop();
+            MediaPlayPauseButton.Content = "▶";
+        }
+        else
+        {
+            PreviewMedia.Play();
+            _mediaTimer.Start();
+            MediaPlayPauseButton.Content = "⏸";
+        }
+
+        _mediaPlaying = !_mediaPlaying;
+    }
+
+    private void MediaMuteButton_Click(object sender, RoutedEventArgs e)
+    {
+        PreviewMedia.IsMuted = !PreviewMedia.IsMuted;
+        MediaMuteButton.Content = PreviewMedia.IsMuted ? "🔇" : "🔊";
+    }
+
+    private void MediaPositionSlider_PreviewMouseLeftButtonUp(object sender, MouseButtonEventArgs e)
+    {
+        if (_mediaDuration > TimeSpan.Zero)
+        {
+            PreviewMedia.Position = TimeSpan.FromSeconds(
+                Math.Clamp(MediaPositionSlider.Value, 0, _mediaDuration.TotalSeconds));
+            UpdateMediaPosition();
+        }
+    }
+
+    private void MediaTimer_Tick(object? sender, EventArgs e)
+    {
+        if (_mediaRequestId != Volatile.Read(ref _previewRequestId) ||
+            MediaPreviewSurface.Visibility != Visibility.Visible)
+        {
+            ResetMedia();
+            return;
+        }
+
+        UpdateMediaPosition();
+    }
+
+    private void UpdateMediaPosition()
+    {
+        var position = PreviewMedia.Position;
+        MediaPositionSlider.Value = Math.Clamp(
+            position.TotalSeconds,
+            0,
+            Math.Max(1, MediaPositionSlider.Maximum));
+        MediaTimeText.Text = $"{FormatMediaTime(position)} / {FormatMediaTime(_mediaDuration)}";
+    }
+
+    private void ResetMedia()
+    {
+        _mediaTimer.Stop();
+        _mediaPlaying = false;
+        try
+        {
+            PreviewMedia.Stop();
+            PreviewMedia.Close();
+        }
+        catch (InvalidOperationException)
+        {
+        }
+
+        PreviewMedia.Source = null;
+        PreviewMedia.IsMuted = false;
+        _mediaRequestId = 0;
+        _mediaDuration = TimeSpan.Zero;
+        _mediaFallbackText = null;
+        MediaPositionSlider.Value = 0;
+        MediaPositionSlider.Maximum = 1;
+        MediaPlayPauseButton.Content = "▶";
+        MediaMuteButton.Content = "🔊";
+        MediaTimeText.Text = "00:00 / 00:00";
+        AudioPlaceholder.Visibility = Visibility.Collapsed;
+    }
+
+    internal static string FormatMediaTime(TimeSpan value)
+    {
+        var bounded = value < TimeSpan.Zero ? TimeSpan.Zero : value;
+        return bounded.TotalHours >= 1
+            ? bounded.ToString(@"h\:mm\:ss")
+            : bounded.ToString(@"mm\:ss");
     }
 
     private void ThrowIfStale(long requestId, CancellationToken cancellationToken)

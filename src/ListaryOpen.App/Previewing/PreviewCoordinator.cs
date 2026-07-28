@@ -8,15 +8,6 @@ internal sealed class PreviewCoordinator
     private static readonly TimeSpan SelectionDebounce = TimeSpan.FromMilliseconds(150);
     /// <summary>Default hard timeout for a single provider chain load.</summary>
     internal static readonly TimeSpan DefaultLoadTimeout = TimeSpan.FromSeconds(5);
-    private static readonly HashSet<string> SystemPreviewExtensions = new(StringComparer.OrdinalIgnoreCase)
-    {
-        ".3gp", ".7z", ".aac", ".avi", ".doc", ".docx", ".flac",
-        ".gz", ".heic", ".heif", ".m4a", ".m4v", ".mkv", ".mov", ".mp3", ".mp4",
-        ".mpeg", ".mpg", ".msg", ".odp", ".ods", ".odt", ".ogg", ".pdf", ".ppt",
-        ".pptx", ".rar", ".rtf", ".tar", ".tgz", ".wav",
-        ".webm", ".wmv", ".xls", ".xlsx", ".xz"
-    };
-
     private readonly IReadOnlyList<IFilePreviewProvider> _providers;
     private readonly object _cacheGate = new();
     private readonly Dictionary<PreviewCacheKey, LinkedListNode<PreviewCacheEntry>> _cache = [];
@@ -28,12 +19,10 @@ internal sealed class PreviewCoordinator
             new RasterImagePreviewProvider(),
             new FontPreviewProvider(),
             new SvgPreviewProvider(),
-            new DocumentPreviewProvider(),
-            new ShellThumbnailPreviewProvider(),
-            new ArchivePreviewProvider(),
-            new PdfPreviewProvider(),
             new MediaPreviewProvider(),
-            new ExecutablePreviewProvider(),
+            new PdfPagePreviewProvider(),
+            new ShellThumbnailPreviewProvider(),
+            new IsolatedTextPreviewProvider(),
             new TextPreviewProvider()
         ])
     {
@@ -45,7 +34,7 @@ internal sealed class PreviewCoordinator
     }
 
     internal static bool ShouldPreferSystemPreview(PreviewContext context) =>
-        SystemPreviewExtensions.Contains(context.Extension);
+        PreviewFormatRegistry.ShouldPreferSystem(context.Extension, context.Name);
 
     internal static Task WaitForSelectionAsync(CancellationToken cancellationToken) =>
         Task.Delay(SelectionDebounce, cancellationToken);
@@ -145,6 +134,8 @@ internal sealed class PreviewCoordinator
     private static bool IsRecoverable(Exception exception) =>
         exception is IOException or UnauthorizedAccessException or InvalidDataException or
             NotSupportedException or ArgumentException or FormatException or OverflowException or
+            System.Text.RegularExpressions.RegexMatchTimeoutException or
+            DllNotFoundException or EntryPointNotFoundException or BadImageFormatException or
             System.Runtime.InteropServices.COMException or System.Xml.XmlException;
 
     private sealed record PreviewCacheKey(string Path, long SizeBytes, long LastWriteTicks);
