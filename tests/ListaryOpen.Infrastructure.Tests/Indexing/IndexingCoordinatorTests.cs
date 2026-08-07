@@ -68,14 +68,17 @@ public sealed class IndexingCoordinatorTests
                 index,
                 new VolumeIndexer(new[] { provider }),
                 provider,
-                _ => new VolumeInfo(rootPath, "NTFS", true));
+                _ => new VolumeInfo(rootPath, "NTFS", true),
+                batchSize: 1);
+            await index.WaitForBackgroundMaintenanceAsync();
+            var rebuildCount = index.FtsRebuildCount;
             using var cancellation = new CancellationTokenSource();
             var statuses = new List<IndexingStatus>();
             coordinator.StatusChanged += (_, status) =>
             {
                 statuses.Add(status);
                 if (status.State == IndexingRunState.Indexing
-                    && status.Message.Contains("Scanning", StringComparison.Ordinal))
+                    && status.Message.StartsWith("Writing ", StringComparison.Ordinal))
                 {
                     cancellation.Cancel();
                 }
@@ -89,6 +92,7 @@ public sealed class IndexingCoordinatorTests
             Assert.Equal(rootPath, finalStatus.CurrentRoot);
             Assert.Equal(1, finalStatus.CurrentRootNumber);
             Assert.Equal(1, finalStatus.TotalRoots);
+            Assert.Equal(rebuildCount, index.FtsRebuildCount);
         }
         finally
         {
@@ -747,10 +751,13 @@ public sealed class IndexingCoordinatorTests
                 new VolumeIndexer(new IIndexProvider[] { provider }),
                 new FallbackIndexProvider(),
                 _ => new VolumeInfo(rootPath, NtfsIndexProvider.ProviderName, true));
+            await index.WaitForBackgroundMaintenanceAsync();
+            var rebuildCount = index.FtsRebuildCount;
 
             await coordinator.IndexRootsAsync(new[] { new IndexRoot(rootPath) }, CancellationToken.None);
 
             Assert.Equal(0, provider.ScanCount);
+            Assert.Equal(rebuildCount, index.FtsRebuildCount);
         }
         finally
         {

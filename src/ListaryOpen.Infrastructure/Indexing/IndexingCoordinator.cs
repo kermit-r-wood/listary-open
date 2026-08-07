@@ -1,6 +1,7 @@
 using System.Diagnostics;
 using System.IO;
 using ListaryOpen.Core.Indexing;
+using ListaryOpen.Core.Search;
 using ListaryOpen.Infrastructure.Indexing.Ntfs;
 using ListaryOpen.Infrastructure.Search;
 
@@ -26,7 +27,7 @@ public sealed record IndexingStatus(
 public sealed class IndexingCoordinator
 {
     /// <summary>Larger batches reduce SQLite transaction overhead on full scans.</summary>
-    private const int DefaultBatchSize = 2_000;
+    private const int DefaultBatchSize = 10_000;
 
     /// <summary>Yield to the scheduler every N flushed batches so UI stays responsive.</summary>
     private const int BatchesBetweenYield = 4;
@@ -79,30 +80,29 @@ public sealed class IndexingCoordinator
         var retainedStaleRecords = false;
         var compatibilityScanRootCount = 0;
         long? indexGeneration = null;
+        IndexingRunState? terminalState = null;
+        string? terminalMessage = null;
         RaiseStatus(
             IndexingRunState.Indexing,
             roots.Count == 0 ? "No indexed roots configured." : "Preparing index...",
             indexedCount,
             totalRoots: roots.Count);
 
-        // Defer FTS trigger maintenance until the whole run finishes so bulk
-        // upserts do not pay per-row FTS insert/delete costs.
         var bulkStarted = false;
-        try
+        async Task<long> EnsureFullScanContextAsync(CancellationToken token)
         {
-            if (roots.Count > 0)
+            if (!bulkStarted)
             {
-                try
-                {
-                    await _index.BeginBulkIndexingAsync(cancellationToken).ConfigureAwait(false);
-                    bulkStarted = true;
-                }
-                catch (ObjectDisposedException)
-                {
-                    // Index already disposed; per-root work records Failed statuses without throwing.
-                }
+                await _index.BeginBulkIndexingAsync(token).ConfigureAwait(false);
+                bulkStarted = true;
             }
 
+            indexGeneration ??= await _index.BeginIndexingRunAsync(token).ConfigureAwait(false);
+            return indexGeneration.Value;
+        }
+
+        try
+        {
             for (var rootIndex = 0; rootIndex < roots.Count; rootIndex++)
             {
                 cancellationToken.ThrowIfCancellationRequested();
@@ -133,7 +133,6 @@ public sealed class IndexingCoordinator
 
                 try
                 {
-                    indexGeneration ??= await _index.BeginIndexingRunAsync(cancellationToken).ConfigureAwait(false);
                     var provider = SelectProvider(root);
                     if (!IsNtfsProvider(provider))
                     {
@@ -150,7 +149,7 @@ public sealed class IndexingCoordinator
                         provider,
                         root,
                         indexedCount,
-                        indexGeneration.Value,
+                        EnsureFullScanContextAsync,
                         currentRootNumber,
                         roots.Count,
                         cancellationToken).ConfigureAwait(false);
@@ -176,12 +175,12 @@ public sealed class IndexingCoordinator
                 }
             }
 
-            var finalState = hadFailures
+            terminalState = hadFailures
                 ? IndexingRunState.Failed
                 : hadCancellations
                     ? IndexingRunState.Canceled
                     : IndexingRunState.Completed;
-            var finalMessage = hadFailures
+            terminalMessage = hadFailures
                 ? "Indexing completed with errors."
                 : hadCancellations
                     ? "Indexing canceled."
@@ -191,7 +190,6 @@ public sealed class IndexingCoordinator
                             ? $"Indexing completed using compatibility scanning for {compatibilityScanRootCount} location(s)."
                         : "Indexing completed.";
 
-            RaiseStatus(finalState, finalMessage, indexedCount, totalRoots: roots.Count);
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
         {
@@ -210,16 +208,54 @@ public sealed class IndexingCoordinator
             {
                 try
                 {
-                    // Prefer completing FTS rebuild even after cancel so the next
-                    // search does not keep a permanently disabled FTS index.
-                    await _index
-                        .EndBulkIndexingAsync(CancellationToken.None)
-                        .ConfigureAwait(false);
+                    if (cancellationToken.IsCancellationRequested)
+                    {
+                        // Do not turn shutdown cancellation into a multi-minute
+                        // FTS rebuild. Restore triggers and leave a durable marker
+                        // so the next successful reconciliation rebuilds it once.
+                        await _index
+                            .AbortBulkIndexingAsync(CancellationToken.None)
+                            .ConfigureAwait(false);
+                    }
+                    else
+                    {
+                        RaiseStatus(
+                            IndexingRunState.Indexing,
+                            "Finalizing search index...",
+                            indexedCount,
+                            currentRoot,
+                            currentRootNumber,
+                            roots.Count);
+                        await _index
+                            .EndBulkIndexingAsync(CancellationToken.None)
+                            .ConfigureAwait(false);
+                    }
                 }
                 catch (Exception exception) when (exception is not OutOfMemoryException)
                 {
                     Trace.TraceWarning("Failed to finalize bulk FTS rebuild: {0}", exception.Message);
                 }
+            }
+            else if (!cancellationToken.IsCancellationRequested && !hadFailures && !hadCancellations)
+            {
+                try
+                {
+                    // Recover a snapshot left incomplete by an earlier canceled
+                    // scan only after journal reconciliation succeeds. OpenAsync
+                    // deliberately does not race startup indexing with this work.
+                    await _index
+                        .EnsureFtsReadyAsync(CancellationToken.None)
+                        .ConfigureAwait(false);
+                }
+                catch (Exception exception) when (exception is not OutOfMemoryException)
+                {
+                    Trace.TraceWarning("Failed to recover FTS after reconciliation: {0}", exception.Message);
+                }
+            }
+
+            if (terminalState is not null && terminalMessage is not null)
+            {
+                RaiseStatus(terminalState.Value, terminalMessage, indexedCount, totalRoots: roots.Count);
             }
         }
     }
@@ -244,13 +280,14 @@ public sealed class IndexingCoordinator
         IIndexProvider provider,
         IndexRoot root,
         int currentIndexedCount,
-        long indexGeneration,
+        Func<CancellationToken, Task<long>> ensureFullScanContextAsync,
         int currentRootNumber,
         int totalRoots,
         CancellationToken cancellationToken)
     {
         if (!IsNtfsProvider(provider))
         {
+            var indexGeneration = await ensureFullScanContextAsync(cancellationToken).ConfigureAwait(false);
             var count = await ScanAndUpsertAsync(
                 provider,
                 root,
@@ -283,7 +320,6 @@ public sealed class IndexingCoordinator
             var catchUp = await TryCatchUpNtfsRootAsync(
                 provider,
                 root,
-                indexGeneration,
                 cancellationToken).ConfigureAwait(false);
             preScanJournalState = catchUp.JournalState;
             if (catchUp.CompletedWithoutFullScan)
@@ -291,6 +327,7 @@ public sealed class IndexingCoordinator
                 return new IndexRootResult(catchUp.IndexedCount, HadFailure: false, WasCanceled: false);
             }
 
+            var indexGeneration = await ensureFullScanContextAsync(cancellationToken).ConfigureAwait(false);
             var count = await ScanAndUpsertAsync(
                 provider,
                 root,
@@ -383,6 +420,7 @@ public sealed class IndexingCoordinator
 
             if (exception.PartialRecordsAccepted)
             {
+                var indexGeneration = await ensureFullScanContextAsync(cancellationToken).ConfigureAwait(false);
                 RaiseStatus(
                     IndexingRunState.Indexing,
                     $"NTFS scan failed after partial output for {root.Path}; restarting with fallback. {exception.Message}",
@@ -423,11 +461,12 @@ public sealed class IndexingCoordinator
                 root.Path,
                 currentRootNumber,
                 totalRoots);
+            var fallbackGeneration = await ensureFullScanContextAsync(cancellationToken).ConfigureAwait(false);
             var fallbackCount = await ScanAndUpsertAsync(
                 _fallbackProvider,
                 root,
                 currentIndexedCount,
-                indexGeneration,
+                fallbackGeneration,
                 currentRootNumber,
                 totalRoots,
                 cancellationToken).ConfigureAwait(false);
@@ -449,7 +488,6 @@ public sealed class IndexingCoordinator
     private async Task<NtfsCatchUpResult> TryCatchUpNtfsRootAsync(
         IIndexProvider provider,
         IndexRoot root,
-        long indexGeneration,
         CancellationToken cancellationToken)
     {
         if (provider is not INtfsJournalProvider journalProvider)
@@ -777,10 +815,31 @@ public sealed class IndexingCoordinator
             return 0;
         }
 
-        await _index.UpsertManyAsync(batch, indexGeneration, cancellationToken).ConfigureAwait(false);
         var count = batch.Count;
-        batch.Clear();
-        return count;
+        using var metrics = PerformanceMetrics.Begin("indexing.sqlite_batch");
+        PerformanceMetrics.SetCounter("batch_size", count);
+        PerformanceMetrics.SetCounter("index_generation", indexGeneration);
+        try
+        {
+            using (PerformanceMetrics.MeasureStage("sqlite.upsert"))
+            {
+                await _index.UpsertManyAsync(batch, indexGeneration, cancellationToken).ConfigureAwait(false);
+            }
+
+            metrics.Complete("success", count);
+            batch.Clear();
+            return count;
+        }
+        catch (OperationCanceledException)
+        {
+            metrics.Complete("canceled");
+            throw;
+        }
+        catch
+        {
+            metrics.Complete("failed");
+            throw;
+        }
     }
 
     private void RaiseStatus(

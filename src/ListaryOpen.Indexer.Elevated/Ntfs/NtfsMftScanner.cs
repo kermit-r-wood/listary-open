@@ -19,6 +19,7 @@ internal sealed class NtfsMftScanner
     private const ulong RootDirectoryRecordNumber = 5;
 
     private readonly record struct DirectoryNode(ulong ParentRecordNumber, string Name);
+    private readonly record struct ResolvedDirectory(string FullPath, bool IsExcluded);
     private readonly record struct NameLink(
         ulong RecordNumber,
         ulong ParentRecordNumber,
@@ -45,16 +46,35 @@ internal sealed class NtfsMftScanner
             var volumeData = QueryVolumeData(handle);
             ValidateVolumeData(volumeData);
 
-            // Stream-parse $MFT into a lightweight record map without retaining raw bytes.
-            var parsedByRecord = StreamParseMftRecords(handle, volumeData, cancellationToken);
-            foreach (var record in ProjectParsedRecords(
-                         parsedByRecord,
-                         scanRoot.VolumeRoot,
-                         scanRoot.RequestedRoot,
-                         rules,
-                         cancellationToken))
+            // Project each bounded parse batch immediately. The old implementation
+            // retained every parsed FILE record (millions on a large volume) and then
+            // constructed a second link collection before producing the first result.
+            // Streaming keeps only directory ancestry plus genuinely unresolved links.
+            var projection = new StreamingProjection(
+                scanRoot.VolumeRoot,
+                scanRoot.RequestedRoot,
+                rules,
+                cancellationToken);
+            foreach (var parsedBatch in StreamParseMftRecordBatches(handle, volumeData, cancellationToken))
             {
-                yield return record;
+                var projected = new List<FileRecord>(parsedBatch.Count);
+                foreach (var parsed in parsedBatch)
+                {
+                    projection.Accept(parsed, projected);
+                }
+
+                foreach (var record in projected)
+                {
+                    yield return record;
+                }
+            }
+
+            foreach (var projectedBatch in projection.CompleteInBatches())
+            {
+                foreach (var record in projectedBatch)
+                {
+                    yield return record;
+                }
             }
         }
         finally
@@ -166,14 +186,27 @@ internal sealed class NtfsMftScanner
             parsedByRecord[parsed.RecordNumber] = parsed;
         }
 
-        foreach (var record in ProjectParsedRecords(
-                     parsedByRecord,
-                     volumeRoot,
-                     requestedRoot,
-                     exclusionRules,
-                     cancellationToken))
+        var projection = new StreamingProjection(
+            volumeRoot,
+            requestedRoot,
+            exclusionRules,
+            cancellationToken);
+        foreach (var parsed in parsedByRecord.Values)
         {
-            yield return record;
+            var output = new List<FileRecord>();
+            projection.Accept(parsed, output);
+            foreach (var record in output)
+            {
+                yield return record;
+            }
+        }
+
+        foreach (var output in projection.CompleteInBatches())
+        {
+            foreach (var record in output)
+            {
+                yield return record;
+            }
         }
     }
 
@@ -294,6 +327,353 @@ internal sealed class NtfsMftScanner
         return names;
     }
 
+    /// <summary>
+    /// Turns parsed records into index records without retaining the complete MFT.
+    /// Directory records are normally allocated before their children, so almost all
+    /// links can be resolved and emitted in the same bounded batch. Links whose parent
+    /// appears later (for example after a directory move) are retried after the scan.
+    /// </summary>
+    private sealed class StreamingProjection
+    {
+        private const int CompletionBatchSize = 4096;
+
+        private readonly string _volumeRoot;
+        private readonly string _requestedRoot;
+        private readonly string _requestedRootWithSeparator;
+        private readonly bool _includesWholeVolume;
+        private readonly IndexExclusionRules _exclusionRules;
+        private readonly CancellationToken _cancellationToken;
+        private readonly Dictionary<ulong, DirectoryNode> _directories = new();
+        private readonly Dictionary<ulong, ResolvedDirectory> _resolvedDirectories = new();
+        private readonly Dictionary<ulong, NtfsMftParsedRecord> _extensionRecords = new();
+        private readonly List<NtfsMftParsedRecord> _deferredBaseRecords = new();
+        private readonly List<NameLink> _unresolvedLinks = new();
+
+        public StreamingProjection(
+            string volumeRoot,
+            string requestedRoot,
+            IndexExclusionRules exclusionRules,
+            CancellationToken cancellationToken)
+        {
+            _volumeRoot = Path.GetFullPath(volumeRoot);
+            _requestedRoot = Path.TrimEndingDirectorySeparator(Path.GetFullPath(requestedRoot));
+            _requestedRootWithSeparator = _requestedRoot.EndsWith(Path.DirectorySeparatorChar)
+                ? _requestedRoot
+                : _requestedRoot + Path.DirectorySeparatorChar;
+            _includesWholeVolume = string.Equals(
+                Path.TrimEndingDirectorySeparator(_volumeRoot),
+                _requestedRoot,
+                StringComparison.OrdinalIgnoreCase);
+            _exclusionRules = exclusionRules;
+            _cancellationToken = cancellationToken;
+
+            var root = new DirectoryNode(RootDirectoryRecordNumber, string.Empty);
+            _directories[RootDirectoryRecordNumber] = root;
+            _resolvedDirectories[RootDirectoryRecordNumber] = new ResolvedDirectory(_volumeRoot, IsExcluded: false);
+        }
+
+        public void Accept(NtfsMftParsedRecord parsed, List<FileRecord> output)
+        {
+            _cancellationToken.ThrowIfCancellationRequested();
+            if (!parsed.IsBaseRecord)
+            {
+                if (parsed.FileNames.Count > 0)
+                {
+                    _extensionRecords[parsed.RecordNumber] = parsed;
+                }
+
+                return;
+            }
+
+            // Attribute-list extension records can appear on either side of the base
+            // record. They are rare, so defer only those bases until all extensions are known.
+            if (parsed.AttributeListFileReferences.Count > 0)
+            {
+                _deferredBaseRecords.Add(parsed);
+                return;
+            }
+
+            RegisterDirectory(parsed, parsed.FileNames);
+            AppendLinks(parsed, parsed.FileNames, output, deferIfUnresolved: true);
+        }
+
+        public IEnumerable<IReadOnlyList<FileRecord>> CompleteInBatches()
+        {
+            var deferred = new List<(NtfsMftParsedRecord Record, IReadOnlyList<NtfsMftFileName> Names)>(
+                _deferredBaseRecords.Count);
+            foreach (var parsed in _deferredBaseRecords)
+            {
+                _cancellationToken.ThrowIfCancellationRequested();
+                var names = CollectDeferredNames(parsed);
+                deferred.Add((parsed, names));
+                RegisterDirectory(parsed, names);
+            }
+
+            var output = new List<FileRecord>(CompletionBatchSize);
+            foreach (var item in deferred)
+            {
+                AppendLinks(item.Record, item.Names, output, deferIfUnresolved: false);
+                if (output.Count >= CompletionBatchSize)
+                {
+                    yield return output;
+                    output = new List<FileRecord>(CompletionBatchSize);
+                }
+            }
+
+            foreach (var link in _unresolvedLinks)
+            {
+                _cancellationToken.ThrowIfCancellationRequested();
+                TryAppendLink(link, output, deferIfUnresolved: false);
+                if (output.Count >= CompletionBatchSize)
+                {
+                    yield return output;
+                    output = new List<FileRecord>(CompletionBatchSize);
+                }
+            }
+
+            if (output.Count > 0)
+            {
+                yield return output;
+            }
+        }
+
+        private IReadOnlyList<NtfsMftFileName> CollectDeferredNames(NtfsMftParsedRecord baseRecord)
+        {
+            var names = new List<NtfsMftFileName>(baseRecord.FileNames.Count + 2);
+            names.AddRange(baseRecord.FileNames);
+            foreach (var extensionRef in baseRecord.AttributeListFileReferences)
+            {
+                if (_extensionRecords.TryGetValue(extensionRef, out var extension)
+                    && extension.RecordNumber != baseRecord.RecordNumber)
+                {
+                    names.AddRange(extension.FileNames);
+                }
+            }
+
+            return names;
+        }
+
+        private void RegisterDirectory(
+            NtfsMftParsedRecord parsed,
+            IReadOnlyList<NtfsMftFileName> names)
+        {
+            if (!parsed.IsDirectory)
+            {
+                return;
+            }
+
+            if (TryGetPrimaryIndexableName(names, out var primary))
+            {
+                _directories[parsed.RecordNumber] = new DirectoryNode(
+                    NtfsMftRecordParser.GetMftSegmentReferenceNumber(primary.ParentFileReferenceNumber),
+                    primary.Name);
+            }
+            else if (parsed.RecordNumber == RootDirectoryRecordNumber)
+            {
+                _directories[parsed.RecordNumber] = new DirectoryNode(parsed.RecordNumber, string.Empty);
+            }
+        }
+
+        private void AppendLinks(
+            NtfsMftParsedRecord parsed,
+            IReadOnlyList<NtfsMftFileName> names,
+            List<FileRecord> output,
+            bool deferIfUnresolved)
+        {
+            var hasWin32Name = HasWin32Name(names);
+            foreach (var name in names)
+            {
+                if (!IsIndexableName(name, hasWin32Name))
+                {
+                    continue;
+                }
+
+                var link = new NameLink(
+                    parsed.RecordNumber,
+                    NtfsMftRecordParser.GetMftSegmentReferenceNumber(name.ParentFileReferenceNumber),
+                    name.Name,
+                    parsed.IsDirectory,
+                    parsed.SizeBytes,
+                    parsed.LastWriteTime);
+                TryAppendLink(link, output, deferIfUnresolved);
+            }
+        }
+
+        private void TryAppendLink(NameLink link, List<FileRecord> output, bool deferIfUnresolved)
+        {
+            if (!TryBuildPath(link, out var fullPath, out var isExcluded))
+            {
+                if (deferIfUnresolved)
+                {
+                    _unresolvedLinks.Add(link);
+                }
+
+                return;
+            }
+
+            if (isExcluded
+                || link.Name.StartsWith('$')
+                || !IsRequestedRootOrDescendant(fullPath))
+            {
+                return;
+            }
+
+            try
+            {
+                output.Add(FileRecord.CreateFromNormalizedPath(
+                    fullPath,
+                    link.IsDirectory,
+                    link.SizeBytes,
+                    link.LastWriteTime,
+                    link.RecordNumber & 0x0000_FFFF_FFFF_FFFFUL));
+            }
+            catch (ArgumentException)
+            {
+                // Ignore malformed names in damaged or transient FILE records.
+            }
+        }
+
+        private bool TryBuildPath(NameLink link, out string fullPath, out bool isExcluded)
+        {
+            fullPath = string.Empty;
+            isExcluded = false;
+            if (string.IsNullOrWhiteSpace(link.Name) && link.RecordNumber != RootDirectoryRecordNumber)
+            {
+                return false;
+            }
+
+            if (link.RecordNumber == RootDirectoryRecordNumber && link.IsDirectory)
+            {
+                fullPath = _volumeRoot;
+                _resolvedDirectories[link.RecordNumber] = new ResolvedDirectory(fullPath, IsExcluded: false);
+                return true;
+            }
+
+            if (!TryResolveDirectoryPath(link.ParentRecordNumber, resolving: null, out var parent))
+            {
+                return false;
+            }
+
+            fullPath = string.IsNullOrEmpty(link.Name)
+                ? parent.FullPath
+                : Path.Combine(parent.FullPath, link.Name);
+            isExcluded = parent.IsExcluded
+                || (link.IsDirectory && _exclusionRules.ShouldExcludeDirectoryName(link.Name));
+
+            if (link.IsDirectory)
+            {
+                _resolvedDirectories[link.RecordNumber] = new ResolvedDirectory(fullPath, isExcluded);
+            }
+
+            return true;
+        }
+
+        private bool TryResolveDirectoryPath(
+            ulong recordNumber,
+            HashSet<ulong>? resolving,
+            out ResolvedDirectory resolved)
+        {
+            if (_resolvedDirectories.TryGetValue(recordNumber, out resolved))
+            {
+                return true;
+            }
+
+            if (recordNumber == RootDirectoryRecordNumber)
+            {
+                resolved = new ResolvedDirectory(_volumeRoot, IsExcluded: false);
+                _resolvedDirectories[recordNumber] = resolved;
+                return true;
+            }
+
+            if (!_directories.TryGetValue(recordNumber, out var node))
+            {
+                resolved = default;
+                return false;
+            }
+
+            resolving ??= new HashSet<ulong>();
+            if (!resolving.Add(recordNumber))
+            {
+                resolved = default;
+                return false;
+            }
+
+            try
+            {
+                if (node.ParentRecordNumber == recordNumber)
+                {
+                    resolved = new ResolvedDirectory(_volumeRoot, IsExcluded: false);
+                    _resolvedDirectories[recordNumber] = resolved;
+                    return true;
+                }
+
+                if (!TryResolveDirectoryPath(node.ParentRecordNumber, resolving, out var parent))
+                {
+                    resolved = default;
+                    return false;
+                }
+
+                var fullPath = string.IsNullOrEmpty(node.Name)
+                    ? parent.FullPath
+                    : Path.Combine(parent.FullPath, node.Name);
+                resolved = new ResolvedDirectory(
+                    fullPath,
+                    parent.IsExcluded || _exclusionRules.ShouldExcludeDirectoryName(node.Name));
+                _resolvedDirectories[recordNumber] = resolved;
+                return true;
+            }
+            finally
+            {
+                resolving.Remove(recordNumber);
+            }
+        }
+
+        private bool IsRequestedRootOrDescendant(string fullPath)
+        {
+            return _includesWholeVolume
+                || string.Equals(fullPath, _requestedRoot, StringComparison.OrdinalIgnoreCase)
+                || fullPath.StartsWith(_requestedRootWithSeparator, StringComparison.OrdinalIgnoreCase);
+        }
+
+        private static bool TryGetPrimaryIndexableName(
+            IReadOnlyList<NtfsMftFileName> names,
+            out NtfsMftFileName primary)
+        {
+            var hasWin32Name = HasWin32Name(names);
+            foreach (var name in names)
+            {
+                if (IsIndexableName(name, hasWin32Name))
+                {
+                    primary = name;
+                    return true;
+                }
+            }
+
+            primary = default;
+            return false;
+        }
+
+        private static bool HasWin32Name(IReadOnlyList<NtfsMftFileName> names)
+        {
+            foreach (var name in names)
+            {
+                if (name.Namespace is NtfsFileNameNamespace.Win32 or NtfsFileNameNamespace.Win32AndDos)
+                {
+                    return true;
+                }
+            }
+
+            return false;
+        }
+
+        private static bool IsIndexableName(NtfsMftFileName name, bool hasWin32Name)
+        {
+            return hasWin32Name
+                ? name.Namespace is NtfsFileNameNamespace.Win32 or NtfsFileNameNamespace.Win32AndDos
+                : name.Namespace != NtfsFileNameNamespace.Dos;
+        }
+    }
+
     private static bool TryBuildPath(
         ulong recordNumber,
         ulong parentRecordNumber,
@@ -407,10 +787,10 @@ internal sealed class NtfsMftScanner
     }
 
     /// <summary>
-    /// Streams $MFT data runs in chunks, parsing FILE records into a map and discarding
-    /// raw bytes so peak memory is dominated by the parsed map rather than the full image.
+    /// Streams $MFT data runs as bounded batches. A batch owns the parsed objects only
+    /// until its records have been projected, keeping memory independent of file count.
     /// </summary>
-    internal static Dictionary<ulong, NtfsMftParsedRecord> StreamParseMftRecords(
+    private static IEnumerable<IReadOnlyList<NtfsMftParsedRecord>> StreamParseMftRecordBatches(
         IntPtr volumeHandle,
         NtfsNativeMethods.NtfsVolumeDataBuffer volumeData,
         CancellationToken cancellationToken)
@@ -451,12 +831,9 @@ internal sealed class NtfsMftScanner
             };
         }
 
-        // Stream $MFT data runs; peak memory is dominated by the parsed record map,
-        // not the raw $MFT image size.
-        var estimatedRecords = (int)Math.Min(validDataLength / Math.Max(bytesPerRecord, 1), int.MaxValue);
-        var parsedByRecord = new Dictionary<ulong, NtfsMftParsedRecord>(Math.Max(16, estimatedRecords / 2));
         long bytesConsumed = 0;
         ulong nextRecordNumber = 0;
+        long parsedRecordCount = 0;
         var carry = Array.Empty<byte>();
         var carryLength = 0;
         var chunkSize = AlignUp(Math.Max(MftStreamChunkBytes, bytesPerRecord), bytesPerRecord);
@@ -471,7 +848,11 @@ internal sealed class NtfsMftScanner
 
             var runBytes = run.ClusterCount * bytesPerCluster;
             var remainingValid = validDataLength - bytesConsumed;
-            var runReadable = (int)Math.Min(runBytes, remainingValid);
+            // A large NTFS volume commonly has a single $MFT extent above 2 GiB.
+            // Keep the extent length 64-bit and narrow only each bounded chunk;
+            // casting the full extent to int overflowed and silently abandoned the
+            // fast MFT scan, forcing a very expensive recursive directory fallback.
+            var runReadable = GetReadableRunLength(runBytes, remainingValid);
             if (runReadable <= 0)
             {
                 break;
@@ -517,14 +898,19 @@ internal sealed class NtfsMftScanner
                 var completeBytes = workLength - (workLength % bytesPerRecord);
                 if (completeBytes > 0)
                 {
-                    ParseRecordChunk(
-                        work.AsSpan(0, completeBytes),
+                    var parsedBatch = ParseRecordChunk(
+                        work,
+                        completeBytes,
                         bytesPerRecord,
                         bytesPerSector,
                         nextRecordNumber,
-                        parsedByRecord,
                         cancellationToken);
+                    parsedRecordCount += parsedBatch.Count;
                     nextRecordNumber += (ulong)(completeBytes / bytesPerRecord);
+                    if (parsedBatch.Count > 0)
+                    {
+                        yield return parsedBatch;
+                    }
                 }
 
                 var leftover = workLength - completeBytes;
@@ -551,38 +937,57 @@ internal sealed class NtfsMftScanner
         if (carryLength >= bytesPerRecord)
         {
             var completeBytes = carryLength - (carryLength % bytesPerRecord);
-            ParseRecordChunk(
-                carry.AsSpan(0, completeBytes),
+            var parsedBatch = ParseRecordChunk(
+                carry,
+                completeBytes,
                 bytesPerRecord,
                 bytesPerSector,
                 nextRecordNumber,
-                parsedByRecord,
                 cancellationToken);
+            parsedRecordCount += parsedBatch.Count;
+            if (parsedBatch.Count > 0)
+            {
+                yield return parsedBatch;
+            }
         }
 
-        if (parsedByRecord.Count == 0)
+        if (parsedRecordCount == 0)
         {
             throw new InvalidDataException("NTFS $MFT stream parse produced no in-use records.");
         }
-
-        return parsedByRecord;
     }
 
-    private static void ParseRecordChunk(
-        ReadOnlySpan<byte> chunk,
+    internal static long GetReadableRunLength(long runBytes, long remainingValid)
+    {
+        if (runBytes <= 0 || remainingValid <= 0)
+        {
+            return 0;
+        }
+
+        return Math.Min(runBytes, remainingValid);
+    }
+
+    private static List<NtfsMftParsedRecord> ParseRecordChunk(
+        byte[] chunk,
+        int chunkLength,
         int bytesPerRecord,
         int bytesPerSector,
         ulong startingRecordNumber,
-        Dictionary<ulong, NtfsMftParsedRecord> parsedByRecord,
         CancellationToken cancellationToken)
     {
-        // One mutable copy per stream chunk so update-sequence can patch in place.
-        var mutable = chunk.ToArray();
-        var recordCount = mutable.Length / bytesPerRecord;
+        // ReadVolumeBytes already returns a private mutable buffer. Apply update
+        // sequences in place instead of copying every 4 MiB chunk a second time.
+        var recordCount = chunkLength / bytesPerRecord;
+        var parsedRecords = new List<NtfsMftParsedRecord>(Math.Max(16, recordCount / 2));
         for (var index = 0; index < recordCount; index++)
         {
             cancellationToken.ThrowIfCancellationRequested();
-            var recordSpan = mutable.AsSpan(index * bytesPerRecord, bytesPerRecord);
+            var recordSpan = chunk.AsSpan(index * bytesPerRecord, bytesPerRecord);
+            if (!IsInUseFileRecord(recordSpan))
+            {
+                continue;
+            }
+
             if (!NtfsMftRecordParser.TryApplyUpdateSequence(recordSpan, bytesPerSector))
             {
                 continue;
@@ -594,8 +999,20 @@ internal sealed class NtfsMftScanner
                 continue;
             }
 
-            parsedByRecord[parsed.RecordNumber] = parsed;
+            parsedRecords.Add(parsed);
         }
+
+        return parsedRecords;
+    }
+
+    private static bool IsInUseFileRecord(ReadOnlySpan<byte> record)
+    {
+        return record.Length >= 0x18
+            && record[0] == (byte)'F'
+            && record[1] == (byte)'I'
+            && record[2] == (byte)'L'
+            && record[3] == (byte)'E'
+            && (record[0x16] & 0x01) != 0;
     }
 
     private static byte[] ReadVolumeBytes(IntPtr volumeHandle, long absoluteOffset, int length, int alignTo)

@@ -18,9 +18,12 @@ public partial class SearchPanel : Window
     private const double CompactSearchHeight = 52;
     private const double CompactSearchWithFiltersHeight = 106;
     /// <summary>Minimum body height so the compact preview can show an image, not only the file name.</summary>
-    private const double CompactPreviewMinBodyHeight = 240;
+    private const double CompactPreviewMinBodyHeight = 400;
     private const double CompactResultRowHeight = 62;
     private const double CompactSearchMaxBodyHeight = 620;
+    private const double CompactGlobalSearchPreferredContentWidth = 840;
+    private const double CompactGlobalSearchWorkAreaMargin = 48;
+    private const double CompactGlobalSearchVerticalMargin = 32;
     private readonly IExplorerSelectionService _explorerSelectionService;
     private IntPtr _explorerSearchWindow;
     private string? _explorerSearchFolder;
@@ -333,7 +336,7 @@ public partial class SearchPanel : Window
         var workArea = SystemParameters.WorkArea;
         // Outer window is transparent; chrome border + shadow need a small margin.
         var chromeMargin = 20;
-        Width = Math.Min(1080, Math.Max(720, workArea.Width - 48)) + chromeMargin;
+        Width = CalculateCompactGlobalSearchOuterWidth(workArea.Width, chromeMargin);
         Height = (ShouldShowSearchFilters() ? CompactSearchWithFiltersHeight : CompactSearchHeight) + chromeMargin;
         SearchPanelRoot.Margin = new Thickness(0);
         WindowChromeBorder.Margin = new Thickness(10);
@@ -368,13 +371,44 @@ public partial class SearchPanel : Window
 
         const double chromeMargin = 20;
         var previewVisible = PreviewPane.Visibility == Visibility.Visible;
-        Height = CalculateCompactGlobalSearchOuterHeight(
+        var desiredHeight = CalculateCompactGlobalSearchOuterHeight(
             ViewModel.Results.Count,
             ShouldShowSearchFilters(),
             previewVisible,
             chromeMargin);
+        var workArea = SystemParameters.WorkArea;
+        var minimumOuterHeight = CompactSearchHeight + chromeMargin;
+        var availableOuterHeight = Math.Max(
+            minimumOuterHeight,
+            workArea.Height - CompactGlobalSearchVerticalMargin);
+        Height = Math.Min(desiredHeight, availableOuterHeight);
         // Keep the user's dragged placement; only re-clamp so growth stays on-screen.
         PositionCompactGlobalSearch();
+    }
+
+    /// <summary>
+    /// Keep compact search comfortably narrower than a desktop while still
+    /// shrinking it to fit small work areas.
+    /// </summary>
+    internal static double CalculateCompactGlobalSearchOuterWidth(
+        double workAreaWidth,
+        double chromeMargin = 20)
+    {
+        if (!double.IsFinite(workAreaWidth) || workAreaWidth <= 0)
+        {
+            throw new ArgumentOutOfRangeException(nameof(workAreaWidth));
+        }
+        if (!double.IsFinite(chromeMargin) || chromeMargin < 0)
+        {
+            throw new ArgumentOutOfRangeException(nameof(chromeMargin));
+        }
+
+        var availableContentWidth = Math.Max(
+            0,
+            workAreaWidth - CompactGlobalSearchWorkAreaMargin);
+        return Math.Min(
+            CompactGlobalSearchPreferredContentWidth,
+            availableContentWidth) + chromeMargin;
     }
 
     /// <summary>

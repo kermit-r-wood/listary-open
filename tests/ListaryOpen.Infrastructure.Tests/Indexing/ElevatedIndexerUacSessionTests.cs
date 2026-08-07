@@ -37,23 +37,90 @@ public sealed class ElevatedIndexerUacSessionTests
                 return startInfo;
             });
 
-        // Without elevation, journal open fails (exit 5) after the worker has started.
-        // Two sequential commands must still reuse the single worker process.
-        var firstError = await Assert.ThrowsAsync<ElevatedIndexerException>(() =>
+        // An invalid relative volume root fails deterministically whether the test
+        // runner is elevated or not. Journal-state, journal-read, and scan commands
+        // must still share the single long-lived worker process (one UAC entry).
+        const string invalidVolumeRoot = "not-a-volume-root";
+        var commands = new[]
+        {
+            "journal-state-to-file",
+            "read-journal-to-file",
+            "scan-to-file",
+            "journal-state-to-file"
+        };
+
+        var errors = new List<ElevatedIndexerException>();
+        foreach (var command in commands)
+        {
+            var extension = command == "scan-to-file" ? ".bin" : ".jsonl";
+            var error = await Assert.ThrowsAsync<ElevatedIndexerException>(() =>
+                session.RunCommandAsync(
+                    command,
+                    invalidVolumeRoot,
+                    Path.Combine(tmp, "listary-open-indexer-" + Guid.NewGuid().ToString("N") + extension),
+                    Path.Combine(tmp, "listary-open-indexer-" + Guid.NewGuid().ToString("N") + ".err"),
+                    expectedUsnJournalId: 0,
+                    startUsn: 0,
+                    endUsn: 0,
+                    CancellationToken.None));
+            errors.Add(error);
+        }
+
+        Assert.Equal(1, startCount);
+        Assert.Equal(commands.Length, errors.Count);
+        Assert.All(
+            errors,
+            error => Assert.Contains("exited with code", error.Message, StringComparison.OrdinalIgnoreCase));
+    }
+
+    [Fact]
+    public async Task StickyUacSessionRestartsWorkerOnlyAfterProcessExit()
+    {
+        var helperPath = ResolveBuiltHelperPath();
+        Assert.True(
+            File.Exists(helperPath),
+            $"Built elevated helper not found at '{helperPath}'. Build ListaryOpen.Indexer.Elevated before this test.");
+
+        var helperDirectory = Path.GetDirectoryName(helperPath)!;
+        var tmp = Path.Combine(helperDirectory, "data", "tmp");
+        Directory.CreateDirectory(tmp);
+
+        var startCount = 0;
+        using var session = new ElevatedIndexerUacSession(
+            helperPath,
+            (_, pipeName) =>
+            {
+                Interlocked.Increment(ref startCount);
+                var startInfo = new ProcessStartInfo
+                {
+                    FileName = helperPath,
+                    UseShellExecute = false,
+                    CreateNoWindow = true,
+                    WorkingDirectory = helperDirectory
+                };
+                startInfo.ArgumentList.Add("worker");
+                startInfo.ArgumentList.Add("--pipe");
+                startInfo.ArgumentList.Add(pipeName);
+                return startInfo;
+            });
+
+        // First multi-command sequence shares one worker; an explicit kill forces
+        // recovery elevation (exactly one replacement start).
+        const string invalidVolumeRoot = "not-a-volume-root";
+        await Assert.ThrowsAsync<ElevatedIndexerException>(() =>
             session.RunCommandAsync(
                 "journal-state-to-file",
-                @"C:\",
+                invalidVolumeRoot,
                 Path.Combine(tmp, "listary-open-indexer-" + Guid.NewGuid().ToString("N") + ".jsonl"),
                 Path.Combine(tmp, "listary-open-indexer-" + Guid.NewGuid().ToString("N") + ".err"),
                 expectedUsnJournalId: 0,
                 startUsn: 0,
                 endUsn: 0,
                 CancellationToken.None));
-
-        var secondError = await Assert.ThrowsAsync<ElevatedIndexerException>(() =>
+        await Assert.ThrowsAsync<ElevatedIndexerException>(() =>
             session.RunCommandAsync(
-                "journal-state-to-file",
-                @"C:\",
+                "read-journal-to-file",
+                invalidVolumeRoot,
                 Path.Combine(tmp, "listary-open-indexer-" + Guid.NewGuid().ToString("N") + ".jsonl"),
                 Path.Combine(tmp, "listary-open-indexer-" + Guid.NewGuid().ToString("N") + ".err"),
                 expectedUsnJournalId: 0,
@@ -62,8 +129,21 @@ public sealed class ElevatedIndexerUacSessionTests
                 CancellationToken.None));
 
         Assert.Equal(1, startCount);
-        Assert.Contains("exited with code", firstError.Message, StringComparison.OrdinalIgnoreCase);
-        Assert.Contains("exited with code", secondError.Message, StringComparison.OrdinalIgnoreCase);
+
+        session.KillWorkerForTests();
+
+        await Assert.ThrowsAsync<ElevatedIndexerException>(() =>
+            session.RunCommandAsync(
+                "scan-to-file",
+                invalidVolumeRoot,
+                Path.Combine(tmp, "listary-open-indexer-" + Guid.NewGuid().ToString("N") + ".bin"),
+                Path.Combine(tmp, "listary-open-indexer-" + Guid.NewGuid().ToString("N") + ".err"),
+                expectedUsnJournalId: 0,
+                startUsn: 0,
+                endUsn: 0,
+                CancellationToken.None));
+
+        Assert.Equal(2, startCount);
     }
 
     private static string ResolveBuiltHelperPath()

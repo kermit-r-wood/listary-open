@@ -34,6 +34,15 @@ internal static class FileIcon
         typeof(FileIcon),
         new PropertyMetadata(false, OnIconRequestChanged));
 
+    private static readonly DependencyPropertyKey HasIconPropertyKey =
+        DependencyProperty.RegisterAttachedReadOnly(
+            "HasIcon",
+            typeof(bool),
+            typeof(FileIcon),
+            new PropertyMetadata(false));
+
+    public static readonly DependencyProperty HasIconProperty = HasIconPropertyKey.DependencyProperty;
+
     public static void SetPath(DependencyObject element, string? value) =>
         element.SetValue(PathProperty, value);
 
@@ -46,6 +55,9 @@ internal static class FileIcon
     public static bool GetIsDirectory(DependencyObject element) =>
         (bool)element.GetValue(IsDirectoryProperty);
 
+    public static bool GetHasIcon(DependencyObject element) =>
+        (bool)element.GetValue(HasIconProperty);
+
     private static void OnIconRequestChanged(DependencyObject dependencyObject, DependencyPropertyChangedEventArgs e)
     {
         if (dependencyObject is not Image image)
@@ -54,6 +66,7 @@ internal static class FileIcon
         }
 
         image.Source = null;
+        image.SetValue(HasIconPropertyKey, false);
         _ = image.Dispatcher.BeginInvoke(new Action(() => LoadIconAsync(image)));
     }
 
@@ -84,6 +97,7 @@ internal static class FileIcon
                 GetIsDirectory(image) == isDirectory)
             {
                 image.Source = source;
+                image.SetValue(HasIconPropertyKey, source is not null);
             }
         }
         catch (Exception)
@@ -119,7 +133,7 @@ internal static class FileIcon
             : $"extension:{extension}";
     }
 
-    private static ImageSource? LoadShellIcon(string path, bool isDirectory)
+    internal static ImageSource? LoadShellIcon(string path, bool isDirectory)
     {
         var useActualFile = !isDirectory &&
             System.IO.Path.GetExtension(path) is { } extension &&

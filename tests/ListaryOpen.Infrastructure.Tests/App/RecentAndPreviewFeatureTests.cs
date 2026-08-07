@@ -124,7 +124,7 @@ public sealed class RecentAndPreviewFeatureTests
             resultCount: 1,
             filtersVisible: true,
             previewVisible: true);
-        Assert.True(withPreview >= 360, $"Expected preview-capable height, got {withPreview}.");
+        Assert.True(withPreview >= 520, $"Expected preview-capable height, got {withPreview}.");
         Assert.True(withPreview > withoutPreview);
 
         // Empty query stays short even if the preview column is open.
@@ -133,6 +133,18 @@ public sealed class RecentAndPreviewFeatureTests
             filtersVisible: true,
             previewVisible: true);
         Assert.True(empty < 160, $"Expected empty compact height, got {empty}.");
+    }
+
+    [Fact]
+    public void CompactGlobalSearchWidthUsesAComfortableDesktopMaximumAndFitsSmallScreens()
+    {
+        var desktop = SearchPanel.CalculateCompactGlobalSearchOuterWidth(1920);
+        var narrow = SearchPanel.CalculateCompactGlobalSearchOuterWidth(800);
+
+        Assert.Equal(860, desktop);
+        Assert.Equal(772, narrow);
+        Assert.True(desktop < 1920 * 0.6);
+        Assert.True(narrow < 800);
     }
 
     [Fact]

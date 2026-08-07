@@ -2,20 +2,24 @@ namespace ListaryOpen.Core.Indexing;
 
 public sealed class FileRecord
 {
+    private string? _pathKey;
+    private string? _name;
+    private string? _parentPath;
+
     private FileRecord(
         string fullPath,
-        string pathKey,
-        string name,
-        string parentPath,
+        string? pathKey,
+        string? name,
+        string? parentPath,
         bool isDirectory,
         long sizeBytes,
         DateTimeOffset lastWriteTime,
         ulong fileReferenceNumber)
     {
         FullPath = fullPath;
-        PathKey = pathKey;
-        Name = name;
-        ParentPath = parentPath;
+        _pathKey = pathKey;
+        _name = name;
+        _parentPath = parentPath;
         IsDirectory = isDirectory;
         SizeBytes = sizeBytes;
         LastWriteTime = lastWriteTime;
@@ -24,11 +28,11 @@ public sealed class FileRecord
 
     public string FullPath { get; }
 
-    public string PathKey { get; }
+    public string PathKey => _pathKey ??= FullPath.ToUpperInvariant();
 
-    public string Name { get; }
+    public string Name => _name ??= GetName(FullPath);
 
-    public string ParentPath { get; }
+    public string ParentPath => _parentPath ??= GetParentPath(FullPath);
 
     public bool IsDirectory { get; }
 
@@ -63,17 +67,50 @@ public sealed class FileRecord
         }
 
         var normalized = Path.TrimEndingDirectorySeparator(Path.GetFullPath(trimmed));
-        var root = Path.GetPathRoot(normalized) ?? string.Empty;
-        var isRoot = string.Equals(normalized, root, StringComparison.OrdinalIgnoreCase);
-        var name = isRoot ? root.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar) : Path.GetFileName(normalized);
-        var parent = isRoot ? string.Empty : Path.GetDirectoryName(normalized) ?? string.Empty;
-        var pathKey = normalized.ToUpperInvariant();
-
         return new FileRecord(
             normalized,
-            pathKey,
-            name,
-            parent,
+            pathKey: null,
+            name: null,
+            parentPath: null,
+            isDirectory,
+            sizeBytes,
+            lastWriteTime,
+            fileReferenceNumber);
+    }
+
+    /// <summary>
+    /// Creates a record from a trusted, already-normalized absolute path. This is used by
+    /// the raw NTFS scanner, which constructs paths from a normalized volume root and MFT
+    /// names. Derived search fields remain lazy so the elevated transport process does not
+    /// allocate name, parent, and upper-case path copies that it never serializes.
+    /// </summary>
+    public static FileRecord CreateFromNormalizedPath(
+        string normalizedFullPath,
+        bool isDirectory,
+        long sizeBytes,
+        DateTimeOffset lastWriteTime,
+        ulong fileReferenceNumber = 0)
+    {
+        if (string.IsNullOrWhiteSpace(normalizedFullPath))
+        {
+            throw new ArgumentException("Path is required.", nameof(normalizedFullPath));
+        }
+
+        if (!Path.IsPathFullyQualified(normalizedFullPath))
+        {
+            throw new ArgumentException("Path must be fully qualified.", nameof(normalizedFullPath));
+        }
+
+        if (sizeBytes < 0)
+        {
+            throw new ArgumentOutOfRangeException(nameof(sizeBytes), "Size cannot be negative.");
+        }
+
+        return new FileRecord(
+            normalizedFullPath,
+            pathKey: null,
+            name: null,
+            parentPath: null,
             isDirectory,
             sizeBytes,
             lastWriteTime,
@@ -89,12 +126,28 @@ public sealed class FileRecord
 
         return new FileRecord(
             FullPath,
-            PathKey,
-            Name,
-            ParentPath,
+            _pathKey,
+            _name,
+            _parentPath,
             IsDirectory,
             SizeBytes,
             LastWriteTime,
             fileReferenceNumber);
+    }
+
+    private static string GetName(string normalizedPath)
+    {
+        var root = Path.GetPathRoot(normalizedPath) ?? string.Empty;
+        return string.Equals(normalizedPath, root, StringComparison.OrdinalIgnoreCase)
+            ? root.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar)
+            : Path.GetFileName(normalizedPath);
+    }
+
+    private static string GetParentPath(string normalizedPath)
+    {
+        var root = Path.GetPathRoot(normalizedPath) ?? string.Empty;
+        return string.Equals(normalizedPath, root, StringComparison.OrdinalIgnoreCase)
+            ? string.Empty
+            : Path.GetDirectoryName(normalizedPath) ?? string.Empty;
     }
 }

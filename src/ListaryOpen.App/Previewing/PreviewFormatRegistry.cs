@@ -167,7 +167,7 @@ internal static class PreviewFormatRegistry
 
         Add(formats, [".aac", ".adts", ".aif", ".aiff", ".amr", ".ape", ".flac", ".m4a", ".m4b", ".mid",
             ".midi", ".mka", ".mp3", ".oga", ".ogg", ".opus", ".wav", ".wma"],
-            PreviewCategory.Audio, PreviewCapability.Metadata, true, true, PreviewFallback.Media | PreviewFallback.ShellThumbnail);
+            PreviewCategory.Audio, PreviewCapability.Metadata, false, true, PreviewFallback.Media | PreviewFallback.ShellThumbnail);
         Add(formats, [".3gp", ".avi", ".flv", ".m2ts", ".m4v", ".mkv", ".mov", ".mp4",
             ".mpeg", ".mpg", ".mts", ".ts", ".vob", ".webm", ".wmv"],
             PreviewCategory.Video, PreviewCapability.Thumbnail, true, true, PreviewFallback.Media | PreviewFallback.ShellThumbnail);

@@ -72,6 +72,23 @@ public sealed class FileRecordTests
     }
 
     [Fact]
+    public void CreateFromNormalizedPathPreservesTransportPathAndDerivedFields()
+    {
+        var record = FileRecord.CreateFromNormalizedPath(
+            "C:\\Docs\\Report.txt",
+            false,
+            42,
+            DateTimeOffset.UnixEpoch,
+            fileReferenceNumber: 7);
+
+        Assert.Equal("C:\\Docs\\Report.txt", record.FullPath);
+        Assert.Equal("C:\\DOCS\\REPORT.TXT", record.PathKey);
+        Assert.Equal("Report.txt", record.Name);
+        Assert.Equal("C:\\Docs", record.ParentPath);
+        Assert.Equal(7ul, record.FileReferenceNumber);
+    }
+
+    [Fact]
     public void ConstructorIsNotPublic()
     {
         Assert.Empty(typeof(FileRecord).GetConstructors());

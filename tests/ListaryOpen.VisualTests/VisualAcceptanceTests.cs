@@ -149,7 +149,10 @@ public sealed class VisualAcceptanceTests
                 Assert.Equal(AppTheme.Light, ThemeManager.Current);
                 Assert.Equal(AppLanguage.SimplifiedChinese, languageSelector.SelectedItem);
                 Assert.Equal(AppLanguage.SimplifiedChinese, LocalizationManager.EffectiveLanguage);
-                Assert.Equal("ListaryOpen 选项", settingsWindow.Title);
+                Assert.Equal("ListaryOpen", settingsWindow.Title);
+                Assert.Equal(
+                    "ListaryOpen 选项",
+                    Assert.IsType<TextBlock>(settingsWindow.FindName("SettingsWindowTitle")).Text);
                 Assert.Equal("设置已保存并应用。", settingsViewModel.SettingsStatusText);
                 Capture(settingsWindow, screenshotDirectory, "12-settings-language-light-zh", stage, evidence);
 
@@ -281,9 +284,11 @@ public sealed class VisualAcceptanceTests
                 quickSwitchBackdrop = null;
 
                 ThemeManager.Apply(AppTheme.Dark);
+                var applicationIconPath = Path.Combine(AppContext.BaseDirectory, "ListaryOpen.App.exe");
+                Assert.True(File.Exists(applicationIconPath));
                 var taskManagerAutomation = new StaticTaskManagerAutomationService(
                 [
-                    new TaskManagerItem("firefox-1", "Firefox", "12 processes · High power usage", "firefox.exe"),
+                    new TaskManagerItem("listary-1", "ListaryOpen", "Application process", applicationIconPath),
                     new TaskManagerItem("terminal-1", "Windows Terminal", "3 processes", "wt.exe"),
                     new TaskManagerItem("explorer-1", "Windows Explorer", "File manager", "explorer.exe")
                 ]);
@@ -296,6 +301,18 @@ public sealed class VisualAcceptanceTests
                 LocalizationManager.Apply(AppLanguage.English);
                 Assert.True(taskManagerViewModel.Results.Count >= 2);
                 PumpLayout(taskManager);
+                Assert.True(
+                    WaitForDispatcherCondition(
+                        () => FindVisualDescendant<Image>(
+                            taskManager,
+                            image => string.Equals(
+                                    FileIcon.GetPath(image),
+                                    applicationIconPath,
+                                    StringComparison.OrdinalIgnoreCase) &&
+                                image.Source is not null &&
+                                FileIcon.GetHasIcon(image)) is not null,
+                        TimeSpan.FromSeconds(3)),
+                    "The Task Manager result did not render the real ListaryOpen executable icon.");
                 Capture(taskManager, screenshotDirectory, "18-task-manager-search-dark-en", stage, evidence);
 
                 stage = "task manager next selection synchronized";
@@ -769,6 +786,27 @@ public sealed class VisualAcceptanceTests
         }
 
         return condition();
+    }
+
+    private static T? FindVisualDescendant<T>(DependencyObject root, Func<T, bool> predicate)
+        where T : DependencyObject
+    {
+        for (var index = 0; index < VisualTreeHelper.GetChildrenCount(root); index++)
+        {
+            var child = VisualTreeHelper.GetChild(root, index);
+            if (child is T match && predicate(match))
+            {
+                return match;
+            }
+
+            var descendant = FindVisualDescendant(child, predicate);
+            if (descendant is not null)
+            {
+                return descendant;
+            }
+        }
+
+        return null;
     }
 
     private static void CompleteWithDispatcher(Task task)

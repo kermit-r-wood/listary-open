@@ -30,6 +30,8 @@
   <PropertyGroup>
     <OutputType>WinExe</OutputType>
     <TargetFramework>net8.0-windows</TargetFramework>
+    <AssemblyTitle>ListaryOpen</AssemblyTitle>
+    <Product>ListaryOpen</Product>
     <ApplicationIcon>Assets\ListaryOpen.ico</ApplicationIcon>
     <ListaryOpenAppManifest Condition="'$(ListaryOpenAppManifest)' == ''">app.manifest</ListaryOpenAppManifest>
     <ApplicationManifest>$(ListaryOpenAppManifest)</ApplicationManifest>

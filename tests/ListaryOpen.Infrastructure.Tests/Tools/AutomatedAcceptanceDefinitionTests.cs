@@ -87,6 +87,11 @@ public sealed class AutomatedAcceptanceDefinitionTests
         Assert.Contains("$ErrorActionPreference = \"Continue\"", script, StringComparison.Ordinal);
         Assert.Contains("$exitCode = $LASTEXITCODE", script, StringComparison.Ordinal);
         Assert.Contains("Remove-DirectoryWithRetry", script, StringComparison.Ordinal);
+        Assert.Contains("Clear-PackageDirectoryPreservingData", script, StringComparison.Ordinal);
+        Assert.Contains("Preserving indexed data directory", script, StringComparison.Ordinal);
+        Assert.Contains("Get-PackageFilesForArchive", script, StringComparison.Ordinal);
+        Assert.Contains("Compress-PackageArchive", script, StringComparison.Ordinal);
+        Assert.Contains("-DataDirectory $packageDataDirectory", script, StringComparison.Ordinal);
         Assert.Contains("waiting 5 seconds for transient file handles", script, StringComparison.Ordinal);
         Assert.Contains("[string]::Equals($_.Method, $evidence.testNameContains, [StringComparison]::Ordinal)", script, StringComparison.Ordinal);
         Assert.DoesNotContain("-like \"*$($evidence.testNameContains)*\"", script, StringComparison.Ordinal);
@@ -165,6 +170,9 @@ public sealed class AutomatedAcceptanceDefinitionTests
         Assert.Contains("tools\\Invoke-AutomatedAcceptance.ps1", workflow, StringComparison.Ordinal);
         Assert.Contains("artifacts/acceptance-results", workflow, StringComparison.Ordinal);
         Assert.Contains("artifacts/ListaryOpen-win-x64.zip", workflow, StringComparison.Ordinal);
+        Assert.Contains("$packageData", workflow, StringComparison.Ordinal);
+        Assert.Contains("Compress-Archive -LiteralPath $archiveItems", workflow, StringComparison.Ordinal);
+        Assert.Contains("ZIP must not contain local index data", workflow, StringComparison.Ordinal);
     }
 
     [Fact]

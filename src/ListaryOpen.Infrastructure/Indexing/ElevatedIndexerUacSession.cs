@@ -15,7 +15,10 @@ internal sealed class ElevatedIndexerUacSession : IDisposable
 {
     private static readonly JsonSerializerOptions JsonOptions = new(JsonSerializerDefaults.Web);
     private static readonly TimeSpan ConnectTimeout = TimeSpan.FromSeconds(60);
-    private static readonly TimeSpan ShutdownTimeout = TimeSpan.FromSeconds(2);
+    // The app has already canceled the active indexing run. Give an idle worker
+    // one short chance to consume "exit", then terminate a scan promptly so the
+    // elevated helper cannot outlive a fast parent shutdown.
+    private static readonly TimeSpan ShutdownTimeout = TimeSpan.FromMilliseconds(200);
 
     private readonly object _gate = new();
     private readonly SemaphoreSlim _commandGate = new(1, 1);
@@ -140,6 +143,18 @@ internal sealed class ElevatedIndexerUacSession : IDisposable
         }
     }
 
+    /// <summary>
+    /// Test hook: force-kill the sticky worker so the next command exercises recovery.
+    /// </summary>
+    internal void KillWorkerForTests()
+    {
+        lock (_gate)
+        {
+            ObjectDisposedException.ThrowIf(_disposed, this);
+            DiscardCurrentWorkerUnlocked();
+        }
+    }
+
     public void Dispose()
     {
         lock (_gate)
@@ -186,6 +201,11 @@ internal sealed class ElevatedIndexerUacSession : IDisposable
             {
                 return;
             }
+
+            // Drop a dead worker (or a half-open pipe) so the next start owns a
+            // clean session. Recovery may elevate again; normal multi-command use
+            // never hits this path while the worker is healthy.
+            DiscardCurrentWorkerUnlocked();
         }
 
         await StartCoreAsync(cancellationToken).ConfigureAwait(false);
@@ -255,6 +275,21 @@ internal sealed class ElevatedIndexerUacSession : IDisposable
             lock (_gate)
             {
                 ObjectDisposedException.ThrowIf(_disposed, this);
+                // Another command may have recovered while we were connecting; keep
+                // the healthy session already published and drop this spare worker.
+                if (_writer is not null && _process is { HasExited: false })
+                {
+                    TryDispose(ref writer);
+                    TryDispose(ref reader);
+                    TryDispose(ref pipe);
+                    TryKill(process);
+                    process.Dispose();
+                    process = null;
+                    pipe = null;
+                    return;
+                }
+
+                DiscardCurrentWorkerUnlocked();
                 _pipe = pipe;
                 _process = process;
                 _reader = reader;
@@ -271,6 +306,35 @@ internal sealed class ElevatedIndexerUacSession : IDisposable
                 TryKill(process);
                 process.Dispose();
             }
+        }
+    }
+
+    private void DiscardCurrentWorkerUnlocked()
+    {
+        TryDispose(ref _writer);
+        TryDispose(ref _reader);
+        TryDispose(ref _pipe);
+
+        var process = _process;
+        _process = null;
+        if (process is null)
+        {
+            return;
+        }
+
+        try
+        {
+            if (!process.HasExited)
+            {
+                TryKill(process);
+            }
+        }
+        catch
+        {
+        }
+        finally
+        {
+            process.Dispose();
         }
     }
 

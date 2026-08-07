@@ -190,6 +190,42 @@ public sealed class TaskManagerSearchViewModelTests
         Assert.Equal("C:\\Program Files\\Mozilla Firefox\\firefox.exe", path);
     }
 
+    [Fact]
+    public void LegacyListaryOpenWindowTitleResolvesApplicationIconPath()
+    {
+        var iconPaths = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+        {
+            ["ListaryOpen.App"] = "C:\\Apps\\ListaryOpen.App.exe"
+        };
+        UiAutomationTaskManagerProvider.AddListaryOpenIconAliases(iconPaths);
+
+        var path = UiAutomationTaskManagerProvider.ResolveIconPath(
+            "Process: ListaryOpen Options",
+            ["ListaryOpen Options", "0%", "155 MB"],
+            iconPaths);
+
+        Assert.Equal("C:\\Apps\\ListaryOpen.App.exe", path);
+    }
+
+    [Theory]
+    [InlineData("Process: ListaryOpen.HookHost.exe (32 bit)")]
+    [InlineData("Process: ListaryOpen.HookHost.exe (32 位)")]
+    [InlineData("Process: ListaryOpen.HookHost.exe (4)")]
+    public void DecoratedExecutableDisplayNameResolvesExecutableIconPath(string displayName)
+    {
+        var iconPaths = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+        {
+            ["ListaryOpen.HookHost"] = "C:\\Apps\\hooks\\x86\\ListaryOpen.HookHost.exe"
+        };
+
+        var path = UiAutomationTaskManagerProvider.ResolveIconPath(
+            displayName,
+            Array.Empty<string>(),
+            iconPaths);
+
+        Assert.Equal("C:\\Apps\\hooks\\x86\\ListaryOpen.HookHost.exe", path);
+    }
+
     [Theory]
     [InlineData("same-id", "anything", "Process: Other", "same-id", "Process: 1Password", 3)]
     [InlineData("new-id", "Process: 1Password", "", "old-id", "Process: 1Password", 2)]

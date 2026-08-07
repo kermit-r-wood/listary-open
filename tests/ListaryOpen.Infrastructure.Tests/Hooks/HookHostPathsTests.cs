@@ -39,4 +39,51 @@ public sealed class HookHostPathsTests
             root.Delete(recursive: true);
         }
     }
+
+    [Fact]
+    public void RuntimeCopyStagesEveryHookFileOutsideProgramDirectoryAndCleansItUp()
+    {
+        var programRoot = Directory.CreateTempSubdirectory("listary-open-hook-source-");
+        var runtimeRoot = Directory.CreateTempSubdirectory("listary-open-hook-runtime-");
+        try
+        {
+            var staleDirectory = Directory.CreateDirectory(
+                Path.Combine(runtimeRoot.FullName, "session-stale"));
+            File.WriteAllText(Path.Combine(staleDirectory.FullName, "old.dll"), "old");
+            foreach (var architecture in new[] { "x64", "x86" })
+            {
+                var architectureDirectory = Directory.CreateDirectory(
+                    Path.Combine(programRoot.FullName, "hooks", architecture));
+                File.WriteAllText(Path.Combine(architectureDirectory.FullName, "ListaryOpen.HookHost.exe"), "host");
+                File.WriteAllText(Path.Combine(architectureDirectory.FullName, "ListaryOpen.Hook.dll"), "hook");
+                File.WriteAllText(Path.Combine(architectureDirectory.FullName, "libunwind.dll"), "runtime");
+            }
+
+            string stagedDirectory;
+            using (var paths = HookHostPaths.CreateRuntimeCopy(programRoot.FullName, runtimeRoot.FullName))
+            {
+                var x64 = paths.ForArchitecture(HookArchitecture.X64);
+                var x86 = paths.ForArchitecture(HookArchitecture.X86);
+                stagedDirectory = Directory.GetParent(Directory.GetParent(x64.DirectoryPath)!.FullName)!.FullName;
+
+                Assert.False(Path.GetFullPath(x64.HostExePath).StartsWith(
+                    Path.GetFullPath(programRoot.FullName) + Path.DirectorySeparatorChar,
+                    StringComparison.OrdinalIgnoreCase));
+                Assert.Equal("host", File.ReadAllText(x64.HostExePath));
+                Assert.Equal("hook", File.ReadAllText(x64.HookDllPath));
+                Assert.Equal(
+                    "runtime",
+                    File.ReadAllText(Path.Combine(x64.DirectoryPath, "libunwind.dll")));
+                Assert.Equal("host", File.ReadAllText(x86.HostExePath));
+                Assert.False(Directory.Exists(staleDirectory.FullName));
+            }
+
+            Assert.False(Directory.Exists(stagedDirectory));
+        }
+        finally
+        {
+            programRoot.Delete(recursive: true);
+            runtimeRoot.Delete(recursive: true);
+        }
+    }
 }

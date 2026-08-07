@@ -54,7 +54,7 @@ use windows_sys::Win32::System::Threading::{
 use windows_sys::Win32::UI::Accessibility::{SetWinEventHook, UnhookWinEvent, HWINEVENTHOOK};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     ChangeWindowMessageFilterEx, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW,
-    EnumWindows, GetAncestor, GetClassNameW, GetForegroundWindow,
+    EnumChildWindows, EnumWindows, GetAncestor, GetClassNameW, GetDlgCtrlID, GetForegroundWindow,
     GetMessageW, GetWindowLongPtrW, GetWindowTextLengthW, GetWindowTextW, GetWindowThreadProcessId,
     IsWindow, IsWindowVisible, MsgWaitForMultipleObjectsEx, PeekMessageW, PostMessageW,
     PostQuitMessage, PostThreadMessageW, RegisterClassW, SendMessageTimeoutW, SetWindowLongPtrW,
@@ -71,8 +71,9 @@ const BUFFER_SIZE: usize = 64 * 1024;
 const HOOK_RESCAN_INTERVAL: Duration = Duration::from_millis(500);
 const HOOK_EVENT_RECOVERY_RESCAN_INTERVAL: Duration = Duration::from_secs(5);
 const HOOK_PRELOAD_RESCAN_INTERVAL: Duration = Duration::from_millis(25);
+const HOOK_EVENT_BURST_RESCAN_INTERVAL: Duration = Duration::from_millis(100);
 const HOOK_TARGET_SESSION_RESCAN_INTERVAL: Duration = Duration::from_millis(100);
-const HOOK_PRELOAD_BURST_DURATION: Duration = Duration::from_secs(3);
+const HOOK_PRELOAD_BURST_DURATION: Duration = Duration::from_secs(1);
 const HOOK_SHUTDOWN_POLL_INTERVAL: Duration = Duration::from_millis(50);
 const HOOK_UNLOAD_QUEUE_TURN_GRACE: Duration = Duration::from_millis(50);
 const ACK_WINDOW_CLASS: &str = "ListaryOpenHookAckWindow";
@@ -81,6 +82,7 @@ const ACK_STARTUP_SHUTDOWN_GRACE: Duration = Duration::from_millis(100);
 const WM_LISTARY_ACK_CLOSE: u32 = WM_APP + 0x4C4F;
 const PIPE_REJECT_REMOTE_CLIENTS: u32 = 0x0000_0008;
 const PRELOAD_HOOK_DLL_EXPORT: &[u8] = b"ListaryOpenPreloadHookProc\0";
+const ADDRESS_BAR_EDIT_CONTROL_ID: i32 = 41477;
 
 #[repr(C)]
 struct FileTime {
@@ -450,8 +452,11 @@ fn hook_runtime_status() -> HookRuntimeStatus {
 
 fn hook_loop(mut hook_state: HookState, event_scan_active: bool, hook_shutdown: &HookShutdown) {
     let rescan_interval = rescan_interval(event_scan_active);
-    let mut preload_burst_until = Instant::now() + HOOK_PRELOAD_BURST_DURATION;
-    let mut next_scan = Instant::now() + HOOK_PRELOAD_RESCAN_INTERVAL;
+    // HookState already performed one complete startup scan before entering the
+    // loop. Do not manufacture a high-frequency burst until a real foreground
+    // or dialog event asks for one.
+    let mut preload_burst_until = Instant::now();
+    let mut next_scan = Instant::now() + rescan_interval;
     loop {
         if hook_shutdown.is_requested() {
             break;
@@ -508,7 +513,7 @@ fn hook_scan_interval(
     explicit_preload: bool,
     preload_ready: bool,
     preload_burst_active: bool,
-    target_session_armed: bool,
+    _target_session_armed: bool,
     recovery_interval: Duration,
 ) -> Duration {
     if explicit_preload {
@@ -518,10 +523,11 @@ fn hook_scan_interval(
             HOOK_PRELOAD_RESCAN_INTERVAL
         };
     }
+    // WinEvent hooks request an immediate scan for foreground/dialog changes.
+    // Persisted authorization mappings are not active work; scanning every
+    // 100 ms merely because one exists keeps the host hot while idle.
     if preload_burst_active {
-        HOOK_PRELOAD_RESCAN_INTERVAL
-    } else if target_session_armed {
-        HOOK_TARGET_SESSION_RESCAN_INTERVAL
+        HOOK_EVENT_BURST_RESCAN_INTERVAL
     } else {
         recovery_interval
     }
@@ -1991,16 +1997,72 @@ fn firefox_dialog_precapture_ready(requires_spawn_proof: bool, has_spawn_proof: 
     !requires_spawn_proof || has_spawn_proof
 }
 
+// Dialog discovery intentionally remains class-only so the native hook can be
+// installed before IFileDialog finishes creating its child hierarchy. Active
+// reporting and jump revalidation reject a populated generic #32770 window,
+// while an empty hierarchy remains provisionally eligible during IFileDialog
+// construction. This prevents Win+R and Properties from receiving an overlay
+// without reintroducing the early-dialog race.
 fn is_supported_dialog_window(hwnd: HWND) -> bool {
     let Some(class_name) = class_name(hwnd) else {
         return false;
     };
 
-    is_supported_dialog_shape(&class_name)
+    is_supported_dialog_shape(&class_name) && file_dialog_content_is_present_or_pending(hwnd)
 }
 
 fn is_supported_dialog_shape(class_name: &str) -> bool {
     class_name == DIALOG_CLASS
+}
+
+fn is_file_dialog_content_class(class_name: &str) -> bool {
+    matches!(
+        class_name,
+        "DUIViewWndClassName" | "DirectUIHWND" | "SHELLDLL_DefView"
+    )
+}
+
+fn is_file_dialog_content_control(class_name: &str, control_id: i32) -> bool {
+    is_file_dialog_content_class(class_name)
+        || (control_id == ADDRESS_BAR_EDIT_CONTROL_ID && class_name.eq_ignore_ascii_case("Edit"))
+}
+
+#[derive(Default)]
+struct DialogContentProbe {
+    has_descendant: bool,
+    has_file_dialog_content: bool,
+}
+
+fn file_dialog_content_is_present_or_pending(hwnd: HWND) -> bool {
+    let mut probe = DialogContentProbe::default();
+    unsafe {
+        EnumChildWindows(
+            hwnd,
+            Some(find_file_dialog_content),
+            (&mut probe as *mut DialogContentProbe) as LPARAM,
+        );
+    }
+    dialog_content_probe_allows_file_dialog(probe.has_descendant, probe.has_file_dialog_content)
+}
+
+fn dialog_content_probe_allows_file_dialog(
+    has_descendant: bool,
+    has_file_dialog_content: bool,
+) -> bool {
+    !has_descendant || has_file_dialog_content
+}
+
+unsafe extern "system" fn find_file_dialog_content(hwnd: HWND, l_param: LPARAM) -> BOOL {
+    let probe = unsafe { &mut *(l_param as *mut DialogContentProbe) };
+    probe.has_descendant = true;
+    if class_name(hwnd).is_some_and(|class_name| {
+        is_file_dialog_content_control(&class_name, unsafe { GetDlgCtrlID(hwnd) })
+    }) {
+        probe.has_file_dialog_content = true;
+        return FALSE;
+    }
+
+    TRUE
 }
 
 fn unsupported_foreground_window_message() -> Option<String> {
@@ -3658,6 +3720,22 @@ mod tests {
     }
 
     #[test]
+    fn event_driven_scan_returns_to_recovery_interval_after_preload_burst() {
+        let recovery_interval = Duration::from_secs(5);
+
+        assert_eq!(Duration::from_secs(1), HOOK_PRELOAD_BURST_DURATION);
+        assert_eq!(Duration::from_millis(100), HOOK_EVENT_BURST_RESCAN_INTERVAL);
+        assert_eq!(
+            recovery_interval,
+            hook_scan_interval(false, true, false, true, recovery_interval)
+        );
+        assert_eq!(
+            HOOK_EVENT_BURST_RESCAN_INTERVAL,
+            hook_scan_interval(false, true, true, true, recovery_interval)
+        );
+    }
+
+    #[test]
     fn parent_monitor_uses_a_waitable_process_handle() {
         let current_process = open_process_for_exit_wait(std::process::id()).unwrap();
 
@@ -4173,6 +4251,31 @@ mod tests {
     #[test]
     fn supported_dialog_shape_rejects_non_dialog_class() {
         assert!(!is_supported_dialog_shape("Chrome_WidgetWin_1"));
+    }
+
+    #[test]
+    fn file_dialog_content_rejects_controls_from_generic_system_dialogs() {
+        assert!(is_file_dialog_content_control("DUIViewWndClassName", 0));
+        assert!(is_file_dialog_content_control("DirectUIHWND", 0));
+        assert!(is_file_dialog_content_control("SHELLDLL_DefView", 0));
+        assert!(is_file_dialog_content_control(
+            "Edit",
+            ADDRESS_BAR_EDIT_CONTROL_ID
+        ));
+
+        // Win+R and other generic #32770 dialogs are composed from these controls.
+        assert!(!is_file_dialog_content_control("Edit", 1001));
+        assert!(!is_file_dialog_content_control("ComboBox", 1001));
+        assert!(!is_file_dialog_content_control("Button", 1));
+        assert!(!is_file_dialog_content_control("Static", 0));
+        assert!(!is_file_dialog_content_control("SysTabControl32", 12320));
+    }
+
+    #[test]
+    fn active_dialog_content_allows_empty_construction_but_rejects_populated_generic_dialogs() {
+        assert!(dialog_content_probe_allows_file_dialog(false, false));
+        assert!(dialog_content_probe_allows_file_dialog(true, true));
+        assert!(!dialog_content_probe_allows_file_dialog(true, false));
     }
 
     #[test]

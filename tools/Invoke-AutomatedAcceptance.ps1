@@ -43,11 +43,22 @@ if (-not (Test-PathUnderRoot -Path $PackageDirectory -Root $artifactsRoot) -or
     throw "Package and results directories must remain under '$artifactsRoot'."
 }
 
+if ($PackageDirectory.Equals($artifactsRoot, [StringComparison]::OrdinalIgnoreCase) -or
+    $ResultsDirectory.Equals($artifactsRoot, [StringComparison]::OrdinalIgnoreCase)) {
+    throw "Package and results directories must be children of '$artifactsRoot', not the artifacts root itself."
+}
+
+if ($PackageDirectory.Equals($ResultsDirectory, [StringComparison]::OrdinalIgnoreCase)) {
+    throw "PackageDirectory and ResultsDirectory must be different directories."
+}
+
+$packageDataDirectory = [IO.Path]::GetFullPath((Join-Path $PackageDirectory "data"))
+
 if (Test-Path -LiteralPath $zipPath) {
     Remove-Item -LiteralPath $zipPath -Force
 }
 
-function Remove-DirectoryWithRetry {
+function Remove-PathWithRetry {
     param([Parameter(Mandatory = $true)][string]$Path)
 
     $lastError = $null
@@ -67,12 +78,90 @@ function Remove-DirectoryWithRetry {
     throw "Could not remove '$Path' after waiting 5 seconds for transient file handles: $($lastError.Exception.Message)"
 }
 
-foreach ($directory in @($PackageDirectory, $ResultsDirectory)) {
-    if (Test-Path -LiteralPath $directory) {
-        Remove-DirectoryWithRetry -Path $directory
-    }
-    New-Item -ItemType Directory -Path $directory -Force | Out-Null
+function Remove-DirectoryWithRetry {
+    param([Parameter(Mandatory = $true)][string]$Path)
+
+    Remove-PathWithRetry -Path $Path
 }
+
+function Clear-PackageDirectoryPreservingData {
+    param(
+        [Parameter(Mandatory = $true)][string]$PackagePath,
+        [Parameter(Mandatory = $true)][string]$DataDirectory
+    )
+
+    if (-not (Test-Path -LiteralPath $PackagePath)) {
+        New-Item -ItemType Directory -Path $PackagePath -Force | Out-Null
+        return
+    }
+
+    $fullPackagePath = [IO.Path]::GetFullPath($PackagePath)
+    $fullDataDirectory = [IO.Path]::GetFullPath($DataDirectory)
+    if (-not (Test-PathUnderRoot -Path $fullDataDirectory -Root $fullPackagePath) -or
+        $fullDataDirectory.Equals($fullPackagePath, [StringComparison]::OrdinalIgnoreCase)) {
+        throw "The preserved data directory must be a child of PackageDirectory."
+    }
+
+    foreach ($item in Get-ChildItem -LiteralPath $fullPackagePath -Force) {
+        $fullItemPath = [IO.Path]::GetFullPath($item.FullName)
+        if ($item.PSIsContainer -and
+            $fullItemPath.Equals($fullDataDirectory, [StringComparison]::OrdinalIgnoreCase)) {
+            Write-Host "Preserving indexed data directory: $fullDataDirectory"
+            continue
+        }
+
+        if (-not (Test-PathUnderRoot -Path $fullItemPath -Root $fullPackagePath) -or
+            $fullItemPath.Equals($fullPackagePath, [StringComparison]::OrdinalIgnoreCase)) {
+            throw "Refusing to remove package item outside PackageDirectory: '$fullItemPath'."
+        }
+
+        Remove-PathWithRetry -Path $fullItemPath
+    }
+}
+
+function Get-PackageFilesForArchive {
+    param(
+        [Parameter(Mandatory = $true)][string]$PackagePath,
+        [Parameter(Mandatory = $true)][string]$DataDirectory
+    )
+
+    return @(
+        Get-ChildItem -LiteralPath $PackagePath -Recurse -Force -File |
+            Where-Object { -not (Test-PathUnderRoot -Path $_.FullName -Root $DataDirectory) }
+    )
+}
+
+function Compress-PackageArchive {
+    param(
+        [Parameter(Mandatory = $true)][string]$PackagePath,
+        [Parameter(Mandatory = $true)][string]$DataDirectory,
+        [Parameter(Mandatory = $true)][string]$DestinationPath
+    )
+
+    $fullDataDirectory = [IO.Path]::GetFullPath($DataDirectory)
+    $archiveItems = @(
+        Get-ChildItem -LiteralPath $PackagePath -Force |
+            Where-Object {
+                -not ([IO.Path]::GetFullPath($_.FullName).Equals(
+                    $fullDataDirectory,
+                    [StringComparison]::OrdinalIgnoreCase))
+            } |
+            ForEach-Object { $_.FullName }
+    )
+
+    if ($archiveItems.Count -eq 0) {
+        throw "No distributable files were found in '$PackagePath'."
+    }
+
+    Compress-Archive -LiteralPath $archiveItems -DestinationPath $DestinationPath -Force
+}
+
+Clear-PackageDirectoryPreservingData -PackagePath $PackageDirectory -DataDirectory $packageDataDirectory
+
+if (Test-Path -LiteralPath $ResultsDirectory) {
+    Remove-DirectoryWithRetry -Path $ResultsDirectory
+}
+New-Item -ItemType Directory -Path $ResultsDirectory -Force | Out-Null
 
 function Invoke-LoggedCommand {
     param(
@@ -357,7 +446,10 @@ foreach ($relativePath in @(
 }
 
 if ($SkipDesktopE2E) {
-    Compress-Archive -Path (Join-Path $PackageDirectory "*") -DestinationPath $zipPath -Force
+    Compress-PackageArchive `
+        -PackagePath $PackageDirectory `
+        -DataDirectory $packageDataDirectory `
+        -DestinationPath $zipPath
     [pscustomobject]@{
         SchemaVersion = 1
         GeneratedAtUtc = [DateTimeOffset]::UtcNow
@@ -1566,7 +1658,10 @@ if ($missingCoverage.Count -gt 0) {
     throw "Automation coverage evidence is missing:`n$($details -join "`n")"
 }
 
-Compress-Archive -Path (Join-Path $PackageDirectory "*") -DestinationPath $zipPath -Force
+Compress-PackageArchive `
+    -PackagePath $PackageDirectory `
+    -DataDirectory $packageDataDirectory `
+    -DestinationPath $zipPath
 
 Add-Type -AssemblyName System.IO.Compression.FileSystem
 $archive = [IO.Compression.ZipFile]::OpenRead($zipPath)
@@ -1579,7 +1674,7 @@ try {
         }
     }
 
-    $publishedFiles = @(Get-ChildItem -LiteralPath $PackageDirectory -Recurse -File | ForEach-Object {
+    $publishedFiles = @(Get-PackageFilesForArchive -PackagePath $PackageDirectory -DataDirectory $packageDataDirectory | ForEach-Object {
         [pscustomobject]@{
             Path = [IO.Path]::GetRelativePath($PackageDirectory, $_.FullName).Replace('\', '/')
             FullName = $_.FullName

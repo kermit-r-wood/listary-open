@@ -44,6 +44,9 @@ public sealed class SettingsXamlTests
         Assert.Contains("SettingsOptionDisplayConverter", xaml);
         Assert.Contains("x:Name=\"SettingsNavigation\"", xaml);
         Assert.Contains("AutomationProperties.AutomationId=\"SettingsWindow\"", xaml);
+        Assert.Contains("Title=\"ListaryOpen\"", xaml);
+        Assert.Contains("x:Name=\"SettingsWindowTitle\"", xaml);
+        Assert.Contains("Text=\"ListaryOpen Options\"", xaml);
         Assert.Contains("AutomationProperties.AutomationId=\"SettingsNavigation\"", xaml);
         Assert.Contains("AutomationProperties.AutomationId=\"SettingsAppearanceTab\"", xaml);
         Assert.Contains("AutomationProperties.AutomationId=\"SettingsThemeSelector\"", xaml);

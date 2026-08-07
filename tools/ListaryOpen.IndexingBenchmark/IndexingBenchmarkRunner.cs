@@ -1,4 +1,5 @@
 using System.Diagnostics;
+using System.Runtime.InteropServices;
 using ListaryOpen.Core.Indexing;
 
 namespace ListaryOpen.IndexingBenchmark;
@@ -68,11 +69,22 @@ internal static class IndexingBenchmarkRunner
         Func<Stopwatch, Task<BenchmarkOutcome>> action)
     {
         ForceGarbageCollection();
+        using var process = Process.GetCurrentProcess();
+        process.Refresh();
+        var processorBefore = process.TotalProcessorTime;
+        _ = TryReadIoCounters(process, out var ioBefore);
         var allocatedBefore = GC.GetTotalAllocatedBytes(precise: true);
         var stopwatch = Stopwatch.StartNew();
         var outcome = await action(stopwatch).ConfigureAwait(false);
         stopwatch.Stop();
         var allocatedBytes = GC.GetTotalAllocatedBytes(precise: true) - allocatedBefore;
+        process.Refresh();
+        var processorMilliseconds = Math.Max(
+            0,
+            (process.TotalProcessorTime - processorBefore).TotalMilliseconds);
+        _ = TryReadIoCounters(process, out var ioAfter);
+        var readTransferBytes = PositiveDelta(ioAfter.ReadTransferCount, ioBefore.ReadTransferCount);
+        var writeTransferBytes = PositiveDelta(ioAfter.WriteTransferCount, ioBefore.WriteTransferCount);
 
         if (outcome.ProcessedOperations != operations)
         {
@@ -88,8 +100,14 @@ internal static class IndexingBenchmarkRunner
             operations,
             elapsedMilliseconds,
             operations / Math.Max(stopwatch.Elapsed.TotalSeconds, double.Epsilon),
+            processorMilliseconds,
+            processorMilliseconds / Math.Max(elapsedMilliseconds, double.Epsilon) /
+                Math.Max(Environment.ProcessorCount, 1) * 100d,
+            readTransferBytes,
+            writeTransferBytes,
             allocatedBytes,
             allocatedBytes / (double)operations,
+            outcome.StorageFootprintBytes,
             outcome.FirstRecordMilliseconds,
             outcome.SemanticChecksum);
     }
@@ -175,6 +193,32 @@ internal static class IndexingBenchmarkRunner
         foreach (var baseline in variants)
         {
             AddIfCaptured(
+                await BenchmarkScenarios.MeasureSqliteRescanAsync(
+                    records.Take(options.SqliteRecords).ToArray(),
+                    baseline,
+                    repeat,
+                    scratchDirectory,
+                    cancellationToken),
+                capture,
+                runs);
+        }
+
+        foreach (var baseline in variants)
+        {
+            AddIfCaptured(
+                await BenchmarkScenarios.MeasureSqliteReconciliationAsync(
+                    records.Take(options.SqliteRecords).ToArray(),
+                    baseline,
+                    repeat,
+                    scratchDirectory,
+                    cancellationToken),
+                capture,
+                runs);
+        }
+
+        foreach (var baseline in variants)
+        {
+            AddIfCaptured(
                 await BenchmarkScenarios.MeasureProgressDispatchAsync(
                     options.ProgressBatches,
                     baseline,
@@ -194,7 +238,8 @@ internal static class IndexingBenchmarkRunner
                 $@"C:\benchmark\folder-{index % 128:D3}\file-{index:D8}-项目.txt",
                 isDirectory: false,
                 sizeBytes: index + 1L,
-                lastWriteTime: timestamp.AddSeconds(index));
+                lastWriteTime: timestamp.AddSeconds(index),
+                fileReferenceNumber: (ulong)index + 1);
         }
 
         return records;
@@ -231,6 +276,37 @@ internal static class IndexingBenchmarkRunner
         {
         }
     }
+
+    private static bool TryReadIoCounters(Process process, out IoCounters counters)
+    {
+        counters = default;
+        return OperatingSystem.IsWindows() && GetProcessIoCounters(process.Handle, out counters);
+    }
+
+    private static long PositiveDelta(ulong after, ulong before)
+    {
+        if (after <= before)
+        {
+            return 0;
+        }
+
+        return (long)Math.Min(after - before, (ulong)long.MaxValue);
+    }
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool GetProcessIoCounters(IntPtr processHandle, out IoCounters counters);
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct IoCounters
+    {
+        public ulong ReadOperationCount;
+        public ulong WriteOperationCount;
+        public ulong OtherOperationCount;
+        public ulong ReadTransferCount;
+        public ulong WriteTransferCount;
+        public ulong OtherTransferCount;
+    }
 }
 
 internal sealed record BenchmarkOutcome(
@@ -238,4 +314,5 @@ internal sealed record BenchmarkOutcome(
     long SemanticChecksum,
     double? FirstRecordMilliseconds = null,
     string? FirstPath = null,
-    string? LastPath = null);
+    string? LastPath = null,
+    long StorageFootprintBytes = 0);

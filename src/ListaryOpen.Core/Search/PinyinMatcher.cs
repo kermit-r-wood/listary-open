@@ -51,13 +51,15 @@ public static class PinyinMatcher
             return string.Empty;
         }
 
-        var normalized = value.Trim().ToLowerInvariant();
-        // Fast path: pure ASCII needs no TinyPinyin/AnyAscii work (common on full-path indexing).
-        if (ClassifyTransliterationNeed(normalized) == TransliterationNeed.None)
+        // Classify before Trim/ToLowerInvariant. The overwhelming majority of indexed
+        // paths are ASCII and need no aliases, so avoid allocating a lower-cased copy
+        // for every record in a multi-million-file scan.
+        if (ClassifyTransliterationNeed(value) == TransliterationNeed.None)
         {
             return string.Empty;
         }
 
+        var normalized = value.Trim().ToLowerInvariant();
         return CreateSearchAliases(normalized, CreateCandidateForms(normalized));
     }
 

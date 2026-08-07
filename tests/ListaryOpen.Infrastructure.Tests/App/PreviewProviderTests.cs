@@ -1061,8 +1061,9 @@ public sealed class PreviewProviderTests
     [InlineData(".docx", "Document", "ExtractedContent", true)]
     [InlineData(".pdf", "Pdf", "Metadata", true)]
     [InlineData(".cbz", "Archive", "ExtractedContent", true)]
-    [InlineData(".opus", "Media", "Metadata", true)]
-    [InlineData(".m4b", "Media", "Metadata", true)]
+    [InlineData(".opus", "Media", "Metadata", false)]
+    [InlineData(".m4b", "Media", "Metadata", false)]
+    [InlineData(".mp3", "Media", "Metadata", false)]
     [InlineData(".cr3", "ShellThumbnail", "Thumbnail", true)]
     [InlineData(".raf", "ShellThumbnail", "Thumbnail", true)]
     [InlineData(".xps", "Document", "ExtractedContent", true)]
@@ -2349,6 +2350,26 @@ public sealed class PreviewProviderTests
     }
 
     [Fact]
+    public async Task DefaultCoordinatorPreviewsStlWithoutAWindowsPreviewHandler()
+    {
+        using var temporary = new TemporaryFile("机械臂模型.stl");
+        var stl = new byte[134];
+        BinaryPrimitives.WriteUInt32LittleEndian(stl.AsSpan(80), 1);
+        WriteSingle(stl, 96, 0); WriteSingle(stl, 100, 0); WriteSingle(stl, 104, 0);
+        WriteSingle(stl, 108, 4); WriteSingle(stl, 112, 0); WriteSingle(stl, 116, 0);
+        WriteSingle(stl, 120, 0); WriteSingle(stl, 124, 5); WriteSingle(stl, 128, 0);
+        await File.WriteAllBytesAsync(temporary.Path, stl);
+        var context = Context(temporary.Path);
+
+        Assert.False(PreviewCoordinator.ShouldPreferSystemPreview(context));
+        var preview = await new PreviewCoordinator().LoadAsync(context, CancellationToken.None);
+
+        Assert.Equal("3D geometry summary", preview?.Source);
+        Assert.Contains("Binary STL", preview?.Text);
+        Assert.Contains("Dimensions: 4 × 5 × 0", preview?.Text);
+    }
+
+    [Fact]
     public async Task ModelProviderSummarizesGltfWithoutFollowingExternalUris()
     {
         using var temporary = new TemporaryFile("sample.gltf");
@@ -2447,6 +2468,27 @@ public sealed class PreviewProviderTests
         Assert.Equal(temporary.Path, preview?.MediaPath);
         Assert.Contains("2 channel(s), 44100 Hz, 16 bit", preview?.Text);
         Assert.Contains("00:00:01", preview?.Text);
+    }
+
+    [Fact]
+    public async Task DefaultCoordinatorUsesBuiltInPlayerForUnicodeMp3Path()
+    {
+        using var temporary = new TemporaryFile(
+            "《第一律法 卷二：世界边缘》：金钱问题 - 机核 GCORES.mp3");
+        await File.WriteAllBytesAsync(
+            temporary.Path,
+            [
+                (byte)'I', (byte)'D', (byte)'3', 4, 0, 0, 0, 0, 0, 0,
+                0xFF, 0xFB, 0x90, 0x64
+            ]);
+        var context = Context(temporary.Path);
+
+        Assert.False(PreviewCoordinator.ShouldPreferSystemPreview(context));
+        var preview = await new PreviewCoordinator().LoadAsync(context, CancellationToken.None);
+
+        Assert.Equal(PreviewContentKind.Media, preview?.Kind);
+        Assert.Equal("Built-in media player", preview?.Source);
+        Assert.Equal(temporary.Path, preview?.MediaPath);
     }
 
     [Fact]

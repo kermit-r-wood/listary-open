@@ -20,6 +20,9 @@ internal sealed class PreviewCoordinator
             new FontPreviewProvider(),
             new SvgPreviewProvider(),
             new MediaPreviewProvider(),
+            // The managed model readers are strictly byte/triangle bounded. Keep them
+            // in-process so STL/OBJ previews do not depend on the optional worker.
+            new ModelPreviewProvider(),
             new PdfPagePreviewProvider(),
             new ShellThumbnailPreviewProvider(),
             new IsolatedTextPreviewProvider(),

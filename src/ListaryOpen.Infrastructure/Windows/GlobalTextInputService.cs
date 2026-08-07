@@ -183,12 +183,22 @@ public sealed class GlobalEditCommandInputEventArgs : EventArgs
     public bool Handled { get; set; }
 }
 
+internal enum OverlayEscapeHookAction
+{
+    None,
+    SuppressAndNotify,
+    SuppressUntilRelease,
+    SuppressRelease
+}
+
 public sealed class GlobalTextInputService : IDisposable
 {
     private const int WhKeyboardLowLevel = 13;
     private const int WhMouseLowLevel = 14;
     private const int WmKeyDown = 0x0100;
+    private const int WmKeyUp = 0x0101;
     private const int WmSystemKeyDown = 0x0104;
+    private const int WmSystemKeyUp = 0x0105;
     private const int WmLeftButtonDown = 0x0201;
     private const int WmRightButtonDown = 0x0204;
     private const int WmMiddleButtonDown = 0x0207;
@@ -218,6 +228,7 @@ public sealed class GlobalTextInputService : IDisposable
     private bool _disposed;
     private int _captureOverlayInput;
     private int _captureExplorerMenuInput;
+    private int _suppressedOverlayEscape;
     private IntPtr _dialogInputWindow;
     private uint _lastLeftButtonTime;
     private NativePoint _lastLeftButtonPoint;
@@ -341,6 +352,7 @@ public sealed class GlobalTextInputService : IDisposable
             _mouseHookHandle = IntPtr.Zero;
         }
 
+        Interlocked.Exchange(ref _suppressedOverlayEscape, 0);
         _disposed = true;
     }
 
@@ -396,12 +408,38 @@ public sealed class GlobalTextInputService : IDisposable
     {
         try
         {
-            if (code >= 0 && IsKeyDownMessage(message))
+            if (code >= 0 && (IsKeyDownMessage(message) || IsKeyUpMessage(message)))
             {
                 var data = Marshal.PtrToStructure<LowLevelKeyboardInput>(dataPointer);
                 if (AcceptInjectedInputForTesting ||
                     (data.Flags & (LlkhfInjected | LlkhfLowerIlInjected)) == 0)
                 {
+                    var isKeyDown = IsKeyDownMessage(message);
+                    var escapeAction = GetOverlayEscapeHookAction(
+                        data.VirtualKey,
+                        isKeyDown,
+                        IsKeyUpMessage(message),
+                        CaptureOverlayInput,
+                        HasCommandModifier(),
+                        Volatile.Read(ref _suppressedOverlayEscape) != 0);
+                    switch (escapeAction)
+                    {
+                        case OverlayEscapeHookAction.SuppressAndNotify:
+                            Interlocked.Exchange(ref _suppressedOverlayEscape, 1);
+                            RaiseEscapePressed();
+                            return new IntPtr(1);
+                        case OverlayEscapeHookAction.SuppressUntilRelease:
+                            return new IntPtr(1);
+                        case OverlayEscapeHookAction.SuppressRelease:
+                            Interlocked.Exchange(ref _suppressedOverlayEscape, 0);
+                            return new IntPtr(1);
+                    }
+
+                    if (!isKeyDown)
+                    {
+                        return CallNextHookEx(_hookHandle, code, message, dataPointer);
+                    }
+
                     var shortcutIndex = GetOverlayResultShortcutIndex(
                         data.VirtualKey,
                         IsKeyDown(VkControl),
@@ -444,14 +482,6 @@ public sealed class GlobalTextInputService : IDisposable
                         {
                             return new IntPtr(1);
                         }
-                    }
-                    else if (ShouldCaptureOverlayEscape(
-                        data.VirtualKey,
-                        CaptureOverlayInput,
-                        HasCommandModifier()))
-                    {
-                        RaiseEscapePressed();
-                        return new IntPtr(1);
                     }
                     else if (!HasCommandModifier()
                         && TryGetSupportedInputContext(
@@ -704,10 +734,49 @@ public sealed class GlobalTextInputService : IDisposable
         bool hasCommandModifier) =>
         captureOverlayInput && !hasCommandModifier && virtualKey == VkEscape;
 
+    internal static OverlayEscapeHookAction GetOverlayEscapeHookAction(
+        uint virtualKey,
+        bool isKeyDown,
+        bool isKeyUp,
+        bool captureOverlayInput,
+        bool hasCommandModifier,
+        bool escapeWasSuppressed)
+    {
+        if (virtualKey != VkEscape)
+        {
+            return OverlayEscapeHookAction.None;
+        }
+
+        if (isKeyUp && escapeWasSuppressed)
+        {
+            return OverlayEscapeHookAction.SuppressRelease;
+        }
+
+        if (!isKeyDown)
+        {
+            return OverlayEscapeHookAction.None;
+        }
+
+        if (escapeWasSuppressed)
+        {
+            return OverlayEscapeHookAction.SuppressUntilRelease;
+        }
+
+        return ShouldCaptureOverlayEscape(virtualKey, captureOverlayInput, hasCommandModifier)
+            ? OverlayEscapeHookAction.SuppressAndNotify
+            : OverlayEscapeHookAction.None;
+    }
+
     private static bool IsKeyDownMessage(IntPtr message)
     {
         var value = message.ToInt64();
         return value is WmKeyDown or WmSystemKeyDown;
+    }
+
+    private static bool IsKeyUpMessage(IntPtr message)
+    {
+        var value = message.ToInt64();
+        return value is WmKeyUp or WmSystemKeyUp;
     }
 
     private static bool IsPointerDownMessage(IntPtr message)

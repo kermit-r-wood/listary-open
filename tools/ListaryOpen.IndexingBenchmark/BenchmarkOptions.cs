@@ -101,7 +101,7 @@ internal sealed record BenchmarkOptions(
         Console.WriteLine("Usage: dotnet run -c Release --project tools/ListaryOpen.IndexingBenchmark -- [options]");
         Console.WriteLine("  --records N             Async-enumerator and writer records (default 20000)");
         Console.WriteLine("  --pipeline-records N    Paced helper-pipeline records (default 4096)");
-        Console.WriteLine("  --sqlite-records N      SQLite upserts per variant (default 5000)");
+        Console.WriteLine("  --sqlite-records N      SQLite upserts/rescan rows per variant (default 5000)");
         Console.WriteLine("  --progress-batches N    Logical batches for throttle ablation (default 100000)");
         Console.WriteLine("  --repeats N             Measured repetitions (default 5)");
         Console.WriteLine("  --warmups N             Unmeasured repetitions (default 1)");

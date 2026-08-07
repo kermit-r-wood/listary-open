@@ -120,7 +120,7 @@ public sealed class ContinuousIndexingService : IDisposable
     private readonly Task _worker;
     private readonly List<IIndexRootWatcher> _watchers = new();
     private volatile PathFilterSnapshot _filter;
-    private volatile TaskCompletionSource _baselineReady = CreateReadySource();
+    private TaskCompletionSource _baselineReady = CreateReadySource();
     private int _reconciliationRequested;
     private bool _started;
     private bool _disposed;
@@ -215,17 +215,31 @@ public sealed class ContinuousIndexingService : IDisposable
     public void PauseUntilBaselineReady()
     {
         ThrowIfDisposed();
-        if (_baselineReady.Task.IsCompleted)
+        while (true)
         {
-            _baselineReady = CreateReadySource();
+            var current = Volatile.Read(ref _baselineReady);
+            if (!current.Task.IsCompleted)
+            {
+                return;
+            }
+
+            var replacement = CreateReadySource();
+            if (ReferenceEquals(
+                    Interlocked.CompareExchange(ref _baselineReady, replacement, current),
+                    current))
+            {
+                return;
+            }
         }
     }
 
-    public void MarkBaselineReady() => _baselineReady.TrySetResult();
+    public void MarkBaselineReady() => Volatile.Read(ref _baselineReady).TrySetResult();
 
     public void NotifyReconciliationCompleted() => Interlocked.Exchange(ref _reconciliationRequested, 0);
 
     internal bool TryEnqueueForTests(FileChangeHint hint) => TryEnqueue(hint);
+
+    internal void ReportWatcherErrorForTests(Exception exception) => OnWatcherError(exception);
 
     public void Dispose()
     {
@@ -295,7 +309,9 @@ public sealed class ContinuousIndexingService : IDisposable
                     DrainAvailableHints(pending);
                 }
 
-                await _baselineReady.Task.WaitAsync(cancellationToken).ConfigureAwait(false);
+                await Volatile.Read(ref _baselineReady).Task
+                    .WaitAsync(cancellationToken)
+                    .ConfigureAwait(false);
                 try
                 {
                     await ApplyPendingAsync(pending, cancellationToken).ConfigureAwait(false);
@@ -374,6 +390,7 @@ public sealed class ContinuousIndexingService : IDisposable
         IReadOnlyDictionary<string, PendingPathAction> pending,
         CancellationToken cancellationToken)
     {
+        var batch = new List<LiveIndexChange>(ApplyBatchSize);
         foreach (var pair in pending)
         {
             cancellationToken.ThrowIfCancellationRequested();
@@ -384,45 +401,50 @@ public sealed class ContinuousIndexingService : IDisposable
 
             if (pair.Value == PendingPathAction.Delete)
             {
-                await _sink.ApplyAsync(
-                    new[] { LiveIndexChange.DeletePathAndDescendants(pair.Key) },
-                    cancellationToken).ConfigureAwait(false);
+                batch.Add(LiveIndexChange.DeletePathAndDescendants(pair.Key));
+                await FlushBatchIfFullAsync(batch, cancellationToken).ConfigureAwait(false);
                 continue;
             }
 
             await RefreshPathAsync(
                 pair.Key,
                 recursive: pair.Value == PendingPathAction.RefreshRecursively,
+                batch,
                 cancellationToken).ConfigureAwait(false);
         }
+
+        await FlushBatchAsync(batch, cancellationToken).ConfigureAwait(false);
     }
 
-    private async Task RefreshPathAsync(string path, bool recursive, CancellationToken cancellationToken)
+    private async Task RefreshPathAsync(
+        string path,
+        bool recursive,
+        List<LiveIndexChange> batch,
+        CancellationToken cancellationToken)
     {
         if (File.Exists(path))
         {
             var fileRecord = TryCreateFileRecord(path);
             if (fileRecord is not null)
             {
-                await _sink.ApplyAsync(new[] { LiveIndexChange.Upsert(fileRecord) }, cancellationToken)
-                    .ConfigureAwait(false);
+                batch.Add(LiveIndexChange.Upsert(fileRecord));
+                await FlushBatchIfFullAsync(batch, cancellationToken).ConfigureAwait(false);
             }
             return;
         }
 
         if (!Directory.Exists(path))
         {
-            await _sink.ApplyAsync(
-                new[] { LiveIndexChange.DeletePathAndDescendants(path) },
-                cancellationToken).ConfigureAwait(false);
+            batch.Add(LiveIndexChange.DeletePathAndDescendants(path));
+            await FlushBatchIfFullAsync(batch, cancellationToken).ConfigureAwait(false);
             return;
         }
 
         var directoryRecord = TryCreateDirectoryRecord(path);
         if (directoryRecord is not null)
         {
-            await _sink.ApplyAsync(new[] { LiveIndexChange.Upsert(directoryRecord) }, cancellationToken)
-                .ConfigureAwait(false);
+            batch.Add(LiveIndexChange.Upsert(directoryRecord));
+            await FlushBatchIfFullAsync(batch, cancellationToken).ConfigureAwait(false);
         }
 
         if (!recursive)
@@ -430,7 +452,6 @@ public sealed class ContinuousIndexingService : IDisposable
             return;
         }
 
-        var batch = new List<LiveIndexChange>(ApplyBatchSize);
         foreach (var record in EnumerateSubtree(path, cancellationToken))
         {
             if (!_filter.ShouldInclude(record.FullPath))
@@ -439,19 +460,24 @@ public sealed class ContinuousIndexingService : IDisposable
             }
 
             batch.Add(LiveIndexChange.Upsert(record));
-            if (batch.Count < ApplyBatchSize)
-            {
-                continue;
-            }
-
-            await _sink.ApplyAsync(batch.ToArray(), cancellationToken).ConfigureAwait(false);
-            batch.Clear();
+            await FlushBatchIfFullAsync(batch, cancellationToken).ConfigureAwait(false);
         }
+    }
 
-        if (batch.Count > 0)
+    private Task FlushBatchIfFullAsync(List<LiveIndexChange> batch, CancellationToken cancellationToken) =>
+        batch.Count >= ApplyBatchSize
+            ? FlushBatchAsync(batch, cancellationToken)
+            : Task.CompletedTask;
+
+    private async Task FlushBatchAsync(List<LiveIndexChange> batch, CancellationToken cancellationToken)
+    {
+        if (batch.Count == 0)
         {
-            await _sink.ApplyAsync(batch, cancellationToken).ConfigureAwait(false);
+            return;
         }
+
+        await _sink.ApplyAsync(batch.ToArray(), cancellationToken).ConfigureAwait(false);
+        batch.Clear();
     }
 
     private IEnumerable<FileRecord> EnumerateSubtree(string rootPath, CancellationToken cancellationToken)
@@ -573,6 +599,16 @@ public sealed class ContinuousIndexingService : IDisposable
 
     private void RequestReconciliationOnce()
     {
+        // A full scan (plus its NTFS post-scan journal catch-up) already covers
+        // changes observed while the baseline is being built. FileSystemWatcher
+        // buffers routinely overflow while millions of rows are scanned; queuing
+        // another full scan here makes a busy volume index forever. Hints that fit
+        // in the channel remain queued and are applied after the baseline opens.
+        if (!Volatile.Read(ref _baselineReady).Task.IsCompleted)
+        {
+            return;
+        }
+
         if (Interlocked.Exchange(ref _reconciliationRequested, 1) != 0)
         {
             return;

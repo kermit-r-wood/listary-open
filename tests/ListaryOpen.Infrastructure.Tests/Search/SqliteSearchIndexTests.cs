@@ -69,6 +69,383 @@ public sealed class SqliteSearchIndexTests
     }
 
     [Fact]
+    public async Task BulkFtsRebuildUsesBoundedTransactionsAndTruncatesWal()
+    {
+        var directory = Directory.CreateTempSubdirectory("listary-open-wal-");
+        var dbPath = Path.Combine(directory.FullName, "index.db");
+        try
+        {
+            await using var index = await SqliteSearchIndex.OpenAsync(dbPath, CancellationToken.None);
+            await index.BeginBulkIndexingAsync(CancellationToken.None);
+            var generation = await index.BeginIndexingRunAsync(CancellationToken.None);
+            var records = Enumerable.Range(0, 10_100)
+                .Select(number => FileRecord.Create(
+                    $@"C:\FtsBatch\item-{number:D5}-boundedwalmarker.txt",
+                    false,
+                    number,
+                    new DateTimeOffset(2026, 1, 2, 3, 4, 5, TimeSpan.Zero),
+                    fileReferenceNumber: unchecked((ulong)(number + 1))))
+                .ToArray();
+            await index.UpsertManyAsync(records, generation, CancellationToken.None);
+
+            await index.EndBulkIndexingAsync(CancellationToken.None);
+
+            await using var connection = new SqliteConnection($"Data Source={dbPath};Mode=ReadOnly;Pooling=False");
+            await connection.OpenAsync();
+            using var command = connection.CreateCommand();
+            command.CommandText = """
+                select count(*)
+                from files_fts_v1
+                where files_fts_v1 match 'boundedwalmarker';
+                """;
+            Assert.Equal(records.Length, Convert.ToInt32(await command.ExecuteScalarAsync()));
+
+            var walPath = dbPath + "-wal";
+            Assert.True(!File.Exists(walPath) || new FileInfo(walPath).Length <= 64 * 1024);
+        }
+        finally
+        {
+            directory.Delete(recursive: true);
+        }
+    }
+
+    [Fact]
+    public async Task DisposeCheckpointsWalAndReleasesAllDatabaseFiles()
+    {
+        var directory = Directory.CreateTempSubdirectory("listary-open-dispose-");
+        var dbPath = Path.Combine(directory.FullName, "index.db");
+        var index = await SqliteSearchIndex.OpenAsync(dbPath, CancellationToken.None);
+        await index.UpsertManyAsync(
+            Enumerable.Range(0, 1_000).Select(number => FileRecord.Create(
+                $@"C:\Dispose\release-{number:D4}.txt",
+                false,
+                number,
+                DateTimeOffset.UtcNow)),
+            CancellationToken.None);
+
+        await index.DisposeAsync();
+
+        foreach (var path in new[] { dbPath, dbPath + "-wal", dbPath + "-shm" })
+        {
+            if (!File.Exists(path))
+            {
+                continue;
+            }
+
+            using var stream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.None);
+            Assert.True(stream.CanRead);
+        }
+
+        directory.Delete(recursive: true);
+    }
+
+    [Fact]
+    public async Task OpenCreatesSparseShortAliasIndex()
+    {
+        var dbPath = CreateTempDbPath();
+        try
+        {
+            await using (var index = await SqliteSearchIndex.OpenAsync(dbPath, CancellationToken.None))
+            {
+                await index.WaitForBackgroundMaintenanceAsync();
+            }
+
+            await using var connection = new SqliteConnection($"Data Source={dbPath};Pooling=False");
+            await connection.OpenAsync();
+            using var command = connection.CreateCommand();
+            command.CommandText = """
+                select sql
+                from sqlite_master
+                where type = 'index'
+                  and name = 'ix_files_search_text_nonempty';
+                """;
+
+            var definition = Assert.IsType<string>(await command.ExecuteScalarAsync());
+            Assert.Contains("where search_text <> ''", definition, StringComparison.OrdinalIgnoreCase);
+        }
+        finally
+        {
+            DeleteIfExists(dbPath);
+        }
+    }
+
+    [Fact]
+    public async Task ExistingFullScanTouchesGenerationWithoutRebuildingReadyFts()
+    {
+        var dbPath = CreateTempDbPath();
+        var record = FileRecord.Create(
+            @"C:\Docs\ExistingRescanAlpha.txt",
+            false,
+            10,
+            new DateTimeOffset(2026, 1, 2, 3, 4, 5, TimeSpan.Zero),
+            fileReferenceNumber: 41);
+
+        try
+        {
+            await using var index = await SqliteSearchIndex.OpenAsync(dbPath, CancellationToken.None);
+            await index.UpsertAsync(record, CancellationToken.None);
+            await index.WaitForBackgroundMaintenanceAsync();
+            var rebuildCount = index.FtsRebuildCount;
+
+            await index.BeginBulkIndexingAsync(CancellationToken.None);
+            var generation = await index.BeginIndexingRunAsync(CancellationToken.None);
+            await index.UpsertManyAsync(
+                [record.WithFileReferenceNumber(42)],
+                generation,
+                CancellationToken.None);
+            await index.EndBulkIndexingAsync(CancellationToken.None);
+
+            Assert.Equal(rebuildCount, index.FtsRebuildCount);
+
+            await using var connection = new SqliteConnection($"Data Source={dbPath};Pooling=False");
+            await connection.OpenAsync();
+            using var generationCommand = connection.CreateCommand();
+            generationCommand.CommandText =
+                "select index_generation, file_reference from files where path_key = $path_key;";
+            generationCommand.Parameters.AddWithValue("$path_key", record.PathKey);
+            await using (var reader = await generationCommand.ExecuteReaderAsync())
+            {
+                Assert.True(await reader.ReadAsync());
+                Assert.Equal(generation, reader.GetInt64(0));
+                Assert.Equal(42, reader.GetInt64(1));
+            }
+
+            var results = await index.SearchAsync(
+                new SearchQuery("RescanAlpha", SearchMode.FilesAndFolders),
+                CancellationToken.None);
+            Assert.Contains(results, item => item.Record.FullPath == record.FullPath);
+        }
+        finally
+        {
+            DeleteIfExists(dbPath);
+        }
+    }
+
+    [Fact]
+    public async Task ExistingFullScanUpdatesChangedMetadataThroughReconciliationPath()
+    {
+        var dbPath = CreateTempDbPath();
+        var timestamp = new DateTimeOffset(2026, 1, 2, 3, 4, 5, TimeSpan.Zero);
+        var original = FileRecord.Create(
+            @"C:\Docs\ChangedMetadata.txt",
+            false,
+            10,
+            timestamp,
+            fileReferenceNumber: 100);
+        var changed = FileRecord.Create(
+            original.FullPath,
+            false,
+            99,
+            timestamp.AddHours(1),
+            fileReferenceNumber: 101);
+
+        try
+        {
+            await using var index = await SqliteSearchIndex.OpenAsync(dbPath, CancellationToken.None);
+            await index.UpsertAsync(original, CancellationToken.None);
+            await index.WaitForBackgroundMaintenanceAsync();
+            var rebuildCount = index.FtsRebuildCount;
+
+            await index.BeginBulkIndexingAsync(CancellationToken.None);
+            var generation = await index.BeginIndexingRunAsync(CancellationToken.None);
+            await index.UpsertManyAsync([changed], generation, CancellationToken.None);
+            await index.EndBulkIndexingAsync(CancellationToken.None);
+
+            Assert.Equal(rebuildCount, index.FtsRebuildCount);
+            var result = Assert.Single(
+                await index.SearchAsync(
+                    new SearchQuery("ChangedMetadata", SearchMode.FilesAndFolders),
+                    CancellationToken.None),
+                item => item.Record.PathKey == changed.PathKey);
+            Assert.Equal(changed.SizeBytes, result.Record.SizeBytes);
+            Assert.Equal(changed.LastWriteTime, result.Record.LastWriteTime);
+
+            await using var connection = new SqliteConnection($"Data Source={dbPath};Pooling=False");
+            await connection.OpenAsync();
+            using var command = connection.CreateCommand();
+            command.CommandText =
+                "select index_generation, file_reference from files where path_key = $path_key;";
+            command.Parameters.AddWithValue("$path_key", changed.PathKey);
+            await using var reader = await command.ExecuteReaderAsync();
+            Assert.True(await reader.ReadAsync());
+            Assert.Equal(generation, reader.GetInt64(0));
+            Assert.Equal(101, reader.GetInt64(1));
+        }
+        finally
+        {
+            DeleteIfExists(dbPath);
+        }
+    }
+
+    [Fact]
+    public async Task FileReferenceReconciliationDoesNotTouchCollidingPathOnAnotherVolume()
+    {
+        var dbPath = CreateTempDbPath();
+        var timestamp = new DateTimeOffset(2026, 1, 2, 3, 4, 5, TimeSpan.Zero);
+        var cRecord = FileRecord.Create(
+            @"C:\Docs\SameReference.txt",
+            false,
+            10,
+            timestamp,
+            fileReferenceNumber: 77);
+        var dRecord = FileRecord.Create(
+            @"D:\Docs\SameReference.txt",
+            false,
+            20,
+            timestamp,
+            fileReferenceNumber: 77);
+
+        try
+        {
+            await using var index = await SqliteSearchIndex.OpenAsync(dbPath, CancellationToken.None);
+            await index.UpsertManyAsync([cRecord, dRecord], CancellationToken.None);
+            await index.BeginBulkIndexingAsync(CancellationToken.None);
+            var generation = await index.BeginIndexingRunAsync(CancellationToken.None);
+            await index.UpsertManyAsync([cRecord], generation, CancellationToken.None);
+            await index.EndBulkIndexingAsync(CancellationToken.None);
+
+            await using var connection = new SqliteConnection($"Data Source={dbPath};Pooling=False");
+            await connection.OpenAsync();
+            using var command = connection.CreateCommand();
+            command.CommandText = """
+                select path_key, index_generation
+                from files
+                where file_reference = 77;
+                """;
+            var generations = new Dictionary<string, long>(StringComparer.Ordinal);
+            await using var reader = await command.ExecuteReaderAsync();
+            while (await reader.ReadAsync())
+            {
+                generations[reader.GetString(0)] = reader.GetInt64(1);
+            }
+
+            Assert.Equal(generation, generations[cRecord.PathKey]);
+            Assert.Equal(0, generations[dRecord.PathKey]);
+        }
+        finally
+        {
+            DeleteIfExists(dbPath);
+        }
+    }
+
+    [Fact]
+    public async Task IncompleteFtsRecoveryWaitsUntilMaintenanceIsRequested()
+    {
+        var dbPath = CreateTempDbPath();
+        var record = FileRecord.Create(
+            @"C:\Docs\DeferredRecovery.txt",
+            false,
+            10,
+            DateTimeOffset.UtcNow);
+
+        try
+        {
+            await using (var index = await SqliteSearchIndex.OpenAsync(dbPath, CancellationToken.None))
+            {
+                await index.BeginBulkIndexingAsync(CancellationToken.None);
+                var generation = await index.BeginIndexingRunAsync(CancellationToken.None);
+                await index.UpsertManyAsync([record], generation, CancellationToken.None);
+                await index.AbortBulkIndexingAsync(CancellationToken.None);
+            }
+
+            await using var reopened = await SqliteSearchIndex.OpenAsync(dbPath, CancellationToken.None);
+            Assert.Equal(0, reopened.FtsRebuildCount);
+
+            await reopened.WaitForBackgroundMaintenanceAsync();
+
+            Assert.Equal(1, reopened.FtsRebuildCount);
+            var results = await reopened.SearchAsync(
+                new SearchQuery("DeferredRecovery", SearchMode.FilesAndFolders),
+                CancellationToken.None);
+            Assert.Contains(results, item => item.Record.FullPath == record.FullPath);
+        }
+        finally
+        {
+            DeleteIfExists(dbPath);
+        }
+    }
+
+    [Fact]
+    public async Task AbortingBulkIndexingRestoresTriggersWithoutRebuildingFts()
+    {
+        var dbPath = CreateTempDbPath();
+        try
+        {
+            await using var index = await SqliteSearchIndex.OpenAsync(dbPath, CancellationToken.None);
+            await index.WaitForBackgroundMaintenanceAsync();
+            var rebuildCount = index.FtsRebuildCount;
+
+            await index.BeginBulkIndexingAsync(CancellationToken.None);
+            var generation = await index.BeginIndexingRunAsync(CancellationToken.None);
+            await index.UpsertManyAsync(
+                [
+                    FileRecord.Create(
+                        @"C:\Docs\CanceledScan.txt",
+                        false,
+                        10,
+                        DateTimeOffset.UtcNow)
+                ],
+                generation,
+                CancellationToken.None);
+            await index.AbortBulkIndexingAsync(CancellationToken.None);
+
+            Assert.Equal(rebuildCount, index.FtsRebuildCount);
+
+            await using var connection = new SqliteConnection($"Data Source={dbPath};Pooling=False");
+            await connection.OpenAsync();
+            using var command = connection.CreateCommand();
+            command.CommandText = """
+                select count(*)
+                from sqlite_master
+                where type = 'trigger'
+                  and name in (
+                    'files_fts_v1_insert',
+                    'files_fts_v1_delete',
+                    'files_fts_v1_update'
+                  );
+                """;
+            Assert.Equal(3, Convert.ToInt32(await command.ExecuteScalarAsync()));
+        }
+        finally
+        {
+            DeleteIfExists(dbPath);
+        }
+    }
+
+    [Fact]
+    public async Task LiveUpsertOfUnchangedRecordPreservesFullScanGeneration()
+    {
+        var dbPath = CreateTempDbPath();
+        var record = FileRecord.Create(
+            @"C:\Docs\Unchanged.txt",
+            false,
+            10,
+            new DateTimeOffset(2026, 1, 2, 3, 4, 5, TimeSpan.Zero));
+
+        try
+        {
+            await using (var index = await SqliteSearchIndex.OpenAsync(dbPath, CancellationToken.None))
+            {
+                var generation = await index.BeginIndexingRunAsync(CancellationToken.None);
+                await index.UpsertManyAsync([record], generation, CancellationToken.None);
+                await index.UpsertAsync(record, CancellationToken.None);
+            }
+
+            await using var connection = new SqliteConnection($"Data Source={dbPath};Pooling=False");
+            await connection.OpenAsync();
+            using var command = connection.CreateCommand();
+            command.CommandText = "select index_generation from files where path_key = $path_key;";
+            command.Parameters.AddWithValue("$path_key", record.PathKey);
+
+            Assert.True(Convert.ToInt64(await command.ExecuteScalarAsync()) > 0);
+        }
+        finally
+        {
+            DeleteIfExists(dbPath);
+        }
+    }
+
+    [Fact]
     public async Task OpenRejectsDatabaseCreatedByNewerApplication()
     {
         var dbPath = CreateTempDbPath();
@@ -315,6 +692,52 @@ public sealed class SqliteSearchIndexTests
 
                 var result = Assert.Single(results);
                 Assert.Equal("合同.docx", result.Record.Name);
+            }
+        }
+        finally
+        {
+            DeleteIfExists(dbPath);
+        }
+    }
+
+    [Fact]
+    public async Task SearchUsesExistingFtsSnapshotForChineseAndPinyinDuringBulkIndexing()
+    {
+        var dbPath = CreateTempDbPath();
+        const string targetName = "《第一律法 卷二：世界边缘》：金钱问题 - 机核 GCORES.mp3";
+
+        try
+        {
+            await using var index = await SqliteSearchIndex.OpenAsync(dbPath, CancellationToken.None);
+            var fillers = Enumerable.Range(0, 300)
+                .Select(number => FileRecord.Create(
+                    $"C:\\Docs\\A-filler-{number:D4}.txt",
+                    false,
+                    10,
+                    DateTimeOffset.UtcNow))
+                .ToArray();
+            await index.UpsertManyAsync(fillers, CancellationToken.None);
+            await index.UpsertAsync(
+                FileRecord.Create($"C:\\Docs\\{targetName}", false, 10, DateTimeOffset.UtcNow),
+                CancellationToken.None);
+            await index.WaitForBackgroundMaintenanceAsync();
+            await index.BeginBulkIndexingAsync(CancellationToken.None);
+
+            try
+            {
+                var chineseResults = await index.SearchAsync(
+                    new SearchQuery("第一律法", SearchMode.FilesAndFolders),
+                    CancellationToken.None);
+                var pinyinResults = await index.SearchAsync(
+                    new SearchQuery("dylf", SearchMode.FilesAndFolders),
+                    CancellationToken.None);
+
+                Assert.Contains(chineseResults, result => result.Record.Name == targetName);
+                Assert.Contains(pinyinResults, result => result.Record.Name == targetName);
+            }
+            finally
+            {
+                await index.EndBulkIndexingAsync(CancellationToken.None);
             }
         }
         finally
@@ -1593,6 +2016,51 @@ public sealed class SqliteSearchIndexTests
     }
 
     [Fact]
+    public void NamePrefixVariantsExpandPascalCaseToSnakeAndKebab()
+    {
+        var variants = SqliteSearchIndex.CreateNamePrefixVariantsForTests(
+            new SearchQuery("ListaryOpen", SearchMode.FilesAndFolders));
+        Assert.Contains("listaryopen", variants);
+        Assert.Contains("listary_open", variants);
+        Assert.Contains("listary-open", variants);
+
+        var lowerOnly = SqliteSearchIndex.CreateNamePrefixVariantsForTests(
+            new SearchQuery("listaryopen", SearchMode.FilesAndFolders));
+        Assert.Equal(new[] { "listaryopen" }, lowerOnly);
+    }
+
+    [Fact]
+    public async Task SearchFindsSnakeCaseNamesFromPascalCasePrefixWithoutFts()
+    {
+        var dbPath = CreateTempDbPath();
+        try
+        {
+            await using var index = await SqliteSearchIndex.OpenAsync(dbPath, CancellationToken.None);
+            await index.UpsertManyAsync(
+                [
+                    FileRecord.Create("C:\\Repos\\ListaryOpen.App.exe", false, 10, DateTimeOffset.UtcNow),
+                    FileRecord.Create("C:\\Repos\\listary_open_hook_host.exe", false, 10, DateTimeOffset.UtcNow),
+                    FileRecord.Create("C:\\Repos\\unrelated.txt", false, 10, DateTimeOffset.UtcNow)
+                ],
+                CancellationToken.None);
+
+            using var measurement = PerformanceMetrics.Begin("test.pascal_prefix");
+            var results = await index.SearchAsync(
+                new SearchQuery("ListaryOpen", SearchMode.FilesAndFolders),
+                CancellationToken.None);
+            var snapshot = measurement.Complete("success", results.Count);
+
+            Assert.Contains(results, result => result.Record.Name == "ListaryOpen.App.exe");
+            Assert.Contains(results, result => result.Record.Name == "listary_open_hook_host.exe");
+            Assert.DoesNotContain("candidates.fts", snapshot.Stages.Keys);
+        }
+        finally
+        {
+            DeleteIfExists(dbPath);
+        }
+    }
+
+    [Fact]
     public async Task SearchFindsChineseFileByTwoCharacterPinyinInitials()
     {
         var dbPath = CreateTempDbPath();
@@ -1624,6 +2092,37 @@ public sealed class SqliteSearchIndexTests
                 Assert.Contains(results, item => item.Record.Name == "合同.docx");
                 Assert.Equal("合同.docx", results[0].Record.Name);
             }
+        }
+        finally
+        {
+            DeleteIfExists(dbPath);
+        }
+    }
+
+    [Fact]
+    public async Task ShortAliasQueryPlanUsesSparseSearchTextIndex()
+    {
+        var dbPath = CreateTempDbPath();
+        try
+        {
+            await using var index = await SqliteSearchIndex.OpenAsync(dbPath, CancellationToken.None);
+            await index.WaitForBackgroundMaintenanceAsync();
+            var plan = await ReadQueryPlanAsync(
+                dbPath,
+                """
+                explain query plan
+                select full_path
+                from files indexed by ix_files_search_text_nonempty
+                where search_text <> ''
+                  and search_text like $alias_contains escape '\'
+                limit 200;
+                """,
+                ("$alias_contains", "%ht%"));
+
+            Assert.Contains(plan, detail =>
+                detail.Contains("ix_files_search_text_nonempty", StringComparison.OrdinalIgnoreCase));
+            Assert.DoesNotContain(plan, detail =>
+                string.Equals(detail, "SCAN files", StringComparison.OrdinalIgnoreCase));
         }
         finally
         {
@@ -1882,6 +2381,34 @@ public sealed class SqliteSearchIndexTests
                 open_count integer not null check(open_count >= 0),
                 last_used_at text not null
             );
+
+            create virtual table files_fts_v1 using fts5(
+                name,
+                parent_path,
+                search_text,
+                tokenize = 'trigram',
+                content = 'files',
+                content_rowid = 'rowid'
+            );
+
+            create trigger files_fts_v1_insert after insert on files begin
+                insert into files_fts_v1(rowid, name, parent_path, search_text)
+                values (new.rowid, new.name, new.parent_path, new.search_text);
+            end;
+
+            create trigger files_fts_v1_delete after delete on files begin
+                insert into files_fts_v1(files_fts_v1, rowid, name, parent_path, search_text)
+                values ('delete', old.rowid, old.name, old.parent_path, old.search_text);
+            end;
+
+            create trigger files_fts_v1_update
+            after update of name, parent_path, search_text on files
+            begin
+                insert into files_fts_v1(files_fts_v1, rowid, name, parent_path, search_text)
+                values ('delete', old.rowid, old.name, old.parent_path, old.search_text);
+                insert into files_fts_v1(rowid, name, parent_path, search_text)
+                values (new.rowid, new.name, new.parent_path, new.search_text);
+            end;
             """;
         await createCommand.ExecuteNonQueryAsync();
 

@@ -55,10 +55,22 @@
                               AutomationProperties.Name="{Binding Name}">
                             <Grid.ColumnDefinitions><ColumnDefinition Width="28"/><ColumnDefinition Width="*"/></Grid.ColumnDefinitions>
                             <Grid Width="24" Height="24" VerticalAlignment="Center">
-                                <TextBlock HorizontalAlignment="Center" VerticalAlignment="Center"
+                                <TextBlock x:Name="ProcessIconFallback"
+                                           HorizontalAlignment="Center" VerticalAlignment="Center"
                                            FontFamily="Segoe MDL2 Assets" FontSize="16"
-                                           Foreground="{DynamicResource Brush.Accent}" Text="&#xE7C4;" />
-                                <Image Width="24" Height="24"
+                                           Foreground="{DynamicResource Brush.Accent}" Text="&#xE7C4;">
+                                    <TextBlock.Style>
+                                        <Style TargetType="TextBlock">
+                                            <Setter Property="Visibility" Value="Visible" />
+                                            <Style.Triggers>
+                                                <DataTrigger Binding="{Binding ElementName=ProcessIcon, Path=(local:FileIcon.HasIcon)}" Value="True">
+                                                    <Setter Property="Visibility" Value="Collapsed" />
+                                                </DataTrigger>
+                                            </Style.Triggers>
+                                        </Style>
+                                    </TextBlock.Style>
+                                </TextBlock>
+                                <Image x:Name="ProcessIcon" Width="24" Height="24"
                                        RenderOptions.BitmapScalingMode="HighQuality"
                                        local:FileIcon.Path="{Binding IconPath}"
                                        local:FileIcon.IsDirectory="False" />

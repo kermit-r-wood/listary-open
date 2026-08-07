@@ -630,7 +630,33 @@ internal sealed class UiAutomationTaskManagerProvider : ITaskManagerAutomationPr
             }
         }
 
+        AddListaryOpenIconAliases(paths);
         return paths;
+    }
+
+    internal static void AddListaryOpenIconAliases(IDictionary<string, string> paths)
+    {
+        ArgumentNullException.ThrowIfNull(paths);
+        if (!paths.TryGetValue("ListaryOpen.App", out var appPath) ||
+            string.IsNullOrWhiteSpace(appPath))
+        {
+            return;
+        }
+
+        foreach (var alias in new[]
+                 {
+                     "ListaryOpen",
+                     "ListaryOpen Options",
+                     "ListaryOpen Settings",
+                     "ListaryOpen 选项",
+                     "ListaryOpen 设置"
+                 })
+        {
+            foreach (var candidate in GetProcessLookupCandidates(alias))
+            {
+                paths[candidate] = appPath;
+            }
+        }
     }
 
     private static void AddProcessIconPath(
@@ -678,19 +704,31 @@ internal sealed class UiAutomationTaskManagerProvider : ITaskManagerAutomationPr
     private static string NormalizeProcessName(string value)
     {
         var normalized = value.Trim();
+        var countStart = normalized.LastIndexOf(" (", StringComparison.Ordinal);
+        if (countStart >= 0 && normalized.EndsWith(')'))
+        {
+            var qualifier = normalized[(countStart + 2)..^1].Trim();
+            if (int.TryParse(qualifier, out _) || IsArchitectureQualifier(qualifier))
+            {
+                normalized = normalized[..countStart].TrimEnd();
+            }
+        }
+
         if (normalized.EndsWith(".exe", StringComparison.OrdinalIgnoreCase))
         {
             normalized = normalized[..^4].TrimEnd();
         }
 
-        var countStart = normalized.LastIndexOf(" (", StringComparison.Ordinal);
-        if (countStart >= 0 && normalized.EndsWith(')') &&
-            int.TryParse(normalized.AsSpan(countStart + 2, normalized.Length - countStart - 3), out _))
-        {
-            normalized = normalized[..countStart].TrimEnd();
-        }
-
         return normalized;
+    }
+
+    private static bool IsArchitectureQualifier(string value)
+    {
+        var compact = value.Replace(" ", string.Empty, StringComparison.Ordinal);
+        return compact.Equals("32bit", StringComparison.OrdinalIgnoreCase) ||
+            compact.Equals("64bit", StringComparison.OrdinalIgnoreCase) ||
+            compact.Equals("32位", StringComparison.Ordinal) ||
+            compact.Equals("64位", StringComparison.Ordinal);
     }
 
     private static IReadOnlyList<string> ReadDescendantText(AutomationElement element)

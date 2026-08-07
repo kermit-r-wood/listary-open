@@ -42,18 +42,61 @@ public sealed class NtfsUsnJournalReader
     {
         // Prefer full MFT enumeration: includes every hard-link FILE_NAME and avoids
         // per-file CreateFile metadata lookups. Fall back to FSCTL_ENUM_USN_DATA on failure.
-        // Probe first so we never yield inside a try/catch (illegal for iterators).
+        // Probe and obtain the first record before yielding so a parse/read failure can
+        // still use the fast USN enumerator instead of forcing the coordinator into a
+        // recursive DirectoryInfo compatibility scan.
         if (NtfsMftScanner.TryValidateVolume(volumeRoot, out _))
         {
             var mftScanner = new NtfsMftScanner();
-            await foreach (var record in mftScanner
-                               .EnumerateVolumeAsync(volumeRoot, volumeRoot, cancellationToken)
-                               .ConfigureAwait(false))
+            IAsyncEnumerator<FileRecord>? enumerator = null;
+            FileRecord? firstRecord = null;
+            try
             {
-                yield return record;
+                enumerator = mftScanner
+                    .EnumerateVolumeAsync(volumeRoot, volumeRoot, cancellationToken)
+                    .GetAsyncEnumerator(cancellationToken);
+                if (await enumerator.MoveNextAsync().ConfigureAwait(false))
+                {
+                    firstRecord = enumerator.Current;
+                }
+            }
+            catch (OperationCanceledException)
+            {
+                if (enumerator is not null)
+                {
+                    await enumerator.DisposeAsync().ConfigureAwait(false);
+                }
+
+                throw;
+            }
+            catch (Exception exception) when (IsExpectedMftFailure(exception))
+            {
+                if (enumerator is not null)
+                {
+                    await enumerator.DisposeAsync().ConfigureAwait(false);
+                }
+
+                enumerator = null;
             }
 
-            yield break;
+            if (enumerator is not null && firstRecord is not null)
+            {
+                await using (enumerator.ConfigureAwait(false))
+                {
+                    yield return firstRecord;
+                    while (await enumerator.MoveNextAsync().ConfigureAwait(false))
+                    {
+                        yield return enumerator.Current;
+                    }
+                }
+
+                yield break;
+            }
+
+            if (enumerator is not null)
+            {
+                await enumerator.DisposeAsync().ConfigureAwait(false);
+            }
         }
 
         await foreach (var record in EnumerateVolumeViaUsnEnumAsync(volumeRoot, cancellationToken)
@@ -62,6 +105,13 @@ public sealed class NtfsUsnJournalReader
             yield return record;
         }
     }
+
+    private static bool IsExpectedMftFailure(Exception exception) =>
+        exception is InvalidDataException
+            or Win32Exception
+            or IOException
+            or UnauthorizedAccessException
+            or ArgumentException;
 
     private async IAsyncEnumerable<FileRecord> EnumerateVolumeViaUsnEnumAsync(
         string volumeRoot,

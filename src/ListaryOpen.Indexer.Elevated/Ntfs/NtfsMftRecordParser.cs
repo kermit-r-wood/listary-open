@@ -99,8 +99,8 @@ internal static class NtfsMftRecordParser
         var hasSize = false;
         DateTimeOffset lastWriteTime = default;
         var hasLastWriteTime = false;
-        var fileNames = new List<NtfsMftFileName>(4);
-        var attributeListReferences = new List<ulong>();
+        List<NtfsMftFileName>? fileNames = null;
+        List<ulong>? attributeListReferences = null;
 
         var offset = (int)firstAttributeOffset;
         while (offset + 8 <= record.Length)
@@ -140,7 +140,7 @@ internal static class NtfsMftRecordParser
                     if (TryReadResidentValue(attribute, out var fileNameValue)
                         && TryParseFileNameAttribute(fileNameValue, out var fileName))
                     {
-                        fileNames.Add(fileName);
+                        (fileNames ??= new List<NtfsMftFileName>(2)).Add(fileName);
                     }
 
                     break;
@@ -171,7 +171,9 @@ internal static class NtfsMftRecordParser
                 case AttributeAttributeList when !nonResident:
                     if (TryReadResidentValue(attribute, out var listValue))
                     {
-                        CollectAttributeListFileReferences(listValue, attributeListReferences);
+                        CollectAttributeListFileReferences(
+                            listValue,
+                            attributeListReferences ??= new List<ulong>());
                     }
 
                     break;
@@ -204,8 +206,8 @@ internal static class NtfsMftRecordParser
             baseFileReference,
             sizeBytes,
             lastWriteTime,
-            fileNames,
-            attributeListReferences);
+            fileNames is null ? Array.Empty<NtfsMftFileName>() : fileNames,
+            attributeListReferences is null ? Array.Empty<ulong>() : attributeListReferences);
         return true;
     }
 
@@ -256,7 +258,7 @@ internal static class NtfsMftRecordParser
     {
         // Prefer Win32 / Win32+DOS names. Skip pure DOS 8.3 short names to avoid noise.
         // Keep POSIX only when no Win32 name exists for that parent+name pair.
-        var list = fileNames.ToList();
+        var list = fileNames as IReadOnlyList<NtfsMftFileName> ?? fileNames.ToList();
         if (list.Count == 0)
         {
             return list;

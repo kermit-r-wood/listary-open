@@ -54,6 +54,32 @@ internal static class BaselinePinyinMatcher
         return string.Join(' ', forms.Distinct(StringComparer.Ordinal));
     }
 
+    /// <summary>
+    /// Whether this baseline dictionary can fairly compare against TinyPinyin output.
+    /// </summary>
+    public static bool IsSemanticComparable(string? value)
+    {
+        if (string.IsNullOrWhiteSpace(value))
+        {
+            return true;
+        }
+
+        foreach (var ch in value)
+        {
+            if (ch <= 127)
+            {
+                continue;
+            }
+
+            if (!KnownPinyin.ContainsKey(ch))
+            {
+                return false;
+            }
+        }
+
+        return true;
+    }
+
     private static string ToPinyin(string value)
         => string.Concat(value.Select(ch => KnownPinyin.TryGetValue(ch, out var pinyin)
             ? pinyin

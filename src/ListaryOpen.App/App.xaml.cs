@@ -27,6 +27,7 @@ public partial class App : Application
     private readonly IndexingRunCancellationManager _indexingCancellation = new();
     private readonly BackgroundIndexingTaskTracker _indexingTasks = new();
     private readonly SemaphoreSlim _indexingRunLock = new(1, 1);
+    private CoalescingIndexingRunner? _indexingRunner;
 
     private DialogBridge? _dialogBridge;
     private ContinuousIndexingService? _continuousIndexing;
@@ -128,10 +129,22 @@ public partial class App : Application
     protected override void OnExit(ExitEventArgs e)
     {
         _e2eControlServer?.Dispose();
+        _indexingRunner?.Dispose();
         _indexingCancellation.CancelActive();
         _shutdownCancellation.Cancel();
-        _continuousIndexing?.Dispose();
-        _elevatedIndexerClient?.Dispose();
+        var backgroundCleanupTasks = new List<Task>(capacity: 4);
+        if (_continuousIndexing is { } continuousIndexing)
+        {
+            backgroundCleanupTasks.Add(StartShutdownCleanup(
+                "continuous indexing",
+                continuousIndexing.Dispose));
+        }
+        if (_elevatedIndexerClient is { } elevatedIndexerClient)
+        {
+            backgroundCleanupTasks.Add(StartShutdownCleanup(
+                "elevated indexer",
+                elevatedIndexerClient.Dispose));
+        }
 
         if (_indexingCoordinator is not null)
         {
@@ -185,7 +198,10 @@ public partial class App : Application
         if (_hookQuickSwitchBridge is not null)
         {
             _hookQuickSwitchBridge.StatusChanged -= OnHookQuickSwitchStatusChanged;
-            _hookQuickSwitchBridge.Dispose();
+            var hookQuickSwitchBridge = _hookQuickSwitchBridge;
+            backgroundCleanupTasks.Add(StartShutdownCleanup(
+                "hook hosts",
+                hookQuickSwitchBridge.Dispose));
         }
 
         _explorerObservationScheduler?.Dispose();
@@ -195,7 +211,13 @@ public partial class App : Application
         StopDialogAttachmentMonitoring();
         _trayController?.Dispose();
         _performanceMetricsFileSink?.Dispose();
-        DisposeSearchIndex();
+        if (_searchIndex is { } searchIndex)
+        {
+            backgroundCleanupTasks.Add(StartShutdownCleanup(
+                "search index",
+                () => searchIndex.DisposeAsync().AsTask().GetAwaiter().GetResult()));
+        }
+        WaitForShutdownCleanup(backgroundCleanupTasks);
         _indexingCancellation.Dispose();
         _singleInstanceGuard?.Dispose();
         _shutdownCancellation.Dispose();
@@ -286,6 +308,11 @@ public partial class App : Application
                 ConfiguredIndexFilter.ShouldInclude(record, _activeSettings.ExcludedPaths) &&
                 !IsPathWithinAnyRoot(record.FullPath, _internalIndexExclusions));
         _indexingCoordinator.StatusChanged += OnIndexingStatusChanged;
+        _indexingRunner = new CoalescingIndexingRunner(
+            _indexingTasks,
+            _indexingCancellation,
+            _shutdownCancellation.Token,
+            RunIndexingRunAsync);
         _continuousIndexing = new ContinuousIndexingService(
             searchIndex,
             GetAllIndexRootPaths(settings),
@@ -357,7 +384,6 @@ public partial class App : Application
         StartHookQuickSwitchEnablementOnStartup(_hookQuickSwitchBridge, EnableHookQuickSwitchAsync);
         StartDialogAttachmentMonitoring();
         ConfigureScheduledIndexing(settings.IndexFrequency);
-        _ = WarmSearchIndexAsync(searchIndex, _shutdownCancellation.Token);
         StartBackgroundIndexing();
         if (settings.CheckForUpdates)
         {
@@ -467,35 +493,6 @@ public partial class App : Application
             IndexUpdateFrequency.Daily => TimeSpan.FromDays(1),
             _ => TimeSpan.Zero
         };
-
-    internal static async Task WarmSearchIndexAsync(
-        ISearchIndex? searchIndex,
-        CancellationToken cancellationToken)
-    {
-        if (searchIndex is null)
-        {
-            return;
-        }
-
-        try
-        {
-            var warmupQuery = new SearchQuery(
-                "__listary_open_warmup__",
-                SearchMode.FilesAndFolders,
-                limit: 1);
-            await Task.Run(
-                    () => searchIndex.SearchAsync(warmupQuery, cancellationToken),
-                    cancellationToken)
-                .ConfigureAwait(false);
-        }
-        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
-        {
-        }
-        catch (Exception exception)
-        {
-            Trace.TraceWarning("Search warmup failed: {0}", exception.Message);
-        }
-    }
 
     private string? ApplyHotkeys(string searchHotkey, string dialogHotkey)
     {
@@ -835,22 +832,24 @@ public partial class App : Application
 
     private void StartBackgroundIndexing(bool cancelActive = false)
     {
-        var runCancellation = _indexingCancellation.CreateRun(_shutdownCancellation.Token, cancelActive);
-        BackgroundIndexingTaskStarter.Start(
-            _indexingTasks,
-            _ => RunIndexingRunAsync(runCancellation),
-            CancellationToken.None);
+        // Close the watcher reconciliation gate before the runner is queued. This
+        // removes the small dispatcher/thread-pool race where a watcher overflow
+        // could enqueue a duplicate scan just before RunIndexingRunAsync started.
+        _continuousIndexing?.PauseUntilBaselineReady();
+        _indexingRunner?.Request(cancelActive);
     }
 
-    private async Task RunIndexingRunAsync(CancellationTokenSource runCancellation)
+    private async Task RunIndexingRunAsync(CancellationToken cancellationToken)
     {
+        // Watcher overflow during a full-volume scan is expected and must not
+        // enqueue another full scan behind the one already in progress.
+        _continuousIndexing?.PauseUntilBaselineReady();
         try
         {
-            await RunInitialIndexAsync(runCancellation.Token).ConfigureAwait(false);
+            await RunInitialIndexAsync(cancellationToken).ConfigureAwait(false);
         }
         finally
         {
-            _indexingCancellation.CompleteRun(runCancellation);
             _continuousIndexing?.NotifyReconciliationCompleted();
             _continuousIndexing?.MarkBaselineReady();
         }
@@ -983,10 +982,18 @@ public partial class App : Application
     }
 
     /// <summary>
-    /// Bound how long exit waits for in-flight indexing so a full MFT scan or
-    /// elevated helper cleanup cannot freeze tray exit.
+    /// Bound how long exit waits for in-flight indexing. Cancellation normally
+    /// completes quickly, but SQLite bulk writes need enough time to leave their
+    /// transaction before the final WAL checkpoint can close the database.
     /// </summary>
-    internal static readonly TimeSpan IndexingShutdownTimeout = TimeSpan.FromSeconds(3);
+    internal static readonly TimeSpan IndexingShutdownTimeout = TimeSpan.FromSeconds(5);
+
+    /// <summary>
+    /// Slow helpers finish concurrently. This budget is deliberately longer than
+    /// the search-index disposal gate so exit can checkpoint WAL files and release
+    /// every database handle instead of abandoning cleanup after a few hundred ms.
+    /// </summary>
+    internal static readonly TimeSpan BackgroundShutdownCleanupTimeout = TimeSpan.FromSeconds(6);
 
     private void WaitForIndexingTasks()
     {
@@ -1010,12 +1017,43 @@ public partial class App : Application
         }
     }
 
-    private void DisposeSearchIndex()
+    private static Task StartShutdownCleanup(string component, Action cleanup)
     {
+        ArgumentException.ThrowIfNullOrWhiteSpace(component);
+        ArgumentNullException.ThrowIfNull(cleanup);
+
+        return Task.Run(() =>
+        {
+            try
+            {
+                cleanup();
+            }
+            catch (Exception exception)
+            {
+                Trace.TraceError("{0} shutdown cleanup failed: {1}", component, exception);
+            }
+        });
+    }
+
+    private static void WaitForShutdownCleanup(IReadOnlyCollection<Task> cleanupTasks)
+    {
+        if (cleanupTasks.Count == 0)
+        {
+            return;
+        }
+
         try
         {
-            // DisposeAsync itself is time-bounded (FTS maintenance + connection gates).
-            _searchIndex?.DisposeAsync().AsTask().GetAwaiter().GetResult();
+            Task.WhenAll(cleanupTasks)
+                .WaitAsync(BackgroundShutdownCleanupTimeout)
+                .GetAwaiter()
+                .GetResult();
+        }
+        catch (TimeoutException)
+        {
+            Trace.TraceWarning(
+                "Timed out after {0} ms waiting for background shutdown cleanup.",
+                BackgroundShutdownCleanupTimeout.TotalMilliseconds);
         }
         catch (Exception exception)
         {
@@ -2487,6 +2525,110 @@ internal static class BackgroundIndexingTaskStarter
                 }
             }
         }));
+    }
+}
+
+internal sealed class CoalescingIndexingRunner : IDisposable
+{
+    private readonly object _gate = new();
+    private readonly BackgroundIndexingTaskTracker _tracker;
+    private readonly IndexingRunCancellationManager _cancellationManager;
+    private readonly CancellationToken _shutdownToken;
+    private readonly Func<CancellationToken, Task> _work;
+    private bool _pending;
+    private bool _workerRunning;
+    private bool _disposed;
+
+    public CoalescingIndexingRunner(
+        BackgroundIndexingTaskTracker tracker,
+        IndexingRunCancellationManager cancellationManager,
+        CancellationToken shutdownToken,
+        Func<CancellationToken, Task> work)
+    {
+        _tracker = tracker ?? throw new ArgumentNullException(nameof(tracker));
+        _cancellationManager = cancellationManager ?? throw new ArgumentNullException(nameof(cancellationManager));
+        _shutdownToken = shutdownToken;
+        _work = work ?? throw new ArgumentNullException(nameof(work));
+    }
+
+    public void Request(bool cancelActive = false)
+    {
+        lock (_gate)
+        {
+            if (_disposed)
+            {
+                return;
+            }
+
+            if (cancelActive)
+            {
+                _cancellationManager.CancelActive();
+            }
+
+            _pending = true;
+            if (_workerRunning)
+            {
+                return;
+            }
+
+            _workerRunning = true;
+        }
+
+        BackgroundIndexingTaskStarter.Start(
+            _tracker,
+            _ => ProcessRequestsAsync(),
+            CancellationToken.None);
+    }
+
+    public void Dispose()
+    {
+        lock (_gate)
+        {
+            _disposed = true;
+            _pending = false;
+        }
+
+        _cancellationManager.CancelActive();
+    }
+
+    private async Task ProcessRequestsAsync()
+    {
+        while (true)
+        {
+            lock (_gate)
+            {
+                if (_disposed || !_pending)
+                {
+                    _workerRunning = false;
+                    return;
+                }
+
+                _pending = false;
+            }
+
+            CancellationTokenSource run;
+            try
+            {
+                run = _cancellationManager.CreateRun(_shutdownToken, cancelActive: false);
+            }
+            catch (ObjectDisposedException)
+            {
+                lock (_gate)
+                {
+                    _workerRunning = false;
+                }
+                return;
+            }
+
+            try
+            {
+                await _work(run.Token).ConfigureAwait(false);
+            }
+            finally
+            {
+                _cancellationManager.CompleteRun(run);
+            }
+        }
     }
 }
 

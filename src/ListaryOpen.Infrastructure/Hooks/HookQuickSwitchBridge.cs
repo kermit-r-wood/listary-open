@@ -239,26 +239,33 @@ public sealed class HookQuickSwitchBridge : IHookQuickSwitchBridge
             _hostProcesses.Clear();
         }
 
-        var gracefulShutdownAccepted = hostProcesses.Length > 0 && RequestGracefulHostShutdown();
-
-        foreach (var client in _clients.Values.OfType<IDisposable>())
+        try
         {
-            client.Dispose();
+            var gracefulShutdownAccepted = hostProcesses.Length > 0 && RequestGracefulHostShutdown();
+
+            foreach (var client in _clients.Values.OfType<IDisposable>())
+            {
+                client.Dispose();
+            }
+
+            foreach (var process in hostProcesses)
+            {
+                if (gracefulShutdownAccepted)
+                {
+                    // Bounded wait (see HookHostProcessFactory.TerminationTimeout). On
+                    // timeout the host is detached, not killed, so native cleanup can
+                    // finish after the parent process exits.
+                    _processFactory.WaitForGracefulExitOrTerminate(process);
+                }
+                else
+                {
+                    _processFactory.Terminate(process);
+                }
+            }
         }
-
-        foreach (var process in hostProcesses)
+        finally
         {
-            if (gracefulShutdownAccepted)
-            {
-                // Bounded wait (see HookHostProcessFactory.TerminationTimeout). On
-                // timeout the host is detached, not killed, so native cleanup can
-                // finish after the parent process exits.
-                _processFactory.WaitForGracefulExitOrTerminate(process);
-            }
-            else
-            {
-                _processFactory.Terminate(process);
-            }
+            _hostPaths?.Dispose();
         }
     }
 

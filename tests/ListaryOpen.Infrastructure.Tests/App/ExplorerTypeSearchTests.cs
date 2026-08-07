@@ -462,6 +462,47 @@ public sealed class ExplorerTypeSearchTests
                 hasCommandModifier));
     }
 
+    [Fact]
+    public void OverlaySuppressesEscapeDownRepeatsAndReleaseAfterItHides()
+    {
+        Assert.Equal(
+            OverlayEscapeHookAction.SuppressAndNotify,
+            GlobalTextInputService.GetOverlayEscapeHookAction(
+                0x1B,
+                isKeyDown: true,
+                isKeyUp: false,
+                captureOverlayInput: true,
+                hasCommandModifier: false,
+                escapeWasSuppressed: false));
+        Assert.Equal(
+            OverlayEscapeHookAction.SuppressUntilRelease,
+            GlobalTextInputService.GetOverlayEscapeHookAction(
+                0x1B,
+                isKeyDown: true,
+                isKeyUp: false,
+                captureOverlayInput: false,
+                hasCommandModifier: false,
+                escapeWasSuppressed: true));
+        Assert.Equal(
+            OverlayEscapeHookAction.SuppressRelease,
+            GlobalTextInputService.GetOverlayEscapeHookAction(
+                0x1B,
+                isKeyDown: false,
+                isKeyUp: true,
+                captureOverlayInput: false,
+                hasCommandModifier: false,
+                escapeWasSuppressed: true));
+        Assert.Equal(
+            OverlayEscapeHookAction.None,
+            GlobalTextInputService.GetOverlayEscapeHookAction(
+                0x1B,
+                isKeyDown: true,
+                isKeyUp: false,
+                captureOverlayInput: false,
+                hasCommandModifier: false,
+                escapeWasSuppressed: false));
+    }
+
     [Theory]
     [InlineData(0x31, 0)]
     [InlineData(0x39, 8)]

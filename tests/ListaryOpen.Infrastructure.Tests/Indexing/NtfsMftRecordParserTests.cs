@@ -145,6 +145,17 @@ public sealed class NtfsMftRecordParserTests
         Assert.Equal(2, runs[1].ClusterCount);
     }
 
+    [Fact]
+    public void ReadableRunLengthPreservesMftExtentsAboveTwoGiB()
+    {
+        var threeGiB = 3L * 1024 * 1024 * 1024;
+
+        var readable = NtfsMftScanner.GetReadableRunLength(threeGiB, threeGiB);
+
+        Assert.Equal(threeGiB, readable);
+        Assert.True(readable > int.MaxValue);
+    }
+
     private static void WriteRecord(
         byte[] mft,
         int recordNumber,

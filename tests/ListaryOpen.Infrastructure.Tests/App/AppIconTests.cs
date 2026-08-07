@@ -8,6 +8,8 @@ public sealed class AppIconTests
         var project = File.ReadAllText(GetRepositoryPath("src", "ListaryOpen.App", "ListaryOpen.App.csproj"));
 
         Assert.Contains("<ApplicationIcon>Assets\\ListaryOpen.ico</ApplicationIcon>", project);
+        Assert.Contains("<AssemblyTitle>ListaryOpen</AssemblyTitle>", project);
+        Assert.Contains("<Product>ListaryOpen</Product>", project);
         Assert.Contains("<Resource Include=\"Assets\\ListaryOpen.ico\" />", project);
         Assert.True(File.Exists(GetRepositoryPath("src", "ListaryOpen.App", "Assets", "ListaryOpen.ico")));
     }
@@ -38,6 +40,17 @@ public sealed class AppIconTests
 
         Assert.Contains("ListaryOpenIcon", source);
         Assert.Contains("IconSource", source);
+    }
+
+    [Fact]
+    public void TaskManagerResultHidesFallbackAfterRealIconLoads()
+    {
+        var xaml = File.ReadAllText(GetRepositoryPath("src", "ListaryOpen.App", "TaskManagerSearchWindow.xaml"));
+
+        Assert.Contains("x:Name=\"ProcessIcon\"", xaml);
+        Assert.Contains("x:Name=\"ProcessIconFallback\"", xaml);
+        Assert.Contains("Path=(local:FileIcon.HasIcon)", xaml);
+        Assert.Contains("<Setter Property=\"Visibility\" Value=\"Collapsed\" />", xaml);
     }
 
     private static string GetRepositoryPath(params string[] segments)

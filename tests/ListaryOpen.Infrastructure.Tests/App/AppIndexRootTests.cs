@@ -263,6 +263,55 @@ public sealed class AppIndexRootTests
     }
 
     [Fact]
+    public async Task CoalescingIndexingRunnerCollapsesBurstIntoOneFollowUpRun()
+    {
+        using var shutdown = new CancellationTokenSource();
+        using var manager = new IndexingRunCancellationManager();
+        var tracker = new BackgroundIndexingTaskTracker();
+        var firstRunStarted = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var releaseFirstRun = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var runCount = 0;
+
+        async Task Work(CancellationToken cancellationToken)
+        {
+            if (Interlocked.Increment(ref runCount) == 1)
+            {
+                firstRunStarted.SetResult();
+                await releaseFirstRun.Task.WaitAsync(cancellationToken);
+            }
+        }
+
+        using var runner = new CoalescingIndexingRunner(tracker, manager, shutdown.Token, Work);
+        runner.Request();
+        await firstRunStarted.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        for (var i = 0; i < 50; i++)
+        {
+            runner.Request();
+        }
+
+        releaseFirstRun.SetResult();
+        await tracker.WaitForCompletionAsync().WaitAsync(TimeSpan.FromSeconds(5));
+
+        Assert.Equal(2, Volatile.Read(ref runCount));
+    }
+
+    [Fact]
+    public void ApplicationShutdownAllowsDatabaseCleanupWithinABoundedBudget()
+    {
+        Assert.InRange(
+            WpfApp.IndexingShutdownTimeout,
+            TimeSpan.FromSeconds(1),
+            TimeSpan.FromSeconds(5));
+        Assert.InRange(
+            WpfApp.BackgroundShutdownCleanupTimeout,
+            TimeSpan.FromSeconds(5),
+            TimeSpan.FromSeconds(6));
+        Assert.True(
+            WpfApp.IndexingShutdownTimeout + WpfApp.BackgroundShutdownCleanupTimeout
+                <= TimeSpan.FromSeconds(11));
+    }
+
+    [Fact]
     public async Task RunSerializedIndexingAsyncQueuesConcurrentRequests()
     {
         using var gate = new SemaphoreSlim(1, 1);

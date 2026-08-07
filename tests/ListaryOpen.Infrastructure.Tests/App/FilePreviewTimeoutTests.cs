@@ -45,7 +45,6 @@ public sealed class FilePreviewTimeoutTests
     [InlineData("REPORT.DOCX")]
     [InlineData("slides.pptx")]
     [InlineData("sheet.xlsx")]
-    [InlineData("music.opus")]
     [InlineData("camera.cr3")]
     [InlineData("design.psd")]
     [InlineData("archive.zip")]
@@ -67,6 +66,9 @@ public sealed class FilePreviewTimeoutTests
     [InlineData("settings.json")]
     [InlineData("vector.svg")]
     [InlineData("photo.png")]
+    [InlineData("music.mp3")]
+    [InlineData("music.opus")]
+    [InlineData("music.wav")]
     public void DeterministicBuiltInFormatsDoNotRequireWindowsPreview(string fileName)
     {
         var context = new PreviewContext(

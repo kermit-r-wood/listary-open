@@ -22,4 +22,13 @@ public sealed class FileIconTests
     {
         Assert.NotEqual(FileIcon.GetCacheKey(first, false), FileIcon.GetCacheKey(second, false));
     }
+
+    [Fact]
+    public void BuiltApplicationExecutableSuppliesARealShellIcon()
+    {
+        var appExecutable = Path.Combine(AppContext.BaseDirectory, "ListaryOpen.App.exe");
+
+        Assert.True(File.Exists(appExecutable), $"Built app executable was not found: {appExecutable}");
+        Assert.NotNull(FileIcon.LoadShellIcon(appExecutable, isDirectory: false));
+    }
 }

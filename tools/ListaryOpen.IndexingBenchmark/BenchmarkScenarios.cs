@@ -48,6 +48,57 @@ internal static class BenchmarkScenarios
             index_generation = excluded.index_generation;
         """;
 
+    private const string PreviousReconciliationUpsertSql = """
+        insert into files (
+            full_path,
+            path_key,
+            name,
+            parent_path,
+            search_text,
+            is_directory,
+            size_bytes,
+            last_write_time,
+            index_generation,
+            file_reference
+        )
+        values (
+            $full_path,
+            $path_key,
+            $name,
+            $parent_path,
+            $search_text,
+            $is_directory,
+            $size_bytes,
+            $last_write_time,
+            $index_generation,
+            $file_reference
+        )
+        on conflict(path_key) do update set
+            full_path = excluded.full_path,
+            name = excluded.name,
+            parent_path = excluded.parent_path,
+            search_text = excluded.search_text,
+            is_directory = excluded.is_directory,
+            size_bytes = excluded.size_bytes,
+            last_write_time = excluded.last_write_time,
+            index_generation = case
+                when excluded.index_generation > 0 then excluded.index_generation
+                else files.index_generation
+            end,
+            file_reference = case
+                when excluded.file_reference > 0 then excluded.file_reference
+                else files.file_reference
+            end
+        where files.full_path is not excluded.full_path
+           or files.name is not excluded.name
+           or files.parent_path is not excluded.parent_path
+           or files.search_text is not excluded.search_text
+           or files.is_directory is not excluded.is_directory
+           or files.size_bytes is not excluded.size_bytes
+           or files.last_write_time is not excluded.last_write_time
+           or (excluded.file_reference > 0 and files.file_reference is not excluded.file_reference);
+        """;
+
     public static async Task<string> CreateHelperBundleAsync(
         string scratchDirectory,
         CancellationToken cancellationToken)
@@ -345,6 +396,267 @@ internal static class BenchmarkScenarios
         }
     }
 
+    public static async Task<BenchmarkRun> MeasureSqliteRescanAsync(
+        IReadOnlyList<FileRecord> records,
+        bool baseline,
+        int repeat,
+        string scratchDirectory,
+        CancellationToken cancellationToken)
+    {
+        var variant = baseline ? "baseline-rewrite-rebuild" : "current-touch-no-rebuild";
+        var databasePath = Path.Combine(
+            scratchDirectory,
+            $"sqlite-rescan-{(baseline ? "old" : "current")}-{Guid.NewGuid():N}.db");
+        await PrepareRescanDatabaseAsync(databasePath, records, cancellationToken).ConfigureAwait(false);
+
+        try
+        {
+            BenchmarkRun run;
+            if (baseline)
+            {
+                var connectionString = new SqliteConnectionStringBuilder
+                {
+                    DataSource = databasePath,
+                    Pooling = false
+                }.ToString();
+                await using var connection = new SqliteConnection(connectionString);
+                await connection.OpenAsync(cancellationToken).ConfigureAwait(false);
+                await ConfigureWriterAsync(connection, cancellationToken).ConfigureAwait(false);
+                run = await IndexingBenchmarkRunner.MeasureAsync(
+                    "sqlite-identical-rescan",
+                    variant,
+                    repeat,
+                    records.Count,
+                    async _ =>
+                    {
+                        await RunHistoricalFullRescanAsync(connection, records, cancellationToken)
+                            .ConfigureAwait(false);
+                        return new BenchmarkOutcome(
+                            records.Count,
+                            ExpectedChecksum(records.Count),
+                            StorageFootprintBytes: GetDatabaseFootprint(databasePath));
+                    }).ConfigureAwait(false);
+            }
+            else
+            {
+                await using var index = await SqliteSearchIndex.OpenAsync(databasePath, cancellationToken)
+                    .ConfigureAwait(false);
+                await index.WaitForBackgroundMaintenanceAsync().ConfigureAwait(false);
+                run = await IndexingBenchmarkRunner.MeasureAsync(
+                    "sqlite-identical-rescan",
+                    variant,
+                    repeat,
+                    records.Count,
+                    async _ =>
+                    {
+                        await index.BeginBulkIndexingAsync(cancellationToken).ConfigureAwait(false);
+                        try
+                        {
+                            var generation = await index.BeginIndexingRunAsync(cancellationToken).ConfigureAwait(false);
+                            foreach (var batch in records.Chunk(10_000))
+                            {
+                                await index.UpsertManyAsync(batch, generation, cancellationToken)
+                                    .ConfigureAwait(false);
+                            }
+
+                            await index.EndBulkIndexingAsync(cancellationToken).ConfigureAwait(false);
+                        }
+                        catch
+                        {
+                            await index.AbortBulkIndexingAsync(CancellationToken.None).ConfigureAwait(false);
+                            throw;
+                        }
+
+                        return new BenchmarkOutcome(
+                            records.Count,
+                            ExpectedChecksum(records.Count),
+                            StorageFootprintBytes: GetDatabaseFootprint(databasePath));
+                    }).ConfigureAwait(false);
+            }
+
+            await using var verification = new SqliteConnection($"Data Source={databasePath};Pooling=False");
+            await verification.OpenAsync(cancellationToken).ConfigureAwait(false);
+            await VerifyDatabaseAsync(verification, records, cancellationToken).ConfigureAwait(false);
+            return run;
+        }
+        finally
+        {
+            TryDeleteFile(databasePath);
+            TryDeleteFile(databasePath + "-shm");
+            TryDeleteFile(databasePath + "-wal");
+        }
+    }
+
+    public static async Task<BenchmarkRun> MeasureSqliteReconciliationAsync(
+        IReadOnlyList<FileRecord> records,
+        bool baseline,
+        int repeat,
+        string scratchDirectory,
+        CancellationToken cancellationToken)
+    {
+        var variant = baseline ? "previous-path-two-lookup" : "current-file-ref-one-lookup";
+        var databasePath = Path.Combine(
+            scratchDirectory,
+            $"sqlite-reconcile-{(baseline ? "previous" : "current")}-{Guid.NewGuid():N}.db");
+        await PrepareRescanDatabaseAsync(databasePath, records, cancellationToken).ConfigureAwait(false);
+
+        try
+        {
+            BenchmarkRun run;
+            if (baseline)
+            {
+                await using var connection = new SqliteConnection($"Data Source={databasePath};Pooling=False");
+                await connection.OpenAsync(cancellationToken).ConfigureAwait(false);
+                await ConfigureWriterAsync(connection, cancellationToken).ConfigureAwait(false);
+                run = await IndexingBenchmarkRunner.MeasureAsync(
+                    "sqlite-reconciliation",
+                    variant,
+                    repeat,
+                    records.Count,
+                    async _ =>
+                    {
+                        await RunPreviousReconciliationAsync(
+                                connection,
+                                records,
+                                generation: repeat + 2L,
+                                cancellationToken)
+                            .ConfigureAwait(false);
+                        return new BenchmarkOutcome(
+                            records.Count,
+                            ExpectedChecksum(records.Count),
+                            StorageFootprintBytes: GetDatabaseFootprint(databasePath));
+                    }).ConfigureAwait(false);
+            }
+            else
+            {
+                await using var index = await SqliteSearchIndex.OpenAsync(databasePath, cancellationToken)
+                    .ConfigureAwait(false);
+                await index.WaitForBackgroundMaintenanceAsync().ConfigureAwait(false);
+                run = await IndexingBenchmarkRunner.MeasureAsync(
+                    "sqlite-reconciliation",
+                    variant,
+                    repeat,
+                    records.Count,
+                    async _ =>
+                    {
+                        await index.BeginBulkIndexingAsync(cancellationToken).ConfigureAwait(false);
+                        try
+                        {
+                            var generation = await index.BeginIndexingRunAsync(cancellationToken).ConfigureAwait(false);
+                            foreach (var batch in records.Chunk(10_000))
+                            {
+                                await index.UpsertManyAsync(batch, generation, cancellationToken)
+                                    .ConfigureAwait(false);
+                            }
+
+                            await index.EndBulkIndexingAsync(cancellationToken).ConfigureAwait(false);
+                        }
+                        catch
+                        {
+                            await index.AbortBulkIndexingAsync(CancellationToken.None).ConfigureAwait(false);
+                            throw;
+                        }
+
+                        return new BenchmarkOutcome(
+                            records.Count,
+                            ExpectedChecksum(records.Count),
+                            StorageFootprintBytes: GetDatabaseFootprint(databasePath));
+                    }).ConfigureAwait(false);
+            }
+
+            await using var verification = new SqliteConnection($"Data Source={databasePath};Pooling=False");
+            await verification.OpenAsync(cancellationToken).ConfigureAwait(false);
+            await VerifyDatabaseAsync(verification, records, cancellationToken).ConfigureAwait(false);
+            return run;
+        }
+        finally
+        {
+            TryDeleteFile(databasePath);
+            TryDeleteFile(databasePath + "-shm");
+            TryDeleteFile(databasePath + "-wal");
+        }
+    }
+
+    public static async Task<BenchmarkRun> MeasureExistingReconciliationAsync(
+        string databasePath,
+        IReadOnlyList<FileRecord> records,
+        bool baseline,
+        int repeat,
+        CancellationToken cancellationToken)
+    {
+        var variant = baseline ? "previous-path-two-lookup" : "current-file-ref-one-lookup";
+        var checksum = records.Aggregate(0L, (sum, record) => checked(sum + record.SizeBytes));
+        long generation;
+        BenchmarkRun run;
+
+        if (baseline)
+        {
+            generation = 10_000L + repeat + 1;
+            await using var connection = new SqliteConnection($"Data Source={databasePath};Pooling=False");
+            await connection.OpenAsync(cancellationToken).ConfigureAwait(false);
+            await ConfigureWriterAsync(connection, cancellationToken).ConfigureAwait(false);
+            run = await IndexingBenchmarkRunner.MeasureAsync(
+                "sqlite-large-reconcile",
+                variant,
+                repeat,
+                records.Count,
+                async _ =>
+                {
+                    await RunPreviousReconciliationAsync(
+                            connection,
+                            records,
+                            generation,
+                            cancellationToken)
+                        .ConfigureAwait(false);
+                    return new BenchmarkOutcome(
+                        records.Count,
+                        checksum,
+                        StorageFootprintBytes: GetDatabaseFootprint(databasePath));
+                }).ConfigureAwait(false);
+        }
+        else
+        {
+            await using var index = await SqliteSearchIndex.OpenAsync(databasePath, cancellationToken)
+                .ConfigureAwait(false);
+            await index.WaitForBackgroundMaintenanceAsync().ConfigureAwait(false);
+            generation = 0;
+            run = await IndexingBenchmarkRunner.MeasureAsync(
+                "sqlite-large-reconcile",
+                variant,
+                repeat,
+                records.Count,
+                async _ =>
+                {
+                    await index.BeginBulkIndexingAsync(cancellationToken).ConfigureAwait(false);
+                    try
+                    {
+                        generation = await index.BeginIndexingRunAsync(cancellationToken).ConfigureAwait(false);
+                        foreach (var batch in records.Chunk(10_000))
+                        {
+                            await index.UpsertManyAsync(batch, generation, cancellationToken)
+                                .ConfigureAwait(false);
+                        }
+
+                        await index.EndBulkIndexingAsync(cancellationToken).ConfigureAwait(false);
+                    }
+                    catch
+                    {
+                        await index.AbortBulkIndexingAsync(CancellationToken.None).ConfigureAwait(false);
+                        throw;
+                    }
+
+                    return new BenchmarkOutcome(
+                        records.Count,
+                        checksum,
+                        StorageFootprintBytes: GetDatabaseFootprint(databasePath));
+                }).ConfigureAwait(false);
+        }
+
+        await VerifyGenerationAsync(databasePath, records, generation, cancellationToken)
+            .ConfigureAwait(false);
+        return run;
+    }
+
     public static Task<BenchmarkRun> MeasureProgressDispatchAsync(
         int logicalBatches,
         bool baseline,
@@ -609,6 +921,229 @@ internal static class BenchmarkScenarios
     {
         await using var index = await SqliteSearchIndex.OpenAsync(databasePath, cancellationToken)
             .ConfigureAwait(false);
+    }
+
+    private static async Task PrepareRescanDatabaseAsync(
+        string databasePath,
+        IReadOnlyList<FileRecord> records,
+        CancellationToken cancellationToken)
+    {
+        await using var index = await SqliteSearchIndex.OpenAsync(databasePath, cancellationToken)
+            .ConfigureAwait(false);
+        foreach (var batch in records.Chunk(10_000))
+        {
+            await index.UpsertManyAsync(batch, cancellationToken).ConfigureAwait(false);
+        }
+
+        await index.WaitForBackgroundMaintenanceAsync().ConfigureAwait(false);
+    }
+
+    private static async Task RunHistoricalFullRescanAsync(
+        SqliteConnection connection,
+        IReadOnlyList<FileRecord> records,
+        CancellationToken cancellationToken)
+    {
+        using (var dropTriggers = connection.CreateCommand())
+        {
+            dropTriggers.CommandText = """
+                drop trigger if exists files_fts_v1_insert;
+                drop trigger if exists files_fts_v1_delete;
+                drop trigger if exists files_fts_v1_update;
+                """;
+            await dropTriggers.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+        }
+
+        foreach (var batch in records.Chunk(2_000))
+        {
+            await using var transaction = await connection.BeginTransactionAsync(cancellationToken).ConfigureAwait(false);
+            using var command = connection.CreateCommand();
+            command.Transaction = (SqliteTransaction)transaction;
+            command.CommandText = UpsertSql;
+            command.Parameters.Add("$full_path", SqliteType.Text);
+            command.Parameters.Add("$path_key", SqliteType.Text);
+            command.Parameters.Add("$name", SqliteType.Text);
+            command.Parameters.Add("$parent_path", SqliteType.Text);
+            command.Parameters.Add("$search_text", SqliteType.Text);
+            command.Parameters.Add("$is_directory", SqliteType.Integer);
+            command.Parameters.Add("$size_bytes", SqliteType.Integer);
+            command.Parameters.Add("$last_write_time", SqliteType.Text);
+            command.Parameters.Add("$index_generation", SqliteType.Integer);
+            command.Prepare();
+
+            foreach (var record in batch)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                command.Parameters[0].Value = record.FullPath;
+                command.Parameters[1].Value = record.PathKey;
+                command.Parameters[2].Value = record.Name;
+                command.Parameters[3].Value = record.ParentPath;
+                command.Parameters[4].Value = PinyinMatcher.CreateSearchAliases(record.FullPath);
+                command.Parameters[5].Value = record.IsDirectory ? 1 : 0;
+                command.Parameters[6].Value = record.SizeBytes;
+                command.Parameters[7].Value = FormatDateTime(record.LastWriteTime);
+                command.Parameters[8].Value = 1;
+                command.ExecuteNonQuery();
+            }
+
+            await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
+        }
+
+        using var rebuild = connection.CreateCommand();
+        rebuild.CommandText = """
+            create trigger if not exists files_fts_v1_insert after insert on files begin
+                insert into files_fts_v1(rowid, name, parent_path, search_text)
+                values (new.rowid, new.name, new.parent_path, new.search_text);
+            end;
+            create trigger if not exists files_fts_v1_delete after delete on files begin
+                insert into files_fts_v1(files_fts_v1, rowid, name, parent_path, search_text)
+                values ('delete', old.rowid, old.name, old.parent_path, old.search_text);
+            end;
+            create trigger if not exists files_fts_v1_update
+            after update of name, parent_path, search_text on files
+            when old.name <> new.name
+              or old.parent_path <> new.parent_path
+              or old.search_text <> new.search_text
+            begin
+                insert into files_fts_v1(files_fts_v1, rowid, name, parent_path, search_text)
+                values ('delete', old.rowid, old.name, old.parent_path, old.search_text);
+                insert into files_fts_v1(rowid, name, parent_path, search_text)
+                values (new.rowid, new.name, new.parent_path, new.search_text);
+            end;
+            insert into files_fts_v1(files_fts_v1) values('rebuild');
+            """;
+        await rebuild.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+    }
+
+    private static Task RunPreviousReconciliationAsync(
+        SqliteConnection connection,
+        IReadOnlyList<FileRecord> records,
+        long generation,
+        CancellationToken cancellationToken)
+    {
+        using var backgroundMode = WindowsBackgroundMode.EnterCurrentThread();
+        foreach (var batch in records.Chunk(10_000))
+        {
+            using var transaction = connection.BeginTransaction();
+            using var upsert = connection.CreateCommand();
+            upsert.Transaction = transaction;
+            upsert.CommandText = PreviousReconciliationUpsertSql;
+            AddReconciliationParameters(upsert);
+            upsert.Prepare();
+
+            using var touch = connection.CreateCommand();
+            touch.Transaction = transaction;
+            touch.CommandText = """
+                update files
+                set index_generation = $index_generation
+                where path_key = $path_key
+                  and index_generation is not $index_generation;
+                """;
+            touch.Parameters.Add("$index_generation", SqliteType.Integer);
+            touch.Parameters.Add("$path_key", SqliteType.Text);
+            touch.Prepare();
+
+            foreach (var record in batch)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                BindReconciliationParameters(upsert, record, generation);
+                if (upsert.ExecuteNonQuery() != 0)
+                {
+                    continue;
+                }
+
+                touch.Parameters[0].Value = generation;
+                touch.Parameters[1].Value = record.PathKey;
+                touch.ExecuteNonQuery();
+            }
+
+            transaction.Commit();
+        }
+
+        return Task.CompletedTask;
+    }
+
+    private static async Task VerifyGenerationAsync(
+        string databasePath,
+        IReadOnlyList<FileRecord> records,
+        long generation,
+        CancellationToken cancellationToken)
+    {
+        var matched = 0;
+        await using var connection = new SqliteConnection(
+            $"Data Source={databasePath};Mode=ReadOnly;Pooling=False");
+        await connection.OpenAsync(cancellationToken).ConfigureAwait(false);
+        foreach (var chunk in records.Chunk(400))
+        {
+            using var command = connection.CreateCommand();
+            var names = new string[chunk.Length];
+            for (var index = 0; index < chunk.Length; index++)
+            {
+                names[index] = $"$path_{index}";
+                command.Parameters.AddWithValue(names[index], chunk[index].PathKey);
+            }
+
+            command.CommandText = $"""
+                select count(*)
+                from files
+                where index_generation = $generation
+                  and path_key in ({string.Join(", ", names)});
+                """;
+            command.Parameters.AddWithValue("$generation", generation);
+            matched += Convert.ToInt32(
+                await command.ExecuteScalarAsync(cancellationToken).ConfigureAwait(false),
+                CultureInfo.InvariantCulture);
+        }
+
+        if (matched != records.Count)
+        {
+            throw new InvalidDataException(
+                $"Reconciliation semantic guard matched {matched:N0} of {records.Count:N0} generations.");
+        }
+    }
+
+    private static void AddReconciliationParameters(SqliteCommand command)
+    {
+        command.Parameters.Add("$full_path", SqliteType.Text);
+        command.Parameters.Add("$path_key", SqliteType.Text);
+        command.Parameters.Add("$name", SqliteType.Text);
+        command.Parameters.Add("$parent_path", SqliteType.Text);
+        command.Parameters.Add("$search_text", SqliteType.Text);
+        command.Parameters.Add("$is_directory", SqliteType.Integer);
+        command.Parameters.Add("$size_bytes", SqliteType.Integer);
+        command.Parameters.Add("$last_write_time", SqliteType.Text);
+        command.Parameters.Add("$index_generation", SqliteType.Integer);
+        command.Parameters.Add("$file_reference", SqliteType.Integer);
+    }
+
+    private static void BindReconciliationParameters(
+        SqliteCommand command,
+        FileRecord record,
+        long generation)
+    {
+        command.Parameters[0].Value = record.FullPath;
+        command.Parameters[1].Value = record.PathKey;
+        command.Parameters[2].Value = record.Name;
+        command.Parameters[3].Value = record.ParentPath;
+        command.Parameters[4].Value = PinyinMatcher.CreateSearchAliases(record.FullPath);
+        command.Parameters[5].Value = record.IsDirectory ? 1 : 0;
+        command.Parameters[6].Value = record.SizeBytes;
+        command.Parameters[7].Value = FormatDateTime(record.LastWriteTime);
+        command.Parameters[8].Value = generation;
+        command.Parameters[9].Value = unchecked((long)record.FileReferenceNumber);
+    }
+
+    private static long GetDatabaseFootprint(string databasePath)
+    {
+        long total = 0;
+        foreach (var path in new[] { databasePath, databasePath + "-wal", databasePath + "-shm" })
+        {
+            if (File.Exists(path))
+            {
+                total += new FileInfo(path).Length;
+            }
+        }
+
+        return total;
     }
 
     private static async Task ConfigureWriterAsync(

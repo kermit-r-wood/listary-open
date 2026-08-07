@@ -1,4 +1,5 @@
 using System.Diagnostics;
+using System.Runtime.InteropServices;
 using System.Text.Json;
 using ListaryOpen.Indexer.Elevated;
 using ListaryOpen.Indexer.Elevated.Ntfs;
@@ -50,7 +51,13 @@ static void TryLowerProcessPriority()
     try
     {
         using var process = Process.GetCurrentProcess();
-        process.PriorityClass = ProcessPriorityClass.BelowNormal;
+        // PROCESS_MODE_BACKGROUND_BEGIN lowers CPU, disk-I/O, and memory
+        // priority. BelowNormal alone leaves raw-volume reads at normal I/O
+        // priority and can still make the machine feel saturated.
+        if (!IndexerPriorityNativeMethods.SetPriorityClass(process.Handle, 0x00100000))
+        {
+            process.PriorityClass = ProcessPriorityClass.BelowNormal;
+        }
     }
     catch (Exception exception) when (exception is InvalidOperationException
                                           or PlatformNotSupportedException
@@ -89,4 +96,11 @@ static async Task<int> ScanToConsoleAsync(string root)
 internal static class JsonOptions
 {
     internal static readonly JsonSerializerOptions Default = new(JsonSerializerDefaults.Web);
+}
+
+internal static class IndexerPriorityNativeMethods
+{
+    [DllImport("kernel32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    internal static extern bool SetPriorityClass(IntPtr processHandle, uint priorityClass);
 }

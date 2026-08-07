@@ -47,17 +47,17 @@ public sealed class PackagedFirefoxBlackboxIntegrationTests
                 "LISTARYOPEN_PACKAGE_DIR must identify the final published package under test.");
             var packageDirectory = Path.TrimEndingDirectorySeparator(Path.GetFullPath(packageValue));
             var packageExePath = Path.Combine(packageDirectory, "ListaryOpen.App.exe");
-            var hookDllPath = Path.Combine(packageDirectory, "hooks", "x64", "ListaryOpen.Hook.dll");
-            var hookRuntimePath = Path.Combine(packageDirectory, "hooks", "x64", "libunwind.dll");
+            var packageHookDllPath = Path.Combine(packageDirectory, "hooks", "x64", "ListaryOpen.Hook.dll");
+            var packageHookRuntimePath = Path.Combine(packageDirectory, "hooks", "x64", "libunwind.dll");
             Assert.True(File.Exists(packageExePath), $"The packaged app executable is missing: {packageExePath}");
-            Assert.True(File.Exists(hookDllPath), $"The packaged x64 native hook DLL is missing: {hookDllPath}");
-            Assert.True(File.Exists(hookRuntimePath), $"The packaged x64 native hook runtime is missing: {hookRuntimePath}");
+            Assert.True(File.Exists(packageHookDllPath), $"The packaged x64 native hook DLL is missing: {packageHookDllPath}");
+            Assert.True(File.Exists(packageHookRuntimePath), $"The packaged x64 native hook runtime is missing: {packageHookRuntimePath}");
             Assert.True(
                 IsSingleInstanceMutexAvailable(),
                 "ListaryOpen is already running. The black-box test will not terminate a user-owned instance.");
 
             var packageExeSha256 = Sha256(packageExePath);
-            var hookDllSha256 = Sha256(hookDllPath);
+            var hookDllSha256 = Sha256(packageHookDllPath);
             using var packageData = PackageDataCleanup.RequireInitiallyAbsent(packageDirectory);
             using var target = TemporaryDirectory.Create("listary-firefox-packaged-target");
             var selectedFileName = $"selected-{Guid.NewGuid():N}.txt";
@@ -115,11 +115,28 @@ public sealed class PackagedFirefoxBlackboxIntegrationTests
                 _ = GetWindowThreadProcessId(dialog, out var dialogProcessId);
                 Assert.NotEqual(0u, dialogProcessId);
 
+                string? loadedHookDllPath = null;
+                string? loadedHookRuntimePath = null;
                 Assert.True(
                     WaitUntil(
-                        () => IsModuleLoaded((int)dialogProcessId, hookDllPath),
+                        () =>
+                        {
+                            loadedHookDllPath = NativeModuleTestSupport.FindModulePathByFileName(
+                                (int)dialogProcessId,
+                                "ListaryOpen.Hook.dll");
+                            loadedHookRuntimePath = NativeModuleTestSupport.FindModulePathByFileName(
+                                (int)dialogProcessId,
+                                "libunwind.dll");
+                            return loadedHookDllPath is not null;
+                        },
                         TimeSpan.FromSeconds(15)),
-                    "The package hook DLL was not loaded into the Firefox file-dialog process.");
+                    "The staged hook DLL was not loaded into the Firefox file-dialog process.");
+                var runtimeHookDllPath = Assert.IsType<string>(loadedHookDllPath);
+                Assert.NotEqual(
+                    Path.GetFullPath(packageHookDllPath),
+                    Path.GetFullPath(runtimeHookDllPath),
+                    ignoreCase: true);
+                Assert.Equal(hookDllSha256, Sha256(runtimeHookDllPath));
 
                 var fileNameBefore = ReadFileNameEdit(dialog);
                 Assert.Equal(string.Empty, fileNameBefore);
@@ -158,7 +175,7 @@ public sealed class PackagedFirefoxBlackboxIntegrationTests
                 Assert.Equal(string.Empty, fileNameAfter);
                 Assert.Equal(queryBefore, queryAfter);
                 Assert.Equal(string.Empty, queryAfter);
-                Assert.True(IsModuleLoaded((int)dialogProcessId, hookDllPath));
+                Assert.True(IsModuleLoaded((int)dialogProcessId, runtimeHookDllPath));
 
                 Assert.True(GetWindowRect(dialog, out var dialogBounds));
                 Assert.True(GetWindowRect(quickSwitch, out var quickSwitchBounds));
@@ -176,7 +193,7 @@ public sealed class PackagedFirefoxBlackboxIntegrationTests
                     quickSwitchBounds,
                     "30-packaged-firefox-direct-hotkey");
 
-                var hookLoaded = IsModuleLoaded((int)dialogProcessId, hookDllPath);
+                var hookLoaded = IsModuleLoaded((int)dialogProcessId, runtimeHookDllPath);
                 var fallbackDetected = !hookLoaded ||
                     fileNameBefore.Length != 0 ||
                     !string.Equals(fileNameBefore, fileNameAfter, StringComparison.Ordinal) ||
@@ -202,7 +219,7 @@ public sealed class PackagedFirefoxBlackboxIntegrationTests
                     screenshotPath,
                     packageExePath,
                     packageExeSha256,
-                    hookDllPath,
+                    runtimeHookDllPath,
                     hookDllSha256,
                     appProcess.Id,
                     firefoxPath,
@@ -231,10 +248,15 @@ public sealed class PackagedFirefoxBlackboxIntegrationTests
                 Assert.True(shutdownSucceeded, "The packaged app did not exit after authenticated Shutdown.");
                 Assert.Equal(0, appProcess.ExitCode);
                 var unloadStopwatch = Stopwatch.StartNew();
-                var nativeModulesUnloaded =
-                    WaitUntil(
-                        () => AreModulesUnloaded((int)dialogProcessId, hookDllPath, hookRuntimePath),
-                        TimeSpan.FromSeconds(10));
+                var loadedNativeModulePaths = new[] { runtimeHookDllPath, loadedHookRuntimePath }
+                    .Where(path => path is not null)
+                    .Cast<string>()
+                    .ToArray();
+                var nativeModulesUnloaded = WaitUntil(
+                    () => NativeModuleTestSupport.AreModulePathsUnloaded(
+                        (int)dialogProcessId,
+                        loadedNativeModulePaths),
+                    TimeSpan.FromSeconds(10));
                 Assert.True(
                     nativeModulesUnloaded,
                     "The published app exited but its native hook DLL/runtime remained loaded in Firefox.");
@@ -242,8 +264,8 @@ public sealed class PackagedFirefoxBlackboxIntegrationTests
                     Path.Combine(Path.GetDirectoryName(screenshotPath)!, "30-packaged-firefox-direct-hotkey.json"),
                     "firefox",
                     dialogProcessId,
-                    hookDllPath,
-                    hookRuntimePath,
+                    runtimeHookDllPath,
+                    loadedHookRuntimePath,
                     unloadStopwatch.Elapsed);
             }
             finally
@@ -275,7 +297,7 @@ public sealed class PackagedFirefoxBlackboxIntegrationTests
             }
 
             Assert.Equal(packageExeSha256, Sha256(packageExePath));
-            Assert.Equal(hookDllSha256, Sha256(hookDllPath));
+            Assert.Equal(hookDllSha256, Sha256(packageHookDllPath));
         });
     }
 
@@ -601,28 +623,6 @@ public sealed class PackagedFirefoxBlackboxIntegrationTests
         }
     }
 
-    private static bool AreModulesUnloaded(int processId, params string[] expectedPaths)
-    {
-        try
-        {
-            using var process = Process.GetProcessById(processId);
-            var loadedPaths = process.Modules.Cast<ProcessModule>()
-                .Select(module => Path.GetFullPath(module.FileName))
-                .ToHashSet(StringComparer.OrdinalIgnoreCase);
-            return expectedPaths.All(path => !loadedPaths.Contains(Path.GetFullPath(path)));
-        }
-        catch (ArgumentException)
-        {
-            // A terminated Firefox process cannot retain an injected module.
-            return true;
-        }
-        catch (Exception exception) when (exception is InvalidOperationException or System.ComponentModel.Win32Exception)
-        {
-            // Module enumeration failure is not proof of unload.
-            return false;
-        }
-    }
-
     private static void SendCtrlG()
     {
         keybd_event(VkControl, 0, 0, UIntPtr.Zero);
@@ -839,7 +839,7 @@ public sealed class PackagedFirefoxBlackboxIntegrationTests
         string targetProcess,
         long targetProcessId,
         string hookDllPath,
-        string hookRuntimePath,
+        string? hookRuntimePath,
         TimeSpan elapsed)
     {
         var root = JsonNode.Parse(File.ReadAllText(metadataPath))?.AsObject()
@@ -849,7 +849,7 @@ public sealed class PackagedFirefoxBlackboxIntegrationTests
             ["targetProcess"] = targetProcess,
             ["targetProcessId"] = targetProcessId,
             ["hookDllPath"] = Path.GetFullPath(hookDllPath),
-            ["hookRuntimePath"] = Path.GetFullPath(hookRuntimePath),
+            ["hookRuntimePath"] = hookRuntimePath is null ? null : Path.GetFullPath(hookRuntimePath),
             ["authenticatedShutdownCompleted"] = true,
             ["unloadedAfterAuthenticatedShutdown"] = true,
             ["waitTimeoutMs"] = 10_000,

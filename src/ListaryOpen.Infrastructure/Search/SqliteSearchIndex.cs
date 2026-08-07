@@ -13,7 +13,7 @@ namespace ListaryOpen.Infrastructure.Search;
 
 public sealed class SqliteSearchIndex : ISearchIndex, IAsyncDisposable
 {
-    internal const int CurrentSchemaVersion = 3;
+    internal const int CurrentSchemaVersion = 4;
     internal const long CurrentIndexContentVersion = 4;
 
     private const int FallbackCandidateLimit = 200;
@@ -21,6 +21,7 @@ public sealed class SqliteSearchIndex : ISearchIndex, IAsyncDisposable
     private const int MinimumCandidateLimit = 200;
     private const int MaximumCandidateLimit = 5_000;
     private const int UsagePathKeyChunkSize = 500;
+    private const int FtsBuildBatchSize = 10_000;
     private const long DefaultIndexGeneration = 0;
     private const string ContentVersionMetadataKey = "index_content_version";
     private const string FilesGenerationMetadataKey = "files_generation";
@@ -31,6 +32,7 @@ public sealed class SqliteSearchIndex : ISearchIndex, IAsyncDisposable
 
     private readonly SemaphoreSlim _connectionGate = new(1, 1);
     private readonly SemaphoreSlim _searchConnectionGate = new(1, 1);
+    private readonly object _maintenanceGate = new();
     private readonly SqliteConnection _connection;
     private readonly SqliteConnection _searchConnection;
     private readonly CancellationTokenSource _lifetimeCancellation = new();
@@ -38,8 +40,14 @@ public sealed class SqliteSearchIndex : ISearchIndex, IAsyncDisposable
     private Task _performanceIndexBuildTask = Task.CompletedTask;
     private volatile bool _ftsReady;
     private volatile bool _preferredRootIndexReady;
+    private long _ftsRebuildCount;
     private bool _disposed;
     private bool _bulkIndexing;
+    private bool _bulkHasExistingFiles;
+    private bool _bulkFtsRebuildRequired;
+    private bool _bulkFtsTriggersDropped;
+
+    internal long FtsRebuildCount => Interlocked.Read(ref _ftsRebuildCount);
 
     private SqliteSearchIndex(
         SqliteConnection connection,
@@ -78,6 +86,9 @@ public sealed class SqliteSearchIndex : ISearchIndex, IAsyncDisposable
         try
         {
             await ConfigureWriterConnectionAsync(connection, cancellationToken).ConfigureAwait(false);
+            // Recover committed frames from an interrupted prior process and
+            // shrink a stale WAL before schema work or indexing begins.
+            await CheckpointWalCoreAsync(connection, cancellationToken).ConfigureAwait(false);
             await EnsureSupportedSchemaVersionAsync(connection, cancellationToken).ConfigureAwait(false);
             await CreateSchemaAsync(connection, cancellationToken).ConfigureAwait(false);
             await MigrateSchemaAsync(connection, cancellationToken).ConfigureAwait(false);
@@ -104,12 +115,6 @@ public sealed class SqliteSearchIndex : ISearchIndex, IAsyncDisposable
                     searchConnection,
                     ftsReady,
                     preferredRootIndexReady);
-                if (!ftsReady)
-                {
-                    index._ftsBuildTask = Task.Run(
-                        () => index.BuildFtsIndexAsync(index._lifetimeCancellation.Token));
-                }
-
                 if (!preferredRootIndexReady)
                 {
                     index._performanceIndexBuildTask = Task.Run(
@@ -158,6 +163,7 @@ public sealed class SqliteSearchIndex : ISearchIndex, IAsyncDisposable
             using var transaction = _connection.BeginTransaction();
             try
             {
+                using var backgroundMode = WindowsBackgroundMode.EnterCurrentThread();
                 using var command = CreateUpsertCommand(transaction);
                 foreach (var record in records)
                 {
@@ -165,11 +171,11 @@ public sealed class SqliteSearchIndex : ISearchIndex, IAsyncDisposable
                     ExecuteUpsert(command, record, DefaultIndexGeneration);
                 }
 
-                await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
+                transaction.Commit();
             }
             catch
             {
-                await transaction.RollbackAsync(CancellationToken.None).ConfigureAwait(false);
+                transaction.Rollback();
                 throw;
             }
         }
@@ -188,6 +194,10 @@ public sealed class SqliteSearchIndex : ISearchIndex, IAsyncDisposable
             pragma journal_mode = wal;
             pragma synchronous = normal;
             pragma busy_timeout = 5000;
+            pragma cache_size = -65536;
+            pragma temp_store = memory;
+            pragma wal_autocheckpoint = 4096;
+            pragma journal_size_limit = 67108864;
             """;
         await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
     }
@@ -200,6 +210,8 @@ public sealed class SqliteSearchIndex : ISearchIndex, IAsyncDisposable
         command.CommandText = """
             pragma query_only = true;
             pragma busy_timeout = 5000;
+            pragma cache_size = -16384;
+            pragma mmap_size = 268435456;
             """;
         await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
     }
@@ -262,19 +274,71 @@ public sealed class SqliteSearchIndex : ISearchIndex, IAsyncDisposable
             using var transaction = _connection.BeginTransaction();
             try
             {
-                using var command = CreateUpsertCommand(transaction);
-                // Sync ExecuteNonQuery avoids per-row async state machines on bulk scans.
-                foreach (var record in records)
+                using var backgroundMode = WindowsBackgroundMode.EnterCurrentThread();
+                using var upsertCommand = CreateUpsertCommand(transaction);
+                var pendingUpserts = new List<FileRecord>();
+                var reconciledByReference = 0;
+                var reconciledByPath = 0;
+
+                if (_bulkIndexing && !_bulkHasExistingFiles)
                 {
-                    cancellationToken.ThrowIfCancellationRequested();
-                    ExecuteUpsert(command, record, indexGeneration);
+                    // A new database cannot contain reconciliation hits. Skip the
+                    // lookup entirely and sort the bounded insert batch by primary key.
+                    foreach (var record in records)
+                    {
+                        cancellationToken.ThrowIfCancellationRequested();
+                        pendingUpserts.Add(record);
+                    }
+                }
+                else
+                {
+                    using var reconcileByReferenceCommand = CreateReconciliationTouchCommand(
+                        transaction,
+                        useFileReference: true);
+                    using var reconcileByPathCommand = CreateReconciliationTouchCommand(
+                        transaction,
+                        useFileReference: false);
+                    // Sync ExecuteNonQuery avoids per-row async state machines on bulk scans.
+                    foreach (var record in records)
+                    {
+                        cancellationToken.ThrowIfCancellationRequested();
+                        var reconcileCommand = record.FileReferenceNumber > 0
+                            ? reconcileByReferenceCommand
+                            : reconcileByPathCommand;
+                        if (ExecuteUpsert(reconcileCommand, record, indexGeneration) == 0)
+                        {
+                            pendingUpserts.Add(record);
+                        }
+                        else if (record.FileReferenceNumber > 0)
+                        {
+                            reconciledByReference++;
+                        }
+                        else
+                        {
+                            reconciledByPath++;
+                        }
+                    }
                 }
 
-                await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
+                // New and changed rows are uncommon on reconciliation scans. Ordering
+                // this bounded remainder keeps primary-key insert/update I/O localized.
+                pendingUpserts.Sort(static (left, right) =>
+                    string.CompareOrdinal(left.PathKey, right.PathKey));
+                foreach (var record in pendingUpserts)
+                {
+                    cancellationToken.ThrowIfCancellationRequested();
+                    ExecuteUpsert(upsertCommand, record, indexGeneration);
+                }
+
+                PerformanceMetrics.SetCounter("reconciled_by_file_reference", reconciledByReference);
+                PerformanceMetrics.SetCounter("reconciled_by_path", reconciledByPath);
+                PerformanceMetrics.SetCounter("full_upserts", pendingUpserts.Count);
+
+                transaction.Commit();
             }
             catch
             {
-                await transaction.RollbackAsync(CancellationToken.None).ConfigureAwait(false);
+                transaction.Rollback();
                 throw;
             }
         }
@@ -285,11 +349,18 @@ public sealed class SqliteSearchIndex : ISearchIndex, IAsyncDisposable
     }
 
     /// <summary>
-    /// Drops FTS maintenance triggers for the duration of a full indexing run.
-    /// Call <see cref="EndBulkIndexingAsync"/> to rebuild FTS and restore triggers.
+    /// Starts a full-scan reconciliation. A brand-new database defers FTS work
+    /// until the scan completes; an existing index keeps its triggers so an
+    /// unchanged rescan does not rewrite the entire FTS index.
     /// </summary>
     internal async Task BeginBulkIndexingAsync(CancellationToken cancellationToken)
     {
+        var backgroundBuild = Volatile.Read(ref _ftsBuildTask);
+        if (!backgroundBuild.IsCompleted)
+        {
+            await backgroundBuild.WaitAsync(cancellationToken).ConfigureAwait(false);
+        }
+
         await _connectionGate.WaitAsync(cancellationToken).ConfigureAwait(false);
         try
         {
@@ -299,15 +370,28 @@ public sealed class SqliteSearchIndex : ISearchIndex, IAsyncDisposable
                 return;
             }
 
-            await DropFtsTriggersAsync(_connection, cancellationToken).ConfigureAwait(false);
-            await WriteMetadataAsync(
-                    _connection,
-                    FtsStateMetadataKey,
-                    FtsStateBuilding,
-                    transaction: null,
-                    cancellationToken)
-                .ConfigureAwait(false);
-            _ftsReady = false;
+            var hasExistingFiles = await HasAnyFilesAsync(_connection, cancellationToken).ConfigureAwait(false);
+            _bulkHasExistingFiles = hasExistingFiles;
+            _bulkFtsTriggersDropped = !hasExistingFiles;
+            _bulkFtsRebuildRequired = !_ftsReady || _bulkFtsTriggersDropped;
+
+            if (_bulkFtsTriggersDropped)
+            {
+                await DropFtsTriggersAsync(_connection, cancellationToken).ConfigureAwait(false);
+            }
+
+            if (_bulkFtsRebuildRequired)
+            {
+                await WriteMetadataAsync(
+                        _connection,
+                        FtsStateMetadataKey,
+                        FtsStateBuilding,
+                        transaction: null,
+                        cancellationToken)
+                    .ConfigureAwait(false);
+                _ftsReady = false;
+            }
+
             _bulkIndexing = true;
         }
         finally
@@ -317,9 +401,90 @@ public sealed class SqliteSearchIndex : ISearchIndex, IAsyncDisposable
     }
 
     /// <summary>
-    /// Rebuilds the FTS index once and restores triggers after bulk upserts.
+    /// Finalizes a full-scan reconciliation, rebuilding FTS only when the prior
+    /// snapshot was incomplete or triggers were deferred for a brand-new index.
     /// </summary>
     internal async Task EndBulkIndexingAsync(CancellationToken cancellationToken)
+    {
+        if (!_bulkIndexing)
+        {
+            return;
+        }
+
+        var shouldCheckpoint = false;
+        try
+        {
+            await _connectionGate.WaitAsync(cancellationToken).ConfigureAwait(false);
+        }
+        catch (ObjectDisposedException)
+        {
+            _bulkIndexing = false;
+            _bulkHasExistingFiles = false;
+            return;
+        }
+
+        try
+        {
+            if (_disposed || !_bulkIndexing)
+            {
+                _bulkIndexing = false;
+                return;
+            }
+
+            if (_bulkFtsTriggersDropped)
+            {
+                await EnsureFtsTriggersAsync(_connection, cancellationToken).ConfigureAwait(false);
+            }
+
+            if (_bulkFtsRebuildRequired)
+            {
+                await RebuildFtsIndexInBatchesAsync(_connection, cancellationToken)
+                    .ConfigureAwait(false);
+                Interlocked.Increment(ref _ftsRebuildCount);
+
+                await WriteMetadataAsync(
+                        _connection,
+                        FtsStateMetadataKey,
+                        FtsStateReady,
+                        transaction: null,
+                        cancellationToken)
+                    .ConfigureAwait(false);
+                _ftsReady = true;
+            }
+
+            shouldCheckpoint = true;
+        }
+        catch (ObjectDisposedException)
+        {
+            _bulkIndexing = false;
+        }
+        finally
+        {
+            _bulkIndexing = false;
+            _bulkHasExistingFiles = false;
+            _bulkFtsRebuildRequired = false;
+            _bulkFtsTriggersDropped = false;
+            try
+            {
+                _connectionGate.Release();
+            }
+            catch (ObjectDisposedException)
+            {
+            }
+        }
+
+        if (shouldCheckpoint)
+        {
+            await CheckpointWalAsync(cancellationToken).ConfigureAwait(false);
+        }
+    }
+
+    /// <summary>
+    /// Restores incremental FTS maintenance after a canceled full scan without
+    /// starting an expensive rebuild during shutdown. The "building" marker is
+    /// intentionally retained so the next successful reconciliation can rebuild it.
+    /// </summary>
+    internal async Task AbortBulkIndexingAsync(CancellationToken cancellationToken)
     {
         if (!_bulkIndexing)
         {
@@ -333,6 +498,7 @@ public sealed class SqliteSearchIndex : ISearchIndex, IAsyncDisposable
         catch (ObjectDisposedException)
         {
             _bulkIndexing = false;
+            _bulkHasExistingFiles = false;
             return;
         }
 
@@ -344,23 +510,22 @@ public sealed class SqliteSearchIndex : ISearchIndex, IAsyncDisposable
                 return;
             }
 
-            await EnsureFtsTriggersAsync(_connection, cancellationToken).ConfigureAwait(false);
-
-            using (var buildCommand = _connection.CreateCommand())
+            if (_bulkFtsTriggersDropped)
             {
-                buildCommand.CommandText = "insert into files_fts_v1(files_fts_v1) values('rebuild');";
-                await buildCommand.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+                await EnsureFtsTriggersAsync(_connection, cancellationToken).ConfigureAwait(false);
             }
 
-            await WriteMetadataAsync(
-                    _connection,
-                    FtsStateMetadataKey,
-                    FtsStateReady,
-                    transaction: null,
-                    cancellationToken)
-                .ConfigureAwait(false);
-            _ftsReady = true;
-            _bulkIndexing = false;
+            if (_bulkFtsRebuildRequired)
+            {
+                await WriteMetadataAsync(
+                        _connection,
+                        FtsStateMetadataKey,
+                        FtsStateBuilding,
+                        transaction: null,
+                        cancellationToken)
+                    .ConfigureAwait(false);
+                _ftsReady = false;
+            }
         }
         catch (ObjectDisposedException)
         {
@@ -368,6 +533,10 @@ public sealed class SqliteSearchIndex : ISearchIndex, IAsyncDisposable
         }
         finally
         {
+            _bulkIndexing = false;
+            _bulkHasExistingFiles = false;
+            _bulkFtsRebuildRequired = false;
+            _bulkFtsTriggersDropped = false;
             try
             {
                 _connectionGate.Release();
@@ -376,6 +545,7 @@ public sealed class SqliteSearchIndex : ISearchIndex, IAsyncDisposable
             {
             }
         }
+
     }
 
     internal async Task<int> PruneStaleRecordsUnderRootAsync(
@@ -794,7 +964,7 @@ public sealed class SqliteSearchIndex : ISearchIndex, IAsyncDisposable
     internal static readonly TimeSpan DisposeMaintenanceTimeout = TimeSpan.FromSeconds(1);
 
     /// <summary>Maximum time to wait for connection gates before force-closing on dispose.</summary>
-    internal static readonly TimeSpan DisposeGateTimeout = TimeSpan.FromMilliseconds(750);
+    internal static readonly TimeSpan DisposeGateTimeout = TimeSpan.FromSeconds(5);
 
     public async ValueTask DisposeAsync()
     {
@@ -839,7 +1009,9 @@ public sealed class SqliteSearchIndex : ISearchIndex, IAsyncDisposable
                     .ConfigureAwait(false);
             }
 
-            await CloseConnectionsBestEffortAsync().ConfigureAwait(false);
+            await CloseConnectionsBestEffortAsync(
+                    checkpointWal: searchGateHeld && connectionGateHeld)
+                .ConfigureAwait(false);
         }
         finally
         {
@@ -857,12 +1029,12 @@ public sealed class SqliteSearchIndex : ISearchIndex, IAsyncDisposable
             // does not hang waiting for exclusive ownership.
             if (!_disposed)
             {
-                await CloseConnectionsBestEffortAsync().ConfigureAwait(false);
+                await CloseConnectionsBestEffortAsync(checkpointWal: false).ConfigureAwait(false);
             }
         }
     }
 
-    private async Task CloseConnectionsBestEffortAsync()
+    private async Task CloseConnectionsBestEffortAsync(bool checkpointWal)
     {
         if (_disposed)
         {
@@ -870,6 +1042,18 @@ public sealed class SqliteSearchIndex : ISearchIndex, IAsyncDisposable
         }
 
         _disposed = true;
+        if (checkpointWal)
+        {
+            try
+            {
+                await CheckpointWalCoreAsync(_connection, CancellationToken.None).ConfigureAwait(false);
+            }
+            catch (Exception exception) when (exception is not OutOfMemoryException)
+            {
+                Trace.TraceWarning("Final WAL checkpoint failed during dispose: {0}", exception.Message);
+            }
+        }
+
         try
         {
             await _searchConnection.DisposeAsync().ConfigureAwait(false);
@@ -960,6 +1144,9 @@ public sealed class SqliteSearchIndex : ISearchIndex, IAsyncDisposable
                     break;
                 case 3:
                     await MigrateToSchemaVersion3Async(connection, cancellationToken).ConfigureAwait(false);
+                    break;
+                case 4:
+                    await MigrateToSchemaVersion4Async(connection, cancellationToken).ConfigureAwait(false);
                     break;
                 default:
                     throw new InvalidOperationException($"Missing index migration for schema version {schemaVersion + 1}.");
@@ -1056,7 +1243,7 @@ public sealed class SqliteSearchIndex : ISearchIndex, IAsyncDisposable
             return true;
         }
 
-        if (await CountFilesAsync(connection, cancellationToken).ConfigureAwait(false) == 0)
+        if (!await HasAnyFilesAsync(connection, cancellationToken).ConfigureAwait(false))
         {
             await WriteMetadataAsync(
                 connection,
@@ -1078,16 +1265,15 @@ public sealed class SqliteSearchIndex : ISearchIndex, IAsyncDisposable
 
     private async Task BuildFtsIndexAsync(CancellationToken cancellationToken)
     {
+        var rebuilt = false;
         try
         {
             await _connectionGate.WaitAsync(cancellationToken).ConfigureAwait(false);
             try
             {
-                using (var buildCommand = _connection.CreateCommand())
-                {
-                    buildCommand.CommandText = "insert into files_fts_v1(files_fts_v1) values('rebuild');";
-                    await buildCommand.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
-                }
+                await RebuildFtsIndexInBatchesAsync(_connection, cancellationToken)
+                    .ConfigureAwait(false);
+                Interlocked.Increment(ref _ftsRebuildCount);
 
                 await WriteMetadataAsync(
                     _connection,
@@ -1096,14 +1282,16 @@ public sealed class SqliteSearchIndex : ISearchIndex, IAsyncDisposable
                     transaction: null,
                     cancellationToken).ConfigureAwait(false);
                 _ftsReady = true;
-
-                using var checkpointCommand = _connection.CreateCommand();
-                checkpointCommand.CommandText = "pragma wal_checkpoint(truncate);";
-                await checkpointCommand.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+                rebuilt = true;
             }
             finally
             {
                 _connectionGate.Release();
+            }
+
+            if (rebuilt)
+            {
+                await CheckpointWalAsync(cancellationToken).ConfigureAwait(false);
             }
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
@@ -1117,6 +1305,7 @@ public sealed class SqliteSearchIndex : ISearchIndex, IAsyncDisposable
 
     private async Task BuildPreferredRootIndexAsync(CancellationToken cancellationToken)
     {
+        var built = false;
         try
         {
             await _connectionGate.WaitAsync(cancellationToken).ConfigureAwait(false);
@@ -1129,10 +1318,16 @@ public sealed class SqliteSearchIndex : ISearchIndex, IAsyncDisposable
                     """;
                 await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
                 _preferredRootIndexReady = true;
+                built = true;
             }
             finally
             {
                 _connectionGate.Release();
+            }
+
+            if (built)
+            {
+                await CheckpointWalAsync(cancellationToken).ConfigureAwait(false);
             }
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
@@ -1141,6 +1336,134 @@ public sealed class SqliteSearchIndex : ISearchIndex, IAsyncDisposable
         catch (Exception exception)
         {
             Trace.TraceError("Preferred-root index build failed: {0}", exception);
+        }
+    }
+
+    /// <summary>
+    /// Rebuilds the external-content FTS table in bounded transactions. FTS5's
+    /// built-in 'rebuild' command is one transaction and can grow the WAL to the
+    /// size of the entire index before SQLite gets an opportunity to checkpoint.
+    /// </summary>
+    private static async Task RebuildFtsIndexInBatchesAsync(
+        SqliteConnection connection,
+        CancellationToken cancellationToken)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        using (WindowsBackgroundMode.EnterCurrentThread())
+        using (var clearCommand = connection.CreateCommand())
+        {
+            clearCommand.CommandText = "insert into files_fts_v1(files_fts_v1) values('delete-all');";
+            clearCommand.ExecuteNonQuery();
+        }
+
+        long lastRowId = 0;
+        while (true)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            long? batchLastRowId;
+            using (WindowsBackgroundMode.EnterCurrentThread())
+            using (var boundaryCommand = connection.CreateCommand())
+            {
+                boundaryCommand.CommandText = """
+                    select max(rowid)
+                    from (
+                        select rowid
+                        from files
+                        where rowid > $last_rowid
+                        order by rowid
+                        limit $limit
+                    );
+                    """;
+                boundaryCommand.Parameters.AddWithValue("$last_rowid", lastRowId);
+                boundaryCommand.Parameters.AddWithValue("$limit", FtsBuildBatchSize);
+                var value = boundaryCommand.ExecuteScalar();
+                batchLastRowId = value is null or DBNull
+                    ? null
+                    : Convert.ToInt64(value, CultureInfo.InvariantCulture);
+            }
+
+            if (batchLastRowId is null)
+            {
+                return;
+            }
+
+            using (WindowsBackgroundMode.EnterCurrentThread())
+            using (var transaction = connection.BeginTransaction())
+            {
+                try
+                {
+                    using var insertCommand = connection.CreateCommand();
+                    insertCommand.Transaction = transaction;
+                    insertCommand.CommandText = """
+                        insert into files_fts_v1(rowid, name, parent_path, search_text)
+                        select rowid, name, parent_path, search_text
+                        from files
+                        where rowid > $last_rowid
+                          and rowid <= $batch_last_rowid
+                        order by rowid;
+                        """;
+                    insertCommand.Parameters.AddWithValue("$last_rowid", lastRowId);
+                    insertCommand.Parameters.AddWithValue("$batch_last_rowid", batchLastRowId.Value);
+                    insertCommand.ExecuteNonQuery();
+                    transaction.Commit();
+                }
+                catch
+                {
+                    transaction.Rollback();
+                    throw;
+                }
+            }
+
+            lastRowId = batchLastRowId.Value;
+            await Task.Delay(TimeSpan.FromMilliseconds(1), cancellationToken).ConfigureAwait(false);
+        }
+    }
+
+    private async Task CheckpointWalAsync(CancellationToken cancellationToken)
+    {
+        // All code that needs both gates uses search-then-writer order, avoiding
+        // a dispose/checkpoint deadlock with an in-flight interactive query.
+        await _searchConnectionGate.WaitAsync(cancellationToken).ConfigureAwait(false);
+        try
+        {
+            await _connectionGate.WaitAsync(cancellationToken).ConfigureAwait(false);
+            try
+            {
+                ThrowIfDisposed();
+                await CheckpointWalCoreAsync(_connection, cancellationToken).ConfigureAwait(false);
+            }
+            finally
+            {
+                _connectionGate.Release();
+            }
+        }
+        finally
+        {
+            _searchConnectionGate.Release();
+        }
+    }
+
+    private static async Task CheckpointWalCoreAsync(
+        SqliteConnection connection,
+        CancellationToken cancellationToken)
+    {
+        using var command = connection.CreateCommand();
+        command.CommandText = "pragma wal_checkpoint(truncate);";
+        await using var reader = await command.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
+        if (!await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
+        {
+            return;
+        }
+
+        var busy = reader.GetInt32(0);
+        var logFrames = reader.GetInt32(1);
+        var checkpointedFrames = reader.GetInt32(2);
+        if (busy != 0)
+        {
+            Trace.TraceWarning(
+                "WAL truncate checkpoint remained busy (log frames: {0}, checkpointed: {1}).",
+                logFrames,
+                checkpointedFrames);
         }
     }
 
@@ -1179,8 +1502,36 @@ public sealed class SqliteSearchIndex : ISearchIndex, IAsyncDisposable
         return Convert.ToInt64(result, CultureInfo.InvariantCulture) > 0;
     }
 
+    internal async Task EnsureFtsReadyAsync(CancellationToken cancellationToken)
+    {
+        var buildTask = GetOrStartFtsBuild();
+        await buildTask.WaitAsync(cancellationToken).ConfigureAwait(false);
+    }
+
     internal Task WaitForBackgroundMaintenanceAsync() =>
-        Task.WhenAll(_ftsBuildTask, _performanceIndexBuildTask);
+        Task.WhenAll(GetOrStartFtsBuild(), _performanceIndexBuildTask);
+
+    private Task GetOrStartFtsBuild()
+    {
+        lock (_maintenanceGate)
+        {
+            if (_ftsReady || _disposed)
+            {
+                return Task.CompletedTask;
+            }
+
+            if (_ftsBuildTask.IsCompleted)
+            {
+                // Recovery is lazy: the app starts a reconciliation immediately
+                // after opening the database. Starting a multi-gigabyte rebuild here
+                // would race that scan and then make it rebuild FTS a second time.
+                _ftsBuildTask = Task.Run(
+                    () => BuildFtsIndexAsync(_lifetimeCancellation.Token));
+            }
+
+            return _ftsBuildTask;
+        }
+    }
 
     private static async Task EnsureIndexContentVersionAsync(
         SqliteConnection connection,
@@ -1196,8 +1547,6 @@ public sealed class SqliteSearchIndex : ISearchIndex, IAsyncDisposable
             return;
         }
 
-        var existingFileCount = await CountFilesAsync(connection, cancellationToken).ConfigureAwait(false);
-
         using (var transaction = connection.BeginTransaction())
         {
             try
@@ -1205,7 +1554,14 @@ public sealed class SqliteSearchIndex : ISearchIndex, IAsyncDisposable
                 using (var deleteCommand = connection.CreateCommand())
                 {
                     deleteCommand.Transaction = transaction;
-                    deleteCommand.CommandText = "delete from files;";
+                    deleteCommand.CommandText = """
+                        drop trigger if exists files_fts_v1_insert;
+                        drop trigger if exists files_fts_v1_delete;
+                        drop trigger if exists files_fts_v1_update;
+                        drop table if exists files_fts_v1;
+                        delete from files;
+                        delete from volume_checkpoints;
+                        """;
                     await deleteCommand.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
                 }
 
@@ -1230,20 +1586,16 @@ public sealed class SqliteSearchIndex : ISearchIndex, IAsyncDisposable
                 throw;
             }
         }
-
-        if (existingFileCount > 0)
-        {
-            await VacuumAsync(connection, cancellationToken).ConfigureAwait(false);
-        }
     }
 
-    private static async Task<long> CountFilesAsync(SqliteConnection connection, CancellationToken cancellationToken)
+    private static async Task<bool> HasAnyFilesAsync(
+        SqliteConnection connection,
+        CancellationToken cancellationToken)
     {
         using var command = connection.CreateCommand();
-        command.CommandText = "select count(*) from files;";
-
+        command.CommandText = "select exists(select 1 from files limit 1);";
         var result = await command.ExecuteScalarAsync(cancellationToken).ConfigureAwait(false);
-        return Convert.ToInt64(result, CultureInfo.InvariantCulture);
+        return Convert.ToInt64(result, CultureInfo.InvariantCulture) != 0;
     }
 
     private static async Task<long?> ReadMetadataInt64Async(
@@ -1417,14 +1769,6 @@ public sealed class SqliteSearchIndex : ISearchIndex, IAsyncDisposable
         return Convert.ToInt64(result, CultureInfo.InvariantCulture) > 0;
     }
 
-    private static async Task VacuumAsync(SqliteConnection connection, CancellationToken cancellationToken)
-    {
-        using var command = connection.CreateCommand();
-        command.CommandText = "vacuum;";
-
-        await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
-    }
-
     private static async Task BackfillSearchTextAsync(SqliteConnection connection, CancellationToken cancellationToken)
     {
         var rows = new List<(string PathKey, string FullPath)>();
@@ -1536,11 +1880,22 @@ public sealed class SqliteSearchIndex : ISearchIndex, IAsyncDisposable
                 is_directory = excluded.is_directory,
                 size_bytes = excluded.size_bytes,
                 last_write_time = excluded.last_write_time,
-                index_generation = excluded.index_generation,
+                index_generation = case
+                    when excluded.index_generation > 0 then excluded.index_generation
+                    else files.index_generation
+                end,
                 file_reference = case
                     when excluded.file_reference > 0 then excluded.file_reference
                     else files.file_reference
-                end;
+                end
+            where files.full_path is not excluded.full_path
+               or files.name is not excluded.name
+               or files.parent_path is not excluded.parent_path
+               or files.search_text is not excluded.search_text
+               or files.is_directory is not excluded.is_directory
+               or files.size_bytes is not excluded.size_bytes
+               or files.last_write_time is not excluded.last_write_time
+               or (excluded.file_reference > 0 and files.file_reference is not excluded.file_reference);
             """;
 
         command.Parameters.Add("$full_path", SqliteType.Text);
@@ -1557,6 +1912,60 @@ public sealed class SqliteSearchIndex : ISearchIndex, IAsyncDisposable
         return command;
     }
 
+    /// <summary>
+    /// Handles an unchanged full-rescan row with one narrow update. NTFS records use
+    /// the compact file-reference index in the scanner's natural MFT order; records
+    /// without an identity fall back to the path primary key. A zero result means the
+    /// row is new or changed, so the regular upsert handles the uncommon path.
+    /// </summary>
+    private SqliteCommand CreateReconciliationTouchCommand(
+        SqliteTransaction transaction,
+        bool useFileReference)
+    {
+        var command = _connection.CreateCommand();
+        command.Transaction = transaction;
+        var lookup = useFileReference
+            ? "files indexed by ix_files_file_reference"
+            : "files";
+        var referenceFilter = useFileReference
+            ? "and file_reference > 0 and file_reference = $file_reference"
+            : string.Empty;
+        command.CommandText = $"""
+            update {lookup}
+            set index_generation = $index_generation,
+                file_reference = case
+                    when $file_reference > 0 then $file_reference
+                    else file_reference
+                end
+            where path_key = $path_key
+              {referenceFilter}
+              and full_path is $full_path
+              and name is $name
+              and parent_path is $parent_path
+              and search_text is $search_text
+              and is_directory is $is_directory
+              and size_bytes is $size_bytes
+              and last_write_time is $last_write_time;
+            """;
+        AddUpsertParameters(command);
+        command.Prepare();
+        return command;
+    }
+
+    private static void AddUpsertParameters(SqliteCommand command)
+    {
+        command.Parameters.Add("$full_path", SqliteType.Text);
+        command.Parameters.Add("$path_key", SqliteType.Text);
+        command.Parameters.Add("$name", SqliteType.Text);
+        command.Parameters.Add("$parent_path", SqliteType.Text);
+        command.Parameters.Add("$search_text", SqliteType.Text);
+        command.Parameters.Add("$is_directory", SqliteType.Integer);
+        command.Parameters.Add("$size_bytes", SqliteType.Integer);
+        command.Parameters.Add("$last_write_time", SqliteType.Text);
+        command.Parameters.Add("$index_generation", SqliteType.Integer);
+        command.Parameters.Add("$file_reference", SqliteType.Integer);
+    }
+
     private static async Task ExecuteUpsertAsync(
         SqliteCommand command,
         FileRecord record,
@@ -1568,7 +1977,7 @@ public sealed class SqliteSearchIndex : ISearchIndex, IAsyncDisposable
         await Task.CompletedTask.ConfigureAwait(false);
     }
 
-    private static void ExecuteUpsert(
+    private static int ExecuteUpsert(
         SqliteCommand command,
         FileRecord record,
         long indexGeneration)
@@ -1585,7 +1994,7 @@ public sealed class SqliteSearchIndex : ISearchIndex, IAsyncDisposable
         command.Parameters[7].Value = FormatDateTime(record.LastWriteTime);
         command.Parameters[8].Value = indexGeneration;
         command.Parameters[9].Value = unchecked((long)record.FileReferenceNumber);
-        command.ExecuteNonQuery();
+        return command.ExecuteNonQuery();
     }
 
     private static async Task DropFtsTriggersAsync(
@@ -1649,6 +2058,22 @@ public sealed class SqliteSearchIndex : ISearchIndex, IAsyncDisposable
             create index if not exists ix_files_file_reference
                 on files(file_reference)
                 where file_reference > 0;
+            """;
+        await indexCommand.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+    }
+
+    private static async Task MigrateToSchemaVersion4Async(
+        SqliteConnection connection,
+        CancellationToken cancellationToken)
+    {
+        // Only paths that need transliteration have search_text. A partial covering
+        // index lets 1-2 character pinyin-initial searches scan that small subset
+        // instead of every file row and its much wider table payload.
+        using var indexCommand = connection.CreateCommand();
+        indexCommand.CommandText = """
+            create index if not exists ix_files_search_text_nonempty
+                on files(search_text)
+                where search_text <> '';
             """;
         await indexCommand.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
     }
@@ -1856,7 +2281,13 @@ public sealed class SqliteSearchIndex : ISearchIndex, IAsyncDisposable
         }
 
         cancellationToken.ThrowIfCancellationRequested();
-        if (useExpensiveFuzzy && (records.Count < query.Limit || ShouldUseShortAliasCandidates(query)))
+        // Short pinyin (1-2 chars) always keeps FTS as a recall backstop. Longer plain
+        // tokens that already hit the name-prefix index (including CamelCase→snake_case
+        // variants) skip trigram FTS: on multi-GB snapshots a rare-phrase MATCH is often
+        // 50–200ms and ResultRanker + preferred-root already cover interactive ranking.
+        if (useExpensiveFuzzy
+            && (ShouldUseShortAliasCandidates(query)
+                || (records.Count < query.Limit && !HasUsefulNamePrefixHits(query, records.Count))))
         {
             using (PerformanceMetrics.MeasureStage("candidates.fts"))
             {
@@ -1900,45 +2331,152 @@ public sealed class SqliteSearchIndex : ISearchIndex, IAsyncDisposable
         return length is >= 1 and <= 2;
     }
 
+    /// <summary>
+    /// True when the name-prefix pass already found hits via CamelCase→snake_case (or
+    /// kebab-case) expansion so trigram FTS can be skipped. Plain lowercase tokens still
+    /// use FTS for mid-string recall (e.g. "doc" → mydoc.txt).
+    /// </summary>
+    private static bool HasUsefulNamePrefixHits(SearchQuery query, int recordCount)
+    {
+        if (recordCount <= 0)
+        {
+            return false;
+        }
+
+        // Multi-term / operator queries still need FTS for path and phrase recall.
+        if (query.Parsed.Terms.Count + query.Parsed.Phrases.Count != 1
+            || query.Parsed.PathTerms.Count > 0
+            || query.Parsed.ExcludedTerms.Count > 0)
+        {
+            return false;
+        }
+
+        // Only treat prefix hits as "enough" when casing-driven variants were available
+        // (ListaryOpen → listary_open). All-lowercase queries keep FTS mid-string recall.
+        return CreateNamePrefixVariants(query).Count > 1;
+    }
+
     private async Task AddExactCandidatesAsync(
         SearchQuery query,
         int candidateLimit,
         IDictionary<string, FileRecord> records,
         CancellationToken cancellationToken)
     {
-        var normalizedQuery = NormalizeSearchText(query.NormalizedText);
         var directoryFilter = CreateDirectoryFilter(query, "files.");
+        foreach (var prefix in CreateNamePrefixVariants(query))
+        {
+            if (records.Count >= candidateLimit)
+            {
+                return;
+            }
 
-        using var command = _searchConnection.CreateCommand();
-        var parsedFilter = CreateParsedFilter(query, command, "files.");
-        command.CommandText = $"""
-            select
-                full_path,
-                is_directory,
-                size_bytes,
-                last_write_time
-            from files
-            where name >= $query collate nocase
-              and name < $query_upper_bound collate nocase
-              {directoryFilter}{parsedFilter}
-            order by
-                case
-                    when name = $query then 0
-                    when name >= $query collate nocase
-                     and name < $query_upper_bound collate nocase then 1
-                    else 2
-                end,
-                length(name),
-                name,
-                length(full_path),
-                full_path
-            limit $limit;
-            """;
-        command.Parameters.AddWithValue("$query", normalizedQuery);
-        command.Parameters.AddWithValue("$query_upper_bound", normalizedQuery + '\uFFFF');
-        command.Parameters.AddWithValue("$limit", candidateLimit);
+            cancellationToken.ThrowIfCancellationRequested();
+            var remaining = candidateLimit - records.Count;
+            using var command = _searchConnection.CreateCommand();
+            var parsedFilter = CreateParsedFilter(query, command, "files.");
+            command.CommandText = $"""
+                select
+                    full_path,
+                    is_directory,
+                    size_bytes,
+                    last_write_time
+                from files
+                where name >= $query collate nocase
+                  and name < $query_upper_bound collate nocase
+                  {directoryFilter}{parsedFilter}
+                order by
+                    case
+                        when name = $query then 0
+                        when name >= $query collate nocase
+                         and name < $query_upper_bound collate nocase then 1
+                        else 2
+                    end,
+                    length(name),
+                    name,
+                    length(full_path),
+                    full_path
+                limit $limit;
+                """;
+            command.Parameters.AddWithValue("$query", prefix);
+            command.Parameters.AddWithValue("$query_upper_bound", prefix + '\uFFFF');
+            command.Parameters.AddWithValue("$limit", remaining);
 
-        await AddRecordsAsync(command, records, cancellationToken).ConfigureAwait(false);
+            await AddRecordsAsync(command, records, cancellationToken).ConfigureAwait(false);
+        }
+    }
+
+    /// <summary>
+    /// Name-prefix variants for the indexed range scan. PascalCase/camelCase tokens
+    /// also probe snake_case and kebab-case so "ListaryOpen" hits listary_open* via the
+    /// name index instead of a multi-hundred-ms trigram FTS intersection.
+    /// </summary>
+    internal static IReadOnlyList<string> CreateNamePrefixVariantsForTests(SearchQuery query)
+        => CreateNamePrefixVariants(query);
+
+    private static IReadOnlyList<string> CreateNamePrefixVariants(SearchQuery query)
+    {
+        var normalized = NormalizeSearchText(query.NormalizedText);
+        if (normalized.Length == 0)
+        {
+            return Array.Empty<string>();
+        }
+
+        var variants = new List<string>(3) { normalized };
+        if (normalized.Length < 3
+            || normalized.Contains(' ', StringComparison.Ordinal)
+            || query.Parsed.Terms.Count + query.Parsed.Phrases.Count != 1)
+        {
+            return variants;
+        }
+
+        // Boundary detection needs the user's original casing; ranking text is lowercased.
+        var originalToken = query.Text.Trim();
+        var operatorIndex = originalToken.IndexOf(':');
+        if (operatorIndex >= 0)
+        {
+            return variants;
+        }
+
+        var snake = CamelOrPascalToSnakeCase(originalToken);
+        if (snake.Length >= 3
+            && !string.Equals(snake, normalized, StringComparison.OrdinalIgnoreCase))
+        {
+            variants.Add(snake);
+            var kebab = snake.Replace('_', '-');
+            if (!string.Equals(kebab, snake, StringComparison.Ordinal))
+            {
+                variants.Add(kebab);
+            }
+        }
+
+        return variants;
+    }
+
+    private static string CamelOrPascalToSnakeCase(string value)
+    {
+        if (string.IsNullOrEmpty(value))
+        {
+            return value;
+        }
+
+        var builder = new StringBuilder(value.Length + 4);
+        for (var index = 0; index < value.Length; index++)
+        {
+            var current = value[index];
+            if (index > 0 && char.IsUpper(current))
+            {
+                var previous = value[index - 1];
+                var nextIsLower = index + 1 < value.Length && char.IsLower(value[index + 1]);
+                if (char.IsLower(previous) || (char.IsUpper(previous) && nextIsLower))
+                {
+                    builder.Append('_');
+                }
+            }
+
+            builder.Append(char.ToLowerInvariant(current));
+        }
+
+        return builder.ToString();
     }
 
     private async Task AddFuzzyCandidatesAsync(
@@ -1947,33 +2485,27 @@ public sealed class SqliteSearchIndex : ISearchIndex, IAsyncDisposable
         IDictionary<string, FileRecord> records,
         CancellationToken cancellationToken)
     {
-        if (!_ftsReady)
-        {
-            return;
-        }
-
+        // Keep querying the last committed FTS snapshot while a bulk scan rebuilds it.
+        // Bulk indexing deliberately drops the maintenance triggers, but the previous
+        // snapshot remains readable and is substantially more useful than disabling
+        // substring/pinyin recall for the entire (potentially long-running) scan.
+        // ResultRanker validates every returned row against current file data, so stale
+        // terms can never surface as false matches.
         var termsQuery = CreateFtsMatchQuery(query);
         if (string.IsNullOrWhiteSpace(termsQuery))
         {
             return;
         }
 
+        // One all-column MATCH avoids paying trigram intersection twice (name, then
+        // parent_path/search_text) on large FTS snapshots. ResultRanker reorders hits.
+        var ftsLimit = records.Count == 0
+            ? candidateLimit
+            : Math.Clamp(query.Limit * 2, MinimumCandidateLimit, candidateLimit);
         await AddFtsCandidatesAsync(
             query,
-            $"name : ({termsQuery})",
-            candidateLimit,
-            records,
-            cancellationToken).ConfigureAwait(false);
-        if (records.Count >= query.Limit)
-        {
-            return;
-        }
-
-        cancellationToken.ThrowIfCancellationRequested();
-        await AddFtsCandidatesAsync(
-            query,
-            $"{{ parent_path search_text }} : ({termsQuery})",
-            candidateLimit,
+            termsQuery,
+            ftsLimit,
             records,
             cancellationToken).ConfigureAwait(false);
     }
@@ -1990,6 +2522,8 @@ public sealed class SqliteSearchIndex : ISearchIndex, IAsyncDisposable
 
         using var command = _searchConnection.CreateCommand();
         var parsedFilter = CreateParsedFilter(query, command, "files.");
+        // No ORDER BY on non-FTS columns: that forced a full match materialization before
+        // LIMIT. ResultRanker applies the interactive ranking order.
         command.CommandText = $"""
             select
                 files.full_path,
@@ -1999,12 +2533,6 @@ public sealed class SqliteSearchIndex : ISearchIndex, IAsyncDisposable
             from files_fts_v1
             inner join files on files.rowid = files_fts_v1.rowid
             where files_fts_v1 match $match{directoryFilter}{parsedFilter}
-            order by
-                length(files.name),
-                files.name collate nocase,
-                files.name,
-                length(files.full_path),
-                files.full_path
             limit $limit;
             """;
         command.Parameters.AddWithValue("$match", matchQuery);
@@ -2130,17 +2658,18 @@ public sealed class SqliteSearchIndex : ISearchIndex, IAsyncDisposable
         using var command = _searchConnection.CreateCommand();
         var parsedFilter = CreateParsedFilter(query, command, "files.");
         // Match precomputed pinyin/initials in search_text (space-separated aliases).
+        // ASCII names are already covered by the indexed name-prefix query above;
+        // keeping them out of this branch avoids a full-table lower(name) scan.
         command.CommandText = $"""
             select
                 files.full_path,
                 files.is_directory,
                 files.size_bytes,
                 files.last_write_time
-            from files
-            where (
-                files.search_text like $alias_contains escape '\'
-                or lower(files.name) like $name_contains escape '\'
-              ){directoryFilter}{parsedFilter}
+            from files indexed by ix_files_search_text_nonempty
+            where files.search_text <> ''
+              and files.search_text like $alias_contains escape '\'
+              {directoryFilter}{parsedFilter}
             order by
                 length(files.name),
                 files.name collate nocase,
@@ -2152,7 +2681,6 @@ public sealed class SqliteSearchIndex : ISearchIndex, IAsyncDisposable
         var escaped = EscapeLike(normalizedQuery);
         // Substring match covers initials embedded in tokens (e.g. "ht.docx") and standalone aliases.
         command.Parameters.AddWithValue("$alias_contains", "%" + escaped + "%");
-        command.Parameters.AddWithValue("$name_contains", "%" + escaped + "%");
         command.Parameters.AddWithValue("$limit", candidateLimit);
 
         await AddRecordsAsync(command, records, cancellationToken).ConfigureAwait(false);

@@ -60,6 +60,7 @@ public sealed class WpfSmokeTests
                     applyTheme: ThemeManager.Apply);
                 mainWindow = new MainWindow(settingsViewModel);
                 Assert.NotNull(mainWindow.FindName("SettingsContentRoot"));
+                var settingsWindowTitle = Assert.IsType<TextBlock>(mainWindow.FindName("SettingsWindowTitle"));
                 var settingsNavigation = Assert.IsType<TabControl>(mainWindow.FindName("SettingsNavigation"));
                 Assert.Equal(9, settingsNavigation.Items.Count);
                 foreach (var item in settingsNavigation.Items.Cast<TabItem>())
@@ -88,7 +89,8 @@ public sealed class WpfSmokeTests
                 Volatile.Write(ref stage, "Chinese binding updated");
                 mainWindow.UpdateLayout();
                 Assert.Equal(AppLanguage.SimplifiedChinese, settingsViewModel.SelectedLanguage);
-                Assert.Equal("ListaryOpen Options", mainWindow.Title);
+                Assert.Equal("ListaryOpen", mainWindow.Title);
+                Assert.Equal("ListaryOpen Options", settingsWindowTitle.Text);
                 var generalTab = Assert.IsType<TabItem>(settingsNavigation.Items[0]);
                 var generalHeaderPresenter = Assert.IsType<ContentPresenter>(
                     generalTab.Template.FindName("HeaderPresenter", generalTab));
@@ -98,7 +100,8 @@ public sealed class WpfSmokeTests
 
                 settingsViewModel.SavePreferencesCommand.Execute(null);
                 mainWindow.UpdateLayout();
-                Assert.Equal("ListaryOpen 选项", mainWindow.Title);
+                Assert.Equal("ListaryOpen", mainWindow.Title);
+                Assert.Equal("ListaryOpen 选项", settingsWindowTitle.Text);
                 Assert.Equal("常规", generalTab.Header);
                 Assert.Equal("常规", generalHeaderPresenter.Content);
                 Assert.Equal("保存语言设置", Assert.IsType<Button>(mainWindow.FindName("SaveLanguageButton")).Content);
@@ -108,14 +111,16 @@ public sealed class WpfSmokeTests
                 languageSelector.GetBindingExpression(ComboBox.SelectedItemProperty)?.UpdateSource();
                 mainWindow.UpdateLayout();
                 Assert.Equal(AppLanguage.English, settingsViewModel.SelectedLanguage);
-                Assert.Equal("ListaryOpen 选项", mainWindow.Title);
+                Assert.Equal("ListaryOpen", mainWindow.Title);
+                Assert.Equal("ListaryOpen 选项", settingsWindowTitle.Text);
                 Assert.Equal("常规", generalTab.Header);
                 Assert.Equal("常规", generalHeaderPresenter.Content);
                 Assert.Equal("保存语言设置", Assert.IsType<Button>(mainWindow.FindName("SaveLanguageButton")).Content);
 
                 settingsViewModel.SavePreferencesCommand.Execute(null);
                 mainWindow.UpdateLayout();
-                Assert.Equal("ListaryOpen Options", mainWindow.Title);
+                Assert.Equal("ListaryOpen", mainWindow.Title);
+                Assert.Equal("ListaryOpen Options", settingsWindowTitle.Text);
                 Assert.Equal("General", generalTab.Header);
                 Assert.Equal("General", generalHeaderPresenter.Content);
                 Assert.Equal("Save language", Assert.IsType<Button>(mainWindow.FindName("SaveLanguageButton")).Content);

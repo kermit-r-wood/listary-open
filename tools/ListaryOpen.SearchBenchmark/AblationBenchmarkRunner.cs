@@ -218,8 +218,17 @@ internal static class AblationBenchmarkRunner
         var names = (await ReadSampleRecordsAsync(connection, sampleSize, cancellationToken))
             .Select(record => record.Name)
             .ToArray();
+        // The retained baseline only knows a tiny hand-written pinyin dictionary. Equivalence
+        // is therefore enforced on pure-ASCII names (both paths must be identity) and on
+        // names whose every non-ASCII character is in that dictionary. TinyPinyin output for
+        // arbitrary CJK is intentionally richer than the baseline and is timed separately.
         foreach (var name in names)
         {
+            if (!BaselinePinyinMatcher.IsSemanticComparable(name))
+            {
+                continue;
+            }
+
             var baselineText = BaselinePinyinMatcher.CreateSearchText(name);
             var optimizedText = PinyinMatcher.CreateSearchText(name);
             if (!string.Equals(baselineText, optimizedText, StringComparison.Ordinal) ||

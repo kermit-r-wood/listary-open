@@ -82,9 +82,37 @@ jobs:
           if (Test-Path -LiteralPath $zip) {
             Remove-Item -LiteralPath $zip -Force
           }
-          Compress-Archive -Path (Join-Path $package "*") -DestinationPath $zip -CompressionLevel Optimal
+          $packageData = [System.IO.Path]::GetFullPath((Join-Path $package "data"))
+          $archiveItems = @(
+            Get-ChildItem -LiteralPath $package -Force |
+              Where-Object {
+                -not ([System.IO.Path]::GetFullPath($_.FullName).Equals(
+                  $packageData,
+                  [System.StringComparison]::OrdinalIgnoreCase))
+              } |
+              ForEach-Object { $_.FullName }
+          )
+          if ($archiveItems.Count -eq 0) {
+            throw "No distributable files were found in '$package'."
+          }
+          Compress-Archive -LiteralPath $archiveItems -DestinationPath $zip -CompressionLevel Optimal
           if (-not (Test-Path -LiteralPath $zip -PathType Leaf) -or (Get-Item -LiteralPath $zip).Length -le 0) {
             throw "Package archive was not created: $zip"
+          }
+
+          Add-Type -AssemblyName System.IO.Compression.FileSystem
+          $archive = [System.IO.Compression.ZipFile]::OpenRead($zip)
+          try {
+            $localDataEntries = @(
+              $archive.Entries |
+                Where-Object { $_.FullName.Replace('\', '/').StartsWith("data/", [System.StringComparison]::OrdinalIgnoreCase) }
+            )
+            if ($localDataEntries.Count -gt 0) {
+              throw "ZIP must not contain local index data: $($localDataEntries[0].FullName)"
+            }
+          }
+          finally {
+            $archive.Dispose()
           }
 
       - name: Upload acceptance evidence

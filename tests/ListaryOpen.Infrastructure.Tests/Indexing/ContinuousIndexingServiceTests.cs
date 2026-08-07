@@ -127,6 +127,62 @@ public sealed class ContinuousIndexingServiceTests
         }
     }
 
+    [Fact]
+    public void WatcherErrorsDuringFullReconciliationDoNotQueueAnotherFullScan()
+    {
+        var root = CreateTempDirectory();
+        var reconciliationRequests = 0;
+        using var service = new ContinuousIndexingService(
+            new RecordingSink(),
+            new[] { root },
+            Array.Empty<string>(),
+            Array.Empty<string>(),
+            () => Interlocked.Increment(ref reconciliationRequests),
+            new NoopWatcherFactory(),
+            TimeSpan.Zero);
+        service.Start(baselineReady: false);
+
+        for (var index = 0; index < 100; index++)
+        {
+            service.ReportWatcherErrorForTests(new IOException("watcher overflow"));
+        }
+
+        Assert.Equal(0, Volatile.Read(ref reconciliationRequests));
+
+        service.MarkBaselineReady();
+        service.ReportWatcherErrorForTests(new IOException("watcher overflow after baseline"));
+        service.ReportWatcherErrorForTests(new IOException("duplicate watcher overflow"));
+
+        Assert.Equal(1, Volatile.Read(ref reconciliationRequests));
+        Directory.Delete(root, recursive: true);
+    }
+
+    [Fact]
+    public void PausingACompletedBaselineSuppressesWatcherReconciliationUntilRunCompletes()
+    {
+        var root = CreateTempDirectory();
+        var reconciliationRequests = 0;
+        using var service = new ContinuousIndexingService(
+            new RecordingSink(),
+            new[] { root },
+            Array.Empty<string>(),
+            Array.Empty<string>(),
+            () => Interlocked.Increment(ref reconciliationRequests),
+            new NoopWatcherFactory(),
+            TimeSpan.Zero);
+        service.Start(baselineReady: true);
+
+        service.PauseUntilBaselineReady();
+        service.ReportWatcherErrorForTests(new IOException("overflow during scheduled scan"));
+        Assert.Equal(0, Volatile.Read(ref reconciliationRequests));
+
+        service.NotifyReconciliationCompleted();
+        service.MarkBaselineReady();
+        service.ReportWatcherErrorForTests(new IOException("overflow after scheduled scan"));
+        Assert.Equal(1, Volatile.Read(ref reconciliationRequests));
+        Directory.Delete(root, recursive: true);
+    }
+
     private static ContinuousIndexingService CreateService(
         ILiveIndexChangeSink sink,
         string root,

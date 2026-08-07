@@ -1,4 +1,6 @@
 using System.IO.Pipes;
+using System.Runtime;
+using System.Runtime.InteropServices;
 using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
@@ -79,6 +81,10 @@ internal static class ElevatedIndexerPipeWorker
 
                 var exitCode = await ExecuteAsync(request).ConfigureAwait(false);
                 await WriteResponseAsync(writer, exitCode, error: null, cancellationToken).ConfigureAwait(false);
+                if (string.Equals(request.Cmd, "scan-to-file", StringComparison.OrdinalIgnoreCase))
+                {
+                    ReleaseFullScanMemory();
+                }
             }
 
             return 0;
@@ -112,6 +118,44 @@ internal static class ElevatedIndexerPipeWorker
             _ => Task.FromResult(2)
         };
     }
+
+    /// <summary>
+    /// A full MFT projection can temporarily retain a very large managed heap.
+    /// The elevated worker is intentionally sticky to avoid repeated UAC prompts,
+    /// so compact and trim it after the response has been sent instead of keeping
+    /// the scan's working set for the rest of the app session.
+    /// </summary>
+    private static void ReleaseFullScanMemory()
+    {
+        try
+        {
+            GCSettings.LargeObjectHeapCompactionMode =
+                GCLargeObjectHeapCompactionMode.CompactOnce;
+            GC.Collect(
+                GC.MaxGeneration,
+                GCCollectionMode.Aggressive,
+                blocking: true,
+                compacting: true);
+        }
+        catch (Exception)
+        {
+        }
+
+        try
+        {
+            _ = EmptyWorkingSet(GetCurrentProcess());
+        }
+        catch (Exception)
+        {
+        }
+    }
+
+    [DllImport("kernel32.dll")]
+    private static extern IntPtr GetCurrentProcess();
+
+    [DllImport("psapi.dll")]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool EmptyWorkingSet(IntPtr process);
 
     private static async Task WriteResponseAsync(
         StreamWriter writer,

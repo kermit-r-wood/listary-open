@@ -10,8 +10,13 @@ internal sealed record BenchmarkRun(
     int Operations,
     double ElapsedMilliseconds,
     double OperationsPerSecond,
+    double ProcessorMilliseconds,
+    double NormalizedCpuPercent,
+    long ReadTransferBytes,
+    long WriteTransferBytes,
     long AllocatedBytes,
     double AllocatedBytesPerOperation,
+    long StorageFootprintBytes,
     double? FirstRecordMilliseconds,
     long SemanticChecksum);
 
@@ -21,8 +26,13 @@ internal sealed record BenchmarkSummary(
     int Operations,
     double MedianElapsedMilliseconds,
     double MedianOperationsPerSecond,
+    double MedianProcessorMilliseconds,
+    double MedianNormalizedCpuPercent,
+    long MedianReadTransferBytes,
+    long MedianWriteTransferBytes,
     long MedianAllocatedBytes,
     double MedianAllocatedBytesPerOperation,
+    long MedianStorageFootprintBytes,
     double? MedianFirstRecordMilliseconds,
     long SemanticChecksum);
 
@@ -66,8 +76,13 @@ internal static class BenchmarkReportWriter
                     representative.Operations,
                     Median(orderedElapsed.Select(run => run.ElapsedMilliseconds).ToArray()),
                     Median(orderedThroughput.Select(run => run.OperationsPerSecond).ToArray()),
+                    Median(group.Select(run => run.ProcessorMilliseconds).OrderBy(value => value).ToArray()),
+                    Median(group.Select(run => run.NormalizedCpuPercent).OrderBy(value => value).ToArray()),
+                    (long)Median(group.Select(run => (double)run.ReadTransferBytes).OrderBy(value => value).ToArray()),
+                    (long)Median(group.Select(run => (double)run.WriteTransferBytes).OrderBy(value => value).ToArray()),
                     (long)Median(orderedAllocations.Select(run => (double)run.AllocatedBytes).ToArray()),
                     Median(orderedBytesPerOperation.Select(run => run.AllocatedBytesPerOperation).ToArray()),
+                    (long)Median(group.Select(run => (double)run.StorageFootprintBytes).OrderBy(value => value).ToArray()),
                     firstRecordValues.Length == 0 ? null : Median(firstRecordValues),
                     representative.SemanticChecksum);
             })
@@ -91,15 +106,18 @@ internal static class BenchmarkReportWriter
         Console.WriteLine($"Indexing pipeline A/B benchmark - {report.RecordedAt:O}");
         Console.WriteLine($"{report.Environment.Processor}; {report.Environment.Framework}; {report.Environment.OperatingSystem}");
         Console.WriteLine();
-        Console.WriteLine("scenario             variant                 ops    median ms        ops/s      alloc MiB       B/op   first ms");
-        Console.WriteLine(new string('-', 116));
+        Console.WriteLine("scenario             variant                 ops    median ms        ops/s      cpu ms   cpu %   read MiB  write MiB  alloc MiB       B/op  store MiB  first ms");
+        Console.WriteLine(new string('-', 150));
         foreach (var summary in report.Summaries)
         {
             var firstRecord = summary.MedianFirstRecordMilliseconds?.ToString("N2") ?? "-";
             Console.WriteLine(
                 $"{summary.Scenario,-20} {summary.Variant,-20} {summary.Operations,8:N0} " +
                 $"{summary.MedianElapsedMilliseconds,12:N2} {summary.MedianOperationsPerSecond,12:N0} " +
+                $"{summary.MedianProcessorMilliseconds,10:N2} {summary.MedianNormalizedCpuPercent,7:N1} " +
+                $"{summary.MedianReadTransferBytes / 1024d / 1024d,10:N2} {summary.MedianWriteTransferBytes / 1024d / 1024d,10:N2} " +
                 $"{summary.MedianAllocatedBytes / 1024d / 1024d,14:N2} {summary.MedianAllocatedBytesPerOperation,10:N1} " +
+                $"{summary.MedianStorageFootprintBytes / 1024d / 1024d,10:N2} " +
                 $"{firstRecord,10}");
         }
 
