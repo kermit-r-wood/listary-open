@@ -8,6 +8,7 @@ using ListaryOpen.Infrastructure.Dialog;
 using ListaryOpen.Infrastructure.Hooks;
 using ListaryOpen.Infrastructure.Indexing;
 using ListaryOpen.Infrastructure.Search;
+using ListaryOpen.Infrastructure.Search.NameTable;
 using ListaryOpen.Infrastructure.Windows;
 using System.ComponentModel;
 using System.Diagnostics;
@@ -46,7 +47,8 @@ public partial class App : Application
     private QuickSwitchBarWindow? _quickSwitchBar;
     private SearchPanel? _searchPanel;
     private TaskManagerSearchWindow? _taskManagerSearchWindow;
-    private SqliteSearchIndex? _searchIndex;
+    private ISearchIndex? _searchIndex;
+    private NameTableSearchIndex? _nameTableSearchIndex;
     private SettingsViewModel? _settingsViewModel;
     private SingleInstanceGuard? _singleInstanceGuard;
     private E2eControlServer? _e2eControlServer;
@@ -211,7 +213,7 @@ public partial class App : Application
         StopDialogAttachmentMonitoring();
         _trayController?.Dispose();
         _performanceMetricsFileSink?.Dispose();
-        if (_searchIndex is { } searchIndex)
+        if (_searchIndex is IAsyncDisposable searchIndex)
         {
             backgroundCleanupTasks.Add(StartShutdownCleanup(
                 "search index",
@@ -237,10 +239,15 @@ public partial class App : Application
             PinyinMatcher.Configure(settings.SearchTransliteration);
             _performanceMetricsFileSink = new PerformanceMetricsFileSink(
                 appDataPaths.PerformanceMetricsPath);
-            _searchIndex = await SqliteSearchIndex.OpenAsync(appDataPaths.IndexDatabasePath, CancellationToken.None)
+            // NameTable-only production path: LOSN snapshot, no historical index.db.
+            var losnPath = Path.Combine(appDataPaths.DataDirectory, "index.losn");
+            _nameTableSearchIndex = await NameTableSearchIndex.OpenAsync(losnPath, CancellationToken.None)
                 .ConfigureAwait(false);
-            await ImportLegacyUsageIfAvailableAsync(_searchIndex, appDataPaths, CancellationToken.None)
-                .ConfigureAwait(false);
+            _searchIndex = _nameTableSearchIndex;
+            Trace.TraceInformation(
+                "Search backend: NameTableOnly; live rows={0}; LOSN={1}",
+                _nameTableSearchIndex.Engine.LiveCount,
+                losnPath);
         }
         catch (Exception exception) when (IsAppDataStartupException(exception))
         {
@@ -249,39 +256,15 @@ public partial class App : Application
 
         return await InvokeOnDispatcherAsync(
                 Dispatcher,
-                () => InitializeApplicationServices(_searchIndex, settings, appDataPaths))
+                () => InitializeApplicationServices(
+                    _nameTableSearchIndex!,
+                    settings,
+                    appDataPaths))
             .ConfigureAwait(false);
     }
 
-    private static async Task ImportLegacyUsageIfAvailableAsync(
-        SqliteSearchIndex searchIndex,
-        AppDataPaths appDataPaths,
-        CancellationToken cancellationToken)
-    {
-        var legacyDbPath = AppDataPaths.CreateLegacyLocalAppDataIndexDatabasePath();
-        if (string.Equals(
-                Path.GetFullPath(legacyDbPath),
-                Path.GetFullPath(appDataPaths.IndexDatabasePath),
-                StringComparison.OrdinalIgnoreCase))
-        {
-            return;
-        }
-
-        try
-        {
-            await searchIndex.ImportUsageFromAsync(legacyDbPath, cancellationToken).ConfigureAwait(false);
-        }
-        catch (Exception exception) when (exception is IOException
-                                         or UnauthorizedAccessException
-                                         or InvalidOperationException
-                                         or Microsoft.Data.Sqlite.SqliteException)
-        {
-            Trace.TraceWarning("Legacy usage import skipped for '{0}': {1}", legacyDbPath, exception.Message);
-        }
-    }
-
     private bool InitializeApplicationServices(
-        SqliteSearchIndex searchIndex,
+        NameTableSearchIndex nameTable,
         AppSettings settings,
         AppDataPaths appDataPaths)
     {
@@ -301,7 +284,7 @@ public partial class App : Application
         });
         _internalIndexExclusions = new[] { appDataPaths.DataDirectory };
         _indexingCoordinator = new IndexingCoordinator(
-            searchIndex,
+            nameTable,
             _volumeIndexer,
             _fallbackIndexProvider,
             recordFilter: record =>
@@ -314,7 +297,7 @@ public partial class App : Application
             _shutdownCancellation.Token,
             RunIndexingRunAsync);
         _continuousIndexing = new ContinuousIndexingService(
-            searchIndex,
+            nameTable,
             GetAllIndexRootPaths(settings),
             settings.ExcludedPaths,
             _internalIndexExclusions,
@@ -344,6 +327,7 @@ public partial class App : Application
             _explorerTracker,
             () => new DispatcherExplorerObservationTimer());
         StartForegroundObservationMonitoring();
+        ISearchIndex searchIndex = nameTable;
         _searchPanel = new SearchPanel(new SearchPanelViewModel(
             searchIndex,
             JumpDialogToFolderAsync,
@@ -843,7 +827,12 @@ public partial class App : Application
     {
         // Watcher overflow during a full-volume scan is expected and must not
         // enqueue another full scan behind the one already in progress.
-        _continuousIndexing?.PauseUntilBaselineReady();
+        if (_continuousIndexing is not null)
+        {
+            await _continuousIndexing
+                .PauseUntilBaselineReadyAsync(cancellationToken)
+                .ConfigureAwait(false);
+        }
         try
         {
             await RunInitialIndexAsync(cancellationToken).ConfigureAwait(false);

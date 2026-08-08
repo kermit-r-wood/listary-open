@@ -4,6 +4,7 @@ using ListaryOpen.Core.Indexing;
 using ListaryOpen.Core.Search;
 using ListaryOpen.Infrastructure.Indexing.Ntfs;
 using ListaryOpen.Infrastructure.Search;
+using ListaryOpen.Infrastructure.Search.NameTable;
 
 namespace ListaryOpen.Infrastructure.Indexing;
 
@@ -26,7 +27,7 @@ public sealed record IndexingStatus(
 
 public sealed class IndexingCoordinator
 {
-    /// <summary>Larger batches reduce SQLite transaction overhead on full scans.</summary>
+    /// <summary>Larger batches reduce per-batch overhead on full scans.</summary>
     private const int DefaultBatchSize = 10_000;
 
     /// <summary>Yield to the scheduler every N flushed batches so UI stays responsive.</summary>
@@ -34,13 +35,34 @@ public sealed class IndexingCoordinator
 
     private static readonly TimeSpan BatchYieldDelay = TimeSpan.FromMilliseconds(1);
 
-    private readonly SqliteSearchIndex _index;
+    private readonly SqliteSearchIndex? _sqlite;
+    private readonly NameTableSearchIndex? _nameTable;
     private readonly VolumeIndexer _volumeIndexer;
     private readonly IIndexProvider _fallbackProvider;
     private readonly Func<IndexRoot, VolumeInfo> _volumeResolver;
     private readonly int _batchSize;
     private readonly Func<FileRecord, bool> _recordFilter;
 
+    /// <summary>Production path: in-memory NameTable + LOSN durability (no SQLite).</summary>
+    public IndexingCoordinator(
+        NameTableSearchIndex nameTable,
+        VolumeIndexer volumeIndexer,
+        IIndexProvider fallbackProvider,
+        Func<IndexRoot, VolumeInfo>? volumeResolver = null,
+        int batchSize = DefaultBatchSize,
+        Func<FileRecord, bool>? recordFilter = null)
+        : this(
+            sqlite: null,
+            nameTable: nameTable,
+            volumeIndexer,
+            fallbackProvider,
+            volumeResolver,
+            batchSize,
+            recordFilter)
+    {
+    }
+
+    /// <summary>Unit tests and tooling that still exercise the SQLite index path.</summary>
     public IndexingCoordinator(
         SqliteSearchIndex index,
         VolumeIndexer volumeIndexer,
@@ -48,8 +70,31 @@ public sealed class IndexingCoordinator
         Func<IndexRoot, VolumeInfo>? volumeResolver = null,
         int batchSize = DefaultBatchSize,
         Func<FileRecord, bool>? recordFilter = null)
+        : this(
+            sqlite: index,
+            nameTable: null,
+            volumeIndexer,
+            fallbackProvider,
+            volumeResolver,
+            batchSize,
+            recordFilter)
     {
-        ArgumentNullException.ThrowIfNull(index);
+    }
+
+    private IndexingCoordinator(
+        SqliteSearchIndex? sqlite,
+        NameTableSearchIndex? nameTable,
+        VolumeIndexer volumeIndexer,
+        IIndexProvider fallbackProvider,
+        Func<IndexRoot, VolumeInfo>? volumeResolver,
+        int batchSize,
+        Func<FileRecord, bool>? recordFilter)
+    {
+        if (sqlite is null && nameTable is null)
+        {
+            throw new ArgumentException("Either sqlite or nameTable is required.");
+        }
+
         ArgumentNullException.ThrowIfNull(volumeIndexer);
         ArgumentNullException.ThrowIfNull(fallbackProvider);
 
@@ -58,7 +103,8 @@ public sealed class IndexingCoordinator
             throw new ArgumentOutOfRangeException(nameof(batchSize), "Batch size must be positive.");
         }
 
-        _index = index;
+        _sqlite = sqlite;
+        _nameTable = nameTable;
         _volumeIndexer = volumeIndexer;
         _fallbackProvider = fallbackProvider;
         _volumeResolver = volumeResolver ?? ResolveVolume;
@@ -91,13 +137,19 @@ public sealed class IndexingCoordinator
         var bulkStarted = false;
         async Task<long> EnsureFullScanContextAsync(CancellationToken token)
         {
+            if (_sqlite is null)
+            {
+                // NameTable has no FTS bulk/generation context.
+                return indexGeneration ??= 0;
+            }
+
             if (!bulkStarted)
             {
-                await _index.BeginBulkIndexingAsync(token).ConfigureAwait(false);
+                await _sqlite.BeginBulkIndexingAsync(token).ConfigureAwait(false);
                 bulkStarted = true;
             }
 
-            indexGeneration ??= await _index.BeginIndexingRunAsync(token).ConfigureAwait(false);
+            indexGeneration ??= await _sqlite.BeginIndexingRunAsync(token).ConfigureAwait(false);
             return indexGeneration.Value;
         }
 
@@ -204,7 +256,21 @@ public sealed class IndexingCoordinator
         }
         finally
         {
-            if (bulkStarted)
+            if (_nameTable is not null)
+            {
+                try
+                {
+                    // Successful roots commit explicitly. Any stage still present
+                    // here is partial/canceled and must never replace the old epoch.
+                    await _nameTable.AbortFullBuildRootAsync(CancellationToken.None).ConfigureAwait(false);
+                }
+                catch (Exception exception) when (exception is not OutOfMemoryException)
+                {
+                    Trace.TraceWarning("Failed to discard staged NameTable build: {0}", exception.Message);
+                }
+            }
+
+            if (bulkStarted && _sqlite is not null)
             {
                 try
                 {
@@ -213,7 +279,7 @@ public sealed class IndexingCoordinator
                         // Do not turn shutdown cancellation into a multi-minute
                         // FTS rebuild. Restore triggers and leave a durable marker
                         // so the next successful reconciliation rebuilds it once.
-                        await _index
+                        await _sqlite
                             .AbortBulkIndexingAsync(CancellationToken.None)
                             .ConfigureAwait(false);
                     }
@@ -226,7 +292,7 @@ public sealed class IndexingCoordinator
                             currentRoot,
                             currentRootNumber,
                             roots.Count);
-                        await _index
+                        await _sqlite
                             .EndBulkIndexingAsync(CancellationToken.None)
                             .ConfigureAwait(false);
                     }
@@ -236,14 +302,17 @@ public sealed class IndexingCoordinator
                     Trace.TraceWarning("Failed to finalize bulk FTS rebuild: {0}", exception.Message);
                 }
             }
-            else if (!cancellationToken.IsCancellationRequested && !hadFailures && !hadCancellations)
+            else if (_sqlite is not null
+                && !cancellationToken.IsCancellationRequested
+                && !hadFailures
+                && !hadCancellations)
             {
                 try
                 {
                     // Recover a snapshot left incomplete by an earlier canceled
                     // scan only after journal reconciliation succeeds. OpenAsync
                     // deliberately does not race startup indexing with this work.
-                    await _index
+                    await _sqlite
                         .EnsureFtsReadyAsync(CancellationToken.None)
                         .ConfigureAwait(false);
                 }
@@ -251,6 +320,31 @@ public sealed class IndexingCoordinator
                 {
                     Trace.TraceWarning("Failed to recover FTS after reconciliation: {0}", exception.Message);
                 }
+            }
+
+            if (_nameTable is not null
+                && !cancellationToken.IsCancellationRequested
+                && !hadFailures
+                && !hadCancellations
+                && _nameTable.Engine.HasPendingDurability)
+            {
+                try
+                {
+                    // One compact LOSN commit covers all successfully reconciled
+                    // roots/volumes in this run.
+                    await _nameTable
+                        .FlushDurableSnapshotAsync(CancellationToken.None)
+                        .ConfigureAwait(false);
+                }
+                catch (Exception exception) when (exception is not OutOfMemoryException)
+                {
+                    Trace.TraceWarning("Failed to save NameTable LOSN after indexing: {0}", exception.Message);
+                }
+            }
+
+            if (_nameTable is not null)
+            {
+                _nameTable.TrimTransientBuildMemory();
             }
 
             if (terminalState is not null && terminalMessage is not null)
@@ -288,6 +382,7 @@ public sealed class IndexingCoordinator
         if (!IsNtfsProvider(provider))
         {
             var indexGeneration = await ensureFullScanContextAsync(cancellationToken).ConfigureAwait(false);
+            await PrepareFullScanRootAsync(root, cancellationToken).ConfigureAwait(false);
             var count = await ScanAndUpsertAsync(
                 provider,
                 root,
@@ -303,7 +398,8 @@ public sealed class IndexingCoordinator
                 root.Path,
                 currentRootNumber,
                 totalRoots);
-            await _index.PruneStaleRecordsUnderRootAsync(root.Path, indexGeneration, cancellationToken).ConfigureAwait(false);
+            await PruneStaleUnderRootAsync(root.Path, indexGeneration, cancellationToken).ConfigureAwait(false);
+            await CommitFullScanRootAsync(root, cancellationToken).ConfigureAwait(false);
             return new IndexRootResult(count, HadFailure: false, WasCanceled: false);
         }
 
@@ -328,6 +424,7 @@ public sealed class IndexingCoordinator
             }
 
             var indexGeneration = await ensureFullScanContextAsync(cancellationToken).ConfigureAwait(false);
+            await PrepareFullScanRootAsync(root, cancellationToken).ConfigureAwait(false);
             var count = await ScanAndUpsertAsync(
                 provider,
                 root,
@@ -351,13 +448,19 @@ public sealed class IndexingCoordinator
                 cancellationToken).ConfigureAwait(false);
             if (postScanJournalState is not null)
             {
-                await _index.PruneStaleRecordsUnderRootAsync(root.Path, indexGeneration, cancellationToken).ConfigureAwait(false);
+                await PruneStaleUnderRootAsync(root.Path, indexGeneration, cancellationToken).ConfigureAwait(false);
+                await CommitFullScanRootAsync(root, cancellationToken).ConfigureAwait(false);
                 await SaveNtfsCheckpointAsync(root, postScanJournalState, cancellationToken).ConfigureAwait(false);
                 return new IndexRootResult(count, HadFailure: false, WasCanceled: false);
             }
 
             if (count > 0)
             {
+                if (_nameTable is not null)
+                {
+                    await _nameTable.AbortFullBuildRootAsync(CancellationToken.None).ConfigureAwait(false);
+                }
+
                 RaiseStatus(
                     IndexingRunState.Indexing,
                     $"NTFS prune skipped for {root.Path}: scan completeness could not be verified.",
@@ -387,6 +490,7 @@ public sealed class IndexingCoordinator
                 currentRootNumber,
                 totalRoots,
                 cancellationToken).ConfigureAwait(false);
+            await CommitFullScanRootAsync(root, cancellationToken).ConfigureAwait(false);
             RaiseStatus(
                 IndexingRunState.Indexing,
                 $"NTFS prune skipped for {root.Path}: recovery scan has no journal completeness proof.",
@@ -408,6 +512,11 @@ public sealed class IndexingCoordinator
         {
             if (IsElevatedIndexerLaunchCanceled(exception))
             {
+                if (_nameTable is not null)
+                {
+                    await _nameTable.AbortFullBuildRootAsync(CancellationToken.None).ConfigureAwait(false);
+                }
+
                 RaiseStatus(
                     IndexingRunState.Canceled,
                     $"NTFS scan canceled for {root.Path}.",
@@ -421,6 +530,7 @@ public sealed class IndexingCoordinator
             if (exception.PartialRecordsAccepted)
             {
                 var indexGeneration = await ensureFullScanContextAsync(cancellationToken).ConfigureAwait(false);
+                await PrepareFullScanRootAsync(root, cancellationToken).ConfigureAwait(false);
                 RaiseStatus(
                     IndexingRunState.Indexing,
                     $"NTFS scan failed after partial output for {root.Path}; restarting with fallback. {exception.Message}",
@@ -443,10 +553,11 @@ public sealed class IndexingCoordinator
                     root.Path,
                     currentRootNumber,
                     totalRoots);
-                await _index.PruneStaleRecordsUnderRootAsync(
+                await PruneStaleUnderRootAsync(
                     root.Path,
                     indexGeneration,
                     cancellationToken).ConfigureAwait(false);
+                await CommitFullScanRootAsync(root, cancellationToken).ConfigureAwait(false);
                 return new IndexRootResult(
                     recoveredCount,
                     HadFailure: true,
@@ -462,6 +573,7 @@ public sealed class IndexingCoordinator
                 currentRootNumber,
                 totalRoots);
             var fallbackGeneration = await ensureFullScanContextAsync(cancellationToken).ConfigureAwait(false);
+            await PrepareFullScanRootAsync(root, cancellationToken).ConfigureAwait(false);
             var fallbackCount = await ScanAndUpsertAsync(
                 _fallbackProvider,
                 root,
@@ -470,6 +582,7 @@ public sealed class IndexingCoordinator
                 currentRootNumber,
                 totalRoots,
                 cancellationToken).ConfigureAwait(false);
+            await CommitFullScanRootAsync(root, cancellationToken).ConfigureAwait(false);
             RaiseStatus(
                 IndexingRunState.Indexing,
                 $"NTFS prune skipped for {root.Path}: recovery scan has no journal completeness proof.",
@@ -523,8 +636,7 @@ public sealed class IndexingCoordinator
             return NtfsCatchUpResult.NeedsFullScan(journalState: null);
         }
 
-        var checkpoint = await _index
-            .ReadVolumeCheckpointAsync(root.Path, cancellationToken)
+        var checkpoint = await ReadVolumeCheckpointAsync(root.Path, cancellationToken)
             .ConfigureAwait(false);
         var plan = UsnJournalCatchUpPlanner.Plan(
             checkpoint,
@@ -552,11 +664,12 @@ public sealed class IndexingCoordinator
                 cancellationToken);
             applyResult = await UsnJournalChangeApplier
                 .ApplyAsync(
-                    _index,
+                    _sqlite,
                     changes,
                     nextCheckpoint,
                     cancellationToken,
-                    recordFilter: _recordFilter)
+                    recordFilter: _recordFilter,
+                    nameTable: _nameTable)
                 .ConfigureAwait(false);
         }
         catch (OperationCanceledException)
@@ -593,8 +706,15 @@ public sealed class IndexingCoordinator
             return;
         }
 
-        await _index
-            .SaveVolumeCheckpointAsync(CreateCheckpoint(root, journalState, journalState.NextUsn), cancellationToken)
+        var checkpoint = CreateCheckpoint(root, journalState, journalState.NextUsn);
+        if (_nameTable is not null)
+        {
+            await _nameTable.UpdateMemoryCheckpointAsync(checkpoint, cancellationToken).ConfigureAwait(false);
+            return;
+        }
+
+        await _sqlite!
+            .SaveVolumeCheckpointAsync(checkpoint, cancellationToken)
             .ConfigureAwait(false);
     }
 
@@ -634,12 +754,13 @@ public sealed class IndexingCoordinator
                 postScanJournalState.NextUsn,
                 cancellationToken);
             var result = await UsnJournalChangeApplier.ApplyAsync(
-                    _index,
+                    _sqlite,
                     changes,
                     CreateCheckpoint(root, postScanJournalState, postScanJournalState.NextUsn),
                     cancellationToken,
                     indexGeneration,
-                    _recordFilter)
+                    _recordFilter,
+                    nameTable: _nameTable)
                 .ConfigureAwait(false);
             return result.RequiresFullRescan ? null : postScanJournalState;
         }
@@ -816,14 +937,25 @@ public sealed class IndexingCoordinator
         }
 
         var count = batch.Count;
-        using var metrics = PerformanceMetrics.Begin("indexing.sqlite_batch");
+        var metricName = _nameTable is not null ? "indexing.nametable_batch" : "indexing.sqlite_batch";
+        using var metrics = PerformanceMetrics.Begin(metricName);
         PerformanceMetrics.SetCounter("batch_size", count);
         PerformanceMetrics.SetCounter("index_generation", indexGeneration);
         try
         {
-            using (PerformanceMetrics.MeasureStage("sqlite.upsert"))
+            if (_nameTable is not null)
             {
-                await _index.UpsertManyAsync(batch, indexGeneration, cancellationToken).ConfigureAwait(false);
+                using (PerformanceMetrics.MeasureStage("nametable.upsert"))
+                {
+                    await _nameTable.UpsertManyAsync(batch, cancellationToken).ConfigureAwait(false);
+                }
+            }
+            else
+            {
+                using (PerformanceMetrics.MeasureStage("sqlite.upsert"))
+                {
+                    await _sqlite!.UpsertManyAsync(batch, indexGeneration, cancellationToken).ConfigureAwait(false);
+                }
             }
 
             metrics.Complete("success", count);
@@ -853,6 +985,57 @@ public sealed class IndexingCoordinator
         StatusChanged?.Invoke(
             this,
             new IndexingStatus(state, message, indexedCount, currentRoot, currentRootNumber, totalRoots));
+    }
+
+    /// <summary>NameTable scans build an isolated root epoch; SQLite uses generation pruning.</summary>
+    private Task PrepareFullScanRootAsync(IndexRoot root, CancellationToken cancellationToken)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        if (_nameTable is not null)
+        {
+            return _nameTable.BeginFullBuildRootAsync(root.Path, cancellationToken);
+        }
+
+        return Task.CompletedTask;
+    }
+
+    private Task CommitFullScanRootAsync(IndexRoot root, CancellationToken cancellationToken) =>
+        _nameTable is null
+            ? Task.CompletedTask
+            : _nameTable.CommitFullBuildRootAsync(root.Path, cancellationToken);
+
+    private async Task PruneStaleUnderRootAsync(
+        string rootPath,
+        long indexGeneration,
+        CancellationToken cancellationToken)
+    {
+        if (_sqlite is null)
+        {
+            // NameTable publishes the complete staged root atomically after this step.
+            return;
+        }
+
+        await _sqlite.PruneStaleRecordsUnderRootAsync(rootPath, indexGeneration, cancellationToken)
+            .ConfigureAwait(false);
+    }
+
+    private async Task<UsnJournalCheckpoint?> ReadVolumeCheckpointAsync(
+        string rootPath,
+        CancellationToken cancellationToken)
+    {
+        if (_nameTable is not null)
+        {
+            if (!_nameTable.Engine.TryGetDurableCheckpoint(rootPath, out var checkpoint)
+                || checkpoint is null
+                || checkpoint.NextUsn <= 0)
+            {
+                return null;
+            }
+
+            return checkpoint;
+        }
+
+        return await _sqlite!.ReadVolumeCheckpointAsync(rootPath, cancellationToken).ConfigureAwait(false);
     }
 
     private static bool IsNtfsProvider(IIndexProvider provider)

@@ -1,5 +1,7 @@
 using ListaryOpen.Core.Indexing;
 using ListaryOpen.Infrastructure.Search;
+using ListaryOpen.Infrastructure.Search.NameTable;
+// DualWrite removed: USN applies to NameTable and/or Sqlite explicitly.
 
 namespace ListaryOpen.Infrastructure.Indexing.Ntfs;
 
@@ -112,11 +114,12 @@ public sealed record UsnJournalApplyResult(
 public static class UsnJournalChangeApplier
 {
     public static async Task<UsnJournalApplyResult> ApplyAsync(
-        SqliteSearchIndex index,
+        SqliteSearchIndex? index,
         IEnumerable<UsnJournalChange> changes,
         UsnJournalCheckpoint nextCheckpoint,
         CancellationToken cancellationToken,
-        Func<FileRecord, bool>? recordFilter = null)
+        Func<FileRecord, bool>? recordFilter = null,
+        NameTableSearchIndex? nameTable = null)
     {
         ArgumentNullException.ThrowIfNull(changes);
 
@@ -125,19 +128,25 @@ public static class UsnJournalChangeApplier
                 ToAsyncEnumerable(changes, cancellationToken),
                 nextCheckpoint,
                 cancellationToken,
-                recordFilter: recordFilter)
+                recordFilter: recordFilter,
+                nameTable: nameTable)
             .ConfigureAwait(false);
     }
 
     public static async Task<UsnJournalApplyResult> ApplyAsync(
-        SqliteSearchIndex index,
+        SqliteSearchIndex? index,
         IAsyncEnumerable<UsnJournalChange> changes,
         UsnJournalCheckpoint nextCheckpoint,
         CancellationToken cancellationToken,
         long indexGeneration = 0,
-        Func<FileRecord, bool>? recordFilter = null)
+        Func<FileRecord, bool>? recordFilter = null,
+        NameTableSearchIndex? nameTable = null)
     {
-        ArgumentNullException.ThrowIfNull(index);
+        if (index is null && nameTable is null)
+        {
+            throw new ArgumentException("Either sqlite index or nameTable is required.");
+        }
+
         ArgumentNullException.ThrowIfNull(changes);
         ArgumentNullException.ThrowIfNull(nextCheckpoint);
 
@@ -197,9 +206,21 @@ public static class UsnJournalChangeApplier
             }
         }
 
-        await index
-            .ApplyUsnJournalChangesAsync(indexChanges, nextCheckpoint, cancellationToken, indexGeneration)
-            .ConfigureAwait(false);
+        if (nameTable is not null)
+        {
+            // Apply mutations and advance only the in-memory cursor atomically.
+            // The coordinator's single durability boundary persists the complete
+            // run, avoiding one full LOSN rewrite per USN batch.
+            await nameTable
+                .ApplyUsnMutationsAsync(indexChanges, nextCheckpoint, cancellationToken)
+                .ConfigureAwait(false);
+        }
+        else
+        {
+            await index!
+                .ApplyUsnJournalChangesAsync(indexChanges, nextCheckpoint, cancellationToken, indexGeneration)
+                .ConfigureAwait(false);
+        }
 
         return new UsnJournalApplyResult(
             RequiresFullRescan: false,

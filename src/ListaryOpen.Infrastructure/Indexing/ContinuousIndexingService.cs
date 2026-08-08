@@ -4,6 +4,7 @@ using System.Security;
 using System.Threading.Channels;
 using ListaryOpen.Core.Indexing;
 using ListaryOpen.Infrastructure.Search;
+using ListaryOpen.Infrastructure.Search.NameTable;
 
 namespace ListaryOpen.Infrastructure.Indexing;
 
@@ -118,6 +119,7 @@ public sealed class ContinuousIndexingService : IDisposable
     private readonly TimeSpan _debounce;
     private readonly CancellationTokenSource _cancellation = new();
     private readonly Task _worker;
+    private readonly SemaphoreSlim _applyGate = new(1, 1);
     private readonly List<IIndexRootWatcher> _watchers = new();
     private volatile PathFilterSnapshot _filter;
     private TaskCompletionSource _baselineReady = CreateReadySource();
@@ -125,6 +127,24 @@ public sealed class ContinuousIndexingService : IDisposable
     private bool _started;
     private bool _disposed;
 
+    public ContinuousIndexingService(
+        NameTableSearchIndex nameTable,
+        IReadOnlyList<string> indexedRoots,
+        IReadOnlyList<string> configuredExclusions,
+        IReadOnlyList<string> internalExcludedPaths,
+        Action requestReconciliation)
+        : this(
+            new NameTableLiveIndexChangeSink(nameTable),
+            indexedRoots,
+            configuredExclusions,
+            internalExcludedPaths,
+            requestReconciliation,
+            new FileSystemIndexRootWatcherFactory(),
+            DefaultDebounce)
+    {
+    }
+
+    /// <summary>Unit tests that exercise SQLite live apply.</summary>
     public ContinuousIndexingService(
         SqliteSearchIndex index,
         IReadOnlyList<string> indexedRoots,
@@ -235,6 +255,13 @@ public sealed class ContinuousIndexingService : IDisposable
 
     public void MarkBaselineReady() => Volatile.Read(ref _baselineReady).TrySetResult();
 
+    public async Task PauseUntilBaselineReadyAsync(CancellationToken cancellationToken = default)
+    {
+        PauseUntilBaselineReady();
+        await _applyGate.WaitAsync(cancellationToken).ConfigureAwait(false);
+        _applyGate.Release();
+    }
+
     public void NotifyReconciliationCompleted() => Interlocked.Exchange(ref _reconciliationRequested, 0);
 
     internal bool TryEnqueueForTests(FileChangeHint hint) => TryEnqueue(hint);
@@ -274,6 +301,7 @@ public sealed class ContinuousIndexingService : IDisposable
         }
         finally
         {
+            _applyGate.Dispose();
             _cancellation.Dispose();
         }
     }
@@ -309,9 +337,20 @@ public sealed class ContinuousIndexingService : IDisposable
                     DrainAvailableHints(pending);
                 }
 
-                await Volatile.Read(ref _baselineReady).Task
-                    .WaitAsync(cancellationToken)
-                    .ConfigureAwait(false);
+                while (true)
+                {
+                    var observedReady = Volatile.Read(ref _baselineReady);
+                    await observedReady.Task.WaitAsync(cancellationToken).ConfigureAwait(false);
+                    await _applyGate.WaitAsync(cancellationToken).ConfigureAwait(false);
+                    if (ReferenceEquals(observedReady, Volatile.Read(ref _baselineReady))
+                        && observedReady.Task.IsCompleted)
+                    {
+                        break;
+                    }
+
+                    _applyGate.Release();
+                }
+
                 try
                 {
                     await ApplyPendingAsync(pending, cancellationToken).ConfigureAwait(false);
@@ -324,6 +363,10 @@ public sealed class ContinuousIndexingService : IDisposable
                 {
                     Trace.TraceError("Could not apply continuous index changes: {0}", exception);
                     RequestReconciliationOnce();
+                }
+                finally
+                {
+                    _applyGate.Release();
                 }
             }
         }

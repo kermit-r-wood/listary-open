@@ -183,6 +183,35 @@ public sealed class ContinuousIndexingServiceTests
         Directory.Delete(root, recursive: true);
     }
 
+    [Fact]
+    public async Task AsyncPauseWaitsForInflightApplyAndBlocksFollowingBatches()
+    {
+        var root = CreateTempDirectory();
+        var firstPath = Path.Combine(root, "first.txt");
+        var secondPath = Path.Combine(root, "second.txt");
+        await File.WriteAllTextAsync(firstPath, "first");
+        await File.WriteAllTextAsync(secondPath, "second");
+        var sink = new BlockingSink();
+        using var service = CreateService(sink, root, TimeSpan.Zero);
+        service.Start(baselineReady: true);
+
+        Assert.True(service.TryEnqueueForTests(new FileChangeHint(FileChangeHintKind.Changed, firstPath)));
+        await sink.FirstApplyStarted.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        var pause = service.PauseUntilBaselineReadyAsync();
+        await Task.Delay(50);
+        Assert.False(pause.IsCompleted);
+
+        sink.ReleaseFirstApply.TrySetResult();
+        await pause.WaitAsync(TimeSpan.FromSeconds(5));
+        Assert.True(service.TryEnqueueForTests(new FileChangeHint(FileChangeHintKind.Changed, secondPath)));
+        await Task.Delay(100);
+        Assert.Equal(1, sink.ApplyCalls);
+
+        service.MarkBaselineReady();
+        await WaitUntilAsync(() => sink.ApplyCalls >= 2);
+        Directory.Delete(root, recursive: true);
+    }
+
     private static ContinuousIndexingService CreateService(
         ILiveIndexChangeSink sink,
         string root,

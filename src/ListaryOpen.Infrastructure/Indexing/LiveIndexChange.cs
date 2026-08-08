@@ -1,5 +1,6 @@
 using ListaryOpen.Core.Indexing;
 using ListaryOpen.Infrastructure.Search;
+using ListaryOpen.Infrastructure.Search.NameTable;
 
 namespace ListaryOpen.Infrastructure.Indexing;
 
@@ -43,4 +44,34 @@ internal sealed class SqliteLiveIndexChangeSink : ILiveIndexChangeSink
 
     public Task ApplyAsync(IReadOnlyList<LiveIndexChange> changes, CancellationToken cancellationToken) =>
         _index.ApplyLiveIndexChangesAsync(changes, cancellationToken);
+}
+
+/// <summary>NameTable live FS hints — production path (no SQLite files writes).</summary>
+internal sealed class NameTableLiveIndexChangeSink : ILiveIndexChangeSink
+{
+    private readonly NameTableSearchIndex _nameTable;
+
+    public NameTableLiveIndexChangeSink(NameTableSearchIndex nameTable)
+    {
+        _nameTable = nameTable ?? throw new ArgumentNullException(nameof(nameTable));
+    }
+
+    public async Task ApplyAsync(IReadOnlyList<LiveIndexChange> changes, CancellationToken cancellationToken)
+    {
+        foreach (var change in changes)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            switch (change.Kind)
+            {
+                case LiveIndexChangeKind.Upsert:
+                    await _nameTable.UpsertAsync(change.Record!, cancellationToken).ConfigureAwait(false);
+                    break;
+                case LiveIndexChangeKind.DeletePathAndDescendants:
+                    await _nameTable
+                        .DeletePathAndDescendantsAsync(change.FullPath!, cancellationToken)
+                        .ConfigureAwait(false);
+                    break;
+            }
+        }
+    }
 }

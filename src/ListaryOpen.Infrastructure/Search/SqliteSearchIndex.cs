@@ -839,6 +839,10 @@ public sealed class SqliteSearchIndex : ISearchIndex, IAsyncDisposable
         }
     }
 
+    /// <summary>
+    /// Applies USN mutations and persists the volume checkpoint in one transaction.
+    /// Prefer <see cref="ApplyUsnMutationsAsync"/> + <see cref="SaveVolumeCheckpointAsync"/> under dual-write.
+    /// </summary>
     internal async Task ApplyUsnJournalChangesAsync(
         IEnumerable<UsnJournalIndexChange> changes,
         UsnJournalCheckpoint checkpoint,
@@ -862,41 +866,11 @@ public sealed class SqliteSearchIndex : ISearchIndex, IAsyncDisposable
             using var transaction = _connection.BeginTransaction();
             try
             {
-                using var upsertCommand = CreateUpsertCommand(transaction);
-                using var deleteCommand = CreateDeleteCommand(transaction);
-                foreach (var change in materializedChanges)
-                {
-                    switch (change.Kind)
-                    {
-                        case UsnJournalIndexChangeKind.Upsert:
-                            await ExecuteUpsertAsync(
-                                upsertCommand,
-                                change.Record!,
-                                indexGeneration,
-                                cancellationToken).ConfigureAwait(false);
-                            break;
-
-                        case UsnJournalIndexChangeKind.Delete:
-                            await ExecuteDeleteAsync(
-                                deleteCommand,
-                                change.FullPath!,
-                                cancellationToken).ConfigureAwait(false);
-                            break;
-
-                        case UsnJournalIndexChangeKind.HardLinkResync:
-                            await ExecuteHardLinkResyncAsync(
-                                upsertCommand,
-                                transaction,
-                                change.FileReferenceNumber,
-                                change.LiveHardLinkRecords ?? Array.Empty<FileRecord>(),
-                                indexGeneration,
-                                cancellationToken).ConfigureAwait(false);
-                            break;
-
-                        default:
-                            throw new NotSupportedException($"Unsupported USN index change kind: {change.Kind}.");
-                    }
-                }
+                await ApplyUsnMutationsCoreAsync(
+                    materializedChanges,
+                    indexGeneration,
+                    transaction,
+                    cancellationToken).ConfigureAwait(false);
 
                 await ExecuteSaveVolumeCheckpointAsync(
                     checkpoint,
@@ -913,6 +887,96 @@ public sealed class SqliteSearchIndex : ISearchIndex, IAsyncDisposable
         finally
         {
             _connectionGate.Release();
+        }
+    }
+
+    /// <summary>
+    /// Applies USN file mutations without writing volume checkpoints (KD21).
+    /// </summary>
+    internal async Task ApplyUsnMutationsAsync(
+        IEnumerable<UsnJournalIndexChange> changes,
+        CancellationToken cancellationToken,
+        long indexGeneration = DefaultIndexGeneration)
+    {
+        ArgumentNullException.ThrowIfNull(changes);
+        if (indexGeneration < DefaultIndexGeneration)
+        {
+            throw new ArgumentOutOfRangeException(nameof(indexGeneration));
+        }
+
+        var materializedChanges = changes.ToArray();
+        if (materializedChanges.Length == 0)
+        {
+            return;
+        }
+
+        await _connectionGate.WaitAsync(cancellationToken).ConfigureAwait(false);
+        try
+        {
+            ThrowIfDisposed();
+
+            using var transaction = _connection.BeginTransaction();
+            try
+            {
+                await ApplyUsnMutationsCoreAsync(
+                    materializedChanges,
+                    indexGeneration,
+                    transaction,
+                    cancellationToken).ConfigureAwait(false);
+                await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
+            }
+            catch
+            {
+                await transaction.RollbackAsync(CancellationToken.None).ConfigureAwait(false);
+                throw;
+            }
+        }
+        finally
+        {
+            _connectionGate.Release();
+        }
+    }
+
+    private async Task ApplyUsnMutationsCoreAsync(
+        IReadOnlyList<UsnJournalIndexChange> materializedChanges,
+        long indexGeneration,
+        SqliteTransaction transaction,
+        CancellationToken cancellationToken)
+    {
+        using var upsertCommand = CreateUpsertCommand(transaction);
+        using var deleteCommand = CreateDeleteCommand(transaction);
+        foreach (var change in materializedChanges)
+        {
+            switch (change.Kind)
+            {
+                case UsnJournalIndexChangeKind.Upsert:
+                    await ExecuteUpsertAsync(
+                        upsertCommand,
+                        change.Record!,
+                        indexGeneration,
+                        cancellationToken).ConfigureAwait(false);
+                    break;
+
+                case UsnJournalIndexChangeKind.Delete:
+                    await ExecuteDeleteAsync(
+                        deleteCommand,
+                        change.FullPath!,
+                        cancellationToken).ConfigureAwait(false);
+                    break;
+
+                case UsnJournalIndexChangeKind.HardLinkResync:
+                    await ExecuteHardLinkResyncAsync(
+                        upsertCommand,
+                        transaction,
+                        change.FileReferenceNumber,
+                        change.LiveHardLinkRecords ?? Array.Empty<FileRecord>(),
+                        indexGeneration,
+                        cancellationToken).ConfigureAwait(false);
+                    break;
+
+                default:
+                    throw new NotSupportedException($"Unsupported USN index change kind: {change.Kind}.");
+            }
         }
     }
 
