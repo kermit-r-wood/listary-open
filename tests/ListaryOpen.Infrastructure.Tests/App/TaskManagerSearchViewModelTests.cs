@@ -112,6 +112,107 @@ public sealed class TaskManagerSearchViewModelTests
     }
 
     [Fact]
+    public void NoMatchDoesNotDiscardTheTaskManagerSnapshotOrBlockALaterSelection()
+    {
+        var viewModel = new TaskManagerSearchViewModel(TimeSpan.Zero);
+        viewModel.SetItems(
+        [
+            new TaskManagerItem("1", "Windows Explorer", "explorer.exe"),
+            new TaskManagerItem("2", "Windows Terminal", "terminal.exe"),
+            new TaskManagerItem("3", "Firefox", "firefox.exe"),
+            new TaskManagerItem("4", "Settings", "SystemSettings.exe")
+        ]);
+
+        viewModel.QueryText = "program-that-does-not-exist";
+
+        Assert.Empty(viewModel.Results);
+        Assert.Null(viewModel.SelectedItem);
+
+        viewModel.QueryText = "terminal";
+
+        Assert.Equal("Windows Terminal", Assert.Single(viewModel.Results).Name);
+        Assert.Same(viewModel.Results[0], viewModel.SelectedItem);
+    }
+
+    [Fact]
+    public void CanonicalProcessSearchIgnoresUnrelatedWindowTitlesContainingListary()
+    {
+        var viewModel = new TaskManagerSearchViewModel(TimeSpan.Zero);
+        viewModel.SetItems(
+        [
+            new TaskManagerItem(
+                "listary",
+                "Process: ListaryOpen",
+                "ListaryOpen",
+                SearchText: "ListaryOpen.App ListaryOpen",
+                ProcessIdentity: "ListaryOpen.App"),
+            new TaskManagerItem(
+                "powershell-repo",
+                "Process: ⠇ listary_open",
+                "pwsh.exe",
+                SearchText: "pwsh PowerShell",
+                ProcessIdentity: "pwsh"),
+            new TaskManagerItem(
+                "powershell-grok",
+                "Process: Optimize Listary Index Performance Match... - grok",
+                "pwsh.exe",
+                SearchText: "pwsh PowerShell",
+                ProcessIdentity: "pwsh")
+        ]);
+
+        viewModel.QueryText = "listary";
+
+        Assert.Equal("Process: ListaryOpen", Assert.Single(viewModel.Results).Name);
+    }
+
+    [Fact]
+    public void CanonicalProcessSearchDoesNotFuzzyMatchAcrossMetadataAliases()
+    {
+        var viewModel = new TaskManagerSearchViewModel(TimeSpan.Zero);
+        viewModel.SetItems(
+        [
+            new TaskManagerItem(
+                "listary",
+                "Process: ListaryOpen",
+                "ListaryOpen",
+                SearchText: "ListaryOpen.App\nListaryOpen",
+                ProcessIdentity: "ListaryOpen.App"),
+            new TaskManagerItem(
+                "application-frame-host",
+                "Process: Application Frame Host",
+                "ApplicationFrameHost.exe",
+                SearchText: "ApplicationFrameHost\nApplication Frame Host\nMicrosoft Windows Operating System",
+                ProcessIdentity: "ApplicationFrameHost"),
+            new TaskManagerItem(
+                "security-health-systray",
+                "Process: Windows Security notification icon",
+                "SecurityHealthSystray.exe",
+                SearchText: "SecurityHealthSystray\nWindows Security notification icon\nMicrosoft Windows Operating System",
+                ProcessIdentity: "SecurityHealthSystray"),
+            new TaskManagerItem(
+                "wlanext",
+                "Process: Windows Wireless LAN 802.11 Extensibility Framework",
+                "wlanext.exe",
+                SearchText: "wlanext\nWindows Wireless LAN 802.11 Extensibility Framework\nMicrosoft Windows Operating System",
+                ProcessIdentity: "wlanext")
+        ]);
+
+        viewModel.QueryText = "listary";
+
+        Assert.Equal("Process: ListaryOpen", Assert.Single(viewModel.Results).Name);
+    }
+
+    [Theory]
+    [InlineData("ListaryOpen.HookHost")]
+    [InlineData("ListaryOpen.PreviewHost.exe")]
+    [InlineData("ListaryOpen.Indexer.Elevated")]
+    public void InternalListaryHelpersAreExcludedFromTaskManagerResults(string processIdentity)
+    {
+        Assert.True(UiAutomationTaskManagerProvider.IsInternalListaryProcess(processIdentity));
+        Assert.False(UiAutomationTaskManagerProvider.IsInternalListaryProcess("ListaryOpen.App"));
+    }
+
+    [Fact]
     public async Task QueryRefreshIsDebouncedAndKeepsPreviousFrameUntilReady()
     {
         using var viewModel = new TaskManagerSearchViewModel(TimeSpan.FromMilliseconds(60));

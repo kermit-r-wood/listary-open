@@ -1,6 +1,7 @@
 using System.Collections.Concurrent;
 using System.Diagnostics;
 using System.Runtime.InteropServices;
+using System.Text;
 using System.Text.Json;
 using ListaryOpen.Infrastructure.Windows;
 
@@ -60,6 +61,71 @@ public sealed class GlobalInputHookIntegrationTests
         Assert.Equal(expectedHost, input.Host);
         Assert.Equal(host.WindowHandle, input.ForegroundWindow);
         Assert.Equal(focusedClass, input.FocusedControlClass, ignoreCase: true);
+    }
+
+    [Fact]
+    [Trait("Category", "DesktopIntegration")]
+    public async Task ActiveTaskManagerOverlaySuppressesTextEvenWhenItsNativeSearchEditHasFocus()
+    {
+        using var host = await InputWindowSession.StartAsync(
+            "TaskManagerWindow",
+            "Edit",
+            focusedControlId: 0,
+            taskManagerProcessName: true);
+        using var hook = new GlobalInputHookHarness();
+        hook.Service.OverlayTextInputWindow = host.WindowHandle;
+        hook.Service.CaptureOverlayInput = true;
+
+        Assert.True(DesktopWindowActivator.TryActivate(host.WindowHandle));
+        await Task.Delay(100);
+        SendVirtualKey(VkO);
+
+        Assert.True(
+            await hook.TextSignal.WaitAsync(TimeSpan.FromSeconds(3)),
+            "Text was not rerouted after the native Task Manager search edit regained focus.");
+        Assert.True(hook.TextInputs.TryDequeue(out var input));
+        Assert.Equal(GlobalTextInputHost.TaskManager, input.Host);
+        Assert.Equal("o", input.Text, ignoreCase: true);
+        await Task.Delay(100);
+        Assert.Equal(
+            string.Empty,
+            ReadWindowText(host.FocusedHandle));
+    }
+
+    [Theory]
+    [InlineData("CabinetWClass", false, GlobalTextInputHost.Explorer)]
+    [InlineData("ListaryOpenDialogHost", true, GlobalTextInputHost.Dialog)]
+    [Trait("Category", "DesktopIntegration")]
+    public async Task ActiveExplorerAndDialogOverlaysSuppressTextWhenNativeEditsHaveFocus(
+        string topLevelClass,
+        bool attachAsDialog,
+        GlobalTextInputHost expectedHost)
+    {
+        using var host = await InputWindowSession.StartAsync(
+            topLevelClass,
+            "Edit",
+            focusedControlId: 41477,
+            taskManagerProcessName: false);
+        using var hook = new GlobalInputHookHarness();
+        if (attachAsDialog)
+        {
+            hook.Service.DialogInputWindow = host.WindowHandle;
+        }
+        hook.Service.OverlayTextInputWindow = host.WindowHandle;
+        hook.Service.CaptureOverlayInput = true;
+
+        Assert.True(DesktopWindowActivator.TryActivate(host.WindowHandle));
+        await Task.Delay(100);
+        SendVirtualKey(VkO);
+
+        Assert.True(
+            await hook.TextSignal.WaitAsync(TimeSpan.FromSeconds(3)),
+            "Text was not rerouted after a native host edit regained focus.");
+        Assert.True(hook.TextInputs.TryDequeue(out var input));
+        Assert.Equal(expectedHost, input.Host);
+        Assert.Equal("o", input.Text, ignoreCase: true);
+        await Task.Delay(100);
+        Assert.Equal(string.Empty, ReadWindowText(host.FocusedHandle));
     }
 
     [Fact]
@@ -196,6 +262,14 @@ public sealed class GlobalInputHookIntegrationTests
         keybd_event(modifier, 0, 0, UIntPtr.Zero);
         SendVirtualKey(virtualKey);
         keybd_event(modifier, 0, KeyEventKeyUp, UIntPtr.Zero);
+    }
+
+    private static string ReadWindowText(IntPtr window)
+    {
+        var length = GetWindowTextLength(window);
+        var buffer = new StringBuilder(length + 1);
+        _ = GetWindowText(window, buffer, buffer.Capacity);
+        return buffer.ToString();
     }
 
     private sealed class GlobalInputHookHarness : IDisposable
@@ -636,6 +710,12 @@ public sealed class GlobalInputHookIntegrationTests
 
     [DllImport("user32.dll")]
     private static extern IntPtr GetForegroundWindow();
+
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+    private static extern int GetWindowTextLength(IntPtr window);
+
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+    private static extern int GetWindowText(IntPtr window, StringBuilder text, int maximumCount);
 
     [DllImport("user32.dll")]
     [return: MarshalAs(UnmanagedType.Bool)]

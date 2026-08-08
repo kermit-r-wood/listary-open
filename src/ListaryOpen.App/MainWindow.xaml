@@ -244,7 +244,15 @@
                     <TextBlock Text="General" Style="{StaticResource PageTitleStyle}" />
                     <Border x:Name="GeneralIndexingCard" Style="{StaticResource PageCardStyle}"><StackPanel>
                         <TextBlock Text="Indexing activity" Style="{StaticResource Text.SectionTitle}" />
-                        <ProgressBar Height="5" Margin="0,12,0,10" IsIndeterminate="True" Visibility="{Binding IsIndexing, Converter={StaticResource BooleanToVisibilityConverter}}" />
+                        <!-- Keep the indexing indicator static. WPF's indeterminate ProgressBar animates
+                             every frame; inside the transparent, shadowed window that forces expensive
+                             full-window recomposition while indexing is active. -->
+                        <Border x:Name="IndexingActivityIndicator"
+                                Height="5"
+                                Margin="0,12,0,10"
+                                CornerRadius="2.5"
+                                Background="{DynamicResource Brush.Accent}"
+                                Visibility="{Binding IsIndexing, Converter={StaticResource BooleanToVisibilityConverter}}" />
                         <TextBlock Text="{Binding IndexingStatusText}" Style="{StaticResource SettingsDetailStyle}" />
                         <TextBlock Text="{Binding IndexingProgressText}" Margin="0,5,0,0" />
                         <TextBlock Text="{Binding CurrentIndexRootText}" Style="{StaticResource SettingsPathTextStyle}" Margin="0,5,0,0" />

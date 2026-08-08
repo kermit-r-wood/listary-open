@@ -42,8 +42,12 @@ public static class ConfiguredIndexFilter
             try
             {
                 var excluded = Path.TrimEndingDirectorySeparator(Path.GetFullPath(expanded));
+                var excludedPrefix = excluded.EndsWith(Path.DirectorySeparatorChar)
+                    || excluded.EndsWith(Path.AltDirectorySeparatorChar)
+                        ? excluded
+                        : excluded + Path.DirectorySeparatorChar;
                 if (string.Equals(record.FullPath, excluded, StringComparison.OrdinalIgnoreCase) ||
-                    record.FullPath.StartsWith(excluded + Path.DirectorySeparatorChar, StringComparison.OrdinalIgnoreCase))
+                    record.FullPath.StartsWith(excludedPrefix, StringComparison.OrdinalIgnoreCase))
                 {
                     return false;
                 }

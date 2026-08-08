@@ -131,9 +131,10 @@ public sealed class RealTaskManagerElevatedIntegrationTests
                 Assert.True(overlay.IsTaskManagerSearchActive);
                 Assert.Equal(taskManagerHandle, overlay.TaskManagerWindow);
 
-                stage = "verify initial overlay-to-Task-Manager selection synchronization";
+                stage = "establish a host selection before overlay preview";
                 var firstOverlaySelection = Assert.IsType<TaskManagerItem>(viewModel.SelectedItem);
                 Assert.Equal(viewModel.Results[0].Id, firstOverlaySelection.Id);
+                Assert.True(TrySelectRow(taskManagerHandle, firstOverlaySelection.Id));
                 var firstHostSelection = WaitForSelectedRow(
                     taskManagerHandle,
                     firstOverlaySelection.Id,
@@ -142,18 +143,23 @@ public sealed class RealTaskManagerElevatedIntegrationTests
                 var firstOverlayOracle = ReadOverlaySelection(overlay, firstOverlaySelection);
                 Assert.Equal(firstOverlaySelection.Id, firstOverlayOracle.RuntimeId);
 
-                stage = "move production overlay selection to a second real row";
+                stage = "move overlay preview without mutating Task Manager";
                 overlay.MoveSelection(1);
                 var secondOverlaySelection = Assert.IsType<TaskManagerItem>(viewModel.SelectedItem);
                 Assert.Equal(viewModel.Results[1].Id, secondOverlaySelection.Id);
                 Assert.NotEqual(firstOverlaySelection.Id, secondOverlaySelection.Id);
-                var secondHostSelection = WaitForSelectedRow(
-                    taskManagerHandle,
-                    secondOverlaySelection.Id,
-                    TimeSpan.FromSeconds(6));
-                Assert.NotNull(secondHostSelection);
                 var secondOverlayOracle = ReadOverlaySelection(overlay, secondOverlaySelection);
                 Assert.Equal(secondOverlaySelection.Id, secondOverlayOracle.RuntimeId);
+                Thread.Sleep(350);
+                var hostSelectionAfterPreview = WaitForSelectedRow(
+                    taskManagerHandle,
+                    firstOverlaySelection.Id,
+                    TimeSpan.FromSeconds(2));
+                Assert.NotNull(hostSelectionAfterPreview);
+                Assert.Null(WaitForSelectedRow(
+                    taskManagerHandle,
+                    secondOverlaySelection.Id,
+                    TimeSpan.FromMilliseconds(250)));
 
                 stage = "capture composed Task Manager and production overlay evidence";
                 var overlayHandle = new WindowInteropHelper(overlay).Handle;
@@ -165,6 +171,15 @@ public sealed class RealTaskManagerElevatedIntegrationTests
                     taskManagerBounds,
                     overlayBounds,
                     "28-real-task-manager-overlay-selection");
+
+                stage = "confirm the second overlay result explicitly";
+                overlay.ConfirmSelection();
+                var confirmedHostSelection = WaitForSelectedRow(
+                    taskManagerHandle,
+                    secondOverlaySelection.Id,
+                    TimeSpan.FromSeconds(6));
+                Assert.NotNull(confirmedHostSelection);
+
                 WriteEvidenceMetadata(
                     screenshotPath,
                     acquisition.StartedByTest,
@@ -182,7 +197,8 @@ public sealed class RealTaskManagerElevatedIntegrationTests
                     firstHostSelection!,
                     secondOverlaySelection,
                     secondOverlayOracle,
-                    secondHostSelection!);
+                    hostSelectionAfterPreview!,
+                    confirmedHostSelection!);
             }
             catch (Exception exception)
             {
@@ -386,6 +402,40 @@ public sealed class RealTaskManagerElevatedIntegrationTests
             : null;
     }
 
+    private static bool TrySelectRow(IntPtr taskManagerHandle, string runtimeId)
+    {
+        var root = AutomationElement.FromHandle(taskManagerHandle);
+        if (root is null)
+        {
+            return false;
+        }
+
+        var rows = root.FindAll(
+            TreeScope.Descendants,
+            new PropertyCondition(AutomationElement.IsSelectionItemPatternAvailableProperty, true));
+        for (var index = 0; index < rows.Count; index++)
+        {
+            try
+            {
+                var identity = ReadSelectionIdentity(rows[index]);
+                if (!string.Equals(identity.RuntimeId, runtimeId, StringComparison.Ordinal) ||
+                    !rows[index].TryGetCurrentPattern(SelectionItemPattern.Pattern, out var patternObject) ||
+                    patternObject is not SelectionItemPattern pattern)
+                {
+                    continue;
+                }
+
+                pattern.Select();
+                return true;
+            }
+            catch (Exception exception) when (exception is ElementNotAvailableException or InvalidOperationException)
+            {
+            }
+        }
+
+        return false;
+    }
+
     private static SelectionIdentity ReadOverlaySelection(
         TaskManagerSearchWindow overlay,
         TaskManagerItem expected)
@@ -572,7 +622,8 @@ public sealed class RealTaskManagerElevatedIntegrationTests
         SelectionIdentity firstHost,
         TaskManagerItem secondOverlay,
         SelectionIdentity secondOverlayOracle,
-        SelectionIdentity secondHost)
+        SelectionIdentity hostAfterPreview,
+        SelectionIdentity confirmedHost)
     {
         var metadataPath = Path.ChangeExtension(screenshotPath, ".json");
         var metadata = new
@@ -603,7 +654,7 @@ public sealed class RealTaskManagerElevatedIntegrationTests
                 windowHandle = overlayHandle.ToInt64(),
                 bounds = EvidenceBounds(overlayBounds)
             },
-            transitions = new[]
+            transitions = new object[]
             {
                 new
                 {
@@ -617,7 +668,15 @@ public sealed class RealTaskManagerElevatedIntegrationTests
                     action = "MoveSelection(1)",
                     overlaySelectedIdentity = EvidenceItem(secondOverlay),
                     overlayUiaSelectedIdentity = secondOverlayOracle,
-                    taskManagerUiaSelectedIdentity = secondHost
+                    taskManagerUiaSelectedIdentity = hostAfterPreview,
+                    hostSelectionChanged = false
+                },
+                new
+                {
+                    action = "ConfirmSelection()",
+                    overlaySelectedIdentity = EvidenceItem(secondOverlay),
+                    taskManagerUiaSelectedIdentity = confirmedHost,
+                    hostSelectionChanged = true
                 }
             },
             screenshot = Path.GetFileName(screenshotPath),

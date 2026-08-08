@@ -84,6 +84,22 @@ public sealed class NameTableEngineTests
     }
 
     [Fact]
+    public void CollectCandidatesDoesNotReplaceAMatchingRootWithItsChildren()
+    {
+        var engine = new NameTableEngine();
+        var now = DateTimeOffset.UtcNow;
+        var project = FileRecord.Create(@"C:\Projects\listary_open", true, 0, now);
+        engine.Upsert(project);
+        engine.Upsert(FileRecord.Create(@"C:\Projects\listary_open\.git", true, 0, now));
+
+        var candidates = engine.CollectCandidates(
+            new SearchQuery("listary_open", SearchMode.FilesAndFolders),
+            50);
+
+        Assert.Equal(project.FullPath, Assert.Single(candidates).FullPath);
+    }
+
+    [Fact]
     public void DeletePathAndDescendantsRemovesTree()
     {
         var engine = new NameTableEngine();
@@ -94,5 +110,40 @@ public sealed class NameTableEngineTests
         engine.DeletePathAndDescendants(@"C:\Root");
         Assert.Equal(1, engine.LiveCount);
         Assert.True(engine.TryGetByPathKey(@"C:\Other\x.txt".ToUpperInvariant(), out _));
+    }
+
+    [Fact]
+    public void ReplaceRootFromAcceptsDescendantsOfDriveRoot()
+    {
+        var target = new NameTableEngine();
+        target.Upsert(FileRecord.Create(@"C:\Old.txt", false, 1, DateTimeOffset.UtcNow));
+        var staged = new NameTableEngine();
+        var scanned = FileRecord.Create(
+            @"C:\System Volume Information",
+            true,
+            0,
+            DateTimeOffset.UtcNow);
+        staged.Upsert(scanned);
+
+        target.ReplaceRootFrom(@"C:\", staged);
+
+        Assert.False(target.TryGetByPathKey(@"C:\Old.txt".ToUpperInvariant(), out _));
+        Assert.True(target.TryGetByPathKey(scanned.PathKey, out _));
+    }
+
+    [Fact]
+    public void MergeRootFromPublishesScannedRecordsWithoutDeletingStaleRecords()
+    {
+        var target = new NameTableEngine();
+        var stale = FileRecord.Create(@"C:\Preserved.txt", false, 1, DateTimeOffset.UtcNow);
+        target.Upsert(stale);
+        var staged = new NameTableEngine();
+        var scanned = FileRecord.Create(@"C:\Scanned.txt", false, 2, DateTimeOffset.UtcNow);
+        staged.Upsert(scanned);
+
+        target.MergeRootFrom(@"C:\", staged);
+
+        Assert.True(target.TryGetByPathKey(stale.PathKey, out _));
+        Assert.True(target.TryGetByPathKey(scanned.PathKey, out _));
     }
 }

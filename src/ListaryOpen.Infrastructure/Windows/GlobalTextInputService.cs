@@ -230,6 +230,7 @@ public sealed class GlobalTextInputService : IDisposable
     private int _captureExplorerMenuInput;
     private int _suppressedOverlayEscape;
     private IntPtr _dialogInputWindow;
+    private IntPtr _overlayTextInputWindow;
     private uint _lastLeftButtonTime;
     private NativePoint _lastLeftButtonPoint;
     private long _lastRightButtonTick;
@@ -309,6 +310,16 @@ public sealed class GlobalTextInputService : IDisposable
         set => Interlocked.Exchange(ref _dialogInputWindow, value);
     }
 
+    /// <summary>
+    /// Identifies the Explorer, Task Manager, or dialog host whose native text
+    /// controls must not receive text while its ListaryOpen overlay is active.
+    /// </summary>
+    public IntPtr OverlayTextInputWindow
+    {
+        get => Interlocked.CompareExchange(ref _overlayTextInputWindow, IntPtr.Zero, IntPtr.Zero);
+        set => Interlocked.Exchange(ref _overlayTextInputWindow, value);
+    }
+
     public void Start()
     {
         ObjectDisposedException.ThrowIf(_disposed, this);
@@ -353,6 +364,7 @@ public sealed class GlobalTextInputService : IDisposable
         }
 
         Interlocked.Exchange(ref _suppressedOverlayEscape, 0);
+        Interlocked.Exchange(ref _overlayTextInputWindow, IntPtr.Zero);
         _disposed = true;
     }
 
@@ -490,7 +502,16 @@ public sealed class GlobalTextInputService : IDisposable
                             out var focusedControlClass,
                             out var focusedControlId,
                             out var host)
-                        && ShouldCaptureTextInput(host, focusedControlClass, focusedControlId)
+                        && ShouldCaptureTextInput(
+                            host,
+                            focusedControlClass,
+                            focusedControlId,
+                            captureActiveOverlayInput:
+                                IsOverlayTextInputWindow(
+                                    host,
+                                    foregroundWindow,
+                                    OverlayTextInputWindow,
+                                    CaptureOverlayInput))
                         && !ShouldSuppressTextAfterRightClick(
                             host,
                             foregroundWindow,
@@ -875,8 +896,18 @@ public sealed class GlobalTextInputService : IDisposable
     internal static bool ShouldCaptureTextInput(
         GlobalTextInputHost host,
         string? focusedControlClass,
-        int focusedControlId)
+        int focusedControlId,
+        bool captureActiveOverlayInput = false)
     {
+        // A host can reclaim focus into one of its native text controls while an
+        // overlay synchronizes a selection. Keep routing that text to the active
+        // overlay so Explorer/Task Manager lists and dialog fields are not changed
+        // behind it.
+        if (captureActiveOverlayInput)
+        {
+            return true;
+        }
+
         if (host == GlobalTextInputHost.Dialog &&
             focusedControlId is FileNameEditControlId or FolderNameEditControlId &&
             string.Equals(focusedControlClass, "Edit", StringComparison.OrdinalIgnoreCase))
@@ -885,6 +916,24 @@ public sealed class GlobalTextInputService : IDisposable
         }
 
         return !IsTextEntryControlClass(focusedControlClass);
+    }
+
+    internal static bool IsOverlayTextInputWindow(
+        GlobalTextInputHost host,
+        IntPtr foregroundWindow,
+        IntPtr overlayTextInputWindow,
+        bool captureOverlayInput)
+    {
+        if (!captureOverlayInput ||
+            foregroundWindow == IntPtr.Zero ||
+            overlayTextInputWindow == IntPtr.Zero)
+        {
+            return false;
+        }
+
+        return foregroundWindow == overlayTextInputWindow ||
+            (host == GlobalTextInputHost.Dialog &&
+                IsConfiguredDialogInputWindow(foregroundWindow, overlayTextInputWindow));
     }
 
     internal static bool ShouldSuppressTextAfterRightClick(

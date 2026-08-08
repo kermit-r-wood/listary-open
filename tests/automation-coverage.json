@@ -24,11 +24,12 @@
     },
     {
       "id": "settings-drive-roots",
-      "requirement": "Every ready fixed drive is selected by default and full-drive roots do not reappear as duplicate additional folders.",
+      "requirement": "Every ready fixed drive is selected by default, full-drive roots do not reappear as duplicate additional folders, and a drive-root exclusion applies to all descendants.",
       "evidence": [
         { "suite": "dotnet", "testNameContains": "DefaultDriveOptionsSelectEveryReadyDrive" },
         { "suite": "dotnet", "testNameContains": "CreateIndexRootsCollapsesDescendantsToAvoidDuplicateScans" },
-        { "suite": "dotnet", "testNameContains": "LoadMigratesLegacyUserProfileDefaultToAllReadyDrives" }
+        { "suite": "dotnet", "testNameContains": "LoadMigratesLegacyUserProfileDefaultToAllReadyDrives" },
+        { "suite": "dotnet", "testNameContains": "DriveRootExclusionRejectsDescendants" }
       ]
     },
     {
@@ -45,10 +46,19 @@
     },
     {
       "id": "indexing-providers-continuous",
-      "requirement": "NTFS, fallback and continuous indexing select correctly, persist records, apply journal changes and recover safely.",
+      "requirement": "NTFS, fallback and continuous indexing select correctly, include drive-root descendants, preserve and persist usable scan results when journal completeness cannot be proved, persist every successfully committed root even when another root fails, apply journal changes, treat a complete compatibility fallback as a successful recovery, reject missing helper output, and write bounded actionable diagnostics for journal, root, and snapshot failures.",
       "evidence": [
         { "suite": "dotnet", "testNameContains": "SelectProviderPrefersNtfsForReadyNtfsVolume" },
         { "suite": "dotnet", "testNameContains": "ScanAsyncReturnsFilesAndFolders" },
+        { "suite": "dotnet", "testNameContains": "IndexRootsAsyncCompletesWhenNtfsScanFailsAndFallbackSucceeds" },
+        { "suite": "dotnet", "testNameContains": "IndexRootsAsyncPersistsSuccessfulNameTableRootsWhenAnotherRootFails" },
+        { "suite": "dotnet", "testNameContains": "IndexRootsAsyncPublishesAndPersistsUnverifiedNtfsDriveRootScan" },
+        { "suite": "dotnet", "testNameContains": "ReplaceRootFromAcceptsDescendantsOfDriveRoot" },
+        { "suite": "dotnet", "testNameContains": "QueryJournalStateAsyncRejectsMissingSuccessfulHelperOutput" },
+        { "suite": "dotnet", "testNameContains": "IndexRootsAsyncWritesActionableRootFailureAndSnapshotDiagnostics" },
+        { "suite": "dotnet", "testNameContains": "DiagnosticFileIsReadableWhileOpenAndContainsTraceMetadata" },
+        { "suite": "dotnet", "testNameContains": "OversizedDiagnosticFileRotatesAtStartup" },
+        { "suite": "dotnet", "testNameContains": "CurrentContentVersionRebuildsIndexesWithLegacyParentPathSemantics" },
         { "suite": "dotnet", "testNameContains": "CreateAndDeleteHintsUpdateSearchIndex" },
         { "suite": "dotnet", "testNameContains": "ApplyUsnJournalChangesDeletesUpsertsAndSavesCheckpointAtomically" },
         { "suite": "dotnet", "testNameContains": "CreateFileRecordsSkipsUnreadableMetadataEvenInStrictMode" }
@@ -74,9 +84,12 @@
     },
     {
       "id": "search-ranking-filters",
-      "requirement": "Indexed search supports exact, substring and fuzzy ranking plus file type, extension, path and date filters before paging.",
+      "requirement": "Indexed search supports exact, substring and fuzzy filename ranking plus explicit file type, extension, path and date filters before paging; a plain term does not match every child merely because its parent path matches.",
       "evidence": [
         { "suite": "dotnet", "testNameContains": "SearchReturnsExactMatchAfterMoreThanFiveThousandEarlierFuzzyCandidates" },
+        { "suite": "dotnet", "testNameContains": "PlainQueryDoesNotReturnEveryChildOfAMatchingParentFolder" },
+        { "suite": "dotnet", "testNameContains": "PlainQueryDoesNotLetMatchingParentPathsStarveMatchingNames" },
+        { "suite": "dotnet", "testNameContains": "CollectCandidatesDoesNotReplaceAMatchingRootWithItsChildren" },
         { "suite": "dotnet", "testNameContains": "SearchAppliesExtensionPathPhraseAndExclusionFilters" },
         { "suite": "dotnet", "testNameContains": "SqliteSearchAppliesTypeAndDateFiltersBeforePaging" }
       ]
@@ -137,27 +150,36 @@
     },
     {
       "id": "explorer-repeat-focus-input",
-      "requirement": "Explorer direct typing starts search, repeated typing stays in the same session, and Escape, navigation, Ctrl+A and Backspace target only the active overlay.",
+      "requirement": "Explorer direct typing starts search, repeated typing stays in the same session even if a native Explorer text control retakes focus, no-result frames cancel stale host selection, and Escape, navigation, Ctrl+A, Backspace and Enter target only the active overlay.",
       "evidence": [
         { "suite": "dotnet", "testNameContains": "FollowUpInputFromSameExplorerAlwaysAppendsWhileSearchPanelIsVisible" },
+        { "suite": "dotnet", "testNameContains": "FollowUpExplorerInputStillAppendsIfTheNativeSearchEditRetakesFocus" },
+        { "suite": "dotnet", "testNameContains": "ExplorerCaptureCanProtectAnActiveSessionAfterNativeSearchRetakesFocus" },
         { "suite": "dotnet", "testNameContains": "EscapeFromSameExplorerDismissesVisibleTypeSearch" },
+        { "suite": "dotnet", "testNameContains": "UiResourcesAndWindowsLoadOnStaThread" },
         { "suite": "desktop", "testNameContains": "OverlayCaptureRoutesBackspaceNavigationEnterAndEscapeWithoutClosingHost" },
         { "suite": "desktop", "testNameContains": "LowLevelHookRoutesTextFromRealForegroundAndFocusedHostControls" },
+        { "suite": "desktop", "testNameContains": "ActiveExplorerAndDialogOverlaysSuppressTextWhenNativeEditsHaveFocus" },
         { "suite": "packagedBlackbox", "testNameContains": "PackagedElevatedAppCapturesRealExplorerInputAndSynchronizesSelection" }
       ]
     },
     {
       "id": "task-manager-search",
-      "requirement": "Task Manager search is debounced, deduplicates provider rows, resolves icons, and synchronizes keyboard selection into both the real elevated system Task Manager and the final packaged app.",
+      "requirement": "Task Manager search uses canonical process identity instead of arbitrary window titles, scores each process metadata alias independently, preserves its snapshot and the native Apps list across no-match and preview movement, deduplicates provider rows, and changes the real native selection only after explicit confirmation.",
       "evidence": [
         { "suite": "dotnet", "testNameContains": "QueryRefreshIsDebouncedAndKeepsPreviousFrameUntilReady" },
+        { "suite": "dotnet", "testNameContains": "NoMatchDoesNotDiscardTheTaskManagerSnapshotOrBlockALaterSelection" },
+        { "suite": "dotnet", "testNameContains": "CanonicalProcessSearchIgnoresUnrelatedWindowTitlesContainingListary" },
+        { "suite": "dotnet", "testNameContains": "CanonicalProcessSearchDoesNotFuzzyMatchAcrossMetadataAliases" },
+        { "suite": "dotnet", "testNameContains": "InternalListaryHelpersAreExcludedFromTaskManagerResults" },
+        { "suite": "dotnet", "testNameContains": "ActiveTaskManagerOverlayKeepsTextOutOfTheNativeSearchControl" },
         { "suite": "dotnet", "testNameContains": "DuplicateChildProcessesCollapseToOneVisibleResult" },
         { "suite": "dotnet", "testNameContains": "ProcessDisplayNameResolvesExecutableIconPath" },
         { "suite": "dotnet", "testNameContains": "OverlayCapturesKeyboardSelectionAndConfirmation" },
-        { "suite": "dotnet", "testNameContains": "PreviewSelectionReachesTheStaProviderWithoutActivatingTaskManager" },
         { "suite": "dotnet", "testNameContains": "UiResourcesAndWindowsLoadOnStaThread" },
         { "suite": "dotnet", "testNameContains": "SelectionRematchesRowsWhenTaskManagerRuntimeIdsChange" },
         { "suite": "desktop", "testNameContains": "LowLevelHookRoutesTextFromRealForegroundAndFocusedHostControls" },
+        { "suite": "desktop", "testNameContains": "ActiveTaskManagerOverlaySuppressesTextEvenWhenItsNativeSearchEditHasFocus" },
         { "suite": "elevatedDesktop", "testNameContains": "ProductionOverlaySynchronizesTwoSelectionsWithRealSystemTaskManager" },
         { "suite": "packagedBlackbox", "testNameContains": "PackagedAppCapturesRealTaskManagerInputAndSynchronizesTwoRows" },
         { "suite": "visual", "testNameContains": "ProductionWindowsRenderVisualAcceptanceMatrix", "screenshot": "18-task-manager-search-dark-en.png" },
@@ -191,10 +213,13 @@
     },
     {
       "id": "dialog-repeat-input",
-      "requirement": "After one dialog search/jump session, the next direct input starts a new search; Ctrl+A and other edit commands remain routed to the overlay.",
+      "requirement": "After Ctrl+G directly jumps a file dialog, the very next printable key starts a new Quick Switch search even when the native filename control retakes focus; expanded-search edit commands remain routed to the overlay.",
       "evidence": [
         { "suite": "dotnet", "testNameContains": "ResetQuickSwitchQueryStartsTheNextCollapsedSearchFromEmptyText" },
+        { "suite": "dotnet", "testNameContains": "UiResourcesAndWindowsLoadOnStaThread" },
         { "suite": "desktop", "testNameContains": "DialogInputCanRestartAfterACompletedSearchAndStillRoutesEditCommands" },
+        { "suite": "desktop", "testNameContains": "ActiveExplorerAndDialogOverlaysSuppressTextWhenNativeEditsHaveFocus" },
+        { "suite": "packagedBlackbox", "testNameContains": "PublishedAppUsesCtrlGAndItsNativeHookToNavigateARealFirefoxPicker" },
         { "suite": "visual", "testNameContains": "ProductionWindowsRenderVisualAcceptanceMatrix", "screenshot": "16-quick-switch-collapsed-geek-en.png" },
         { "suite": "visual", "testNameContains": "ProductionWindowsRenderVisualAcceptanceMatrix", "screenshot": "17-quick-switch-expanded-geek-en.png" }
       ]
@@ -205,6 +230,7 @@
       "evidence": [
         { "suite": "dotnet", "testNameContains": "DialogQuickSwitchCommandsRequireTheActiveAttachedDialog" },
         { "suite": "desktop", "testNameContains": "LowLevelHookRoutesTextFromRealForegroundAndFocusedHostControls" },
+        { "suite": "desktop", "testNameContains": "ActiveExplorerAndDialogOverlaysSuppressTextWhenNativeEditsHaveFocus" },
         { "suite": "desktop", "testNameContains": "OverlayCaptureRoutesBackspaceNavigationEnterAndEscapeWithoutClosingHost" },
         { "suite": "desktop", "testNameContains": "ForegroundSwitchRoutesRepeatedInputToTheActiveExplorerWindow" },
         { "suite": "desktop", "testNameContains": "UnsupportedForegroundWindowDoesNotStartGlobalTypeSearch" }
@@ -234,12 +260,15 @@
     },
     {
       "id": "explorer-menu-selection",
-      "requirement": "Explorer menu commands expand the active folder correctly and overlay selection synchronizes only a direct child into the intended Explorer window.",
+      "requirement": "Explorer menu commands expand the active folder correctly, overlay selection synchronizes only a direct child into the intended window, and confirming a directory search result navigates that same Explorer window instead of opening another one.",
       "evidence": [
         { "suite": "dotnet", "testNameContains": "PowerShellStartsInTheExplorerFolder" },
         { "suite": "dotnet", "testNameContains": "CustomCommandExpandsConfiguredValuesAndExecutionOptions" },
         { "suite": "dotnet", "testNameContains": "DirectChildIsSelectedInRequestedExplorerWindow" },
-        { "suite": "desktop", "testNameContains": "ProductionTrackerAndSelectionServiceDriveARealSystemExplorerWindow" }
+        { "suite": "dotnet", "testNameContains": "ExplorerTypeSearchNavigatesDirectoryInCapturedWindowInsteadOfOpeningANewOne" },
+        { "suite": "dotnet", "testNameContains": "ExistingFolderIsNavigatedInRequestedWindowOnStaThread" },
+        { "suite": "desktop", "testNameContains": "ProductionTrackerAndSelectionServiceDriveARealSystemExplorerWindow" },
+        { "suite": "desktop", "testNameContains": "ProductionNavigationServiceReusesARealExplorerWindow" }
       ]
     },
     {

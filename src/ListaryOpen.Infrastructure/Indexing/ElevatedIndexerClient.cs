@@ -272,6 +272,12 @@ public sealed class ElevatedIndexerClient : IElevatedIndexerClient, IDisposable
             return null;
         }
 
+        Trace.TraceInformation(
+            "Elevated NTFS journal query started. Root={0}; Helper={1}; LaunchMode={2}",
+            root.Path,
+            helperPath,
+            launchMode);
+
         var outputPath = CreateTempIndexerFilePath(".jsonl");
         var errorPath = CreateTempIndexerFilePath(".err");
         try
@@ -289,7 +295,14 @@ public sealed class ElevatedIndexerClient : IElevatedIndexerClient, IDisposable
                     cancellationToken)
                 .ConfigureAwait(false);
 
-            return await ParseJournalStateFileIfExistsAsync(outputPath, cancellationToken).ConfigureAwait(false);
+            var state = await ParseJournalStateFileAsync(outputPath, cancellationToken).ConfigureAwait(false);
+            Trace.TraceInformation(
+                "Elevated NTFS journal query completed. Root={0}; JournalId={1}; LowestValidUsn={2}; NextUsn={3}",
+                root.Path,
+                state.UsnJournalId,
+                state.LowestValidUsn,
+                state.NextUsn);
+            return state;
         }
         finally
         {
@@ -961,13 +974,13 @@ public sealed class ElevatedIndexerClient : IElevatedIndexerClient, IDisposable
         return true;
     }
 
-    private static async Task<UsnJournalState?> ParseJournalStateFileIfExistsAsync(
+    private static async Task<UsnJournalState> ParseJournalStateFileAsync(
         string path,
         CancellationToken cancellationToken)
     {
         if (!File.Exists(path))
         {
-            return null;
+            throw new InvalidDataException("Elevated indexer journal state output is missing.");
         }
 
         using var stream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read, bufferSize: 64 * 1024, useAsync: true);
@@ -975,7 +988,7 @@ public sealed class ElevatedIndexerClient : IElevatedIndexerClient, IDisposable
         var line = await reader.ReadLineAsync(cancellationToken).ConfigureAwait(false);
         if (string.IsNullOrWhiteSpace(line))
         {
-            return null;
+            throw new InvalidDataException("Elevated indexer journal state output is empty.");
         }
 
         try

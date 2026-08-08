@@ -49,28 +49,36 @@ public sealed class ElevatedIndexerUacSessionTests
             "journal-state-to-file"
         };
 
+        var createdPaths = new List<string>();
         var errors = new List<ElevatedIndexerException>();
-        foreach (var command in commands)
+        try
         {
-            var extension = command == "scan-to-file" ? ".bin" : ".jsonl";
-            var error = await Assert.ThrowsAsync<ElevatedIndexerException>(() =>
-                session.RunCommandAsync(
-                    command,
-                    invalidVolumeRoot,
-                    Path.Combine(tmp, "listary-open-indexer-" + Guid.NewGuid().ToString("N") + extension),
-                    Path.Combine(tmp, "listary-open-indexer-" + Guid.NewGuid().ToString("N") + ".err"),
-                    expectedUsnJournalId: 0,
-                    startUsn: 0,
-                    endUsn: 0,
-                    CancellationToken.None));
-            errors.Add(error);
-        }
+            foreach (var command in commands)
+            {
+                var extension = command == "scan-to-file" ? ".bin" : ".jsonl";
+                var error = await Assert.ThrowsAsync<ElevatedIndexerException>(() =>
+                    session.RunCommandAsync(
+                        command,
+                        invalidVolumeRoot,
+                        CreateOutputPath(tmp, extension, createdPaths),
+                        CreateOutputPath(tmp, ".err", createdPaths),
+                        expectedUsnJournalId: 0,
+                        startUsn: 0,
+                        endUsn: 0,
+                        CancellationToken.None));
+                errors.Add(error);
+            }
 
-        Assert.Equal(1, startCount);
-        Assert.Equal(commands.Length, errors.Count);
-        Assert.All(
-            errors,
-            error => Assert.Contains("exited with code", error.Message, StringComparison.OrdinalIgnoreCase));
+            Assert.Equal(1, startCount);
+            Assert.Equal(commands.Length, errors.Count);
+            Assert.All(
+                errors,
+                error => Assert.Contains("exited with code", error.Message, StringComparison.OrdinalIgnoreCase));
+        }
+        finally
+        {
+            DeleteFiles(createdPaths);
+        }
     }
 
     [Fact]
@@ -107,43 +115,71 @@ public sealed class ElevatedIndexerUacSessionTests
         // First multi-command sequence shares one worker; an explicit kill forces
         // recovery elevation (exactly one replacement start).
         const string invalidVolumeRoot = "not-a-volume-root";
-        await Assert.ThrowsAsync<ElevatedIndexerException>(() =>
-            session.RunCommandAsync(
-                "journal-state-to-file",
-                invalidVolumeRoot,
-                Path.Combine(tmp, "listary-open-indexer-" + Guid.NewGuid().ToString("N") + ".jsonl"),
-                Path.Combine(tmp, "listary-open-indexer-" + Guid.NewGuid().ToString("N") + ".err"),
-                expectedUsnJournalId: 0,
-                startUsn: 0,
-                endUsn: 0,
-                CancellationToken.None));
-        await Assert.ThrowsAsync<ElevatedIndexerException>(() =>
-            session.RunCommandAsync(
-                "read-journal-to-file",
-                invalidVolumeRoot,
-                Path.Combine(tmp, "listary-open-indexer-" + Guid.NewGuid().ToString("N") + ".jsonl"),
-                Path.Combine(tmp, "listary-open-indexer-" + Guid.NewGuid().ToString("N") + ".err"),
-                expectedUsnJournalId: 0,
-                startUsn: 0,
-                endUsn: 0,
-                CancellationToken.None));
+        var createdPaths = new List<string>();
+        try
+        {
+            await Assert.ThrowsAsync<ElevatedIndexerException>(() =>
+                session.RunCommandAsync(
+                    "journal-state-to-file",
+                    invalidVolumeRoot,
+                    CreateOutputPath(tmp, ".jsonl", createdPaths),
+                    CreateOutputPath(tmp, ".err", createdPaths),
+                    expectedUsnJournalId: 0,
+                    startUsn: 0,
+                    endUsn: 0,
+                    CancellationToken.None));
+            await Assert.ThrowsAsync<ElevatedIndexerException>(() =>
+                session.RunCommandAsync(
+                    "read-journal-to-file",
+                    invalidVolumeRoot,
+                    CreateOutputPath(tmp, ".jsonl", createdPaths),
+                    CreateOutputPath(tmp, ".err", createdPaths),
+                    expectedUsnJournalId: 0,
+                    startUsn: 0,
+                    endUsn: 0,
+                    CancellationToken.None));
 
-        Assert.Equal(1, startCount);
+            Assert.Equal(1, startCount);
 
-        session.KillWorkerForTests();
+            session.KillWorkerForTests();
 
-        await Assert.ThrowsAsync<ElevatedIndexerException>(() =>
-            session.RunCommandAsync(
-                "scan-to-file",
-                invalidVolumeRoot,
-                Path.Combine(tmp, "listary-open-indexer-" + Guid.NewGuid().ToString("N") + ".bin"),
-                Path.Combine(tmp, "listary-open-indexer-" + Guid.NewGuid().ToString("N") + ".err"),
-                expectedUsnJournalId: 0,
-                startUsn: 0,
-                endUsn: 0,
-                CancellationToken.None));
+            await Assert.ThrowsAsync<ElevatedIndexerException>(() =>
+                session.RunCommandAsync(
+                    "scan-to-file",
+                    invalidVolumeRoot,
+                    CreateOutputPath(tmp, ".bin", createdPaths),
+                    CreateOutputPath(tmp, ".err", createdPaths),
+                    expectedUsnJournalId: 0,
+                    startUsn: 0,
+                    endUsn: 0,
+                    CancellationToken.None));
 
-        Assert.Equal(2, startCount);
+            Assert.Equal(2, startCount);
+        }
+        finally
+        {
+            DeleteFiles(createdPaths);
+        }
+    }
+
+    private static string CreateOutputPath(string directory, string extension, ICollection<string> paths)
+    {
+        var path = Path.Combine(
+            directory,
+            "listary-open-indexer-" + Guid.NewGuid().ToString("N") + extension);
+        paths.Add(path);
+        return path;
+    }
+
+    private static void DeleteFiles(IEnumerable<string> paths)
+    {
+        foreach (var path in paths)
+        {
+            if (File.Exists(path))
+            {
+                File.Delete(path);
+            }
+        }
     }
 
     private static string ResolveBuiltHelperPath()

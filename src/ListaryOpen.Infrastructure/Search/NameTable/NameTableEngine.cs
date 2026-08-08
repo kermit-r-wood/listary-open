@@ -413,6 +413,42 @@ public sealed class NameTableEngine
         }
     }
 
+    internal void MergeRootFrom(string rootPath, NameTableEngine source)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(rootPath);
+        ArgumentNullException.ThrowIfNull(source);
+        if (ReferenceEquals(this, source))
+        {
+            throw new ArgumentException("A NameTable engine cannot merge a root from itself.", nameof(source));
+        }
+
+        var normalizedRoot = NormalizePath(rootPath);
+        lock (source._gate)
+        {
+            lock (_gate)
+            {
+                for (var id = 0; id < source._entryCount; id++)
+                {
+                    if (!source._entries[id].IsLive)
+                    {
+                        continue;
+                    }
+
+                    var record = source.MaterializeRecordUnlocked(id);
+                    if (!IsSameOrDescendant(record.FullPath, normalizedRoot))
+                    {
+                        throw new InvalidDataException(
+                            $"Staged NameTable record '{record.FullPath}' escapes root '{normalizedRoot}'.");
+                    }
+
+                    UpsertUnlocked(record);
+                }
+
+                OptimizeUnlocked();
+            }
+        }
+    }
+
     public NameTableMemoryStats GetMemoryStats()
     {
         lock (_gate)
@@ -2089,7 +2125,8 @@ public sealed class NameTableEngine
         var alias = _names.GetAlias(entry.NameId);
         foreach (var phrase in context.PhraseBytes)
         {
-            if (folded.IndexOf(phrase) < 0 && !FuzzyPathMatchUnlocked(id, phrase))
+            if (folded.IndexOf(phrase) < 0
+                && !(ContainsPathSeparator(phrase) && FuzzyPathMatchUnlocked(id, phrase)))
             {
                 return false;
             }
@@ -2099,7 +2136,7 @@ public sealed class NameTableEngine
         {
             if (!FuzzyContains(folded, term)
                 && (alias.IsEmpty || !FuzzyContains(alias, term))
-                && !FuzzyPathMatchUnlocked(id, term))
+                && !(ContainsPathSeparator(term) && FuzzyPathMatchUnlocked(id, term)))
             {
                 return false;
             }
@@ -2115,6 +2152,9 @@ public sealed class NameTableEngine
 
         return true;
     }
+
+    private static bool ContainsPathSeparator(ReadOnlySpan<byte> value) =>
+        value.IndexOf((byte)'\\') >= 0 || value.IndexOf((byte)'/') >= 0;
 
     private bool FuzzyPathMatchUnlocked(int id, ReadOnlySpan<byte> query)
     {
@@ -2511,8 +2551,8 @@ public sealed class NameTableEngine
         foreach (var phrase in query.Parsed.Phrases)
         {
             if (!name.Contains(phrase, StringComparison.Ordinal)
-                && !record.ParentPath.Contains(phrase, StringComparison.OrdinalIgnoreCase)
-                && PathSegmentMatcher.Score(record.FullPath, phrase) <= 0)
+                && !(phrase.IndexOfAny(['\\', '/']) >= 0
+                    && PathSegmentMatcher.Score(record.FullPath, phrase) > 0))
             {
                 return false;
             }
@@ -2531,8 +2571,8 @@ public sealed class NameTableEngine
             }
 
             if (PinyinMatcher.Score(term, record.Name) > 0
-                || FuzzyMatcher.Score(term, record.ParentPath) > 0
-                || PathSegmentMatcher.Score(record.FullPath, term) > 0)
+                || (term.IndexOfAny(['\\', '/']) >= 0
+                    && PathSegmentMatcher.Score(record.FullPath, term) > 0))
             {
                 continue;
             }
@@ -2648,7 +2688,11 @@ public sealed class NameTableEngine
             return true;
         }
 
-        var prefix = Path.TrimEndingDirectorySeparator(root) + Path.DirectorySeparatorChar;
+        var normalizedRoot = Path.TrimEndingDirectorySeparator(root);
+        var prefix = normalizedRoot.EndsWith(Path.DirectorySeparatorChar)
+            || normalizedRoot.EndsWith(Path.AltDirectorySeparatorChar)
+                ? normalizedRoot
+                : normalizedRoot + Path.DirectorySeparatorChar;
         return path.StartsWith(prefix, StringComparison.OrdinalIgnoreCase);
     }
 

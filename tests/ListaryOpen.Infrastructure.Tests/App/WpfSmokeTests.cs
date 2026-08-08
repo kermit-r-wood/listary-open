@@ -276,6 +276,11 @@ public sealed class WpfSmokeTests
                 Assert.Equal(Environment.CurrentDirectory, selectionService.CurrentFolder);
                 Assert.Equal(firstPath, selectionService.ItemPath);
 
+                var cancellationsBeforeNoSelection = selectionService.CancelPendingCount;
+                searchViewModel.SelectedResult = null;
+                Assert.Equal(cancellationsBeforeNoSelection + 1, selectionService.CancelPendingCount);
+                searchViewModel.SelectedResult = firstResult;
+
                 var stressResults = Enumerable.Range(0, 50)
                     .Select(index => new SearchResult(
                         FileRecord.Create(
@@ -346,6 +351,29 @@ public sealed class WpfSmokeTests
 #pragma warning restore xUnit1031
                 Assert.True(quickSwitchBar.IsAttached);
                 Assert.True(searchViewModel.IsQuickSwitchBarCollapsed);
+                quickSwitchBar.PrepareForFollowUpTyping();
+                Assert.True(quickSwitchBar.IsFollowUpTypingArmed);
+                Assert.True(quickSwitchBar.IsDialogTextInputCaptureActive);
+                quickSwitchBar.AttachAsync(
+                        [new QuickSwitchFolderCandidate(
+                            Environment.CurrentDirectory,
+                            "Explorer",
+                            new IntPtr(42),
+                            true)],
+                        (_, _) => Task.FromResult(new DialogJumpResult(
+                            DialogJumpStatus.Success,
+                            "Jumped.")),
+                        new IntPtr(42))
+                    .GetAwaiter()
+                    .GetResult();
+                Assert.True(
+                    quickSwitchBar.IsFollowUpTypingArmed,
+                    "Refreshing the same attached dialog must not consume the Ctrl+G follow-up key state.");
+                Assert.True(quickSwitchBar.TryAppendDialogText("f", dialogWindow));
+                Assert.False(quickSwitchBar.IsFollowUpTypingArmed);
+                Assert.Equal("f", searchViewModel.QueryText);
+                searchViewModel.ResetQuickSwitchQuery();
+                quickSwitchBar.Collapse();
                 Assert.False(quickSwitchBar.TryAppendDialogText("x", new IntPtr(41)));
                 Assert.NotEmpty(searchViewModel.Results);
                 searchViewModel.SelectedResult = searchViewModel.Results[0];
@@ -409,13 +437,18 @@ public sealed class WpfSmokeTests
                 taskManagerSearchWindow = new TaskManagerSearchWindow(taskManagerAutomation);
                 taskManagerSearchWindow.ActivateSearch("fire", new IntPtr(126));
                 var taskQueryBox = Assert.IsType<TextBox>(taskManagerSearchWindow.FindName("TaskQueryBox"));
+                var taskSearchViewModel = Assert.IsType<TaskManagerSearchViewModel>(taskManagerSearchWindow.DataContext);
                 Assert.True(taskManagerSearchWindow.IsTaskManagerSearchActive);
                 Assert.Equal("fire", taskQueryBox.Text);
                 Assert.Equal(taskQueryBox.Text.Length, taskQueryBox.CaretIndex);
+                Assert.True(
+                    WaitForDispatcherCondition(
+                        () => taskSearchViewModel.Results.Count >= 2 && taskSearchViewModel.SelectedItem is not null,
+                        TimeSpan.FromSeconds(3)),
+                    "Task Manager search results did not become ready before selection was tested.");
                 taskManagerSearchWindow.MoveSelection(1);
-                Assert.Same(
-                    Assert.IsType<TaskManagerSearchViewModel>(taskManagerSearchWindow.DataContext).SelectedItem,
-                    taskManagerAutomation.SelectedItem);
+                Assert.NotNull(taskSearchViewModel.SelectedItem);
+                Assert.Null(taskManagerAutomation.SelectedItem);
                 Assert.False(taskManagerAutomation.ActivateSelection);
                 taskManagerSearchWindow.ExecuteEditCommand(GlobalEditCommand.SelectAll);
                 Assert.Equal(taskQueryBox.Text.Length, taskQueryBox.SelectionLength);
@@ -493,6 +526,25 @@ public sealed class WpfSmokeTests
         }
     }
 
+    private static bool WaitForDispatcherCondition(Func<bool> condition, TimeSpan timeout)
+    {
+        var deadline = DateTime.UtcNow + timeout;
+        while (!condition() && DateTime.UtcNow < deadline)
+        {
+            var frame = new DispatcherFrame();
+            var timer = new DispatcherTimer(DispatcherPriority.Background)
+            {
+                Interval = TimeSpan.FromMilliseconds(10)
+            };
+            timer.Tick += (_, _) => frame.Continue = false;
+            timer.Start();
+            Dispatcher.PushFrame(frame);
+            timer.Stop();
+        }
+
+        return condition();
+    }
+
     private sealed class RecordingExplorerSelectionService : IExplorerSelectionService
     {
         public IntPtr ExplorerWindow { get; private set; }
@@ -501,6 +553,8 @@ public sealed class WpfSmokeTests
 
         public string? ItemPath { get; private set; }
 
+        public int CancelPendingCount { get; private set; }
+
         public bool TrySelectItem(IntPtr explorerWindow, string currentFolder, string itemPath)
         {
             ExplorerWindow = explorerWindow;
@@ -508,6 +562,8 @@ public sealed class WpfSmokeTests
             ItemPath = itemPath;
             return true;
         }
+
+        public void CancelPending() => CancelPendingCount++;
     }
 
     private sealed class RecordingTaskManagerAutomationService(

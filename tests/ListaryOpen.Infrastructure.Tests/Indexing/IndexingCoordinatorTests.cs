@@ -1,10 +1,13 @@
 using System.ComponentModel;
+using System.Diagnostics;
 using System.Runtime.CompilerServices;
+using ListaryOpen.App;
 using ListaryOpen.Core.Indexing;
 using ListaryOpen.Core.Search;
 using ListaryOpen.Infrastructure.Indexing;
 using ListaryOpen.Infrastructure.Indexing.Ntfs;
 using ListaryOpen.Infrastructure.Search;
+using ListaryOpen.Infrastructure.Search.NameTable;
 
 namespace ListaryOpen.Infrastructure.Tests.Indexing;
 
@@ -42,7 +45,7 @@ public sealed class IndexingCoordinatorTests
             Assert.Contains(statuses, status =>
                 status.State == IndexingRunState.Indexing
                 && status.Message.StartsWith("Writing ", StringComparison.Ordinal));
-            Assert.Equal(2, statuses[^1].IndexedCount);
+            Assert.Equal(3, statuses[^1].IndexedCount);
             Assert.Equal(IndexingRunState.Completed, statuses[^1].State);
             Assert.Contains("compatibility scanning", statuses[^1].Message, StringComparison.OrdinalIgnoreCase);
         }
@@ -169,7 +172,7 @@ public sealed class IndexingCoordinatorTests
     }
 
     [Fact]
-    public async Task IndexRootsAsyncKeepsFinalFailedStatusWhenNtfsScanFailsAndFallbackSucceeds()
+    public async Task IndexRootsAsyncCompletesWhenNtfsScanFailsAndFallbackSucceeds()
     {
         var rootPath = CreateTempDirectory();
         var dbPath = CreateTempDbPath();
@@ -193,8 +196,8 @@ public sealed class IndexingCoordinatorTests
 
             Assert.Equal("FallbackAfterFailure.txt", Assert.Single(results).Record.Name);
             Assert.Contains(statuses, status => status.State == IndexingRunState.Failed && status.Message.Contains("fallback", StringComparison.OrdinalIgnoreCase));
-            Assert.Equal(IndexingRunState.Failed, statuses[^1].State);
-            Assert.Contains("errors", statuses[^1].Message, StringComparison.OrdinalIgnoreCase);
+            Assert.Equal(IndexingRunState.Completed, statuses[^1].State);
+            Assert.DoesNotContain("errors", statuses[^1].Message, StringComparison.OrdinalIgnoreCase);
         }
         finally
         {
@@ -204,7 +207,7 @@ public sealed class IndexingCoordinatorTests
     }
 
     [Fact]
-    public async Task IndexRootsAsyncKeepsFinalFailedStatusWhenElevatedHelperFailsAndFallbackSucceeds()
+    public async Task IndexRootsAsyncCompletesWhenElevatedHelperFailsAndFallbackSucceeds()
     {
         var rootPath = CreateTempDirectory();
         var dbPath = CreateTempDbPath();
@@ -232,8 +235,8 @@ public sealed class IndexingCoordinatorTests
 
             Assert.Equal("FallbackAfterHelperFailure.txt", Assert.Single(results).Record.Name);
             Assert.Contains(statuses, status => status.State == IndexingRunState.Failed && status.Message.Contains("helper", StringComparison.OrdinalIgnoreCase));
-            Assert.Equal(IndexingRunState.Failed, statuses[^1].State);
-            Assert.Contains("errors", statuses[^1].Message, StringComparison.OrdinalIgnoreCase);
+            Assert.Equal(IndexingRunState.Completed, statuses[^1].State);
+            Assert.DoesNotContain("errors", statuses[^1].Message, StringComparison.OrdinalIgnoreCase);
         }
         finally
         {
@@ -460,7 +463,7 @@ public sealed class IndexingCoordinatorTests
             Assert.DoesNotContain(staleResults, result => result.Record.PathKey == staleRecord.PathKey);
             Assert.Contains(statuses, status =>
                 status.Message.Contains("restarting with fallback", StringComparison.OrdinalIgnoreCase));
-            Assert.Equal(IndexingRunState.Failed, statuses[^1].State);
+            Assert.Equal(IndexingRunState.Completed, statuses[^1].State);
         }
         finally
         {
@@ -505,6 +508,200 @@ public sealed class IndexingCoordinatorTests
             DeleteDirectoryIfExists(existingRootPath);
             DeleteDirectoryIfExists(missingRootPath);
             DeleteFileIfExists(dbPath);
+        }
+    }
+
+    [Fact]
+    public async Task IndexRootsAsyncPersistsSuccessfulNameTableRootsWhenAnotherRootFails()
+    {
+        var existingRootPath = CreateTempDirectory();
+        var missingRootPath = Path.Combine(Path.GetTempPath(), "listary-open-missing-" + Guid.NewGuid());
+        var snapshotPath = Path.Combine(
+            Path.GetTempPath(),
+            "listary-open-partial-success-" + Guid.NewGuid().ToString("N") + ".losn");
+
+        try
+        {
+            await File.WriteAllTextAsync(Path.Combine(existingRootPath, "DurableSuccessfulRoot.txt"), "indexed");
+            var provider = new FallbackIndexProvider();
+            await using (var index = await NameTableSearchIndex.OpenAsync(snapshotPath, CancellationToken.None))
+            {
+                var coordinator = new IndexingCoordinator(
+                    index,
+                    new VolumeIndexer(new IIndexProvider[] { provider }),
+                    provider,
+                    _ => new VolumeInfo(existingRootPath, "NTFS", true));
+
+                await coordinator.IndexRootsAsync(
+                    [new IndexRoot(missingRootPath), new IndexRoot(existingRootPath)],
+                    CancellationToken.None);
+            }
+
+            Assert.True(File.Exists(snapshotPath));
+            await using var reopened = await NameTableSearchIndex.OpenAsync(snapshotPath, CancellationToken.None);
+            var results = await reopened.SearchAsync(
+                new SearchQuery("DurableSuccessfulRoot", SearchMode.FilesAndFolders),
+                CancellationToken.None);
+
+            Assert.Equal("DurableSuccessfulRoot.txt", Assert.Single(results).Record.Name);
+        }
+        finally
+        {
+            DeleteDirectoryIfExists(existingRootPath);
+            DeleteDirectoryIfExists(missingRootPath);
+            DeleteFileIfExists(snapshotPath);
+            DeleteFileIfExists(snapshotPath + ".bak");
+            DeleteFileIfExists(snapshotPath + ".tmp");
+        }
+    }
+
+    [Fact]
+    public async Task IndexRootsAsyncPublishesAndPersistsUnverifiedNtfsDriveRootScan()
+    {
+        var driveRoot = Path.GetPathRoot(Environment.SystemDirectory)!;
+        var snapshotPath = Path.Combine(
+            Path.GetTempPath(),
+            "listary-open-unverified-drive-root-" + Guid.NewGuid().ToString("N") + ".losn");
+        var logPath = Path.Combine(
+            Path.GetTempPath(),
+            "listary-open-unverified-drive-root-" + Guid.NewGuid().ToString("N") + ".log");
+        var staleRecord = FileRecord.Create(
+            Path.Combine(driveRoot, "PreservedWithoutJournal.txt"),
+            isDirectory: false,
+            sizeBytes: 1,
+            DateTimeOffset.UtcNow);
+        var scannedRecord = FileRecord.Create(
+            Path.Combine(driveRoot, "System Volume Information", "ScannedWithoutJournal.txt"),
+            isDirectory: false,
+            sizeBytes: 2,
+            DateTimeOffset.UtcNow);
+
+        try
+        {
+            var provider = new JournalAwareNtfsProvider(
+                journalState: null,
+                records: new[] { scannedRecord });
+            var statuses = new List<IndexingStatus>();
+            await using (var index = await NameTableSearchIndex.OpenAsync(snapshotPath, CancellationToken.None))
+            {
+                await index.UpsertAsync(staleRecord, CancellationToken.None);
+                var coordinator = new IndexingCoordinator(
+                    index,
+                    new VolumeIndexer(new IIndexProvider[] { provider }),
+                    new FallbackIndexProvider(),
+                    _ => new VolumeInfo(driveRoot, NtfsIndexProvider.ProviderName, true));
+                coordinator.StatusChanged += (_, status) => statuses.Add(status);
+
+                using (var listener = new DiagnosticTraceFileListener(logPath))
+                {
+                    Trace.Listeners.Add(listener);
+                    try
+                    {
+                        await coordinator.IndexRootsAsync([new IndexRoot(driveRoot)], CancellationToken.None);
+                        Trace.Flush();
+                    }
+                    finally
+                    {
+                        Trace.Listeners.Remove(listener);
+                    }
+                }
+
+                Assert.False(index.Engine.TryGetDurableCheckpoint(driveRoot, out _));
+                Assert.Contains(
+                    await index.SearchAsync(
+                        new SearchQuery("PreservedWithoutJournal", SearchMode.FilesAndFolders),
+                        CancellationToken.None),
+                    result => result.Record.PathKey == staleRecord.PathKey);
+                Assert.Contains(
+                    await index.SearchAsync(
+                        new SearchQuery("ScannedWithoutJournal", SearchMode.FilesAndFolders),
+                        CancellationToken.None),
+                    result => result.Record.PathKey == scannedRecord.PathKey);
+            }
+
+            Assert.True(File.Exists(snapshotPath));
+            await using var reopened = await NameTableSearchIndex.OpenAsync(snapshotPath, CancellationToken.None);
+            Assert.Contains(
+                await reopened.SearchAsync(
+                    new SearchQuery("PreservedWithoutJournal", SearchMode.FilesAndFolders),
+                    CancellationToken.None),
+                result => result.Record.PathKey == staleRecord.PathKey);
+            Assert.Contains(
+                await reopened.SearchAsync(
+                    new SearchQuery("ScannedWithoutJournal", SearchMode.FilesAndFolders),
+                    CancellationToken.None),
+                result => result.Record.PathKey == scannedRecord.PathKey);
+            Assert.Equal(1, provider.QueryJournalStateCount);
+            Assert.Equal(IndexingRunState.Completed, statuses[^1].State);
+            Assert.Contains("stale records retained", statuses[^1].Message, StringComparison.OrdinalIgnoreCase);
+            var diagnostics = await File.ReadAllTextAsync(logPath);
+            Assert.Contains("NTFS journal query returned no state", diagnostics, StringComparison.Ordinal);
+            Assert.Contains("pre-scan journal state unavailable", diagnostics, StringComparison.Ordinal);
+            Assert.Contains("scanned records were retained", diagnostics, StringComparison.Ordinal);
+            Assert.Contains("NameTable snapshot save finished. Saved=True", diagnostics, StringComparison.Ordinal);
+        }
+        finally
+        {
+            DeleteFileIfExists(snapshotPath);
+            DeleteFileIfExists(snapshotPath + ".bak");
+            DeleteFileIfExists(snapshotPath + ".tmp");
+            DeleteFileIfExists(logPath);
+        }
+    }
+
+    [Fact]
+    public async Task IndexRootsAsyncWritesActionableRootFailureAndSnapshotDiagnostics()
+    {
+        var existingRootPath = CreateTempDirectory();
+        var missingRootPath = Path.Combine(Path.GetTempPath(), "listary-open-missing-" + Guid.NewGuid());
+        var snapshotPath = Path.Combine(
+            Path.GetTempPath(),
+            "listary-open-diagnostic-snapshot-" + Guid.NewGuid().ToString("N") + ".losn");
+        var logPath = Path.Combine(
+            Path.GetTempPath(),
+            "listary-open-diagnostic-log-" + Guid.NewGuid().ToString("N") + ".log");
+
+        try
+        {
+            await File.WriteAllTextAsync(Path.Combine(existingRootPath, "DiagnosticSuccess.txt"), "indexed");
+            var provider = new FallbackIndexProvider();
+            await using var index = await NameTableSearchIndex.OpenAsync(snapshotPath, CancellationToken.None);
+            var coordinator = new IndexingCoordinator(
+                index,
+                new VolumeIndexer(new IIndexProvider[] { provider }),
+                provider,
+                _ => new VolumeInfo(existingRootPath, "NTFS", true));
+
+            using (var listener = new DiagnosticTraceFileListener(logPath))
+            {
+                Trace.Listeners.Add(listener);
+                try
+                {
+                    await coordinator.IndexRootsAsync(
+                        [new IndexRoot(missingRootPath), new IndexRoot(existingRootPath)],
+                        CancellationToken.None);
+                    Trace.Flush();
+                }
+                finally
+                {
+                    Trace.Listeners.Remove(listener);
+                }
+            }
+
+            var diagnostics = await File.ReadAllTextAsync(logPath);
+            Assert.Contains("Index root does not exist or is unavailable", diagnostics, StringComparison.Ordinal);
+            Assert.Contains(missingRootPath, diagnostics, StringComparison.OrdinalIgnoreCase);
+            Assert.Contains("NameTable snapshot save finished. Saved=True", diagnostics, StringComparison.Ordinal);
+            Assert.Contains("Indexing run finished. State=Failed", diagnostics, StringComparison.Ordinal);
+        }
+        finally
+        {
+            DeleteDirectoryIfExists(existingRootPath);
+            DeleteDirectoryIfExists(missingRootPath);
+            DeleteFileIfExists(snapshotPath);
+            DeleteFileIfExists(snapshotPath + ".bak");
+            DeleteFileIfExists(snapshotPath + ".tmp");
+            DeleteFileIfExists(logPath);
         }
     }
 
@@ -568,7 +765,7 @@ public sealed class IndexingCoordinatorTests
                 status.Message.Contains("fallback", StringComparison.OrdinalIgnoreCase)
                 && status.Message.Contains(secondRootPath, StringComparison.OrdinalIgnoreCase));
 
-            Assert.Equal(1, secondFallbackStatus.IndexedCount);
+            Assert.Equal(2, secondFallbackStatus.IndexedCount);
         }
         finally
         {

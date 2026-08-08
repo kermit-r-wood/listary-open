@@ -118,6 +118,11 @@ public sealed class IndexingCoordinator
     {
         ArgumentNullException.ThrowIfNull(roots);
 
+        var runStartedAt = Stopwatch.GetTimestamp();
+        Trace.TraceInformation(
+            "Indexing run started. RootCount={0}; Roots=[{1}]",
+            roots.Count,
+            string.Join(" | ", roots.Select(root => root.Path)));
         var indexedCount = 0;
         string? currentRoot = null;
         var currentRootNumber = 0;
@@ -125,6 +130,7 @@ public sealed class IndexingCoordinator
         var hadCancellations = false;
         var retainedStaleRecords = false;
         var compatibilityScanRootCount = 0;
+        var failureMessages = new List<string>();
         long? indexGeneration = null;
         IndexingRunState? terminalState = null;
         string? terminalMessage = null;
@@ -173,6 +179,8 @@ public sealed class IndexingCoordinator
                 if (!Directory.Exists(root.Path))
                 {
                     hadFailures = true;
+                    failureMessages.Add($"Root missing: {root.Path}");
+                    Trace.TraceWarning("Index root does not exist or is unavailable: {0}", root.Path);
                     RaiseStatus(
                         IndexingRunState.Failed,
                         $"Root missing: {root.Path}",
@@ -186,6 +194,12 @@ public sealed class IndexingCoordinator
                 try
                 {
                     var provider = SelectProvider(root);
+                    Trace.TraceInformation(
+                        "Index root provider selected. Root={0}; Provider={1}; RootNumber={2}; TotalRoots={3}",
+                        root.Path,
+                        provider.Name,
+                        currentRootNumber,
+                        roots.Count);
                     if (!IsNtfsProvider(provider))
                     {
                         compatibilityScanRootCount++;
@@ -209,6 +223,20 @@ public sealed class IndexingCoordinator
                     hadFailures |= result.HadFailure;
                     hadCancellations |= result.WasCanceled;
                     retainedStaleRecords |= result.RetainedStaleRecords;
+                    if (result.UsedCompatibilityScanning)
+                    {
+                        compatibilityScanRootCount++;
+                    }
+
+                    Trace.TraceInformation(
+                        "Index root finished. Root={0}; Provider={1}; IndexedCount={2}; HadFailure={3}; WasCanceled={4}; RetainedStaleRecords={5}; UsedCompatibilityScanning={6}",
+                        root.Path,
+                        provider.Name,
+                        result.IndexedCount,
+                        result.HadFailure,
+                        result.WasCanceled,
+                        result.RetainedStaleRecords,
+                        result.UsedCompatibilityScanning);
                 }
                 catch (OperationCanceledException)
                 {
@@ -217,6 +245,11 @@ public sealed class IndexingCoordinator
                 catch (Exception exception)
                 {
                     hadFailures = true;
+                    failureMessages.Add($"{root.Path}: {exception.Message}");
+                    Trace.TraceError(
+                        "Index root failed. Root={0}; Exception={1}",
+                        root.Path,
+                        exception);
                     RaiseStatus(
                         IndexingRunState.Failed,
                         $"Indexing failed for {root.Path}: {exception.Message}",
@@ -233,7 +266,7 @@ public sealed class IndexingCoordinator
                     ? IndexingRunState.Canceled
                     : IndexingRunState.Completed;
             terminalMessage = hadFailures
-                ? "Indexing completed with errors."
+                ? CreateFailureSummary(failureMessages)
                 : hadCancellations
                     ? "Indexing canceled."
                     : retainedStaleRecords
@@ -245,6 +278,10 @@ public sealed class IndexingCoordinator
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
         {
+            Trace.TraceWarning(
+                "Indexing run canceled. IndexedCount={0}; CurrentRoot={1}",
+                indexedCount,
+                currentRoot ?? "<none>");
             RaiseStatus(
                 IndexingRunState.Canceled,
                 "Indexing canceled.",
@@ -266,7 +303,7 @@ public sealed class IndexingCoordinator
                 }
                 catch (Exception exception) when (exception is not OutOfMemoryException)
                 {
-                    Trace.TraceWarning("Failed to discard staged NameTable build: {0}", exception.Message);
+                    Trace.TraceWarning("Failed to discard staged NameTable build: {0}", exception);
                 }
             }
 
@@ -299,7 +336,7 @@ public sealed class IndexingCoordinator
                 }
                 catch (Exception exception) when (exception is not OutOfMemoryException)
                 {
-                    Trace.TraceWarning("Failed to finalize bulk FTS rebuild: {0}", exception.Message);
+                    Trace.TraceWarning("Failed to finalize bulk FTS rebuild: {0}", exception);
                 }
             }
             else if (_sqlite is not null
@@ -318,27 +355,37 @@ public sealed class IndexingCoordinator
                 }
                 catch (Exception exception) when (exception is not OutOfMemoryException)
                 {
-                    Trace.TraceWarning("Failed to recover FTS after reconciliation: {0}", exception.Message);
+                    Trace.TraceWarning("Failed to recover FTS after reconciliation: {0}", exception);
                 }
             }
 
             if (_nameTable is not null
                 && !cancellationToken.IsCancellationRequested
-                && !hadFailures
                 && !hadCancellations
                 && _nameTable.Engine.HasPendingDurability)
             {
                 try
                 {
-                    // One compact LOSN commit covers all successfully reconciled
-                    // roots/volumes in this run.
-                    await _nameTable
+                    // Each full root is staged and only successful roots are
+                    // committed to the live engine. A failure in another root
+                    // must not keep those valid commits memory-only: persisting
+                    // the live engine retains the previous epoch for failed
+                    // roots while making successful roots durable.
+                    Trace.TraceInformation(
+                        "Saving NameTable snapshot after indexing. IndexedCount={0}; HadFailures={1}",
+                        indexedCount,
+                        hadFailures);
+                    var saved = await _nameTable
                         .FlushDurableSnapshotAsync(CancellationToken.None)
                         .ConfigureAwait(false);
+                    Trace.TraceInformation(
+                        "NameTable snapshot save finished. Saved={0}; LiveCount={1}",
+                        saved,
+                        _nameTable.Engine.LiveCount);
                 }
                 catch (Exception exception) when (exception is not OutOfMemoryException)
                 {
-                    Trace.TraceWarning("Failed to save NameTable LOSN after indexing: {0}", exception.Message);
+                    Trace.TraceWarning("Failed to save NameTable LOSN after indexing: {0}", exception);
                 }
             }
 
@@ -350,6 +397,12 @@ public sealed class IndexingCoordinator
             if (terminalState is not null && terminalMessage is not null)
             {
                 RaiseStatus(terminalState.Value, terminalMessage, indexedCount, totalRoots: roots.Count);
+                Trace.TraceInformation(
+                    "Indexing run finished. State={0}; IndexedCount={1}; Elapsed={2}; Failures=[{3}]",
+                    terminalState.Value,
+                    indexedCount,
+                    Stopwatch.GetElapsedTime(runStartedAt),
+                    string.Join(" | ", failureMessages));
             }
         }
     }
@@ -456,14 +509,11 @@ public sealed class IndexingCoordinator
 
             if (count > 0)
             {
-                if (_nameTable is not null)
-                {
-                    await _nameTable.AbortFullBuildRootAsync(CancellationToken.None).ConfigureAwait(false);
-                }
+                await CommitFullScanRootRetainingStaleAsync(root, cancellationToken).ConfigureAwait(false);
 
                 RaiseStatus(
                     IndexingRunState.Indexing,
-                    $"NTFS prune skipped for {root.Path}: scan completeness could not be verified.",
+                    $"NTFS prune skipped for {root.Path}: scan completeness could not be verified; scanned records were retained.",
                     currentIndexedCount + count,
                     root.Path,
                     currentRootNumber,
@@ -490,7 +540,7 @@ public sealed class IndexingCoordinator
                 currentRootNumber,
                 totalRoots,
                 cancellationToken).ConfigureAwait(false);
-            await CommitFullScanRootAsync(root, cancellationToken).ConfigureAwait(false);
+            await CommitFullScanRootRetainingStaleAsync(root, cancellationToken).ConfigureAwait(false);
             RaiseStatus(
                 IndexingRunState.Indexing,
                 $"NTFS prune skipped for {root.Path}: recovery scan has no journal completeness proof.",
@@ -510,6 +560,11 @@ public sealed class IndexingCoordinator
         }
         catch (IndexProviderScanException exception)
         {
+            Trace.TraceWarning(
+                "NTFS provider scan failed. Root={0}; PartialRecordsAccepted={1}; Exception={2}",
+                root.Path,
+                exception.PartialRecordsAccepted,
+                exception);
             if (IsElevatedIndexerLaunchCanceled(exception))
             {
                 if (_nameTable is not null)
@@ -560,9 +615,10 @@ public sealed class IndexingCoordinator
                 await CommitFullScanRootAsync(root, cancellationToken).ConfigureAwait(false);
                 return new IndexRootResult(
                     recoveredCount,
-                    HadFailure: true,
+                    HadFailure: false,
                     WasCanceled: false,
-                    RetainedStaleRecords: false);
+                    RetainedStaleRecords: false,
+                    UsedCompatibilityScanning: true);
             }
 
             RaiseStatus(
@@ -582,7 +638,7 @@ public sealed class IndexingCoordinator
                 currentRootNumber,
                 totalRoots,
                 cancellationToken).ConfigureAwait(false);
-            await CommitFullScanRootAsync(root, cancellationToken).ConfigureAwait(false);
+            await CommitFullScanRootRetainingStaleAsync(root, cancellationToken).ConfigureAwait(false);
             RaiseStatus(
                 IndexingRunState.Indexing,
                 $"NTFS prune skipped for {root.Path}: recovery scan has no journal completeness proof.",
@@ -592,9 +648,10 @@ public sealed class IndexingCoordinator
                 totalRoots);
             return new IndexRootResult(
                 fallbackCount,
-                HadFailure: true,
+                HadFailure: false,
                 WasCanceled: false,
-                RetainedStaleRecords: true);
+                RetainedStaleRecords: true,
+                UsedCompatibilityScanning: true);
         }
     }
 
@@ -605,6 +662,10 @@ public sealed class IndexingCoordinator
     {
         if (provider is not INtfsJournalProvider journalProvider)
         {
+            Trace.TraceWarning(
+                "NTFS completeness check unavailable. Root={0}; Provider={1}; Reason=provider does not expose journal state",
+                root.Path,
+                provider.Name);
             return NtfsCatchUpResult.NeedsFullScan(journalState: null);
         }
 
@@ -627,21 +688,53 @@ public sealed class IndexingCoordinator
         }
         catch (Exception exception)
         {
-            Trace.TraceWarning("NTFS journal query failed for '{0}': {1}", root.Path, exception.Message);
+            Trace.TraceWarning("NTFS journal query failed for '{0}': {1}", root.Path, exception);
             return NtfsCatchUpResult.NeedsFullScan(journalState: null);
         }
 
         if (journalState is null)
         {
+            Trace.TraceWarning(
+                "NTFS journal query returned no state. Root={0}; Provider={1}; A full scan will run without a completeness watermark.",
+                root.Path,
+                provider.Name);
             return NtfsCatchUpResult.NeedsFullScan(journalState: null);
         }
 
+        Trace.TraceInformation(
+            "NTFS journal state read. Phase=pre-scan; Root={0}; JournalId={1}; LowestValidUsn={2}; NextUsn={3}",
+            root.Path,
+            journalState.UsnJournalId,
+            journalState.LowestValidUsn,
+            journalState.NextUsn);
+
         var checkpoint = await ReadVolumeCheckpointAsync(root.Path, cancellationToken)
             .ConfigureAwait(false);
+        if (checkpoint is null)
+        {
+            Trace.TraceInformation("NTFS durable checkpoint not found. Root={0}", root.Path);
+        }
+        else
+        {
+            Trace.TraceInformation(
+                "NTFS durable checkpoint read. Root={0}; JournalId={1}; NextUsn={2}; RulesVersion={3}; CreatedUtc={4:O}",
+                root.Path,
+                checkpoint.UsnJournalId,
+                checkpoint.NextUsn,
+                checkpoint.RulesVersion,
+                checkpoint.LastFullScanAt);
+        }
+
         var plan = UsnJournalCatchUpPlanner.Plan(
             checkpoint,
             journalState,
             SqliteSearchIndex.CurrentIndexContentVersion);
+        Trace.TraceInformation(
+            "NTFS catch-up plan. Root={0}; Action={1}; StartUsn={2}; EndUsn={3}",
+            root.Path,
+            plan.Action,
+            plan.StartUsn,
+            plan.EndUsn);
         if (plan.Action == UsnCatchUpAction.FullRescan)
         {
             return NtfsCatchUpResult.NeedsFullScan(journalState);
@@ -684,12 +777,23 @@ public sealed class IndexingCoordinator
         }
         catch (Exception exception)
         {
-            Trace.TraceWarning("NTFS journal catch-up failed for '{0}': {1}", root.Path, exception.Message);
+            Trace.TraceWarning("NTFS journal catch-up failed for '{0}': {1}", root.Path, exception);
             return NtfsCatchUpResult.NeedsFullScan(journalState);
         }
 
+        Trace.TraceInformation(
+            "NTFS catch-up applied. Root={0}; AppliedCount={1}; RequiresFullRescan={2}; NextUsn={3}",
+            root.Path,
+            applyResult.AppliedCount,
+            applyResult.RequiresFullRescan,
+            applyResult.NextUsn);
         if (applyResult.RequiresFullRescan)
         {
+            Trace.TraceWarning(
+                "NTFS catch-up requires a full scan. Root={0}; StartUsn={1}; EndUsn={2}",
+                root.Path,
+                plan.StartUsn,
+                plan.EndUsn);
             return NtfsCatchUpResult.NeedsFullScan(journalState);
         }
 
@@ -725,8 +829,19 @@ public sealed class IndexingCoordinator
         long indexGeneration,
         CancellationToken cancellationToken)
     {
-        if (provider is not INtfsJournalProvider journalProvider || preScanJournalState is null)
+        if (provider is not INtfsJournalProvider journalProvider)
         {
+            Trace.TraceWarning(
+                "NTFS post-scan verification skipped. Root={0}; Reason=provider does not expose journal state",
+                root.Path);
+            return null;
+        }
+
+        if (preScanJournalState is null)
+        {
+            Trace.TraceWarning(
+                "NTFS post-scan verification skipped. Root={0}; Reason=pre-scan journal state unavailable",
+                root.Path);
             return null;
         }
 
@@ -735,15 +850,47 @@ public sealed class IndexingCoordinator
             var postScanJournalState = await journalProvider
                 .QueryJournalStateAsync(root, cancellationToken)
                 .ConfigureAwait(false);
-            if (postScanJournalState is null
-                || postScanJournalState.UsnJournalId != preScanJournalState.UsnJournalId
-                || postScanJournalState.NextUsn < preScanJournalState.NextUsn)
+            if (postScanJournalState is null)
             {
+                Trace.TraceWarning(
+                    "NTFS post-scan journal query returned no state. Root={0}",
+                    root.Path);
+                return null;
+            }
+
+            Trace.TraceInformation(
+                "NTFS journal state read. Phase=post-scan; Root={0}; JournalId={1}; LowestValidUsn={2}; NextUsn={3}",
+                root.Path,
+                postScanJournalState.UsnJournalId,
+                postScanJournalState.LowestValidUsn,
+                postScanJournalState.NextUsn);
+
+            if (postScanJournalState.UsnJournalId != preScanJournalState.UsnJournalId)
+            {
+                Trace.TraceWarning(
+                    "NTFS post-scan verification failed. Root={0}; Reason=journal id changed; PreJournalId={1}; PostJournalId={2}",
+                    root.Path,
+                    preScanJournalState.UsnJournalId,
+                    postScanJournalState.UsnJournalId);
+                return null;
+            }
+
+            if (postScanJournalState.NextUsn < preScanJournalState.NextUsn)
+            {
+                Trace.TraceWarning(
+                    "NTFS post-scan verification failed. Root={0}; Reason=journal moved backwards; PreNextUsn={1}; PostNextUsn={2}",
+                    root.Path,
+                    preScanJournalState.NextUsn,
+                    postScanJournalState.NextUsn);
                 return null;
             }
 
             if (postScanJournalState.NextUsn == preScanJournalState.NextUsn)
             {
+                Trace.TraceInformation(
+                    "NTFS post-scan verification completed without changes. Root={0}; NextUsn={1}",
+                    root.Path,
+                    postScanJournalState.NextUsn);
                 return postScanJournalState;
             }
 
@@ -762,7 +909,21 @@ public sealed class IndexingCoordinator
                     _recordFilter,
                     nameTable: _nameTable)
                 .ConfigureAwait(false);
-            return result.RequiresFullRescan ? null : postScanJournalState;
+            Trace.TraceInformation(
+                "NTFS post-scan catch-up applied. Root={0}; AppliedCount={1}; RequiresFullRescan={2}; NextUsn={3}",
+                root.Path,
+                result.AppliedCount,
+                result.RequiresFullRescan,
+                result.NextUsn);
+            if (result.RequiresFullRescan)
+            {
+                Trace.TraceWarning(
+                    "NTFS post-scan verification could not prove completeness. Root={0}; Reason=journal changes require another full scan",
+                    root.Path);
+                return null;
+            }
+
+            return postScanJournalState;
         }
         catch (OperationCanceledException)
         {
@@ -770,7 +931,7 @@ public sealed class IndexingCoordinator
         }
         catch (Exception exception)
         {
-            Trace.TraceWarning("NTFS post-scan journal catch-up failed for '{0}': {1}", root.Path, exception.Message);
+            Trace.TraceWarning("NTFS post-scan journal catch-up failed for '{0}': {1}", root.Path, exception);
             return null;
         }
     }
@@ -982,6 +1143,14 @@ public sealed class IndexingCoordinator
         int currentRootNumber = 0,
         int totalRoots = 0)
     {
+        Trace.TraceInformation(
+            "Indexing status. State={0}; IndexedCount={1}; CurrentRoot={2}; RootNumber={3}; TotalRoots={4}; Message={5}",
+            state,
+            indexedCount,
+            currentRoot ?? "<none>",
+            currentRootNumber,
+            totalRoots,
+            message);
         StatusChanged?.Invoke(
             this,
             new IndexingStatus(state, message, indexedCount, currentRoot, currentRootNumber, totalRoots));
@@ -1003,6 +1172,13 @@ public sealed class IndexingCoordinator
         _nameTable is null
             ? Task.CompletedTask
             : _nameTable.CommitFullBuildRootAsync(root.Path, cancellationToken);
+
+    private Task CommitFullScanRootRetainingStaleAsync(
+        IndexRoot root,
+        CancellationToken cancellationToken) =>
+        _nameTable is null
+            ? Task.CompletedTask
+            : _nameTable.CommitFullBuildRootRetainingStaleAsync(root.Path, cancellationToken);
 
     private async Task PruneStaleUnderRootAsync(
         string rootPath,
@@ -1119,7 +1295,19 @@ public sealed class IndexingCoordinator
         int IndexedCount,
         bool HadFailure,
         bool WasCanceled,
-        bool RetainedStaleRecords = false);
+        bool RetainedStaleRecords = false,
+        bool UsedCompatibilityScanning = false);
+
+    private static string CreateFailureSummary(IReadOnlyList<string> failures)
+    {
+        if (failures.Count == 0)
+        {
+            return "Indexing completed with errors.";
+        }
+
+        var suffix = failures.Count == 1 ? string.Empty : $" (+{failures.Count - 1} more)";
+        return $"Indexing completed with errors: {failures[0]}{suffix}";
+    }
 
     private sealed record NtfsCatchUpResult(
         bool CompletedWithoutFullScan,

@@ -113,6 +113,60 @@ public sealed class RealExplorerIntegrationTests
     }
 
     [Fact]
+    [Trait("Category", "DesktopIntegration")]
+    public async Task ProductionNavigationServiceReusesARealExplorerWindow()
+    {
+        await RunInStaAsync(() =>
+        {
+            using var directory = TemporaryExplorerDirectory.Create();
+            var navigationTarget = Directory.CreateDirectory(Path.Combine(directory.Path, "target"));
+            var existingExplorerHandles = EnumerateExplorerWindows()
+                .Select(window => window.Handle)
+                .ToHashSet();
+            LaunchExplorer(directory.Path);
+            var explorer = WaitForExplorerWindow(directory.Path, TimeSpan.FromSeconds(15));
+            Assert.NotNull(explorer);
+            Assert.DoesNotContain(explorer.Handle, existingExplorerHandles);
+            using var cleanup = new OwnedExplorerWindow(explorer.Handle, directory.Path);
+            var navigationService = new ExplorerNavigationService();
+
+            try
+            {
+#pragma warning disable xUnit1031 // The service completes on its own dedicated STA worker.
+                Assert.True(
+                    navigationService.NavigateToFolderAsync(explorer.Handle, navigationTarget.FullName)
+                        .GetAwaiter()
+                        .GetResult());
+#pragma warning restore xUnit1031
+                Assert.True(
+                    WaitUntil(
+                        () => EnumerateExplorerWindows().Any(window =>
+                            window.Handle == explorer.Handle &&
+                            PathsEqual(window.FolderPath, navigationTarget.FullName)),
+                        TimeSpan.FromSeconds(8)),
+                    "The requested folder was not shown in the original Explorer HWND.");
+                Assert.DoesNotContain(
+                    EnumerateExplorerWindows(),
+                    window => !existingExplorerHandles.Contains(window.Handle) &&
+                        window.Handle != explorer.Handle &&
+                        PathsEqual(window.FolderPath, navigationTarget.FullName));
+            }
+            finally
+            {
+#pragma warning disable xUnit1031 // Restore the owned window for guarded cleanup.
+                _ = navigationService.NavigateToFolderAsync(explorer.Handle, directory.Path)
+                    .GetAwaiter()
+                    .GetResult();
+#pragma warning restore xUnit1031
+                _ = WaitUntil(
+                    () => EnumerateExplorerWindows().Any(window =>
+                        window.Handle == explorer.Handle && PathsEqual(window.FolderPath, directory.Path)),
+                    TimeSpan.FromSeconds(8));
+            }
+        });
+    }
+
+    [Fact]
     [Trait("Category", "ElevatedPackagedBlackboxE2E")]
     public async Task PackagedElevatedAppCapturesRealExplorerInputAndSynchronizesSelection()
     {

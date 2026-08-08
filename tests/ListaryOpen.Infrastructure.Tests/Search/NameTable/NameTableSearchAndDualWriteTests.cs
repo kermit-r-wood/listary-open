@@ -108,7 +108,7 @@ public sealed class NameTableSearchAndDualWriteTests
             CancellationToken.None);
 
         var results = await index.SearchAsync(
-            new SearchQuery("ListaryOpen", SearchMode.FilesAndFolders),
+            new SearchQuery("path:ListaryOpen", SearchMode.FilesAndFolders),
             CancellationToken.None);
 
         Assert.NotEmpty(results);

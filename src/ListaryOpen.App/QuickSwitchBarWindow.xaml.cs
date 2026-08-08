@@ -24,6 +24,7 @@ public partial class QuickSwitchBarWindow : Window
     private double _lastAnchorDpiScale;
     private bool _hasCachedPosition;
     private bool _repositionInvalidated = true;
+    private bool _followUpTypingArmed;
     private long _suppressCollapseUntilTick;
 
     internal event EventHandler? AttachmentChanged;
@@ -47,7 +48,6 @@ public partial class QuickSwitchBarWindow : Window
             ScrollViewer.ScrollChangedEvent,
             new ScrollChangedEventHandler(Results_ScrollChanged));
         DataContext = viewModel;
-        viewModel.PropertyChanged += ViewModel_PropertyChanged;
     }
 
     private SearchPanelViewModel ViewModel => (SearchPanelViewModel)DataContext;
@@ -64,12 +64,23 @@ public partial class QuickSwitchBarWindow : Window
 
     internal bool IsDialogSearchExpanded => IsAttached && !ViewModel.IsQuickSwitchBarCollapsed;
 
+    internal bool IsFollowUpTypingArmed => IsAttached && _followUpTypingArmed;
+
+    internal bool IsDialogTextInputCaptureActive =>
+        IsAttached && (IsDialogSearchExpanded || _followUpTypingArmed);
+
     internal async Task AttachAsync(
         IReadOnlyList<QuickSwitchFolderCandidate> candidates,
         Func<string, CancellationToken, Task<DialogJumpResult>> activation,
         IntPtr anchorWindow)
     {
         await ViewModel.ActivateQuickSwitchFolderSearchAsync(candidates, activation);
+        // The periodic dialog probe and Ctrl+G can both observe the same dialog.
+        // If a probe refresh finishes after the direct jump has armed follow-up
+        // typing, refreshing candidates must not silently disarm that next key.
+        var preserveFollowUpTyping = IsAttached &&
+            _anchorWindow == anchorWindow &&
+            _followUpTypingArmed;
         ViewModel.ResetQuickSwitchQuery();
         var attachmentChanged = !IsAttached || _anchorWindow != anchorWindow;
         _anchorWindow = anchorWindow;
@@ -87,6 +98,10 @@ public partial class QuickSwitchBarWindow : Window
         }
 
         Reposition();
+        if (preserveFollowUpTyping)
+        {
+            PrepareForFollowUpTyping();
+        }
     }
 
     internal void Detach()
@@ -98,6 +113,7 @@ public partial class QuickSwitchBarWindow : Window
 
         IsAttached = false;
         _anchorWindow = IntPtr.Zero;
+        _followUpTypingArmed = false;
         _hasCachedPosition = false;
         _repositionInvalidated = true;
         Hide();
@@ -210,7 +226,7 @@ public partial class QuickSwitchBarWindow : Window
 
     internal void CollapseFromDialogInput(IntPtr dialogWindow)
     {
-        if (CanHandleDialogInput(dialogWindow))
+        if (IsDialogTextInputCaptureActive && IsInputFromAttachedDialog(dialogWindow))
         {
             Collapse(restoreAnchorFocus: true);
         }
@@ -222,6 +238,15 @@ public partial class QuickSwitchBarWindow : Window
         {
             return;
         }
+
+        // Attachment does not mean system-wide topmost. The periodic attachment
+        // timer calls Reposition even when geometry is cached, so update this
+        // before the fast return.
+        Topmost = ShouldKeepAttachedBarTopmostAfterDeactivation(
+            IsAttached,
+            GetForegroundWindow(),
+            _anchorWindow,
+            _windowHandle);
 
         var fallbackDpiScale = VisualTreeHelper.GetDpi(this).DpiScaleX;
         var dpiScale = VisibleWindowBounds.GetWindowDpiScale(_anchorWindow, fallbackDpiScale);
@@ -287,6 +312,7 @@ public partial class QuickSwitchBarWindow : Window
             return;
         }
 
+        _followUpTypingArmed = false;
         Topmost = true;
         ViewModel.SetQuickSwitchBarCollapsed(false);
         InvalidateReposition();
@@ -306,6 +332,7 @@ public partial class QuickSwitchBarWindow : Window
             return;
         }
 
+        _followUpTypingArmed = false;
         ViewModel.SetQuickSwitchBarCollapsed(true);
         InvalidateReposition();
         ShowActivated = false;
@@ -317,8 +344,30 @@ public partial class QuickSwitchBarWindow : Window
         }
     }
 
+    /// <summary>
+    /// Arms the collapsed bar after Ctrl+G changes the dialog folder. The next
+    /// printable key starts Quick Switch even if the native dialog restores focus
+    /// to its file-name edit.
+    /// </summary>
+    internal void PrepareForFollowUpTyping()
+    {
+        if (!IsAttached)
+        {
+            return;
+        }
+
+        ViewModel.ResetQuickSwitchQuery();
+        ViewModel.SetQuickSwitchBarCollapsed(true);
+        _followUpTypingArmed = true;
+        Topmost = true;
+        InputCaptureStateChanged?.Invoke(this, EventArgs.Empty);
+    }
+
     private bool CanHandleDialogInput(IntPtr dialogWindow) =>
         IsDialogSearchExpanded &&
+        IsInputFromAttachedDialog(dialogWindow);
+
+    private bool IsInputFromAttachedDialog(IntPtr dialogWindow) =>
         App.ShouldHandleDialogQuickSwitchInput(dialogWindow, _anchorWindow, _windowHandle);
 
     private void ApplyDialogInputBackspace()
@@ -370,7 +419,13 @@ public partial class QuickSwitchBarWindow : Window
             return;
         }
 
-        if (Environment.TickCount64 < _suppressCollapseUntilTick)
+        var foreground = GetForegroundWindow();
+        var keepTopmost = ShouldKeepAttachedBarTopmostAfterDeactivation(
+            IsAttached,
+            foreground,
+            _anchorWindow,
+            _windowHandle);
+        if (Environment.TickCount64 < _suppressCollapseUntilTick && keepTopmost)
         {
             Topmost = true;
             if (IsDialogSearchExpanded)
@@ -382,7 +437,6 @@ public partial class QuickSwitchBarWindow : Window
             return;
         }
 
-        var foreground = GetForegroundWindow();
         if (ShouldKeepDialogSearchExpandedAfterDeactivation(
                 IsAttached,
                 IsDialogSearchExpanded,
@@ -394,10 +448,7 @@ public partial class QuickSwitchBarWindow : Window
             return;
         }
 
-        // The collapsed bar is still part of the attached dialog UI. Returning
-        // focus to the dialog must not put the bar behind that dialog; otherwise
-        // a successful direct jump looks as though Quick Switch disappeared.
-        Topmost = ShouldKeepAttachedBarTopmostAfterDeactivation(IsAttached);
+        Topmost = keepTopmost;
         if (!ViewModel.IsQuickSwitchBarCollapsed)
         {
             Collapse();
@@ -621,23 +672,9 @@ public partial class QuickSwitchBarWindow : Window
         Collapse(restoreAnchorFocus: true);
     }
 
-    private void ViewModel_PropertyChanged(object? sender, PropertyChangedEventArgs e)
-    {
-        if (string.Equals(e.PropertyName, nameof(SearchPanelViewModel.Results), StringComparison.Ordinal) &&
-            IsAttached &&
-            !ViewModel.IsQuickSwitchBarCollapsed)
-        {
-            InvalidateReposition();
-            Dispatcher.BeginInvoke(
-                System.Windows.Threading.DispatcherPriority.Loaded,
-                new Action(Reposition));
-        }
-    }
-
     protected override void OnClosed(EventArgs e)
     {
         _windowHandle = IntPtr.Zero;
-        ViewModel.PropertyChanged -= ViewModel_PropertyChanged;
         InputCaptureStateChanged?.Invoke(this, EventArgs.Empty);
         base.OnClosed(e);
     }
@@ -671,7 +708,15 @@ public partial class QuickSwitchBarWindow : Window
         && (foregroundWindow == quickSwitchWindow
             || GlobalTextInputService.IsConfiguredDialogInputWindow(foregroundWindow, anchorWindow));
 
-    internal static bool ShouldKeepAttachedBarTopmostAfterDeactivation(bool isAttached) => isAttached;
+    internal static bool ShouldKeepAttachedBarTopmostAfterDeactivation(
+        bool isAttached,
+        IntPtr foregroundWindow,
+        IntPtr anchorWindow,
+        IntPtr quickSwitchWindow = default) =>
+        isAttached
+        && foregroundWindow != IntPtr.Zero
+        && (foregroundWindow == quickSwitchWindow
+            || GlobalTextInputService.IsConfiguredDialogInputWindow(foregroundWindow, anchorWindow));
 
     private static bool AreClose(double left, double right) => Math.Abs(left - right) < 0.1;
 

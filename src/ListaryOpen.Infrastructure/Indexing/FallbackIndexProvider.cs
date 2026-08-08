@@ -51,6 +51,15 @@ public sealed class FallbackIndexProvider : IIndexProvider
         var normalizedRootPath = NormalizePath(root.Path);
         var skippedInaccessibleLocation = false;
 
+        // The NTFS provider projects the requested directory itself, whereas the
+        // compatibility walk historically started at its children. That made a
+        // custom indexed root impossible to find by its own name while descendants
+        // could still match through the parent path.
+        if (TryCreateDirectoryRecord(root.Path, out var rootRecord, out _))
+        {
+            yield return rootRecord;
+        }
+
         while (pending.Count > 0)
         {
             cancellationToken.ThrowIfCancellationRequested();

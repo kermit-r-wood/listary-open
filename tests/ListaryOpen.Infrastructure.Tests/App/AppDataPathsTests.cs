@@ -15,6 +15,7 @@ public sealed class AppDataPathsTests
         Assert.Equal(Path.Combine(programDirectory, "data"), paths.DataDirectory);
         Assert.Equal(Path.Combine(programDirectory, "data", "index.db"), paths.IndexDatabasePath);
         Assert.Equal(Path.Combine(programDirectory, "data", "tmp"), paths.IndexerTempDirectory);
+        Assert.Equal(Path.Combine(programDirectory, "data", "listaryopen.log"), paths.DiagnosticLogPath);
     }
 
     [Fact]

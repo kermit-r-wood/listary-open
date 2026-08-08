@@ -25,6 +25,7 @@ public partial class SearchPanel : Window
     private const double CompactGlobalSearchWorkAreaMargin = 48;
     private const double CompactGlobalSearchVerticalMargin = 32;
     private readonly IExplorerSelectionService _explorerSelectionService;
+    private readonly IExplorerNavigationService _explorerNavigationService;
     private IntPtr _explorerSearchWindow;
     private string? _explorerSearchFolder;
     private string? _lastSyncedExplorerPath;
@@ -49,22 +50,32 @@ public partial class SearchPanel : Window
     }
 
     public SearchPanel(SearchPanelViewModel viewModel)
-        : this(viewModel, new ExplorerSelectionService())
+        : this(viewModel, new ExplorerSelectionService(), new ExplorerNavigationService())
     {
     }
 
     internal SearchPanel(
         SearchPanelViewModel viewModel,
         IExplorerSelectionService explorerSelectionService)
+        : this(viewModel, explorerSelectionService, new ExplorerNavigationService())
+    {
+    }
+
+    internal SearchPanel(
+        SearchPanelViewModel viewModel,
+        IExplorerSelectionService explorerSelectionService,
+        IExplorerNavigationService explorerNavigationService)
     {
         ArgumentNullException.ThrowIfNull(viewModel);
         ArgumentNullException.ThrowIfNull(explorerSelectionService);
+        ArgumentNullException.ThrowIfNull(explorerNavigationService);
 
         InitializeComponent();
         ResultsList.AddHandler(
             ScrollViewer.ScrollChangedEvent,
             new ScrollChangedEventHandler(ResultsList_ScrollChanged));
         _explorerSelectionService = explorerSelectionService;
+        _explorerNavigationService = explorerNavigationService;
         DataContext = viewModel;
         viewModel.PropertyChanged += ViewModel_PropertyChanged;
         viewModel.QuickLaunchExecuted += ViewModel_QuickLaunchExecuted;
@@ -597,9 +608,19 @@ public partial class SearchPanel : Window
         var selectedPath = ViewModel.SelectedResult?.Record.FullPath;
         if (!ViewModel.IsExplorerTypeSearchMode ||
             _explorerSearchWindow == IntPtr.Zero ||
-            string.IsNullOrWhiteSpace(_explorerSearchFolder) ||
-            string.IsNullOrWhiteSpace(selectedPath) ||
-            string.Equals(selectedPath, _lastSyncedExplorerPath, StringComparison.OrdinalIgnoreCase))
+            string.IsNullOrWhiteSpace(_explorerSearchFolder))
+        {
+            return;
+        }
+
+        if (string.IsNullOrWhiteSpace(selectedPath))
+        {
+            _lastSyncedExplorerPath = null;
+            _explorerSelectionService.CancelPending();
+            return;
+        }
+
+        if (string.Equals(selectedPath, _lastSyncedExplorerPath, StringComparison.OrdinalIgnoreCase))
         {
             return;
         }
@@ -1119,9 +1140,17 @@ public partial class SearchPanel : Window
 
     private async Task ActivateSelectedFromQuickSwitchAsync()
     {
+        var explorerWindow = _explorerSearchWindow;
         var activated = await RunInteractionAsync(
             ViewModel,
-            viewModel => viewModel.ActivateSelectedAsync(),
+            viewModel => viewModel.ActivateSelectedAsync(
+                viewModel.IsExplorerTypeSearchMode && explorerWindow != IntPtr.Zero
+                    ? (path, cancellationToken) =>
+                        _explorerNavigationService.NavigateToFolderAsync(
+                            explorerWindow,
+                            path,
+                            cancellationToken)
+                    : null),
             fallback: false);
         if (!activated)
         {
@@ -1133,6 +1162,9 @@ public partial class SearchPanel : Window
             DismissExplorerSearch();
         }
     }
+
+    internal void ConfirmSelectionFromHostInput() =>
+        _ = ActivateSelectedFromQuickSwitchAsync();
 
     private void RevealResultMenuItem_Click(object sender, RoutedEventArgs e)
     {

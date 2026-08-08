@@ -167,6 +167,18 @@ public sealed class ExplorerTypeSearchTests
         Assert.True(shouldAppend);
     }
 
+    [Fact]
+    public void FollowUpExplorerInputStillAppendsIfTheNativeSearchEditRetakesFocus()
+    {
+        var explorerWindow = new IntPtr(42);
+        var input = new GlobalTextInputEventArgs("e", explorerWindow, "SearchBoxControl");
+
+        Assert.True(WpfApp.ShouldAppendExplorerTypeSearchInput(
+            input,
+            explorerWindow,
+            explorerSearchPanelVisible: true));
+    }
+
     [Theory]
     [InlineData(false, 42)]
     [InlineData(true, 41)]
@@ -258,6 +270,58 @@ public sealed class ExplorerTypeSearchTests
                 host,
                 focusedControlClass,
                 focusedControlId));
+    }
+
+    [Fact]
+    public void ActiveTaskManagerOverlayKeepsTextOutOfTheNativeSearchControl()
+    {
+        Assert.False(GlobalTextInputService.ShouldCaptureTextInput(
+            GlobalTextInputHost.TaskManager,
+            "Edit",
+            focusedControlId: 0));
+        Assert.True(GlobalTextInputService.ShouldCaptureTextInput(
+            GlobalTextInputHost.TaskManager,
+            "Edit",
+            focusedControlId: 0,
+            captureActiveOverlayInput: true));
+    }
+
+    [Theory]
+    [InlineData(GlobalTextInputHost.Explorer)]
+    [InlineData(GlobalTextInputHost.TaskManager)]
+    [InlineData(GlobalTextInputHost.Dialog)]
+    public void AnyActiveHostOverlayOverridesItsNativeTextControl(
+        GlobalTextInputHost host)
+    {
+        Assert.False(GlobalTextInputService.ShouldCaptureTextInput(
+            host,
+            "SearchBoxControl",
+            focusedControlId: 0));
+        Assert.True(GlobalTextInputService.ShouldCaptureTextInput(
+            host,
+            "SearchBoxControl",
+            focusedControlId: 0,
+            captureActiveOverlayInput: true));
+    }
+
+    [Fact]
+    public void OverlayTextOverrideIsBoundToTheExactActiveHostWindow()
+    {
+        Assert.True(GlobalTextInputService.IsOverlayTextInputWindow(
+            GlobalTextInputHost.Explorer,
+            foregroundWindow: new IntPtr(42),
+            overlayTextInputWindow: new IntPtr(42),
+            captureOverlayInput: true));
+        Assert.False(GlobalTextInputService.IsOverlayTextInputWindow(
+            GlobalTextInputHost.Explorer,
+            foregroundWindow: new IntPtr(41),
+            overlayTextInputWindow: new IntPtr(42),
+            captureOverlayInput: true));
+        Assert.False(GlobalTextInputService.IsOverlayTextInputWindow(
+            GlobalTextInputHost.Explorer,
+            foregroundWindow: new IntPtr(42),
+            overlayTextInputWindow: new IntPtr(42),
+            captureOverlayInput: false));
     }
 
     [Fact]
@@ -397,6 +461,49 @@ public sealed class ExplorerTypeSearchTests
         Assert.Same(activeSession, capturedSession);
         Assert.True(capture.IsCurrent(activeSession));
         Assert.True(input.Handled);
+    }
+
+    [Fact]
+    public void TaskManagerCaptureHandlesNavigationAndConfirmationAfterNativeSearchRetakesFocus()
+    {
+        var taskManagerWindow = new IntPtr(42);
+        var capture = new ExplorerTypeSearchNavigationCapture();
+        var activeSession = capture.Activate(
+            taskManagerWindow,
+            captureTextEntryControl: true);
+        var navigation = new GlobalNavigationInputEventArgs(1, taskManagerWindow, "Edit");
+        var confirmation = new GlobalConfirmInputEventArgs(taskManagerWindow, "Edit");
+
+        Assert.Same(activeSession, capture.TryCapture(navigation));
+        Assert.Same(activeSession, capture.TryCapture(confirmation));
+        Assert.True(navigation.Handled);
+        Assert.True(confirmation.Handled);
+    }
+
+    [Fact]
+    public void ExplorerCaptureCanProtectAnActiveSessionAfterNativeSearchRetakesFocus()
+    {
+        var explorerWindow = new IntPtr(42);
+        var capture = new ExplorerTypeSearchNavigationCapture();
+        var activeSession = capture.Activate(
+            explorerWindow,
+            captureTextEntryControl: true);
+        var input = new GlobalConfirmInputEventArgs(explorerWindow, "SearchBoxControl");
+
+        Assert.Same(activeSession, capture.TryCapture(input));
+        Assert.True(input.Handled);
+    }
+
+    [Fact]
+    public void ExplorerCaptureStillYieldsToANativeTextControl()
+    {
+        var explorerWindow = new IntPtr(42);
+        var capture = new ExplorerTypeSearchNavigationCapture();
+        capture.Activate(explorerWindow);
+        var input = new GlobalConfirmInputEventArgs(explorerWindow, "Edit");
+
+        Assert.Null(capture.TryCapture(input));
+        Assert.False(input.Handled);
     }
 
     [Fact]

@@ -21,4 +21,17 @@ public sealed class ConfiguredIndexFilterTests
         var record = FileRecord.Create("C:\\Work\\src\\app.cs", false, 1, DateTimeOffset.UtcNow);
         Assert.True(ConfiguredIndexFilter.ShouldInclude(record, ["node_modules", "*.tmp", "C:\\Private"]));
     }
+
+    [Fact]
+    public void DriveRootExclusionRejectsDescendants()
+    {
+        var driveRoot = Path.GetPathRoot(Environment.SystemDirectory)!;
+        var record = FileRecord.Create(
+            Path.Combine(driveRoot, "Windows", "System32", "example.dll"),
+            false,
+            1,
+            DateTimeOffset.UtcNow);
+
+        Assert.False(ConfiguredIndexFilter.ShouldInclude(record, [driveRoot]));
+    }
 }

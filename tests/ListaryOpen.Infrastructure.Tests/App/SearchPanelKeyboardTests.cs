@@ -38,10 +38,31 @@ public sealed class SearchPanelKeyboardTests
     }
 
     [Fact]
-    public void AttachedQuickSwitchStaysTopmostAfterFocusReturnsToDialog()
+    public void AttachedQuickSwitchIsTopmostOnlyForItsDialogOrItsOwnWindow()
     {
-        Assert.True(QuickSwitchBarWindow.ShouldKeepAttachedBarTopmostAfterDeactivation(isAttached: true));
-        Assert.False(QuickSwitchBarWindow.ShouldKeepAttachedBarTopmostAfterDeactivation(isAttached: false));
+        var dialog = new IntPtr(42);
+        var bar = new IntPtr(84);
+
+        Assert.True(QuickSwitchBarWindow.ShouldKeepAttachedBarTopmostAfterDeactivation(
+            isAttached: true,
+            foregroundWindow: dialog,
+            anchorWindow: dialog,
+            quickSwitchWindow: bar));
+        Assert.True(QuickSwitchBarWindow.ShouldKeepAttachedBarTopmostAfterDeactivation(
+            isAttached: true,
+            foregroundWindow: bar,
+            anchorWindow: dialog,
+            quickSwitchWindow: bar));
+        Assert.False(QuickSwitchBarWindow.ShouldKeepAttachedBarTopmostAfterDeactivation(
+            isAttached: true,
+            foregroundWindow: new IntPtr(126),
+            anchorWindow: dialog,
+            quickSwitchWindow: bar));
+        Assert.False(QuickSwitchBarWindow.ShouldKeepAttachedBarTopmostAfterDeactivation(
+            isAttached: false,
+            foregroundWindow: dialog,
+            anchorWindow: dialog,
+            quickSwitchWindow: bar));
     }
 
     [Theory]

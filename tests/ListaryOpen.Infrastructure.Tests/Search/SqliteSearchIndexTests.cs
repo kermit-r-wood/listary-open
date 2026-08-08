@@ -776,6 +776,48 @@ public sealed class SqliteSearchIndexTests
     }
 
     [Fact]
+    public async Task PlainQueryDoesNotLetMatchingParentPathsStarveMatchingNames()
+    {
+        var dbPath = CreateTempDbPath();
+        try
+        {
+            await using var index = await SqliteSearchIndex.OpenAsync(dbPath, CancellationToken.None);
+            await index.WaitForBackgroundMaintenanceAsync();
+            var records = Enumerable.Range(0, 500)
+                .Select(number => FileRecord.Create(
+                    $"C:\\Projects\\listary_open\\child-{number:D4}.txt",
+                    false,
+                    1,
+                    DateTimeOffset.UtcNow))
+                .Append(FileRecord.Create(
+                    "C:\\Projects\\listary_open",
+                    true,
+                    0,
+                    DateTimeOffset.UtcNow))
+                .Append(FileRecord.Create(
+                    "C:\\Elsewhere\\my-listary-match.txt",
+                    false,
+                    1,
+                    DateTimeOffset.UtcNow))
+                .ToArray();
+            await index.UpsertManyAsync(records, CancellationToken.None);
+            await index.WaitForBackgroundMaintenanceAsync();
+
+            var results = await index.SearchAsync(
+                new SearchQuery("listary", SearchMode.FilesAndFolders, limit: 20),
+                CancellationToken.None);
+
+            Assert.Contains(results, result => result.Record.FullPath == "C:\\Projects\\listary_open");
+            Assert.Contains(results, result => result.Record.Name == "my-listary-match.txt");
+            Assert.DoesNotContain(results, result => result.Record.Name.StartsWith("child-", StringComparison.Ordinal));
+        }
+        finally
+        {
+            DeleteIfExists(dbPath);
+        }
+    }
+
+    [Fact]
     public async Task SearchIncludesPreferredRootMatchOutsideGlobalCandidateWindow()
     {
         var dbPath = CreateTempDbPath();

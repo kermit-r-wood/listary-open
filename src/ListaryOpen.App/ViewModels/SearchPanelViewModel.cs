@@ -466,7 +466,10 @@ public sealed class SearchPanelViewModel : INotifyPropertyChanged
         }
     }
 
-    public async Task<bool> ActivateSelectedAsync()
+    public Task<bool> ActivateSelectedAsync() => ActivateSelectedAsync(explorerFolderActivation: null);
+
+    internal async Task<bool> ActivateSelectedAsync(
+        Func<string, CancellationToken, Task<bool>>? explorerFolderActivation)
     {
         var selected = TryGetCurrentSelectedResult();
         if (selected is null)
@@ -484,6 +487,30 @@ public sealed class SearchPanelViewModel : INotifyPropertyChanged
             }
 
             return await ActivateDialogFolderAsync(path);
+        }
+
+        if (_isExplorerTypeSearchMode &&
+            selected.Record.IsDirectory &&
+            explorerFolderActivation is not null)
+        {
+            try
+            {
+                if (!await explorerFolderActivation(path, CancellationToken.None))
+                {
+                    StatusText = $"Could not navigate the current Explorer window to {path}.";
+                    return false;
+                }
+
+                StatusText = $"Navigated to {path}";
+                await RecordUsageAsync(path);
+                return true;
+            }
+            catch (Exception exception) when (IsExpectedActivationException(exception))
+            {
+                Trace.TraceError(exception.ToString());
+                StatusText = $"Could not navigate the current Explorer window to {path}: {exception.Message}";
+                return false;
+            }
         }
 
         try

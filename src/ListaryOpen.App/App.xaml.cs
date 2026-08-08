@@ -28,6 +28,7 @@ public partial class App : Application
     private readonly IndexingRunCancellationManager _indexingCancellation = new();
     private readonly BackgroundIndexingTaskTracker _indexingTasks = new();
     private readonly SemaphoreSlim _indexingRunLock = new(1, 1);
+    private readonly SemaphoreSlim _dialogAttachmentGate = new(1, 1);
     private CoalescingIndexingRunner? _indexingRunner;
 
     private DialogBridge? _dialogBridge;
@@ -43,6 +44,7 @@ public partial class App : Application
     private IndexingCoordinator? _indexingCoordinator;
     private NtfsIndexProvider? _ntfsIndexProvider;
     private PerformanceMetricsFileSink? _performanceMetricsFileSink;
+    private DiagnosticTraceFileListener? _diagnosticTraceFileListener;
     private IQuickSwitchWindowProvider? _quickSwitchWindowProvider;
     private QuickSwitchBarWindow? _quickSwitchBar;
     private SearchPanel? _searchPanel;
@@ -130,6 +132,7 @@ public partial class App : Application
 
     protected override void OnExit(ExitEventArgs e)
     {
+        Trace.TraceInformation("ListaryOpen shutdown started. ExitCode={0}", e.ApplicationExitCode);
         _e2eControlServer?.Dispose();
         _indexingRunner?.Dispose();
         _indexingCancellation.CancelActive();
@@ -164,6 +167,7 @@ public partial class App : Application
         if (_globalTextInputService is not null)
         {
             _globalTextInputService.CaptureOverlayInput = false;
+            _globalTextInputService.OverlayTextInputWindow = IntPtr.Zero;
             _globalTextInputService.DialogInputWindow = IntPtr.Zero;
             _explorerNavigationCapture.Deactivate();
             _globalTextInputService.TextInput -= OnGlobalTextInput;
@@ -224,6 +228,9 @@ public partial class App : Application
         _singleInstanceGuard?.Dispose();
         _shutdownCancellation.Dispose();
 
+        Trace.TraceInformation("ListaryOpen shutdown completed. ExitCode={0}", e.ApplicationExitCode);
+        StopDiagnosticLogging();
+
         base.OnExit(e);
     }
 
@@ -234,8 +241,14 @@ public partial class App : Application
         try
         {
             appDataPaths.EnsureDirectories();
+            StartDiagnosticLogging(appDataPaths);
             _settingsPath = appDataPaths.SettingsPath;
             settings = _settingsStore.Load(appDataPaths.SettingsPath);
+            Trace.TraceInformation(
+                "Index configuration loaded. ConfiguredRoots=[{0}]; EffectiveRoots=[{1}]; ExcludedPaths=[{2}]",
+                string.Join(" | ", settings.IndexedRoots),
+                string.Join(" | ", GetAllIndexRootPaths(settings)),
+                string.Join(" | ", settings.ExcludedPaths));
             PinyinMatcher.Configure(settings.SearchTransliteration);
             _performanceMetricsFileSink = new PerformanceMetricsFileSink(
                 appDataPaths.PerformanceMetricsPath);
@@ -261,6 +274,51 @@ public partial class App : Application
                     settings,
                     appDataPaths))
             .ConfigureAwait(false);
+    }
+
+    private void StartDiagnosticLogging(AppDataPaths paths)
+    {
+        if (_diagnosticTraceFileListener is not null)
+        {
+            return;
+        }
+
+        try
+        {
+            _diagnosticTraceFileListener = new DiagnosticTraceFileListener(paths.DiagnosticLogPath);
+            Trace.Listeners.Add(_diagnosticTraceFileListener);
+            Trace.TraceInformation(
+                "ListaryOpen startup. Version={0}; ProcessId={1}; Is64BitProcess={2}; BaseDirectory={3}; DataDirectory={4}; OS={5}",
+                typeof(App).Assembly.GetName().Version,
+                Environment.ProcessId,
+                Environment.Is64BitProcess,
+                AppContext.BaseDirectory,
+                paths.DataDirectory,
+                Environment.OSVersion.VersionString);
+        }
+        catch (Exception exception) when (exception is IOException or UnauthorizedAccessException)
+        {
+            _diagnosticTraceFileListener?.Dispose();
+            _diagnosticTraceFileListener = null;
+            Trace.TraceWarning(
+                "Could not start persistent diagnostics at '{0}': {1}",
+                paths.DiagnosticLogPath,
+                exception.Message);
+        }
+    }
+
+    private void StopDiagnosticLogging()
+    {
+        var listener = _diagnosticTraceFileListener;
+        if (listener is null)
+        {
+            return;
+        }
+
+        _diagnosticTraceFileListener = null;
+        Trace.Flush();
+        Trace.Listeners.Remove(listener);
+        listener.Dispose();
     }
 
     private bool InitializeApplicationServices(
@@ -1221,7 +1279,7 @@ public partial class App : Application
             return;
         }
 
-        var dialogInputWindow = TryCaptureDialogQuickSwitchInput(input.ForegroundWindow);
+        var dialogInputWindow = TryCaptureDialogTextInput(input.ForegroundWindow);
         Dispatcher.BeginInvoke(new Action(() => HandleGlobalEscapePressed(input, dialogInputWindow)));
     }
 
@@ -1353,7 +1411,7 @@ public partial class App : Application
             _taskManagerSearchWindow.DismissSearch();
         }
 
-        if (_quickSwitchBar?.IsDialogSearchExpanded == true &&
+        if (_quickSwitchBar?.IsDialogTextInputCaptureActive == true &&
             !_quickSwitchBar.ContainsScreenPoint(input.ScreenX, input.ScreenY))
         {
             _quickSwitchBar.Collapse();
@@ -1425,14 +1483,37 @@ public partial class App : Application
         }
 
         var dialogInputWindow = TryCaptureDialogQuickSwitchInput(input.ForegroundWindow);
-        if (dialogInputWindow == IntPtr.Zero)
+        if (dialogInputWindow != IntPtr.Zero)
+        {
+            input.Handled = true;
+            Dispatcher.BeginInvoke(new Action(() =>
+                _quickSwitchBar?.ConfirmSelectionFromDialogInput(input.ForegroundWindow)));
+            return;
+        }
+
+        var capturedSession = _explorerNavigationCapture.TryCapture(input);
+        if (capturedSession is null)
         {
             return;
         }
 
-        input.Handled = true;
         Dispatcher.BeginInvoke(new Action(() =>
-            _quickSwitchBar?.ConfirmSelectionFromDialogInput(input.ForegroundWindow)));
+        {
+            var currentPanel = _searchPanel;
+            if (_explorerNavigationCapture.IsCurrent(capturedSession) &&
+                _lastExplorerTypeSearchWindow == capturedSession.ExplorerWindow &&
+                currentPanel?.IsVisible == true &&
+                currentPanel.IsExplorerTypeSearchActive)
+            {
+                currentPanel.ConfirmSelectionFromHostInput();
+            }
+            else if (_explorerNavigationCapture.IsCurrent(capturedSession) &&
+                _lastTaskManagerSearchWindow == capturedSession.ExplorerWindow &&
+                _taskManagerSearchWindow?.IsTaskManagerSearchActive == true)
+            {
+                _taskManagerSearchWindow.ConfirmSelection();
+            }
+        }));
     }
 
     private void OnGlobalEditCommandPressed(object? sender, GlobalEditCommandInputEventArgs input)
@@ -1559,8 +1640,7 @@ public partial class App : Application
     {
         // Trust the hook-time focused class. A deferred UIA FocusedElement probe can
         // false-positive on Task Manager chrome (names containing "search") and abort show.
-        if (string.IsNullOrWhiteSpace(input.Text) ||
-            GlobalTextInputService.IsTextEntryControlClass(input.FocusedControlClass))
+        if (string.IsNullOrWhiteSpace(input.Text))
         {
             return;
         }
@@ -1572,6 +1652,11 @@ public partial class App : Application
             return;
         }
 
+        if (GlobalTextInputService.IsTextEntryControlClass(input.FocusedControlClass))
+        {
+            return;
+        }
+
         if (_searchPanel?.IsExplorerTypeSearchActive == true)
         {
             _searchPanel.DismissExplorerSearch();
@@ -1580,7 +1665,9 @@ public partial class App : Application
         _taskManagerSearchWindow ??= CreateTaskManagerSearchWindow();
         _lastTaskManagerSearchWindow = input.ForegroundWindow;
         _taskManagerSearchWindow.ActivateSearch(input.Text, input.ForegroundWindow);
-        _explorerNavigationCapture.Activate(input.ForegroundWindow);
+        _explorerNavigationCapture.Activate(
+            input.ForegroundWindow,
+            captureTextEntryControl: true);
         RefreshOverlayInputCapture();
     }
 
@@ -1675,7 +1762,9 @@ public partial class App : Application
             request.InitialQuery,
             request.CurrentFolder,
             request.ExplorerWindow);
-        _explorerNavigationCapture.Activate(request.ExplorerWindow);
+        _explorerNavigationCapture.Activate(
+            request.ExplorerWindow,
+            captureTextEntryControl: true);
         RefreshOverlayInputCapture();
         return true;
     }
@@ -1701,18 +1790,35 @@ public partial class App : Application
 
     private void RefreshOverlayInputCapture()
     {
-        var dialogInputWindow = _quickSwitchBar?.IsDialogSearchExpanded == true
+        var dialogCommandInputWindow = _quickSwitchBar?.IsDialogSearchExpanded == true
             ? _quickSwitchBar.AnchorWindow
             : IntPtr.Zero;
-        Interlocked.Exchange(ref _activeDialogQuickSwitchInputWindow, dialogInputWindow);
+        var dialogTextInputWindow = _quickSwitchBar?.IsDialogTextInputCaptureActive == true
+            ? _quickSwitchBar.AnchorWindow
+            : IntPtr.Zero;
+        Interlocked.Exchange(ref _activeDialogQuickSwitchInputWindow, dialogCommandInputWindow);
         if (_globalTextInputService is not null)
         {
+            var taskManagerInputWindow =
+                _taskManagerSearchWindow?.IsTaskManagerSearchActive == true
+                    ? _taskManagerSearchWindow.TaskManagerWindow
+                    : IntPtr.Zero;
+            var explorerInputWindow =
+                _searchPanel?.IsVisible == true && _searchPanel.IsExplorerTypeSearchActive
+                    ? _lastExplorerTypeSearchWindow
+                    : IntPtr.Zero;
+            _globalTextInputService.OverlayTextInputWindow =
+                taskManagerInputWindow != IntPtr.Zero
+                    ? taskManagerInputWindow
+                    : explorerInputWindow != IntPtr.Zero
+                        ? explorerInputWindow
+                        : dialogTextInputWindow;
             _globalTextInputService.DialogInputWindow =
                 _quickSwitchBar?.IsAttached == true
                     ? _quickSwitchBar.AnchorWindow
                     : IntPtr.Zero;
             _globalTextInputService.CaptureOverlayInput = ShouldCaptureOverlayInput(
-                dialogInputWindow != IntPtr.Zero,
+                dialogTextInputWindow != IntPtr.Zero,
                 _explorerQuickMenu?.IsOpen == true,
                 _taskManagerSearchWindow?.IsTaskManagerSearchActive == true,
                 _searchPanel?.IsResultContextMenuOpen == true,
@@ -1746,6 +1852,19 @@ public partial class App : Application
             : IntPtr.Zero;
     }
 
+    private IntPtr TryCaptureDialogTextInput(IntPtr foregroundWindow)
+    {
+        var dialogInputWindow = _quickSwitchBar?.IsDialogTextInputCaptureActive == true
+            ? _quickSwitchBar.AnchorWindow
+            : IntPtr.Zero;
+        return ShouldHandleDialogQuickSwitchInput(
+                foregroundWindow,
+                dialogInputWindow,
+                _quickSwitchBar?.WindowHandle ?? IntPtr.Zero)
+            ? dialogInputWindow
+            : IntPtr.Zero;
+    }
+
     internal static bool ShouldHandleDialogQuickSwitchInput(
         IntPtr foregroundWindow,
         IntPtr activeDialogInputWindow,
@@ -1765,8 +1884,7 @@ public partial class App : Application
         return explorerSearchPanelVisible
             && activeExplorerWindow != IntPtr.Zero
             && input.ForegroundWindow == activeExplorerWindow
-            && !string.IsNullOrWhiteSpace(input.Text)
-            && !GlobalTextInputService.IsTextEntryControlClass(input.FocusedControlClass);
+            && !string.IsNullOrWhiteSpace(input.Text);
     }
 
     internal static bool ShouldDismissExplorerTypeSearch(
@@ -1879,6 +1997,19 @@ public partial class App : Application
 
     private async Task HandleDialogHotkeyAsync()
     {
+        await _dialogAttachmentGate.WaitAsync(CancellationToken.None);
+        try
+        {
+            await HandleDialogHotkeyCoreAsync();
+        }
+        finally
+        {
+            _dialogAttachmentGate.Release();
+        }
+    }
+
+    private async Task HandleDialogHotkeyCoreAsync()
+    {
         using var metrics = PerformanceMetrics.Begin("quick_switch.hotkey");
         try
         {
@@ -1911,6 +2042,21 @@ public partial class App : Application
                     CancellationToken.None);
                 if (jumped)
                 {
+                    if (_quickSwitchBar is not null && capturedDialog is not null)
+                    {
+                        if (!_quickSwitchBar.IsAttached ||
+                            _quickSwitchBar.AnchorWindow != capturedDialog.WindowHandle)
+                        {
+                            await _quickSwitchBar.AttachAsync(
+                                candidates,
+                                dialogFolderActivations.Panel,
+                                capturedDialog.WindowHandle);
+                        }
+
+                        _attachedDialogId = capturedDialog.Id;
+                        _quickSwitchBar.PrepareForFollowUpTyping();
+                    }
+
                     if (directJumpResult is not null)
                     {
                         ReportDirectDialogJumpStatus(
@@ -2015,6 +2161,23 @@ public partial class App : Application
     }
 
     private async void OnDialogAttachmentTick(object? sender, EventArgs e)
+    {
+        if (!_dialogAttachmentGate.Wait(0))
+        {
+            return;
+        }
+
+        try
+        {
+            await ProbeDialogAttachmentAsync();
+        }
+        finally
+        {
+            _dialogAttachmentGate.Release();
+        }
+    }
+
+    private async Task ProbeDialogAttachmentAsync()
     {
         if (_dialogAttachmentProbeRunning || IsShuttingDown)
         {

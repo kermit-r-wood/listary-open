@@ -132,10 +132,10 @@ public sealed class PackagedFirefoxBlackboxIntegrationTests
                         TimeSpan.FromSeconds(15)),
                     "The staged hook DLL was not loaded into the Firefox file-dialog process.");
                 var runtimeHookDllPath = Assert.IsType<string>(loadedHookDllPath);
-                Assert.NotEqual(
+                Assert.False(string.Equals(
                     Path.GetFullPath(packageHookDllPath),
                     Path.GetFullPath(runtimeHookDllPath),
-                    ignoreCase: true);
+                    StringComparison.OrdinalIgnoreCase));
                 Assert.Equal(hookDllSha256, Sha256(runtimeHookDllPath));
 
                 var fileNameBefore = ReadFileNameEdit(dialog);
@@ -166,15 +166,21 @@ public sealed class PackagedFirefoxBlackboxIntegrationTests
                     WaitUntil(
                         () => DialogBreadcrumbShowsFolder(dialog, target.Path) &&
                             DialogContainsExactName(dialog, selectedFileName),
-                        TimeSpan.FromSeconds(12)),
+                    TimeSpan.FromSeconds(12)),
                     $"The packaged app did not directly navigate Firefox to '{target.Path}' after real Ctrl+G input.");
+
+                SendVirtualKey(VkO);
+                Assert.True(
+                    WaitUntil(
+                        () => string.Equals(ReadQuickSwitchQuery(quickSwitch), "o", StringComparison.OrdinalIgnoreCase),
+                        TimeSpan.FromSeconds(8)),
+                    "The first character typed after Ctrl+G did not enter the Quick Switch search box.");
 
                 var fileNameAfter = ReadFileNameEdit(dialog);
                 var queryAfter = ReadQuickSwitchQuery(quickSwitch);
                 Assert.Equal(fileNameBefore, fileNameAfter);
                 Assert.Equal(string.Empty, fileNameAfter);
-                Assert.Equal(queryBefore, queryAfter);
-                Assert.Equal(string.Empty, queryAfter);
+                Assert.Equal("o", queryAfter, ignoreCase: true);
                 Assert.True(IsModuleLoaded((int)dialogProcessId, runtimeHookDllPath));
 
                 Assert.True(GetWindowRect(dialog, out var dialogBounds));
@@ -198,10 +204,13 @@ public sealed class PackagedFirefoxBlackboxIntegrationTests
                     fileNameBefore.Length != 0 ||
                     !string.Equals(fileNameBefore, fileNameAfter, StringComparison.Ordinal) ||
                     queryBefore.Length != 0 ||
-                    !string.Equals(queryBefore, queryAfter, StringComparison.Ordinal);
+                    !string.Equals(queryAfter, "o", StringComparison.OrdinalIgnoreCase);
                 Assert.False(
                     fallbackDetected,
                     "A path-input fallback was observable; this scenario only accepts native-hook direct navigation.");
+                Assert.True(TryActivateWindow(dialog));
+                SendVirtualKey(VkEscape);
+                Thread.Sleep(300);
                 Assert.True(TryActivateWindow(dialog));
                 SendVirtualKey(VkEscape);
                 // Quick Switch can retain focus after the native jump. Close

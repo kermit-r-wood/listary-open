@@ -300,6 +300,8 @@ public sealed class VisualAcceptanceTests
                 ThemeManager.Apply(AppTheme.Dark);
                 LocalizationManager.Apply(AppLanguage.English);
                 Assert.True(taskManagerViewModel.Results.Count >= 2);
+                var initialTaskManagerSelection = Assert.IsType<TaskManagerItem>(
+                    taskManagerViewModel.SelectedItem);
                 PumpLayout(taskManager);
                 Assert.True(
                     WaitForDispatcherCondition(
@@ -315,9 +317,12 @@ public sealed class VisualAcceptanceTests
                     "The Task Manager result did not render the real ListaryOpen executable icon.");
                 Capture(taskManager, screenshotDirectory, "18-task-manager-search-dark-en", stage, evidence);
 
-                stage = "task manager next selection synchronized";
+                stage = "task manager next preview preserves host selection";
                 taskManager.MoveSelection(1);
-                Assert.NotNull(taskManagerAutomation.SelectedItem);
+                var movedTaskManagerSelection = Assert.IsType<TaskManagerItem>(
+                    taskManagerViewModel.SelectedItem);
+                Assert.NotEqual(initialTaskManagerSelection.Id, movedTaskManagerSelection.Id);
+                Assert.Null(taskManagerAutomation.SelectedItem);
                 Assert.False(taskManagerAutomation.ActivateSelection);
                 PumpLayout(taskManager);
                 Capture(taskManager, screenshotDirectory, "20-task-manager-selection-next-dark-en", stage, evidence);

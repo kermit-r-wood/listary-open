@@ -723,6 +723,40 @@ public sealed class SearchPanelViewModelTests
     }
 
     [Fact]
+    public async Task ExplorerTypeSearchNavigatesDirectoryInCapturedWindowInsteadOfOpeningANewOne()
+    {
+        var folder = Directory.CreateTempSubdirectory("listary-open-explorer-navigation-");
+        try
+        {
+            var result = CreateResult(folder.FullName, isDirectory: true);
+            var activation = new RecordingActivationService();
+            var index = new RecordingSearchIndex([result]);
+            var navigatedPaths = new List<string>();
+            var viewModel = new SearchPanelViewModel(index, activation);
+
+            await viewModel.ActivateExplorerSearchAsync(folder.Name, folder.Parent!.FullName);
+            viewModel.SetResultsForTesting([result]);
+            viewModel.SelectedResult = result;
+
+            var activated = await viewModel.ActivateSelectedAsync((path, _) =>
+            {
+                navigatedPaths.Add(path);
+                return Task.FromResult(true);
+            });
+
+            Assert.True(activated);
+            Assert.Equal([folder.FullName], navigatedPaths);
+            Assert.Empty(activation.OpenedPaths);
+            Assert.Equal([folder.FullName], index.RecordedUsagePaths);
+            Assert.Contains("Navigated", viewModel.StatusText, StringComparison.OrdinalIgnoreCase);
+        }
+        finally
+        {
+            folder.Delete(recursive: true);
+        }
+    }
+
+    [Fact]
     public async Task RefreshSelectsFirstResultWhenPreviousSelectionNoLongerExists()
     {
         var first = CreateResult("C:\\Docs\\Invoice.xlsx", isDirectory: false);

@@ -110,6 +110,7 @@ public sealed class NameTableSearchIndex : ISearchIndex, IAsyncDisposable
             // unpublished stage and starts clean for the fallback provider.
             _buildingRoot = normalized;
             _buildingEngine = new NameTableEngine();
+            Trace.TraceInformation("NameTable staged root build started. Root={0}", normalized);
         }
         finally
         {
@@ -130,8 +131,58 @@ public sealed class NameTableSearchIndex : ISearchIndex, IAsyncDisposable
                 throw new InvalidOperationException($"No staged full build exists for '{normalized}'.");
             }
 
+            var stagedCount = _buildingEngine.LiveCount;
+            var liveCountBefore = _engine.LiveCount;
+            Trace.TraceInformation(
+                "NameTable staged root commit started. Root={0}; Mode=replace; StagedCount={1}; LiveCountBefore={2}",
+                normalized,
+                stagedCount,
+                liveCountBefore);
             _buildingEngine.Optimize();
             _engine.ReplaceRootFrom(normalized, _buildingEngine);
+            Trace.TraceInformation(
+                "NameTable staged root commit completed. Root={0}; Mode=replace; StagedCount={1}; LiveCountAfter={2}",
+                normalized,
+                stagedCount,
+                _engine.LiveCount);
+            _buildingEngine = null;
+            _buildingRoot = null;
+        }
+        finally
+        {
+            _mutatorGate.Release();
+        }
+    }
+
+    public async Task CommitFullBuildRootRetainingStaleAsync(
+        string rootPath,
+        CancellationToken cancellationToken)
+    {
+        ObjectDisposedException.ThrowIf(_disposed, this);
+        var normalized = Path.TrimEndingDirectorySeparator(Path.GetFullPath(rootPath));
+        await _mutatorGate.WaitAsync(cancellationToken).ConfigureAwait(false);
+        try
+        {
+            if (_buildingEngine is null
+                || !string.Equals(_buildingRoot, normalized, StringComparison.OrdinalIgnoreCase))
+            {
+                throw new InvalidOperationException($"No staged full build exists for '{normalized}'.");
+            }
+
+            var stagedCount = _buildingEngine.LiveCount;
+            var liveCountBefore = _engine.LiveCount;
+            Trace.TraceInformation(
+                "NameTable staged root commit started. Root={0}; Mode=merge-retaining-stale; StagedCount={1}; LiveCountBefore={2}",
+                normalized,
+                stagedCount,
+                liveCountBefore);
+            _buildingEngine.Optimize();
+            _engine.MergeRootFrom(normalized, _buildingEngine);
+            Trace.TraceInformation(
+                "NameTable staged root commit completed. Root={0}; Mode=merge-retaining-stale; StagedCount={1}; LiveCountAfter={2}",
+                normalized,
+                stagedCount,
+                _engine.LiveCount);
             _buildingEngine = null;
             _buildingRoot = null;
         }
@@ -147,6 +198,14 @@ public sealed class NameTableSearchIndex : ISearchIndex, IAsyncDisposable
         await _mutatorGate.WaitAsync(cancellationToken).ConfigureAwait(false);
         try
         {
+            if (_buildingEngine is not null)
+            {
+                Trace.TraceWarning(
+                    "NameTable staged root build aborted. Root={0}; StagedCount={1}",
+                    _buildingRoot ?? "<unknown>",
+                    _buildingEngine.LiveCount);
+            }
+
             _buildingEngine = null;
             _buildingRoot = null;
         }

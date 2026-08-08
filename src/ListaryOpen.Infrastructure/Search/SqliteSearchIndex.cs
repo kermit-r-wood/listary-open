@@ -14,7 +14,11 @@ namespace ListaryOpen.Infrastructure.Search;
 public sealed class SqliteSearchIndex : ISearchIndex, IAsyncDisposable
 {
     internal const int CurrentSchemaVersion = 4;
-    internal const long CurrentIndexContentVersion = 4;
+    // Version 5 changes indexed search text to leaf-name aliases and makes the
+    // configured fallback root a first-class record. Force one reconciliation
+    // so existing checkpoints cannot preserve the old parent-path semantics or
+    // omit the indexed root indefinitely.
+    internal const long CurrentIndexContentVersion = 5;
 
     private const int FallbackCandidateLimit = 200;
     private const int CandidateLimitMultiplier = 20;
@@ -2674,9 +2678,9 @@ public sealed class SqliteSearchIndex : ISearchIndex, IAsyncDisposable
             from files
             where files.parent_path = $root collate nocase
               and (
-                lower(files.full_path) like $contains escape '\'
+                lower(files.name) like $contains escape '\'
                 or files.search_text like $contains escape '\'
-                or lower(files.full_path) like $ordered escape '\'
+                or lower(files.name) like $ordered escape '\'
                 or files.search_text like $ordered escape '\'
               ){directoryFilter}{parsedFilter}
             order by
@@ -2696,14 +2700,22 @@ public sealed class SqliteSearchIndex : ISearchIndex, IAsyncDisposable
 
     private static string CreateFtsMatchQuery(SearchQuery query)
     {
-        // Include length-2 terms so short pinyin initials participate in FTS.
-        var terms = query.Parsed.Phrases
-            .Concat(query.Parsed.Terms)
-            .Select(NormalizeSearchText)
-            .Where(term => term.Length >= 2)
-            .Select(term => $"\"{term.Replace("\"", "\"\"")}\"")
-            .ToArray();
-        return terms.Length == 0 ? string.Empty : string.Join(" AND ", terms);
+        // Plain terms search the leaf name (plus name-derived transliteration
+        // aliases), never parent_path. Path operators and quoted phrases retain
+        // their explicit full-path semantics through parsed filtering.
+        var clauses = new List<string>();
+        foreach (var term in query.Parsed.Terms.Select(NormalizeSearchText).Where(term => term.Length >= 2))
+        {
+            var escaped = $"\"{term.Replace("\"", "\"\"")}\"";
+            clauses.Add($"(name : {escaped} OR search_text : {escaped})");
+        }
+
+        foreach (var phrase in query.Parsed.Phrases.Select(NormalizeSearchText).Where(term => term.Length >= 2))
+        {
+            clauses.Add($"\"{phrase.Replace("\"", "\"\"")}\"");
+        }
+
+        return clauses.Count == 0 ? string.Empty : string.Join(" AND ", clauses);
     }
 
     private async Task AddShortAliasCandidatesAsync(
@@ -3147,7 +3159,7 @@ public sealed class SqliteSearchIndex : ISearchIndex, IAsyncDisposable
     }
 
     private static string CreateRecordSearchText(string fullPath)
-        => PinyinMatcher.CreateSearchAliases(fullPath);
+        => PinyinMatcher.CreateSearchAliases(Path.GetFileName(fullPath));
 
     private static string NormalizeSearchText(string value)
     {

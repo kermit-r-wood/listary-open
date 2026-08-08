@@ -27,6 +27,7 @@ public sealed class PackagedTaskManagerBlackboxIntegrationTests
     private const uint KeyEventKeyUp = 0x0002;
     private const uint MapVkToVsc = 0;
     private const ushort VkDown = 0x28;
+    private const ushort VkReturn = 0x0D;
     private const ushort VkEscape = 0x1B;
 
     [Fact]
@@ -186,10 +187,10 @@ public sealed class PackagedTaskManagerBlackboxIntegrationTests
                 Assert.NotNull(initialOverlaySelection);
                 var initialTaskManagerSelection = WaitForSelectedTaskManagerRow(
                     taskManager.Handle,
-                    initialOverlaySelection.RuntimeId,
+                    focusRow.RuntimeId,
                     TimeSpan.FromSeconds(8));
                 Assert.NotNull(initialTaskManagerSelection);
-                Assert.Equal(initialOverlaySelection.RuntimeId, initialTaskManagerSelection.RuntimeId);
+                Assert.Equal(focusRow.RuntimeId, initialTaskManagerSelection.RuntimeId);
                 Assert.True(IsRealContentRow(initialTaskManagerSelection));
 
                 SendVirtualKey(VkDown);
@@ -199,18 +200,31 @@ public sealed class PackagedTaskManagerBlackboxIntegrationTests
                     TimeSpan.FromSeconds(8));
                 Assert.NotNull(movedOverlaySelection);
                 Assert.NotEqual(initialOverlaySelection.RuntimeId, movedOverlaySelection.RuntimeId);
-                var movedTaskManagerSelection = WaitForSelectedTaskManagerRow(
+                var hostSelectionAfterPreview = WaitForSelectedTaskManagerRow(
+                    taskManager.Handle,
+                    focusRow.RuntimeId,
+                    TimeSpan.FromSeconds(3));
+                Assert.NotNull(hostSelectionAfterPreview);
+                Assert.Null(WaitForSelectedTaskManagerRow(
                     taskManager.Handle,
                     movedOverlaySelection.RuntimeId,
-                    TimeSpan.FromSeconds(8));
-                Assert.NotNull(movedTaskManagerSelection);
-                Assert.Equal(movedOverlaySelection.RuntimeId, movedTaskManagerSelection.RuntimeId);
-                Assert.True(IsRealContentRow(movedTaskManagerSelection));
+                    TimeSpan.FromMilliseconds(300)));
+                Assert.True(IsRealContentRow(hostSelectionAfterPreview));
 
                 var screenshotPath = CaptureComposedEvidence(
                     taskManager.Handle,
                     overlayHandle,
                     "29-packaged-real-task-manager-overlay");
+                SendVirtualKey(VkReturn);
+                Assert.True(
+                    WaitUntil(() => !IsWindowVisible(overlayHandle), TimeSpan.FromSeconds(8)),
+                    "Confirming the Task Manager result did not dismiss the overlay.");
+                var confirmedTaskManagerSelection = WaitForSelectedTaskManagerRow(
+                    taskManager.Handle,
+                    movedOverlaySelection.RuntimeId,
+                    TimeSpan.FromSeconds(8));
+                Assert.NotNull(confirmedTaskManagerSelection);
+
                 WriteEvidenceMetadata(
                     screenshotPath,
                     packageDirectory,
@@ -226,12 +240,9 @@ public sealed class PackagedTaskManagerBlackboxIntegrationTests
                     initialOverlaySelection,
                     initialTaskManagerSelection,
                     movedOverlaySelection,
-                    movedTaskManagerSelection);
+                    hostSelectionAfterPreview,
+                    confirmedTaskManagerSelection);
 
-                SendVirtualKey(VkEscape);
-                Assert.True(
-                    WaitUntil(() => !IsWindowVisible(overlayHandle), TimeSpan.FromSeconds(8)),
-                    "Injected Escape did not dismiss the packaged Task Manager overlay.");
                 Assert.True(IsWindow(taskManager.Handle), "Dismissing the overlay unexpectedly closed Task Manager.");
 
                 var shutdownStopwatch = Stopwatch.StartNew();
@@ -940,7 +951,8 @@ public sealed class PackagedTaskManagerBlackboxIntegrationTests
         SelectionIdentity initialOverlay,
         SelectionIdentity initialTaskManager,
         SelectionIdentity movedOverlay,
-        SelectionIdentity movedTaskManager)
+        SelectionIdentity hostAfterPreview,
+        SelectionIdentity confirmedTaskManager)
     {
         Assert.True(GetWindowRect(taskManager.Handle, out var taskBounds));
         Assert.True(GetWindowRect(overlay, out var overlayBounds));
@@ -984,9 +996,10 @@ public sealed class PackagedTaskManagerBlackboxIntegrationTests
             transitions = new[]
             {
                 new { action = "initial", overlaySelectedIdentity = initialOverlay, taskManagerSelectedIdentity = initialTaskManager },
-                new { action = "SendInput(Down)", overlaySelectedIdentity = movedOverlay, taskManagerSelectedIdentity = movedTaskManager }
+                new { action = "SendInput(Down)", overlaySelectedIdentity = movedOverlay, taskManagerSelectedIdentity = hostAfterPreview },
+                new { action = "SendInput(Enter)", overlaySelectedIdentity = movedOverlay, taskManagerSelectedIdentity = confirmedTaskManager }
             },
-            escapeDismissedOverlay = true,
+            enterConfirmedAndDismissedOverlay = true,
             fakeServiceUsed = false,
             skipped = false,
             screenshot = Path.GetFileName(screenshotPath),

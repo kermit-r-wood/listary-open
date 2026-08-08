@@ -1,4 +1,5 @@
 using ListaryOpen.Infrastructure.Indexing.Ntfs;
+using ListaryOpen.Infrastructure.Search;
 
 namespace ListaryOpen.Infrastructure.Tests.Indexing;
 
@@ -45,6 +46,26 @@ public sealed class UsnJournalCatchUpPlannerTests
         var journal = new UsnJournalState(1, LowestValidUsn: 50, NextUsn: 200);
 
         var plan = UsnJournalCatchUpPlanner.Plan(checkpoint, journal, currentRulesVersion: 2);
+
+        Assert.Equal(UsnCatchUpAction.FullRescan, plan.Action);
+    }
+
+    [Fact]
+    public void CurrentContentVersionRebuildsIndexesWithLegacyParentPathSemantics()
+    {
+        var checkpoint = new UsnJournalCheckpoint(
+            "C:\\",
+            "NTFS",
+            1,
+            100,
+            SqliteSearchIndex.CurrentIndexContentVersion - 1,
+            DateTimeOffset.UtcNow);
+        var journal = new UsnJournalState(1, LowestValidUsn: 50, NextUsn: 100);
+
+        var plan = UsnJournalCatchUpPlanner.Plan(
+            checkpoint,
+            journal,
+            SqliteSearchIndex.CurrentIndexContentVersion);
 
         Assert.Equal(UsnCatchUpAction.FullRescan, plan.Action);
     }

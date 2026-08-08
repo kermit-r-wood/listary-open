@@ -6,7 +6,13 @@ using System.Windows.Automation;
 
 namespace ListaryOpen.Infrastructure.Windows;
 
-public sealed record TaskManagerItem(string Id, string Name, string Details, string IconPath = "");
+public sealed record TaskManagerItem(
+    string Id,
+    string Name,
+    string Details,
+    string IconPath = "",
+    string SearchText = "",
+    string ProcessIdentity = "");
 
 public interface ITaskManagerAutomationService : IDisposable
 {
@@ -285,9 +291,9 @@ internal sealed class UiAutomationTaskManagerProvider : ITaskManagerAutomationPr
         try
         {
             var root = AutomationElement.FromHandle(taskManagerWindow);
-            var processIconPaths = CreateProcessIconPathMap();
+            var processSnapshot = CreateProcessSnapshot();
             var items = EnumerateCandidates(root)
-                .Select(element => CreateItem(element, processIconPaths))
+                .Select(element => CreateItem(element, processSnapshot))
                 .Where(item => item is not null)
                 .Cast<TaskManagerItem>()
                 .DistinctBy(item => item.Id, StringComparer.Ordinal)
@@ -512,7 +518,7 @@ internal sealed class UiAutomationTaskManagerProvider : ITaskManagerAutomationPr
 
     private static TaskManagerItem? CreateItem(
         AutomationElement element,
-        IReadOnlyDictionary<string, string> processIconPaths)
+        ProcessSnapshot processSnapshot)
     {
         try
         {
@@ -527,9 +533,31 @@ internal sealed class UiAutomationTaskManagerProvider : ITaskManagerAutomationPr
                 GetElementId(element),
                 element.Current.Name,
                 childText);
-            return item is null
-                ? null
-                : item with { IconPath = ResolveIconPath(item.Name, childText, processIconPaths) };
+            if (item is null)
+            {
+                return null;
+            }
+
+            var metadata = ResolveProcessMetadata(item.Name, childText, processSnapshot);
+            if (metadata is not null && IsInternalListaryProcess(metadata.Identity))
+            {
+                return null;
+            }
+
+            // Navigation/sidebar controls can expose the same selectable UIA shapes
+            // as process rows. Keep a row only when Task Manager labels it as a
+            // process or when it resolves to a process observed in the OS snapshot.
+            if (metadata is null && !LooksLikeProcessRow(item.Name))
+            {
+                return null;
+            }
+
+            return item with
+            {
+                IconPath = metadata?.IconPath ?? ResolveIconPath(item.Name, childText, processSnapshot.IconPaths),
+                SearchText = metadata?.SearchText ?? string.Empty,
+                ProcessIdentity = metadata?.Identity ?? string.Empty
+            };
         }
         catch (Exception exception) when (IsExpectedAutomationException(exception))
         {
@@ -570,7 +598,11 @@ internal sealed class UiAutomationTaskManagerProvider : ITaskManagerAutomationPr
     {
         ArgumentNullException.ThrowIfNull(items);
         return items
-            .GroupBy(item => GetProcessIdentity(item.Name), StringComparer.OrdinalIgnoreCase)
+            .GroupBy(
+                item => string.IsNullOrWhiteSpace(item.ProcessIdentity)
+                    ? GetProcessIdentity(item.Name)
+                    : item.ProcessIdentity,
+                StringComparer.OrdinalIgnoreCase)
             .Select(group => group
                 .OrderByDescending(item => !string.IsNullOrWhiteSpace(item.IconPath))
                 .First())
@@ -600,26 +632,56 @@ internal sealed class UiAutomationTaskManagerProvider : ITaskManagerAutomationPr
         return string.Empty;
     }
 
-    private static IReadOnlyDictionary<string, string> CreateProcessIconPathMap()
+    private static ProcessSnapshot CreateProcessSnapshot()
     {
+        var aliases = new Dictionary<string, ProcessMetadata>(StringComparer.OrdinalIgnoreCase);
+        var titles = new Dictionary<string, ProcessMetadata>(StringComparer.OrdinalIgnoreCase);
         var paths = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
         foreach (var process in Process.GetProcesses())
         {
             using (process)
             {
+                string processName;
+                try
+                {
+                    processName = process.ProcessName;
+                }
+                catch (Exception exception) when (exception is Win32Exception
+                                                   or InvalidOperationException
+                                                   or NotSupportedException
+                                                   or UnauthorizedAccessException)
+                {
+                    continue;
+                }
+
+                var searchTerms = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+                {
+                    processName
+                };
+                var iconPath = string.Empty;
                 try
                 {
                     var path = process.MainModule?.FileName;
-                    if (string.IsNullOrWhiteSpace(path) || !File.Exists(path))
+                    if (!string.IsNullOrWhiteSpace(path) && File.Exists(path))
                     {
-                        continue;
-                    }
+                        iconPath = path;
+                        searchTerms.Add(Path.GetFileNameWithoutExtension(path));
+                        var version = FileVersionInfo.GetVersionInfo(path);
+                        if (!string.IsNullOrWhiteSpace(version.FileDescription))
+                        {
+                            searchTerms.Add(version.FileDescription);
+                        }
 
-                    AddProcessIconPath(paths, process.ProcessName, path);
-                    AddProcessIconPath(paths, Path.GetFileNameWithoutExtension(path), path);
-                    var version = FileVersionInfo.GetVersionInfo(path);
-                    AddProcessIconPath(paths, version.FileDescription, path);
-                    AddProcessIconPath(paths, version.ProductName, path);
+                        if (!string.IsNullOrWhiteSpace(version.ProductName))
+                        {
+                            searchTerms.Add(version.ProductName);
+                        }
+
+                        foreach (var term in searchTerms)
+                        {
+                            AddProcessIconPath(paths, term, path);
+                        }
+                    }
                 }
                 catch (Exception exception) when (exception is Win32Exception
                                                    or InvalidOperationException
@@ -627,12 +689,99 @@ internal sealed class UiAutomationTaskManagerProvider : ITaskManagerAutomationPr
                                                    or UnauthorizedAccessException)
                 {
                 }
+
+                if (string.Equals(processName, "ListaryOpen.App", StringComparison.OrdinalIgnoreCase))
+                {
+                    searchTerms.Add("ListaryOpen");
+                }
+
+                var metadata = new ProcessMetadata(
+                    NormalizeProcessName(processName),
+                    // Keep aliases as separate search candidates. Joining them with
+                    // spaces allowed the subsequence matcher to assemble one query
+                    // from unrelated fields (process name + description + product).
+                    string.Join('\n', searchTerms.Select(NormalizeSearchAlias)),
+                    iconPath);
+                foreach (var term in searchTerms)
+                {
+                    foreach (var candidate in GetProcessLookupCandidates(term))
+                    {
+                        aliases.TryAdd(candidate, metadata);
+                    }
+                }
+
+                try
+                {
+                    foreach (var candidate in GetProcessLookupCandidates(process.MainWindowTitle))
+                    {
+                        titles.TryAdd(candidate, metadata);
+                    }
+                }
+                catch (Exception exception) when (exception is Win32Exception or InvalidOperationException)
+                {
+                }
             }
         }
 
         AddListaryOpenIconAliases(paths);
-        return paths;
+        if (aliases.TryGetValue("ListaryOpen.App", out var listaryMetadata))
+        {
+            foreach (var alias in new[]
+                     {
+                         "ListaryOpen",
+                         "ListaryOpen Options",
+                         "ListaryOpen Settings",
+                         "ListaryOpen 选项",
+                         "ListaryOpen 设置"
+                     })
+            {
+                aliases[alias] = listaryMetadata;
+            }
+        }
+
+        return new ProcessSnapshot(aliases, titles, paths);
     }
+
+    private static string NormalizeSearchAlias(string value) =>
+        value.Replace('\r', ' ').Replace('\n', ' ').Trim();
+
+    private static ProcessMetadata? ResolveProcessMetadata(
+        string processDisplayName,
+        IEnumerable<string?> rowText,
+        ProcessSnapshot snapshot)
+    {
+        foreach (var value in new[] { processDisplayName }.Concat(rowText))
+        {
+            var identity = GetProcessIdentity(value ?? string.Empty);
+            if (snapshot.WindowTitles.TryGetValue(identity, out var titleMatch))
+            {
+                return titleMatch;
+            }
+        }
+
+        foreach (var value in new[] { processDisplayName }.Concat(rowText))
+        {
+            foreach (var candidate in GetProcessLookupCandidates(value))
+            {
+                if (snapshot.Aliases.TryGetValue(candidate, out var aliasMatch))
+                {
+                    return aliasMatch;
+                }
+            }
+        }
+
+        return null;
+    }
+
+    internal static bool IsInternalListaryProcess(string processIdentity)
+    {
+        var normalized = NormalizeProcessName(processIdentity);
+        return normalized.StartsWith("ListaryOpen.", StringComparison.OrdinalIgnoreCase)
+            && !string.Equals(normalized, "ListaryOpen.App", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static bool LooksLikeProcessRow(string name) =>
+        name.TrimStart().StartsWith("Process:", StringComparison.OrdinalIgnoreCase);
 
     internal static void AddListaryOpenIconAliases(IDictionary<string, string> paths)
     {
@@ -730,6 +879,13 @@ internal sealed class UiAutomationTaskManagerProvider : ITaskManagerAutomationPr
             compact.Equals("32位", StringComparison.Ordinal) ||
             compact.Equals("64位", StringComparison.Ordinal);
     }
+
+    private sealed record ProcessMetadata(string Identity, string SearchText, string IconPath);
+
+    private sealed record ProcessSnapshot(
+        IReadOnlyDictionary<string, ProcessMetadata> Aliases,
+        IReadOnlyDictionary<string, ProcessMetadata> WindowTitles,
+        IReadOnlyDictionary<string, string> IconPaths);
 
     private static IReadOnlyList<string> ReadDescendantText(AutomationElement element)
     {

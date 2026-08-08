@@ -49,7 +49,7 @@ public sealed class ResultRankerTests
     }
 
     [Fact]
-    public void RankOrdersExactNameBeforePrefixBeforeSubstringBeforePath()
+    public void RankOrdersExactNameBeforePrefixBeforeSubstringAndExcludesParentOnlyMatches()
     {
         var now = new DateTimeOffset(2026, 7, 12, 0, 0, 0, TimeSpan.Zero);
         var records = new[]
@@ -67,8 +67,24 @@ public sealed class ResultRankerTests
             Array.Empty<string>());
 
         Assert.Equal(
-            new[] { "Invoice", "InvoiceArchive.txt", "OldInvoice.txt", "unrelated.txt" },
+            new[] { "Invoice", "InvoiceArchive.txt", "OldInvoice.txt" },
             ranked.Select(result => result.Record.Name));
+    }
+
+    [Fact]
+    public void PlainQueryDoesNotReturnEveryChildOfAMatchingParentFolder()
+    {
+        var now = DateTimeOffset.UtcNow;
+        var project = FileRecord.Create(@"C:\Projects\listary_open", true, 0, now);
+        var child = FileRecord.Create(@"C:\Projects\listary_open\.git", true, 0, now);
+
+        var ranked = ResultRanker.Rank(
+            new SearchQuery("listary_open", SearchMode.FilesAndFolders),
+            [child, project],
+            Array.Empty<UsageRecord>(),
+            Array.Empty<string>());
+
+        Assert.Equal(project.FullPath, Assert.Single(ranked).Record.FullPath);
     }
 
     [Fact]

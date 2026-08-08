@@ -17,7 +17,8 @@ public sealed class SettingsXamlTests
         Assert.Contains("Header=\"Quick Launch\" Tag=\"&#xE768;\"", xaml);
         Assert.Contains("Header=\"Menu\" Tag=\"&#xE700;\"", xaml);
         Assert.Contains("Header=\"About\" Tag=\"&#xE946;\"", xaml);
-        Assert.Contains("IsIndeterminate=\"True\"", xaml);
+        Assert.Contains("x:Name=\"IndexingActivityIndicator\"", xaml);
+        Assert.DoesNotContain("IsIndeterminate=\"True\"", xaml);
         Assert.Contains("IndexingProgressText", xaml);
         Assert.Contains("CurrentIndexRootText", xaml);
         Assert.Contains("NtfsFastIndexingActionText", xaml);

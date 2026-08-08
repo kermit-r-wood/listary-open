@@ -38,6 +38,8 @@ public sealed record AppDataPaths(
 
     public string PerformanceMetricsPath => Path.Combine(DataDirectory, "performance-metrics.jsonl");
 
+    public string DiagnosticLogPath => Path.Combine(DataDirectory, "listaryopen.log");
+
     public void EnsureDirectories()
     {
         Directory.CreateDirectory(DataDirectory);

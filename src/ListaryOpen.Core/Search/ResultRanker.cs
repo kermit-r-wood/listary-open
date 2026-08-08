@@ -300,7 +300,10 @@ public static class ResultRanker
             return (new TextMatchKey(4, pinyinScore, Math.Abs(name.Length - query.Length)), "pinyin");
         }
 
-        // Multi-segment path expressions (a\b or a/b) and plain path substrings.
+        // A plain search term describes the item's name. Path matching is opt-in:
+        // use a multi-segment expression (a\b or a/b), or the parsed path: filter.
+        // Treating every ancestor folder as searchable text makes a query for a
+        // project return all of its children (for example .git, bin, and x64).
         var pathSegmentScore = PathSegmentMatcher.Score(record.FullPath, query);
         if (pathSegmentScore > 0 && query.IndexOfAny(['\\', '/']) >= 0)
         {
@@ -308,14 +311,7 @@ public static class ResultRanker
             return (new TextMatchKey(2, pathSegmentScore, Math.Abs(record.ParentPath.Length - query.Length)), "path-segment");
         }
 
-        var pathScore = allowFuzzy
-            ? Math.Max(FuzzyMatcher.Score(query, record.ParentPath), pathSegmentScore)
-            : record.ParentPath.Contains(query, StringComparison.OrdinalIgnoreCase)
-                ? query.Length
-                : pathSegmentScore;
-        return pathScore > 0
-            ? (new TextMatchKey(5, pathScore, Math.Abs(record.ParentPath.Length - query.Length)), "path")
-            : (TextMatchKey.NoMatch, "none");
+        return (TextMatchKey.NoMatch, "none");
     }
 
     private static double RecencyBoost(DateTimeOffset lastUsedAt, DateTimeOffset now)

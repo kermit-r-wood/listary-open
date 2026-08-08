@@ -133,23 +133,15 @@ public partial class TaskManagerSearchWindow : Window
         if (ViewModel.SelectedItem is not null)
         {
             TaskResults.ScrollIntoView(ViewModel.SelectedItem);
-            SynchronizeHostSelection();
         }
     }
 
     private void TaskResults_SelectionChanged(object sender, SelectionChangedEventArgs e)
     {
-        SynchronizeHostSelection();
-    }
-
-    private void SynchronizeHostSelection()
-    {
-        if (_taskManagerWindow == IntPtr.Zero || ViewModel.SelectedItem is not { } item)
+        if (ViewModel.SelectedItem is null)
         {
-            return;
+            _automationService.CancelPending();
         }
-
-        _automationService.QueueSelectItem(_taskManagerWindow, item, activate: false);
     }
 
     internal void ActivateResultShortcut(int index)
@@ -206,7 +198,7 @@ public partial class TaskManagerSearchWindow : Window
         TaskQueryBox.Select(TaskQueryBox.Text.Length, 0);
     }
 
-    private void ConfirmSelection()
+    internal void ConfirmSelection()
     {
         if (_taskManagerWindow == IntPtr.Zero || ViewModel.SelectedItem is not { } item)
         {

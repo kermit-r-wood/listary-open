@@ -537,6 +537,30 @@ public sealed class ElevatedIndexerClientTests
     }
 
     [Fact]
+    public async Task QueryJournalStateAsyncRejectsMissingSuccessfulHelperOutput()
+    {
+        var tempDirectory = Path.Combine(Path.GetTempPath(), "listary-open-" + Guid.NewGuid());
+        Directory.CreateDirectory(tempDirectory);
+
+        try
+        {
+            var helperPath = CreateUsableHelperBundle(tempDirectory);
+            var client = new ElevatedIndexerClient(
+                helperPath,
+                (_, _, _, _) => new NoOutputElevatedIndexerProcess(exitCode: 0));
+
+            var exception = await Assert.ThrowsAsync<InvalidDataException>(
+                () => client.QueryJournalStateAsync(new IndexRoot("C:\\Docs"), CancellationToken.None));
+
+            Assert.Contains("missing", exception.Message, StringComparison.OrdinalIgnoreCase);
+        }
+        finally
+        {
+            Directory.Delete(tempDirectory, recursive: true);
+        }
+    }
+
+    [Fact]
     public async Task ScanNtfsAsyncYieldsFlushedRecordsBeforeHelperExits()
     {
         var tempDirectory = Path.Combine(Path.GetTempPath(), "listary-open-" + Guid.NewGuid());

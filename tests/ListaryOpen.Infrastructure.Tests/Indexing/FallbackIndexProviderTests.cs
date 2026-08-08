@@ -23,6 +23,8 @@ public sealed class FallbackIndexProviderTests
                 records.Add(record);
             }
 
+            Assert.Contains(records, x => x.IsDirectory &&
+                string.Equals(x.FullPath, root, StringComparison.OrdinalIgnoreCase));
             Assert.Contains(records, x => x.IsDirectory && x.Name == "Nested");
             Assert.Contains(records, x => !x.IsDirectory && x.Name == "Invoice.txt");
         }

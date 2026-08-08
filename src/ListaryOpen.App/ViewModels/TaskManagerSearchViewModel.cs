@@ -125,14 +125,38 @@ public sealed class TaskManagerSearchViewModel : INotifyPropertyChanged, IDispos
         }
 
         var normalized = query.Trim();
-        if (string.Equals(item.Name, normalized, StringComparison.OrdinalIgnoreCase)) return 1000;
-        if (item.Name.StartsWith(normalized, StringComparison.OrdinalIgnoreCase)) return 800;
-        var nameIndex = item.Name.IndexOf(normalized, StringComparison.OrdinalIgnoreCase);
-        if (nameIndex >= 0) return 600 - nameIndex;
-        var detailIndex = item.Details.IndexOf(normalized, StringComparison.OrdinalIgnoreCase);
-        if (detailIndex >= 0) return 300 - detailIndex;
+        var hasCanonicalAliases = !string.IsNullOrWhiteSpace(item.SearchText);
+        var aliases = hasCanonicalAliases
+            ? item.SearchText.Split(
+                ['\r', '\n'],
+                StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+            : [item.Name];
+        var aliasScore = aliases
+            .Select(alias => MatchAliasScore(alias, normalized))
+            .DefaultIfEmpty(double.NegativeInfinity)
+            .Max();
+        if (!double.IsNegativeInfinity(aliasScore))
+        {
+            return aliasScore;
+        }
 
-        var candidate = item.Name.AsSpan();
+        // Canonicalized rows deliberately do not search their display title/details:
+        // those strings can be arbitrary document/window titles owned by pwsh,
+        // browsers, terminals, and other unrelated processes.
+        var detailIndex = hasCanonicalAliases
+            ? -1
+            : item.Details.IndexOf(normalized, StringComparison.OrdinalIgnoreCase);
+        return detailIndex >= 0 ? 300 - detailIndex : double.NegativeInfinity;
+    }
+
+    private static double MatchAliasScore(string searchableName, string normalized)
+    {
+        if (string.Equals(searchableName, normalized, StringComparison.OrdinalIgnoreCase)) return 1000;
+        if (searchableName.StartsWith(normalized, StringComparison.OrdinalIgnoreCase)) return 800;
+        var nameIndex = searchableName.IndexOf(normalized, StringComparison.OrdinalIgnoreCase);
+        if (nameIndex >= 0) return 600 - nameIndex;
+
+        var candidate = searchableName.AsSpan();
         var querySpan = normalized.AsSpan();
         var queryIndex = 0;
         for (var index = 0; index < candidate.Length && queryIndex < querySpan.Length; index++)
