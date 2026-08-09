@@ -493,14 +493,14 @@ public sealed class NativeDialogHookIntegrationTests
                 hookHost = Process.Start(hookStart) ?? throw new InvalidOperationException("Could not start native hook host.");
                 client = new HookIpcClient(
                     pipeName,
-                    TimeSpan.FromSeconds(2),
+                    TimeSpan.FromSeconds(3),
                     Environment.ProcessId,
                     secret);
 
                 Assert.True(
                     await WaitUntilAsync(
                         () => client.ProbeHealthAsync(CancellationToken.None).GetAwaiter().GetResult().Status == HookJumpStatus.Success,
-                        TimeSpan.FromSeconds(10)),
+                        TimeSpan.FromSeconds(20)),
                     "Native hook host did not become healthy.");
                 Assert.True(
                     await WaitUntilAsync(

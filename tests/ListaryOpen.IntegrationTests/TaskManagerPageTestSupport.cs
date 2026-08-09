@@ -24,9 +24,7 @@ internal static class TaskManagerPageTestSupport
             return true;
         }
 
-        _ = ShowWindow(taskManagerWindow, SwRestore);
-        _ = SetForegroundWindow(taskManagerWindow);
-        if (!WaitUntil(() => GetForegroundWindow() == taskManagerWindow, TimeSpan.FromSeconds(4)))
+        if (!DesktopWindowActivator.TryActivate(taskManagerWindow, TimeSpan.FromSeconds(5)))
         {
             preparationAction = "task-manager-could-not-be-foregrounded";
             return false;

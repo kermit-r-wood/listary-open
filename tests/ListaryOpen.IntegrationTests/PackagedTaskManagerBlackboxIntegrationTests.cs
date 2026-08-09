@@ -11,6 +11,7 @@ using System.Windows;
 using System.Windows.Automation;
 using System.Windows.Interop;
 using System.Windows.Media.Imaging;
+using ListaryOpen.App.ViewModels;
 using ListaryOpen.Infrastructure.Windows;
 
 namespace ListaryOpen.IntegrationTests;
@@ -116,8 +117,12 @@ public sealed class PackagedTaskManagerBlackboxIntegrationTests
                 Assert.Equal("Ok", control.Exchange(nonce + " AllowInjectedInput"));
 
                 // Task Manager refreshes its UIA rows continuously. Rebuild the
-                // oracle after app startup so selection never relies on a stale
-                // or transiently disabled element captured before UAC/host setup.
+                // oracle with the same production provider and matching rules as
+                // the packaged app. Raw UIA titles can differ from canonical
+                // process aliases and previously produced queries with no results.
+                IReadOnlyList<TaskManagerItem> productItems = Array.Empty<TaskManagerItem>();
+                IReadOnlyList<TaskManagerItem> productResults = Array.Empty<TaskManagerItem>();
+                using var oracleService = new TaskManagerAutomationService();
                 Assert.True(
                     WaitUntil(
                         () =>
@@ -125,20 +130,18 @@ public sealed class PackagedTaskManagerBlackboxIntegrationTests
                             projectedRows = ReadProjectedRows(taskManager.Handle);
                             realRows = projectedRows.Where(IsRealContentRow).ToArray();
                             realRowIds = realRows.Select(row => row.RuntimeId).ToHashSet(StringComparer.Ordinal);
-                            query = FindQueryWhoseFirstTwoResultsAreRealRows(projectedRows, realRowIds);
-                            return realRows.Length >= 2 && !string.IsNullOrWhiteSpace(query);
+                            productItems = oracleService.GetItemsAsync(taskManager.Handle, CancellationToken.None)
+                                .GetAwaiter().GetResult();
+                            query = FindProductionQuery(productItems, realRowIds, out productResults);
+                            return realRows.Length >= 2 && productResults.Count >= 2;
                         },
                         TimeSpan.FromSeconds(5)),
                     "Task Manager rows did not remain queryable after the packaged app completed startup.");
-                var focusRow = realRows.First(row => row.RuntimeId ==
-                    ProjectResults(projectedRows, query)[0].RuntimeId);
+                var focusRow = realRows.First(row => row.RuntimeId == productResults[0].Id);
 
-                _ = ShowWindow(taskManager.Handle, SwRestore);
-                // SetForegroundWindow reports whether Windows honored this individual
-                // request, not whether the window is or shortly becomes foreground.
-                // The real row click below is the user-equivalent activation, and the
-                // pre-SendInput assertion verifies the resulting foreground state.
-                _ = SetForegroundWindow(taskManager.Handle);
+                Assert.True(
+                    DesktopWindowActivator.TryActivate(taskManager.Handle, TimeSpan.FromSeconds(5)),
+                    "Task Manager could not be activated before selecting its initial row.");
                 Assert.True(
                     WaitUntil(
                         () => TrySelectTaskManagerRow(taskManager.Handle, focusRow.RuntimeId),
@@ -531,6 +534,44 @@ public sealed class PackagedTaskManagerBlackboxIntegrationTests
             .Take(100)
             .Select(candidate => candidate.Row)
             .ToArray();
+
+    private static string FindProductionQuery(
+        IReadOnlyList<TaskManagerItem> items,
+        IReadOnlySet<string> realRowIds,
+        out IReadOnlyList<TaskManagerItem> results)
+    {
+        var candidates = items
+            .Where(item => realRowIds.Contains(item.Id))
+            .SelectMany(item => CandidateQueries(item.Name)
+                .Concat(item.SearchText.Split(
+                    ['\r', '\n'],
+                    StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+                    .SelectMany(CandidateQueries)))
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .OrderBy(value => value.Length)
+            .ThenBy(value => value, StringComparer.OrdinalIgnoreCase);
+        foreach (var candidate in candidates)
+        {
+            var matches = items
+                .Select(item => (Item: item, Score: TaskManagerSearchViewModel.MatchScore(item, candidate)))
+                .Where(value => !double.IsNegativeInfinity(value.Score))
+                .OrderByDescending(value => value.Score)
+                .ThenBy(value => value.Item.Name, StringComparer.OrdinalIgnoreCase)
+                .Take(100)
+                .Select(value => value.Item)
+                .ToArray();
+            if (matches.Length >= 2 &&
+                realRowIds.Contains(matches[0].Id) &&
+                realRowIds.Contains(matches[1].Id))
+            {
+                results = matches;
+                return candidate;
+            }
+        }
+
+        results = Array.Empty<TaskManagerItem>();
+        return string.Empty;
+    }
 
     private static double MatchScore(ProjectedRow row, string query)
     {
