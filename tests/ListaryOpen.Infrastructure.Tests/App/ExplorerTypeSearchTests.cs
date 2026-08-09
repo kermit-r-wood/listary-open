@@ -122,6 +122,90 @@ public sealed class ExplorerTypeSearchTests
             resultContextMenuOpen: false,
             explorerTypeSearchActive: false));
         Assert.False(WpfApp.ShouldCaptureOverlayInput(false, false, false, false, false));
+        // Follow-up arming is reported by the legacy helper for diagnostics, but
+        // full overlay capture (Backspace/arrows) must stay off so Explorer can
+        // navigate to the parent folder after a jump.
+        Assert.True(WpfApp.ShouldCaptureOverlayInput(
+            dialogQuickSwitchExpanded: false,
+            explorerQuickMenuOpen: false,
+            taskManagerSearchActive: false,
+            resultContextMenuOpen: false,
+            explorerTypeSearchActive: false,
+            explorerFollowUpTypingArmed: true));
+        Assert.False(WpfApp.ShouldCaptureFullOverlayInput(
+            dialogQuickSwitchExpanded: false,
+            explorerQuickMenuOpen: false,
+            taskManagerSearchActive: false,
+            resultContextMenuOpen: false,
+            explorerTypeSearchActive: false));
+        Assert.True(WpfApp.ShouldCaptureFullOverlayInput(
+            dialogQuickSwitchExpanded: false,
+            explorerQuickMenuOpen: false,
+            taskManagerSearchActive: false,
+            resultContextMenuOpen: false,
+            explorerTypeSearchActive: true));
+    }
+
+    [Fact]
+    public void FollowUpTypingAllowsExplorerTextEntryFocusToReopenSearch()
+    {
+        var explorerWindow = new IntPtr(42);
+        Assert.True(WpfApp.ShouldAllowExplorerFollowUpTextEntry(explorerWindow, explorerWindow));
+        Assert.False(WpfApp.ShouldAllowExplorerFollowUpTextEntry(explorerWindow, IntPtr.Zero));
+        Assert.False(WpfApp.ShouldAllowExplorerFollowUpTextEntry(new IntPtr(41), explorerWindow));
+
+        var input = new GlobalTextInputEventArgs("r", explorerWindow, "Edit");
+        var provider = new FixedWindowProvider(
+            new QuickSwitchFolderCandidate("C:\\Projects", "Explorer", explorerWindow, true));
+
+        Assert.Null(WpfApp.TryCreateExplorerTypeSearchRequest(input, provider));
+        var request = WpfApp.TryCreateExplorerTypeSearchRequest(
+            input,
+            provider,
+            allowTextEntryFocus: true);
+        Assert.NotNull(request);
+        Assert.Equal("r", request!.InitialQuery);
+        Assert.Equal(explorerWindow, request.ExplorerWindow);
+    }
+
+    [Fact]
+    public void FollowUpBackspaceParentResolutionUsesCurrentFolderPath()
+    {
+        var root = Path.Combine(Path.GetTempPath(), "listary-open-followup-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(root);
+        try
+        {
+            var child = Directory.CreateDirectory(Path.Combine(root, "jumped-child"));
+            var parent = WpfApp.TryResolveParentFolderPath(child.FullName);
+            Assert.NotNull(parent);
+            Assert.Equal(
+                Path.TrimEndingDirectorySeparator(Path.GetFullPath(root)),
+                Path.TrimEndingDirectorySeparator(Path.GetFullPath(parent!)),
+                ignoreCase: true);
+            Assert.Null(WpfApp.TryResolveParentFolderPath(null));
+            Assert.Null(WpfApp.TryResolveParentFolderPath(" "));
+        }
+        finally
+        {
+            Directory.Delete(root, recursive: true);
+        }
+    }
+
+    [Fact]
+    public void GlobalTextInputEventArgsAllowsEmptyTextForFollowUpBackspace()
+    {
+        // Empty text must be constructible: FollowUpHostBackspacePassthrough uses it.
+        // ThrowIfNullOrEmpty previously dropped the entire event in the keyboard hook.
+        var input = new GlobalTextInputEventArgs(
+            string.Empty,
+            new IntPtr(42),
+            string.Empty,
+            GlobalTextInputHost.Explorer);
+        Assert.Equal(string.Empty, input.Text);
+        Assert.Equal(new IntPtr(42), input.ForegroundWindow);
+        Assert.False(input.Handled);
+        input.Handled = true;
+        Assert.True(input.Handled);
     }
 
     [Theory]
@@ -284,6 +368,44 @@ public sealed class ExplorerTypeSearchTests
             "Edit",
             focusedControlId: 0,
             captureActiveOverlayInput: true));
+    }
+
+    [Fact]
+    public void FollowUpCaptureYieldsExplorerNativeSearchBoxButStillCapturesAddressEdit()
+    {
+        // After a folder jump, follow-up capture must not steal Explorer SearchBox
+        // (Shift/IME), but may still reclaim address-bar Edit to reopen type-to-search.
+        Assert.False(GlobalTextInputService.ShouldCaptureTextInput(
+            GlobalTextInputHost.Explorer,
+            "SearchBoxControl",
+            focusedControlId: 0,
+            captureActiveOverlayInput: true,
+            yieldHostSearchBoxToNativeInput: true));
+        Assert.True(GlobalTextInputService.ShouldCaptureTextInput(
+            GlobalTextInputHost.Explorer,
+            "Edit",
+            focusedControlId: 0,
+            captureActiveOverlayInput: true,
+            yieldHostSearchBoxToNativeInput: true));
+        // Full Explorer type-to-search session still captures SearchBox.
+        Assert.True(GlobalTextInputService.ShouldCaptureTextInput(
+            GlobalTextInputHost.Explorer,
+            "SearchBoxControl",
+            focusedControlId: 0,
+            captureActiveOverlayInput: true,
+            yieldHostSearchBoxToNativeInput: false));
+    }
+
+    [Fact]
+    public void AsyncModifierStateAppliesShiftBitsForHookSideTextTranslation()
+    {
+        var keyboardState = new byte[256];
+        GlobalTextInputService.ApplyAsyncModifierState(keyboardState);
+        // Without physical shift held in the test process, the high bit should clear.
+        Assert.Equal(0, keyboardState[0x10] & 0x80);
+        keyboardState[0x10] = 0x80;
+        GlobalTextInputService.ApplyAsyncModifierState(keyboardState);
+        Assert.Equal(0, keyboardState[0x10] & 0x80);
     }
 
     [Theory]

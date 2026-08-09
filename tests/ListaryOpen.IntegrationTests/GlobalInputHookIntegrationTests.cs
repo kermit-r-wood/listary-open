@@ -199,6 +199,123 @@ public sealed class GlobalInputHookIntegrationTests
 
     [Fact]
     [Trait("Category", "DesktopIntegration")]
+    public async Task FollowUpTextCaptureRoutesTypingButLeavesBackspaceForExplorer()
+    {
+        // Post-jump follow-up must reopen type-to-search on the next printable key
+        // without stealing Explorer Backspace (parent-folder navigation).
+        using var host = await InputWindowSession.StartAsync(
+            "CabinetWClass",
+            "DirectUIHWND",
+            0,
+            taskManagerProcessName: false);
+        using var hook = new GlobalInputHookHarness();
+        hook.Service.OverlayTextInputWindow = host.WindowHandle;
+        hook.Service.CaptureFollowUpTextInput = true;
+        hook.Service.YieldHostSearchBoxToNativeInput = true;
+        hook.Service.CaptureOverlayInput = false;
+
+        Assert.True(DesktopWindowActivator.TryActivate(host.WindowHandle));
+        await Task.Delay(100);
+        Assert.True(
+            DesktopWindowActivator.TryActivate(host.WindowHandle, TimeSpan.FromSeconds(1))
+            && GetForegroundWindow() == host.WindowHandle,
+            "Explorer host lost foreground before follow-up input.");
+
+        // Full overlay would raise EditCommand.Backspace; follow-up must not.
+        SendVirtualKey(VkBack);
+        Assert.False(
+            await hook.EditSignal.WaitAsync(TimeSpan.FromMilliseconds(500)),
+            "Follow-up mode must not treat Backspace as an overlay edit command.");
+        Assert.Empty(hook.EditCommands);
+
+        // Follow-up Backspace must always notify the app so it can navigate parent
+        // when Shell focus is not on the items view. Soft-waiting here previously
+        // masked a constructor bug that dropped the event entirely.
+        Assert.True(
+            await hook.FollowUpBackspaceSignal.WaitAsync(TimeSpan.FromSeconds(2)),
+            "Follow-up mode must raise FollowUpHostBackspacePassthrough for Explorer Backspace.");
+        Assert.True(hook.FollowUpBackspaces.TryDequeue(out var passthrough));
+        Assert.Equal(host.WindowHandle, passthrough.ForegroundWindow);
+        Assert.Equal(GlobalTextInputHost.Explorer, passthrough.Host);
+        Assert.Equal(string.Empty, passthrough.Text);
+
+        SendVirtualKey(VkO);
+        Assert.True(
+            await hook.TextSignal.WaitAsync(TimeSpan.FromSeconds(3)),
+            "Follow-up mode did not route printable text after Backspace.");
+        Assert.True(hook.TextInputs.TryDequeue(out var text));
+        Assert.Equal("o", text.Text, ignoreCase: true);
+        Assert.Equal(GlobalTextInputHost.Explorer, text.Host);
+        Assert.Empty(hook.NavigationInputs);
+        Assert.Empty(hook.ConfirmInputs);
+        Assert.Empty(hook.EscapeInputs);
+    }
+
+    [Fact]
+    [Trait("Category", "DesktopIntegration")]
+    public async Task FollowUpTextCaptureYieldsNativeSearchBoxButCapturesAddressEdit()
+    {
+        using var searchBoxHost = await InputWindowSession.StartAsync(
+            "CabinetWClass",
+            "SearchBoxControl",
+            0,
+            taskManagerProcessName: false);
+        using var hook = new GlobalInputHookHarness();
+        hook.Service.OverlayTextInputWindow = searchBoxHost.WindowHandle;
+        hook.Service.CaptureFollowUpTextInput = true;
+        hook.Service.YieldHostSearchBoxToNativeInput = true;
+        hook.Service.CaptureOverlayInput = false;
+
+        Assert.True(DesktopWindowActivator.TryActivate(searchBoxHost.WindowHandle));
+        await Task.Delay(100);
+        SendVirtualKey(VkO);
+        Assert.False(
+            await hook.TextSignal.WaitAsync(TimeSpan.FromMilliseconds(750)),
+            "Follow-up capture must not steal Explorer native SearchBox keystrokes.");
+
+        using var addressHost = await InputWindowSession.StartAsync(
+            "CabinetWClass",
+            "Edit",
+            0,
+            taskManagerProcessName: false);
+        hook.Service.OverlayTextInputWindow = addressHost.WindowHandle;
+        Assert.True(DesktopWindowActivator.TryActivate(addressHost.WindowHandle));
+        await Task.Delay(100);
+        SendVirtualKey(VkN);
+        Assert.True(
+            await hook.TextSignal.WaitAsync(TimeSpan.FromSeconds(3)),
+            "Follow-up capture should reclaim address-band Edit to reopen type-to-search.");
+        Assert.True(hook.TextInputs.TryDequeue(out var text));
+        Assert.Equal("n", text.Text, ignoreCase: true);
+        Assert.Equal(GlobalTextInputHost.Explorer, text.Host);
+    }
+
+    [Fact]
+    [Trait("Category", "DesktopIntegration")]
+    public async Task FullOverlayCaptureStillInterceptsSearchBoxWhileSessionIsActive()
+    {
+        using var host = await InputWindowSession.StartAsync(
+            "CabinetWClass",
+            "SearchBoxControl",
+            0,
+            taskManagerProcessName: false);
+        using var hook = new GlobalInputHookHarness();
+        hook.Service.OverlayTextInputWindow = host.WindowHandle;
+        hook.Service.CaptureOverlayInput = true;
+        hook.Service.YieldHostSearchBoxToNativeInput = false;
+
+        Assert.True(DesktopWindowActivator.TryActivate(host.WindowHandle));
+        await Task.Delay(100);
+        SendVirtualKey(VkO);
+        Assert.True(
+            await hook.TextSignal.WaitAsync(TimeSpan.FromSeconds(3)),
+            "Active Explorer type-to-search must keep keys out of the native SearchBox.");
+        Assert.True(hook.TextInputs.TryDequeue(out var text));
+        Assert.Equal("o", text.Text, ignoreCase: true);
+    }
+
+    [Fact]
+    [Trait("Category", "DesktopIntegration")]
     public async Task ForegroundSwitchRoutesRepeatedInputToTheActiveExplorerWindow()
     {
         using var firstHost = await InputWindowSession.StartAsync(
@@ -311,11 +428,13 @@ public sealed class GlobalInputHookIntegrationTests
         public ConcurrentQueue<GlobalNavigationInputEventArgs> NavigationInputs { get; } = new();
         public ConcurrentQueue<GlobalConfirmInputEventArgs> ConfirmInputs { get; } = new();
         public ConcurrentQueue<GlobalEscapeInputEventArgs> EscapeInputs { get; } = new();
+        public ConcurrentQueue<GlobalTextInputEventArgs> FollowUpBackspaces { get; } = new();
         public SemaphoreSlim TextSignal { get; } = new(0);
         public SemaphoreSlim EditSignal { get; } = new(0);
         public SemaphoreSlim NavigationSignal { get; } = new(0);
         public SemaphoreSlim ConfirmSignal { get; } = new(0);
         public SemaphoreSlim EscapeSignal { get; } = new(0);
+        public SemaphoreSlim FollowUpBackspaceSignal { get; } = new(0);
 
         public void Dispose()
         {
@@ -355,6 +474,7 @@ public sealed class GlobalInputHookIntegrationTests
                 NavigationSignal.Dispose();
                 ConfirmSignal.Dispose();
                 EscapeSignal.Dispose();
+                FollowUpBackspaceSignal.Dispose();
             }
 
             Assert.True(quitPosted || joined, "The global input hook test could not stop its message-pump thread.");
@@ -396,6 +516,11 @@ public sealed class GlobalInputHookIntegrationTests
                 {
                     EscapeInputs.Enqueue(input);
                     EscapeSignal.Release();
+                };
+                _service.FollowUpHostBackspacePassthrough += (_, input) =>
+                {
+                    FollowUpBackspaces.Enqueue(input);
+                    FollowUpBackspaceSignal.Release();
                 };
                 _service.Start();
             }

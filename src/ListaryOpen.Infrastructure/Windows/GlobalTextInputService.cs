@@ -20,7 +20,9 @@ public sealed class GlobalTextInputEventArgs : EventArgs
         string focusedControlClass,
         GlobalTextInputHost host = GlobalTextInputHost.Explorer)
     {
-        ArgumentException.ThrowIfNullOrEmpty(text);
+        // Empty text is intentional for non-character control notifications such as
+        // post-jump Explorer Backspace passthrough (parent-folder navigation).
+        ArgumentNullException.ThrowIfNull(text);
 
         Text = text;
         ForegroundWindow = foregroundWindow;
@@ -209,11 +211,14 @@ public sealed class GlobalTextInputService : IDisposable
     private const uint LlmhfInjected = 0x00000001;
     private const int VkControl = 0x11;
     private const int VkShift = 0x10;
+    private const int VkLShift = 0xA0;
+    private const int VkRShift = 0xA1;
     private const int VkEscape = 0x1B;
     private const int VkReturn = 0x0D;
     private const int VkUp = 0x26;
     private const int VkDown = 0x28;
     private const int VkMenu = 0x12;
+    private const int VkCapital = 0x14;
     private const int VkLwin = 0x5B;
     private const int VkRwin = 0x5C;
     private const uint ToUnicodeDoNotChangeKeyboardState = 0x0004;
@@ -228,6 +233,8 @@ public sealed class GlobalTextInputService : IDisposable
     private bool _disposed;
     private int _captureOverlayInput;
     private int _captureExplorerMenuInput;
+    private int _captureFollowUpTextInput;
+    private int _yieldHostSearchBoxToNativeInput;
     private int _suppressedOverlayEscape;
     private IntPtr _dialogInputWindow;
     private IntPtr _overlayTextInputWindow;
@@ -271,6 +278,12 @@ public sealed class GlobalTextInputService : IDisposable
     public event EventHandler<ExplorerMenuGestureInputEventArgs>? ExplorerMenuGesturePressed;
 
     /// <summary>
+    /// Raised when Backspace is left for Explorer while post-jump follow-up
+    /// typing is armed (parent-folder navigation).
+    /// </summary>
+    public event EventHandler<GlobalTextInputEventArgs>? FollowUpHostBackspacePassthrough;
+
+    /// <summary>
     /// Enables the pointer, escape, and navigation paths only while the Explorer overlay is active.
     /// Keeping this flag in the hook service avoids dispatching every system click and arrow key to WPF.
     /// </summary>
@@ -299,6 +312,34 @@ public sealed class GlobalTextInputService : IDisposable
             }
         }
     }
+
+    /// <summary>
+    /// After an Explorer folder jump, capture only printable text to reopen
+    /// type-to-search. Unlike <see cref="CaptureOverlayInput"/>, this must not
+    /// swallow Backspace/Enter/arrows so Explorer can navigate parent folders.
+    /// </summary>
+    public bool CaptureFollowUpTextInput
+    {
+        get => Volatile.Read(ref _captureFollowUpTextInput) != 0;
+        set => Interlocked.Exchange(ref _captureFollowUpTextInput, value ? 1 : 0);
+    }
+
+    /// <summary>
+    /// When true, do not steal keys from the host's native search box while an
+    /// overlay text window is configured (used for post-jump follow-up typing so
+    /// Explorer SearchBox Shift/IME input stays native).
+    /// </summary>
+    public bool YieldHostSearchBoxToNativeInput
+    {
+        get => Volatile.Read(ref _yieldHostSearchBoxToNativeInput) != 0;
+        set => Interlocked.Exchange(ref _yieldHostSearchBoxToNativeInput, value ? 1 : 0);
+    }
+
+    /// <summary>
+    /// True while either a full overlay or post-jump follow-up text capture is armed.
+    /// </summary>
+    public bool IsOverlayOrFollowUpTextCaptureActive =>
+        CaptureOverlayInput || CaptureFollowUpTextInput;
 
     /// <summary>
     /// Identifies the currently attached file dialog whose non-edit keystrokes
@@ -475,6 +516,37 @@ public sealed class GlobalTextInputService : IDisposable
                         }
                     }
 
+                    // Post-jump follow-up: notify the app about Explorer Backspace so it
+                    // can navigate to the parent when Shell focus is not on the items view.
+                    // When Handled, swallow the key — address-band focus would otherwise
+                    // eat Backspace without going up a folder.
+                    if (CaptureFollowUpTextInput
+                        && !CaptureOverlayInput
+                        && !HasCommandModifier()
+                        && data.VirtualKey == 0x08)
+                    {
+                        var followUpWindow = NativeMethods.GetForegroundWindow();
+                        var overlayWindow = OverlayTextInputWindow;
+                        if (followUpWindow != IntPtr.Zero
+                            && (overlayWindow == IntPtr.Zero || followUpWindow == overlayWindow)
+                            && TryGetSupportedHost(followUpWindow, out var followUpHost)
+                            && followUpHost == GlobalTextInputHost.Explorer)
+                        {
+                            var passthrough = new GlobalTextInputEventArgs(
+                                string.Empty,
+                                followUpWindow,
+                                string.Empty,
+                                followUpHost);
+                            FollowUpHostBackspacePassthrough?.Invoke(this, passthrough);
+                            if (passthrough.Handled)
+                            {
+                                return new IntPtr(1);
+                            }
+                        }
+
+                        return CallNextHookEx(_hookHandle, code, message, dataPointer);
+                    }
+
                     var editCommand = GetOverlayEditCommand(
                         data.VirtualKey,
                         IsKeyDown(VkControl),
@@ -488,8 +560,12 @@ public sealed class GlobalTextInputService : IDisposable
                             return new IntPtr(1);
                         }
                     }
-                    else if (!HasCommandModifier() && CaptureOverlayInput && data.VirtualKey is VkUp or VkDown)
+                    else if (!HasCommandModifier()
+                        && !IsShiftDown()
+                        && CaptureOverlayInput
+                        && data.VirtualKey is VkUp or VkDown)
                     {
+                        // Shift+Arrow is text selection / extend, not result navigation.
                         if (RaiseNavigationPressed(data.VirtualKey == VkUp ? -1 : 1))
                         {
                             return new IntPtr(1);
@@ -511,7 +587,8 @@ public sealed class GlobalTextInputService : IDisposable
                                     host,
                                     foregroundWindow,
                                     OverlayTextInputWindow,
-                                    CaptureOverlayInput))
+                                    IsOverlayOrFollowUpTextCaptureActive),
+                            yieldHostSearchBoxToNativeInput: YieldHostSearchBoxToNativeInput)
                         && !ShouldSuppressTextAfterRightClick(
                             host,
                             foregroundWindow,
@@ -522,7 +599,7 @@ public sealed class GlobalTextInputService : IDisposable
                             data.VirtualKey,
                             data.ScanCode,
                             foregroundThreadId,
-                            CaptureOverlayInput,
+                            allowWhitespace: CaptureOverlayInput,
                             out var text))
                     {
                         if (RaiseTextInput(text, foregroundWindow, focusedControlClass, host))
@@ -822,6 +899,9 @@ public sealed class GlobalTextInputService : IDisposable
             || IsKeyDown(VkRwin);
     }
 
+    private static bool IsShiftDown() =>
+        IsKeyDown(VkShift) || IsKeyDown(VkLShift) || IsKeyDown(VkRShift);
+
     private static bool IsKeyDown(int virtualKey) => (GetAsyncKeyState(virtualKey) & 0x8000) != 0;
 
     private static bool TryTranslateText(
@@ -838,6 +918,11 @@ public sealed class GlobalTextInputService : IDisposable
             return false;
         }
 
+        // Low-level hooks run on the installing thread. GetKeyboardState is
+        // thread-local and often misses modifiers held while another window is
+        // focused, which made Shift+letter always produce lowercase when the
+        // Explorer type-to-search path fed the query box via the hook.
+        ApplyAsyncModifierState(keyboardState);
         keyboardState[virtualKey] |= 0x80;
         var buffer = new StringBuilder(8);
         var characterCount = ToUnicodeEx(
@@ -855,6 +940,40 @@ public sealed class GlobalTextInputService : IDisposable
 
         text = buffer.ToString(0, Math.Min(characterCount, buffer.Length));
         return IsSupportedTranslatedText(text, allowWhitespace);
+    }
+
+    internal static void ApplyAsyncModifierState(byte[] keyboardState)
+    {
+        ArgumentNullException.ThrowIfNull(keyboardState);
+        SetKeyStateBit(keyboardState, VkShift, IsShiftDown());
+        SetKeyStateBit(keyboardState, VkLShift, IsKeyDown(VkLShift));
+        SetKeyStateBit(keyboardState, VkRShift, IsKeyDown(VkRShift));
+        SetKeyStateBit(keyboardState, VkControl, IsKeyDown(VkControl));
+        SetKeyStateBit(keyboardState, VkMenu, IsKeyDown(VkMenu));
+        // Caps Lock is a toggle: low bit is toggle state, high bit is current down.
+        if (keyboardState.Length > VkCapital)
+        {
+            var capsState = GetAsyncKeyState(VkCapital);
+            keyboardState[VkCapital] = (byte)(((capsState & 0x0001) != 0 ? 0x01 : 0x00)
+                | ((capsState & 0x8000) != 0 ? 0x80 : 0x00));
+        }
+    }
+
+    private static void SetKeyStateBit(byte[] keyboardState, int virtualKey, bool isDown)
+    {
+        if (virtualKey < 0 || virtualKey >= keyboardState.Length)
+        {
+            return;
+        }
+
+        if (isDown)
+        {
+            keyboardState[virtualKey] |= 0x80;
+        }
+        else
+        {
+            keyboardState[virtualKey] = (byte)(keyboardState[virtualKey] & ~0x80);
+        }
     }
 
     internal static bool IsSupportedTranslatedText(string text, bool allowWhitespace) =>
@@ -897,15 +1016,17 @@ public sealed class GlobalTextInputService : IDisposable
         GlobalTextInputHost host,
         string? focusedControlClass,
         int focusedControlId,
-        bool captureActiveOverlayInput = false)
+        bool captureActiveOverlayInput = false,
+        bool yieldHostSearchBoxToNativeInput = false)
     {
         // A host can reclaim focus into one of its native text controls while an
         // overlay synchronizes a selection. Keep routing that text to the active
         // overlay so Explorer/Task Manager lists and dialog fields are not changed
-        // behind it.
+        // behind it — except when follow-up capture must leave Explorer's own
+        // SearchBox alone (Shift/IME/typeahead are native there).
         if (captureActiveOverlayInput)
         {
-            return true;
+            return !(yieldHostSearchBoxToNativeInput && IsNativeSearchBoxControlClass(focusedControlClass));
         }
 
         if (host == GlobalTextInputHost.Dialog &&
@@ -917,6 +1038,10 @@ public sealed class GlobalTextInputService : IDisposable
 
         return !IsTextEntryControlClass(focusedControlClass);
     }
+
+    internal static bool IsNativeSearchBoxControlClass(string? className) =>
+        !string.IsNullOrWhiteSpace(className)
+        && className.Contains("SearchBox", StringComparison.OrdinalIgnoreCase);
 
     internal static bool IsOverlayTextInputWindow(
         GlobalTextInputHost host,

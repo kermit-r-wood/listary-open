@@ -444,8 +444,37 @@ public sealed class ContinuousIndexingService : IDisposable
 
             if (pair.Value == PendingPathAction.Delete)
             {
-                batch.Add(LiveIndexChange.DeletePathAndDescendants(pair.Key));
-                await FlushBatchIfFullAsync(batch, cancellationToken).ConfigureAwait(false);
+                // FileSystemWatcher (and OneDrive cloud placeholders) can emit
+                // Deleted while the path is still present. Applying that blindly
+                // tombstones whole subtrees and leaves search empty until the next
+                // full rescan. Re-verify before deleting; if the path survived,
+                // rebuild it recursively so children are restored too.
+                var existence = ProbePathExistence(pair.Key);
+                if (existence == PathExistence.Ambiguous)
+                {
+                    Trace.TraceWarning(
+                        "Skipping index delete for ambiguous path '{0}' (existence could not be confirmed).",
+                        pair.Key);
+                    continue;
+                }
+
+                if (existence is PathExistence.File or PathExistence.Directory)
+                {
+                    Trace.TraceWarning(
+                        "Ignoring spurious delete for still-present path '{0}'; refreshing instead.",
+                        pair.Key);
+                    await RefreshPathAsync(
+                        pair.Key,
+                        recursive: existence == PathExistence.Directory,
+                        batch,
+                        cancellationToken).ConfigureAwait(false);
+                }
+                else
+                {
+                    batch.Add(LiveIndexChange.DeletePathAndDescendants(pair.Key));
+                    await FlushBatchIfFullAsync(batch, cancellationToken).ConfigureAwait(false);
+                }
+
                 continue;
             }
 
@@ -465,7 +494,16 @@ public sealed class ContinuousIndexingService : IDisposable
         List<LiveIndexChange> batch,
         CancellationToken cancellationToken)
     {
-        if (File.Exists(path))
+        var existence = ProbePathExistence(path);
+        if (existence == PathExistence.Ambiguous)
+        {
+            Trace.TraceWarning(
+                "Skipping index refresh/delete for ambiguous path '{0}' (existence could not be confirmed).",
+                path);
+            return;
+        }
+
+        if (existence == PathExistence.File)
         {
             var fileRecord = TryCreateFileRecord(path);
             if (fileRecord is not null)
@@ -476,8 +514,9 @@ public sealed class ContinuousIndexingService : IDisposable
             return;
         }
 
-        if (!Directory.Exists(path))
+        if (existence == PathExistence.Missing)
         {
+            // Only tombstone when the path is confirmed gone.
             batch.Add(LiveIndexChange.DeletePathAndDescendants(path));
             await FlushBatchIfFullAsync(batch, cancellationToken).ConfigureAwait(false);
             return;
@@ -505,6 +544,33 @@ public sealed class ContinuousIndexingService : IDisposable
             batch.Add(LiveIndexChange.Upsert(record));
             await FlushBatchIfFullAsync(batch, cancellationToken).ConfigureAwait(false);
         }
+    }
+
+    private static PathExistence ProbePathExistence(string path)
+    {
+        try
+        {
+            if (File.Exists(path))
+            {
+                return PathExistence.File;
+            }
+
+            return Directory.Exists(path) ? PathExistence.Directory : PathExistence.Missing;
+        }
+        catch (Exception exception) when (IsExpectedFileSystemException(exception))
+        {
+            // Treat unresolved access as "unknown", not "deleted", so a transient
+            // UnauthorizedAccessException does not erase indexed content.
+            return PathExistence.Ambiguous;
+        }
+    }
+
+    private enum PathExistence
+    {
+        Missing,
+        File,
+        Directory,
+        Ambiguous
     }
 
     private Task FlushBatchIfFullAsync(List<LiveIndexChange> batch, CancellationToken cancellationToken) =>
@@ -573,7 +639,11 @@ public sealed class ContinuousIndexingService : IDisposable
                         FileRecord? record;
                         try
                         {
-                            if (directory.Attributes.HasFlag(FileAttributes.ReparsePoint))
+                            // Match FallbackIndexProvider: OneDrive cloud placeholders are
+                            // reparse points without a link target and must still be walked.
+                            if (FallbackIndexProvider.ShouldSkipReparseDirectory(
+                                    directory.Attributes,
+                                    GetLinkTargetWithoutTraversal(directory)))
                             {
                                 continue;
                             }
@@ -694,7 +764,9 @@ public sealed class ContinuousIndexingService : IDisposable
         try
         {
             var info = new DirectoryInfo(path);
-            if (info.Attributes.HasFlag(FileAttributes.ReparsePoint))
+            if (FallbackIndexProvider.ShouldSkipReparseDirectory(
+                    info.Attributes,
+                    GetLinkTargetWithoutTraversal(info)))
             {
                 return null;
             }
@@ -704,6 +776,19 @@ public sealed class ContinuousIndexingService : IDisposable
         catch (Exception exception) when (IsExpectedFileSystemException(exception))
         {
             return null;
+        }
+    }
+
+    private static string? GetLinkTargetWithoutTraversal(DirectoryInfo info)
+    {
+        try
+        {
+            return info.LinkTarget;
+        }
+        catch (Exception exception) when (IsExpectedFileSystemException(exception))
+        {
+            // Preserve cycle-safe behavior when the target cannot be classified.
+            return "<unavailable>";
         }
     }
 

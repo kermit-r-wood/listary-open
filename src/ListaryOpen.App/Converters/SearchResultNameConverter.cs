@@ -1,6 +1,7 @@
 using System.Globalization;
 using System.IO;
 using System.Windows.Data;
+using ListaryOpen.Core.Search;
 
 namespace ListaryOpen.App.Converters;
 
@@ -9,9 +10,7 @@ public sealed class SearchResultNameConverter : IValueConverter
     public object Convert(object value, Type targetType, object parameter, CultureInfo culture)
     {
         var path = value as string ?? string.Empty;
-        return string.Equals(Path.GetExtension(path), ".lnk", StringComparison.OrdinalIgnoreCase)
-            ? Path.GetFileNameWithoutExtension(path)
-            : Path.GetFileName(path);
+        return PathDisplayName.FromFullPath(path);
     }
 
     public object ConvertBack(object value, Type targetType, object parameter, CultureInfo culture) =>

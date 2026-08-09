@@ -259,6 +259,16 @@ public static class ResultRanker
             return (new TextMatchKey(0, query.Length, 0), "exact-name");
         }
 
+        // Prefer a clean decoded leaf (listary_open) over a raw percent-encoded
+        // session folder name that only contains the query as a substring.
+        var displayLeaf = PathDisplayName.UnescapeFileName(name);
+        if (!string.Equals(displayLeaf, name, StringComparison.Ordinal)
+            && string.Equals(displayLeaf, query, StringComparison.Ordinal))
+        {
+            // Still below a true on-disk exact basename so the real project folder wins.
+            return (new TextMatchKey(1, query.Length, Math.Max(0, name.Length - query.Length)), "exact-name");
+        }
+
         if (name.StartsWith(query, StringComparison.Ordinal))
         {
             return (new TextMatchKey(1, query.Length, name.Length - query.Length), "name-prefix");
@@ -266,6 +276,13 @@ public static class ResultRanker
 
         if (name.Contains(query, StringComparison.Ordinal))
         {
+            // Tooling caches often store whole paths as one %XX-encoded directory
+            // name. Keep them discoverable but rank them after ordinary matches.
+            if (PathDisplayName.LooksLikePercentEncodedPath(name))
+            {
+                return (new TextMatchKey(6, query.Length, name.Length - query.Length), "name-substring");
+            }
+
             return (new TextMatchKey(2, query.Length, name.Length - query.Length), "name-substring");
         }
 

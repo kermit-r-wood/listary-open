@@ -46,6 +46,14 @@ public sealed class ExplorerNavigationServiceTests
         Assert.False(await service.NavigateToFolderAsync(new IntPtr(42), folder.Path));
     }
 
+    [Fact]
+    public void TryFocusFolderViewRejectsInvalidWindowsWithoutThrowing()
+    {
+        var service = new ExplorerNavigationService(new RecordingNavigationProvider());
+        Assert.False(service.TryFocusFolderView(IntPtr.Zero));
+        Assert.False(service.TryFocusFolderView(new IntPtr(1)));
+    }
+
     private sealed class RecordingNavigationProvider : IExplorerShellNavigationProvider
     {
         public int CallCount { get; private set; }

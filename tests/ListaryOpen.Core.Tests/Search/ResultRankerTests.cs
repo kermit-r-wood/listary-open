@@ -88,6 +88,32 @@ public sealed class ResultRankerTests
     }
 
     [Fact]
+    public void RankPrefersRealProjectFolderOverPercentEncodedSessionFolder()
+    {
+        var now = DateTimeOffset.UtcNow;
+        var realProject = FileRecord.Create(
+            @"C:\Users\paulx\OneDrive\projects\listary_open",
+            true,
+            0,
+            now);
+        var sessionFolder = FileRecord.Create(
+            @"C:\Users\paulx\.grok\sessions\C%3A%5CUsers%5Cpaulx%5COneDrive%5Cprojects%5Clistary_open",
+            true,
+            0,
+            now);
+
+        var ranked = ResultRanker.Rank(
+            new SearchQuery("listary_open", SearchMode.FilesAndFolders),
+            [sessionFolder, realProject],
+            Array.Empty<UsageRecord>(),
+            Array.Empty<string>());
+
+        Assert.Equal(2, ranked.Count);
+        Assert.Equal(realProject.FullPath, ranked[0].Record.FullPath);
+        Assert.Equal(sessionFolder.FullPath, ranked[1].Record.FullPath);
+    }
+
+    [Fact]
     public void RankUsageCannotPromoteSubstringAboveExactName()
     {
         var now = DateTimeOffset.UtcNow;

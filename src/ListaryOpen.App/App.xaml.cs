@@ -69,6 +69,8 @@ public partial class App : Application
     private string? _attachedDialogId;
     private HookDialogContext? _lastE2eHookDialog;
     private IntPtr _lastExplorerTypeSearchWindow;
+    private IntPtr _explorerFollowUpTypingWindow;
+    private string? _explorerFollowUpFolderPath;
     private IntPtr _lastTaskManagerSearchWindow;
     private readonly ExplorerTypeSearchNavigationCapture _explorerNavigationCapture = new();
     private readonly object _globalTextInputQueueGate = new();
@@ -167,6 +169,8 @@ public partial class App : Application
         if (_globalTextInputService is not null)
         {
             _globalTextInputService.CaptureOverlayInput = false;
+            _globalTextInputService.CaptureFollowUpTextInput = false;
+            _globalTextInputService.YieldHostSearchBoxToNativeInput = false;
             _globalTextInputService.OverlayTextInputWindow = IntPtr.Zero;
             _globalTextInputService.DialogInputWindow = IntPtr.Zero;
             _explorerNavigationCapture.Deactivate();
@@ -178,12 +182,14 @@ public partial class App : Application
             _globalTextInputService.EditCommandPressed -= OnGlobalEditCommandPressed;
             _globalTextInputService.ResultShortcutPressed -= OnGlobalResultShortcutPressed;
             _globalTextInputService.ExplorerMenuGesturePressed -= OnExplorerMenuGesturePressed;
+            _globalTextInputService.FollowUpHostBackspacePassthrough -= OnFollowUpHostBackspacePassthrough;
             _globalTextInputService.Dispose();
         }
 
         if (_searchPanel is not null)
         {
             _searchPanel.ExplorerSearchSessionEnded -= OnExplorerSearchSessionEnded;
+            _searchPanel.ExplorerFollowUpTypingRequested -= OnExplorerFollowUpTypingRequested;
             _searchPanel.ResultContextMenuOpenStateChanged -= OnResultContextMenuOpenStateChanged;
         }
 
@@ -391,6 +397,7 @@ public partial class App : Application
             JumpDialogToFolderAsync,
             () => _activeSettings.QuickLaunchEntries));
         _searchPanel.ExplorerSearchSessionEnded += OnExplorerSearchSessionEnded;
+        _searchPanel.ExplorerFollowUpTypingRequested += OnExplorerFollowUpTypingRequested;
         _searchPanel.ResultContextMenuOpenStateChanged += OnResultContextMenuOpenStateChanged;
         _quickSwitchBar = new QuickSwitchBarWindow(
             new SearchPanelViewModel(searchIndex, JumpDialogToFolderAsync));
@@ -1146,6 +1153,7 @@ public partial class App : Application
             _globalTextInputService.EditCommandPressed += OnGlobalEditCommandPressed;
             _globalTextInputService.ResultShortcutPressed += OnGlobalResultShortcutPressed;
             _globalTextInputService.ExplorerMenuGesturePressed += OnExplorerMenuGesturePressed;
+            _globalTextInputService.FollowUpHostBackspacePassthrough += OnFollowUpHostBackspacePassthrough;
             _globalTextInputService.CaptureExplorerMenuInput = true;
             _globalTextInputService.Start();
         }
@@ -1162,6 +1170,7 @@ public partial class App : Application
                 _globalTextInputService.EditCommandPressed -= OnGlobalEditCommandPressed;
                 _globalTextInputService.ResultShortcutPressed -= OnGlobalResultShortcutPressed;
                 _globalTextInputService.ExplorerMenuGesturePressed -= OnExplorerMenuGesturePressed;
+                _globalTextInputService.FollowUpHostBackspacePassthrough -= OnFollowUpHostBackspacePassthrough;
                 _globalTextInputService.Dispose();
                 _globalTextInputService = null;
             }
@@ -1178,9 +1187,11 @@ public partial class App : Application
         // Swallow only when the native host would race us (dialog / Task Manager) or an
         // overlay is already open. Explorer first-key is NOT swallowed here: activation is
         // deferred on shell observation, so consuming early would drop keys if observation
-        // misses the folder snapshot.
+        // misses the folder snapshot. Post-jump follow-up capture does swallow so the
+        // character lands only in ListaryOpen (not the address bar).
         input.Handled = ShouldConsumeGlobalTextInput(input.Host)
-            || _globalTextInputService?.CaptureOverlayInput == true;
+            || _globalTextInputService?.CaptureOverlayInput == true
+            || _globalTextInputService?.CaptureFollowUpTextInput == true;
 
         var scheduleDrain = false;
         lock (_globalTextInputQueueGate)
@@ -1399,6 +1410,11 @@ public partial class App : Application
 
     private void HandleGlobalPointerPressed(GlobalPointerInputEventArgs input)
     {
+        // A click means the user is driving the host UI again. Drop armed
+        // follow-up capture so address-bar / dialog edit interactions stay native
+        // until the next jump.
+        DisarmExplorerFollowUpTyping();
+
         if (_explorerQuickMenu?.IsOpen == true &&
             !_explorerQuickMenu.ContainsScreenPoint(input.ScreenX, input.ScreenY))
         {
@@ -1662,6 +1678,7 @@ public partial class App : Application
             _searchPanel.DismissExplorerSearch();
         }
 
+        DisarmExplorerFollowUpTyping();
         _taskManagerSearchWindow ??= CreateTaskManagerSearchWindow();
         _lastTaskManagerSearchWindow = input.ForegroundWindow;
         _taskManagerSearchWindow.ActivateSearch(input.Text, input.ForegroundWindow);
@@ -1746,7 +1763,13 @@ public partial class App : Application
             return true;
         }
 
-        var request = TryCreateExplorerTypeSearchRequest(input, _explorerTracker);
+        var allowTextEntryFocus = ShouldAllowExplorerFollowUpTextEntry(
+            input.ForegroundWindow,
+            _explorerFollowUpTypingWindow);
+        var request = TryCreateExplorerTypeSearchRequest(
+            input,
+            _explorerTracker,
+            allowTextEntryFocus);
         if (request is null || searchPanel is null)
         {
             return false;
@@ -1757,6 +1780,9 @@ public partial class App : Application
             _taskManagerSearchWindow.DismissSearch();
         }
 
+        // Opening a fresh Explorer session replaces any post-jump arming.
+        _explorerFollowUpTypingWindow = IntPtr.Zero;
+        _explorerFollowUpFolderPath = null;
         _lastExplorerTypeSearchWindow = request.ExplorerWindow;
         searchPanel.ActivateExplorerSearch(
             request.InitialQuery,
@@ -1775,6 +1801,175 @@ public partial class App : Application
         _lastExplorerTypeSearchWindow = IntPtr.Zero;
         RefreshOverlayInputCapture();
     }
+
+    private void OnExplorerFollowUpTypingRequested(object? sender, ExplorerFollowUpArming arming)
+    {
+        if (arming.ExplorerWindow == IntPtr.Zero)
+        {
+            return;
+        }
+
+        if (!string.IsNullOrWhiteSpace(arming.FolderPath))
+        {
+            _explorerFollowUpFolderPath = Path.TrimEndingDirectorySeparator(
+                Path.GetFullPath(arming.FolderPath));
+        }
+
+        ArmExplorerFollowUpTyping(arming.ExplorerWindow);
+    }
+
+    private void OnFollowUpHostBackspacePassthrough(object? sender, GlobalTextInputEventArgs input)
+    {
+        if (IsShuttingDown || input.ForegroundWindow == IntPtr.Zero)
+        {
+            return;
+        }
+
+        // After an in-place jump, Shell often parks focus in the address band.
+        // Native Backspace then edits the path instead of going up a folder.
+        // Navigate the parent ourselves and swallow the key (input.Handled).
+        var explorerWindow = input.ForegroundWindow;
+        if (_explorerFollowUpTypingWindow != IntPtr.Zero &&
+            explorerWindow != _explorerFollowUpTypingWindow)
+        {
+            return;
+        }
+
+        var parentFolder = TryGetExplorerFollowUpParentFolder(explorerWindow);
+        if (string.IsNullOrWhiteSpace(parentFolder))
+        {
+            // Fall back to list focus so a subsequent Shell Backspace can work.
+            ArmExplorerFollowUpTyping(explorerWindow);
+            Dispatcher.BeginInvoke(
+                DispatcherPriority.Background,
+                new Action(() => RestoreExplorerFolderViewFocus(explorerWindow)));
+            return;
+        }
+
+        input.Handled = true;
+        _explorerFollowUpFolderPath = parentFolder;
+        ArmExplorerFollowUpTyping(explorerWindow);
+        _ = NavigateExplorerFollowUpParentAsync(explorerWindow, parentFolder);
+    }
+
+    private string? TryGetExplorerFollowUpParentFolder(IntPtr explorerWindow)
+    {
+        var currentFolder = _explorerFollowUpFolderPath;
+        if (string.IsNullOrWhiteSpace(currentFolder))
+        {
+            currentFolder = _explorerTracker?
+                .GetFolderCandidates()
+                .FirstOrDefault(candidate => candidate.WindowHandle == explorerWindow)
+                ?.FolderPath;
+        }
+
+        return TryResolveParentFolderPath(currentFolder);
+    }
+
+    /// <summary>
+    /// Resolves the parent directory for post-jump Explorer Backspace navigation.
+    /// </summary>
+    internal static string? TryResolveParentFolderPath(string? currentFolder)
+    {
+        if (string.IsNullOrWhiteSpace(currentFolder))
+        {
+            return null;
+        }
+
+        try
+        {
+            var parent = Directory.GetParent(Path.TrimEndingDirectorySeparator(Path.GetFullPath(currentFolder)));
+            return parent?.FullName;
+        }
+        catch (Exception exception) when (exception is ArgumentException or IOException or NotSupportedException or UnauthorizedAccessException)
+        {
+            return null;
+        }
+    }
+
+    private async Task NavigateExplorerFollowUpParentAsync(IntPtr explorerWindow, string parentFolder)
+    {
+        try
+        {
+            var navigation = new ExplorerNavigationService();
+            var navigated = await navigation
+                .NavigateToFolderAsync(explorerWindow, parentFolder)
+                .ConfigureAwait(true);
+            if (!navigated)
+            {
+                Trace.TraceWarning(
+                    "Follow-up Backspace could not navigate Explorer {0} to parent '{1}'.",
+                    explorerWindow.ToInt64(),
+                    parentFolder);
+            }
+
+            await Dispatcher.InvokeAsync(
+                () => RestoreExplorerFolderViewFocus(explorerWindow),
+                DispatcherPriority.Background);
+        }
+        catch (Exception exception) when (exception is not OperationCanceledException)
+        {
+            Trace.TraceWarning(
+                "Follow-up Backspace parent navigation failed for Explorer {0}: {1}",
+                explorerWindow.ToInt64(),
+                exception.Message);
+        }
+    }
+
+    private void RestoreExplorerFolderViewFocus(IntPtr explorerWindow)
+    {
+        if (explorerWindow == IntPtr.Zero || IsShuttingDown)
+        {
+            return;
+        }
+
+        _ = ExplorerFolderViewFocus.TryFocusFolderView(explorerWindow);
+    }
+
+    private void ArmExplorerFollowUpTyping(IntPtr explorerWindow)
+    {
+        if (explorerWindow == IntPtr.Zero)
+        {
+            return;
+        }
+
+        _explorerFollowUpTypingWindow = explorerWindow;
+        RefreshOverlayInputCapture();
+    }
+
+    private void DisarmExplorerFollowUpTyping()
+    {
+        if (_explorerFollowUpTypingWindow == IntPtr.Zero)
+        {
+            return;
+        }
+
+        _explorerFollowUpTypingWindow = IntPtr.Zero;
+        _explorerFollowUpFolderPath = null;
+        RefreshOverlayInputCapture();
+    }
+
+    internal static bool ShouldAllowExplorerFollowUpTextEntry(
+        IntPtr foregroundWindow,
+        IntPtr followUpExplorerWindow) =>
+        followUpExplorerWindow != IntPtr.Zero &&
+        foregroundWindow == followUpExplorerWindow;
+
+    /// <summary>
+    /// Full overlay capture must not include follow-up typing. Follow-up only
+    /// intercepts printable text; Backspace/arrows stay with Explorer.
+    /// </summary>
+    internal static bool ShouldCaptureFullOverlayInput(
+        bool dialogQuickSwitchExpanded,
+        bool explorerQuickMenuOpen,
+        bool taskManagerSearchActive,
+        bool resultContextMenuOpen,
+        bool explorerTypeSearchActive) =>
+        dialogQuickSwitchExpanded ||
+        explorerQuickMenuOpen ||
+        taskManagerSearchActive ||
+        resultContextMenuOpen ||
+        explorerTypeSearchActive;
 
     private void OnExplorerQuickMenuOpenStateChanged(object? sender, EventArgs e) =>
         RefreshOverlayInputCapture();
@@ -1803,10 +1998,11 @@ public partial class App : Application
                 _taskManagerSearchWindow?.IsTaskManagerSearchActive == true
                     ? _taskManagerSearchWindow.TaskManagerWindow
                     : IntPtr.Zero;
-            var explorerInputWindow =
-                _searchPanel?.IsVisible == true && _searchPanel.IsExplorerTypeSearchActive
-                    ? _lastExplorerTypeSearchWindow
-                    : IntPtr.Zero;
+            var explorerSearchActive =
+                _searchPanel?.IsVisible == true && _searchPanel.IsExplorerTypeSearchActive;
+            var explorerInputWindow = explorerSearchActive
+                ? _lastExplorerTypeSearchWindow
+                : _explorerFollowUpTypingWindow;
             _globalTextInputService.OverlayTextInputWindow =
                 taskManagerInputWindow != IntPtr.Zero
                     ? taskManagerInputWindow
@@ -1817,12 +2013,19 @@ public partial class App : Application
                 _quickSwitchBar?.IsAttached == true
                     ? _quickSwitchBar.AnchorWindow
                     : IntPtr.Zero;
-            _globalTextInputService.CaptureOverlayInput = ShouldCaptureOverlayInput(
+            var followUpArmed = _explorerFollowUpTypingWindow != IntPtr.Zero && !explorerSearchActive;
+            _globalTextInputService.CaptureOverlayInput = ShouldCaptureFullOverlayInput(
                 dialogTextInputWindow != IntPtr.Zero,
                 _explorerQuickMenu?.IsOpen == true,
                 _taskManagerSearchWindow?.IsTaskManagerSearchActive == true,
                 _searchPanel?.IsResultContextMenuOpen == true,
-                _searchPanel?.IsVisible == true && _searchPanel.IsExplorerTypeSearchActive);
+                explorerSearchActive);
+            // Follow-up only captures printable text (not Backspace), so Explorer
+            // can navigate to the parent folder after a jump.
+            _globalTextInputService.CaptureFollowUpTextInput = followUpArmed;
+            // Follow-up must not steal Explorer's native SearchBox (Shift / IME).
+            // Full type-to-search sessions still capture SearchBox into our query.
+            _globalTextInputService.YieldHostSearchBoxToNativeInput = followUpArmed;
         }
     }
 
@@ -1831,12 +2034,15 @@ public partial class App : Application
         bool explorerQuickMenuOpen,
         bool taskManagerSearchActive,
         bool resultContextMenuOpen,
-        bool explorerTypeSearchActive) =>
-        dialogQuickSwitchExpanded ||
-        explorerQuickMenuOpen ||
-        taskManagerSearchActive ||
-        resultContextMenuOpen ||
-        explorerTypeSearchActive;
+        bool explorerTypeSearchActive,
+        bool explorerFollowUpTypingArmed = false) =>
+        ShouldCaptureFullOverlayInput(
+            dialogQuickSwitchExpanded,
+            explorerQuickMenuOpen,
+            taskManagerSearchActive,
+            resultContextMenuOpen,
+            explorerTypeSearchActive) ||
+        explorerFollowUpTypingArmed;
 
     private IntPtr TryCaptureDialogQuickSwitchInput(IntPtr foregroundWindow)
     {
@@ -1930,12 +2136,14 @@ public partial class App : Application
 
     internal static ExplorerTypeSearchRequest? TryCreateExplorerTypeSearchRequest(
         GlobalTextInputEventArgs input,
-        IQuickSwitchWindowProvider? explorerWindowProvider)
+        IQuickSwitchWindowProvider? explorerWindowProvider,
+        bool allowTextEntryFocus = false)
     {
         ArgumentNullException.ThrowIfNull(input);
         if (explorerWindowProvider is null
             || string.IsNullOrWhiteSpace(input.Text)
-            || GlobalTextInputService.IsTextEntryControlClass(input.FocusedControlClass))
+            || (!allowTextEntryFocus
+                && GlobalTextInputService.IsTextEntryControlClass(input.FocusedControlClass)))
         {
             return null;
         }

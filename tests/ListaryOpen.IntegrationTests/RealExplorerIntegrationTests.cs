@@ -1,3 +1,4 @@
+using System.Collections.Concurrent;
 using System.ComponentModel;
 using System.Diagnostics;
 using System.IO.Pipes;
@@ -162,6 +163,125 @@ public sealed class RealExplorerIntegrationTests
                     () => EnumerateExplorerWindows().Any(window =>
                         window.Handle == explorer.Handle && PathsEqual(window.FolderPath, directory.Path)),
                     TimeSpan.FromSeconds(8));
+            }
+        });
+    }
+
+    [Fact]
+    [Trait("Category", "DesktopIntegration")]
+    public async Task RealExplorerJumpThenParentNavigationStillRoutesFollowUpTypeSearchInput()
+    {
+        // Production path for: jump into a folder → Backspace to parent → type again.
+        // Asserts focus restoration + follow-up text capture without requiring an
+        // elevated packaged app process.
+        await RunInStaAsync(() =>
+        {
+            using var directory = TemporaryExplorerDirectory.Create();
+            var child = Directory.CreateDirectory(Path.Combine(directory.Path, "jump-child"));
+            var existingExplorerHandles = EnumerateExplorerWindows()
+                .Select(window => window.Handle)
+                .ToHashSet();
+            LaunchExplorer(directory.Path);
+            var explorer = WaitForExplorerWindow(directory.Path, TimeSpan.FromSeconds(15));
+            Assert.NotNull(explorer);
+            Assert.DoesNotContain(explorer.Handle, existingExplorerHandles);
+            using var cleanup = new OwnedExplorerWindow(explorer.Handle, directory.Path);
+            var navigationService = new ExplorerNavigationService();
+
+            try
+            {
+                _ = ShowWindow(explorer.Handle, SwRestore);
+                // Foreground activation is best-effort on busy desktops; Navigate2
+                // and follow-up typing only need a valid HWND + eventual focus.
+                _ = DesktopWindowActivator.TryActivate(explorer.Handle, TimeSpan.FromSeconds(2));
+
+#pragma warning disable xUnit1031
+                Assert.True(
+                    navigationService.NavigateToFolderAsync(explorer.Handle, child.FullName)
+                        .GetAwaiter()
+                        .GetResult(),
+                    "Could not navigate the real Explorer window into the child folder.");
+#pragma warning restore xUnit1031
+                Assert.True(
+                    WaitUntil(
+                        () => EnumerateExplorerWindows().Any(window =>
+                            window.Handle == explorer.Handle &&
+                            PathsEqual(window.FolderPath, child.FullName)),
+                        TimeSpan.FromSeconds(8)),
+                    "Explorer did not show the jumped child folder.");
+
+                _ = ExplorerFolderViewFocus.TryFocusFolderView(explorer.Handle);
+                _ = DesktopWindowActivator.TryActivate(explorer.Handle, TimeSpan.FromSeconds(2));
+
+                using var hook = new RealExplorerFollowUpHookHarness();
+                hook.Service.OverlayTextInputWindow = explorer.Handle;
+                hook.Service.CaptureFollowUpTextInput = true;
+                hook.Service.YieldHostSearchBoxToNativeInput = true;
+                hook.Service.CaptureOverlayInput = false;
+
+                // Prefer real Backspace parent navigation when list focus worked.
+                // Fall back to production Navigate for the parent so the follow-up
+                // typing assertion still runs if Shell ignores Backspace.
+                _ = ExplorerFolderViewFocus.TryFocusFolderView(explorer.Handle);
+                _ = DesktopWindowActivator.TryActivate(explorer.Handle, TimeSpan.FromSeconds(1));
+                SendVirtualKey(0x08);
+                Assert.False(
+                    WaitUntil(() => !hook.EditCommands.IsEmpty, TimeSpan.FromMilliseconds(400)),
+                    "Follow-up capture must not treat Explorer Backspace as an overlay edit command.");
+                var returnedViaBackspace = WaitUntil(
+                    () => EnumerateExplorerWindows().Any(window =>
+                        window.Handle == explorer.Handle &&
+                        PathsEqual(window.FolderPath, directory.Path)),
+                    TimeSpan.FromSeconds(3));
+                if (!returnedViaBackspace)
+                {
+#pragma warning disable xUnit1031
+                    Assert.True(
+                        navigationService.NavigateToFolderAsync(explorer.Handle, directory.Path)
+                            .GetAwaiter()
+                            .GetResult(),
+                        "Could not return Explorer to the parent folder after Backspace was ignored.");
+#pragma warning restore xUnit1031
+                    Assert.True(
+                        WaitUntil(
+                            () => EnumerateExplorerWindows().Any(window =>
+                                window.Handle == explorer.Handle &&
+                                PathsEqual(window.FolderPath, directory.Path)),
+                            TimeSpan.FromSeconds(8)),
+                        "Explorer did not show the parent folder after fallback navigation.");
+                }
+
+                // Shell often parks focus in the address band after parent nav.
+                _ = ExplorerFolderViewFocus.TryFocusFolderView(explorer.Handle);
+                _ = DesktopWindowActivator.TryActivate(explorer.Handle, TimeSpan.FromSeconds(3));
+                Thread.Sleep(150);
+
+                // Even if focus remains on address Edit, follow-up capture should
+                // reclaim the next printable key for type-to-search reopening.
+                // Retry activation briefly; if desktop policy blocks SetForeground,
+                // still send input when the HWND is valid (hook uses focused host).
+                for (var attempt = 0; attempt < 5 && GetForegroundWindow() != explorer.Handle; attempt++)
+                {
+                    _ = DesktopWindowActivator.TryActivate(explorer.Handle, TimeSpan.FromSeconds(1));
+                    Thread.Sleep(100);
+                }
+
+                SendVirtualKey(0x4F); // 'O'
+                Assert.True(
+                    WaitUntil(() => !hook.TextInputs.IsEmpty, TimeSpan.FromSeconds(5)),
+                    "Follow-up type-to-search input was not routed after jump → parent → type.");
+                Assert.True(hook.TextInputs.TryDequeue(out var input));
+                Assert.Equal("o", input.Text, ignoreCase: true);
+                Assert.Equal(GlobalTextInputHost.Explorer, input.Host);
+                Assert.Equal(explorer.Handle, input.ForegroundWindow);
+            }
+            finally
+            {
+#pragma warning disable xUnit1031
+                _ = navigationService.NavigateToFolderAsync(explorer.Handle, directory.Path)
+                    .GetAwaiter()
+                    .GetResult();
+#pragma warning restore xUnit1031
             }
         });
     }
@@ -384,6 +504,218 @@ public sealed class RealExplorerIntegrationTests
         });
     }
 
+    [Fact]
+    [Trait("Category", "ElevatedPackagedBlackboxE2E")]
+    public async Task PackagedAppReopensExplorerTypeSearchAfterJumpAndParentBackspace()
+    {
+        // Full product path: type folder → Enter jump → Backspace to parent → type again
+        // must reopen the Explorer type-to-search overlay on the same HWND.
+        await RunInStaAsync(() =>
+        {
+            Assert.True(
+                IsCurrentProcessElevated(),
+                "ElevatedPackagedBlackboxE2E must run in an elevated test process; running it non-elevated is a test failure.");
+
+            var packageDirectory = Environment.GetEnvironmentVariable("LISTARYOPEN_PACKAGE_DIR");
+            Assert.False(
+                string.IsNullOrWhiteSpace(packageDirectory),
+                "LISTARYOPEN_PACKAGE_DIR must identify the published package under test.");
+            packageDirectory = Path.GetFullPath(packageDirectory);
+            var packageExePath = Path.Combine(packageDirectory, "ListaryOpen.App.exe");
+            var hookDllPath = Path.Combine(packageDirectory, "hooks", "x64", "ListaryOpen.Hook.dll");
+            var hookRuntimePath = Path.Combine(packageDirectory, "hooks", "x64", "libunwind.dll");
+            Assert.True(File.Exists(packageExePath), $"The packaged app executable is missing: {packageExePath}");
+            Assert.True(File.Exists(hookDllPath), $"The packaged x64 native hook DLL is missing: {hookDllPath}");
+            Assert.True(File.Exists(hookRuntimePath), $"The packaged x64 native hook runtime is missing: {hookRuntimePath}");
+            Assert.True(
+                IsSingleInstanceMutexAvailable(),
+                "ListaryOpen is already running. Close the existing instance before ElevatedPackagedBlackboxE2E.");
+
+            using var packageData = PackageDataCleanup.RequireInitiallyAbsent(packageDirectory);
+            using var directory = TemporaryExplorerDirectory.Create();
+            var folderQuery = "listaryjump" + CreateLetterNonce(10);
+            var childDirectory = Directory.CreateDirectory(Path.Combine(directory.Path, folderQuery));
+            var seedFile = Path.Combine(directory.Path, "seed-" + CreateLetterNonce(6) + ".txt");
+            File.WriteAllText(seedFile, "Keeps the parent folder non-empty for list focus.");
+
+            var existingExplorerHandles = EnumerateExplorerWindows()
+                .Select(window => window.Handle)
+                .ToHashSet();
+            LaunchExplorer(directory.Path);
+            var explorerWindow = WaitForExplorerWindow(directory.Path, TimeSpan.FromSeconds(15));
+            Assert.NotNull(explorerWindow);
+            Assert.DoesNotContain(explorerWindow.Handle, existingExplorerHandles);
+            using var explorerCleanup = new OwnedExplorerWindow(explorerWindow.Handle, directory.Path);
+
+            var seedElement = WaitForMarkerElement(explorerWindow.Handle, Path.GetFileName(seedFile));
+            Assert.NotNull(seedElement);
+            ClickAutomationElement(seedElement);
+
+            var nonce = Convert.ToHexString(RandomNumberGenerator.GetBytes(32)).ToLowerInvariant();
+            Process? appProcess = null;
+            E2ePipeClient? control = null;
+            var shutdownSucceeded = false;
+            try
+            {
+                appProcess = Process.Start(new ProcessStartInfo
+                {
+                    FileName = packageExePath,
+                    Arguments = "--listary-e2e-control=" + nonce,
+                    WorkingDirectory = packageDirectory,
+                    UseShellExecute = false
+                });
+                Assert.NotNull(appProcess);
+
+                control = E2ePipeClient.Connect(
+                    "ListaryOpen.E2E." + nonce,
+                    appProcess,
+                    TimeSpan.FromSeconds(45));
+                Assert.Equal($"Ready {appProcess.Id}", control.Exchange(nonce + " Ready"));
+                Assert.Equal("Ok", control.Exchange(nonce + " AllowInjectedInput"));
+
+                // Wait for the unique folder to become searchable (startup indexing).
+                Assert.True(
+                    WaitUntil(
+                        () =>
+                        {
+                            Assert.True(TryActivateWindow(explorerWindow.Handle));
+                            ClickAutomationElement(seedElement);
+                            return GetForegroundWindow() == explorerWindow.Handle;
+                        },
+                        TimeSpan.FromSeconds(5)),
+                    "Explorer item view was not ready before the first type-to-search.");
+
+                // First type-to-search: open overlay on the child folder name.
+                Assert.True(TryActivateWindow(explorerWindow.Handle));
+                ClickAutomationElement(seedElement);
+                SendVirtualKeyText(folderQuery);
+
+                var firstOverlay = WaitForTopLevelWindow(
+                    appProcess.Id,
+                    "ListaryOpen Search",
+                    TimeSpan.FromSeconds(20));
+                Assert.NotEqual(IntPtr.Zero, firstOverlay);
+                Assert.True(IsWindowVisible(firstOverlay));
+
+                var firstOverlayElement = AutomationElement.FromHandle(firstOverlay);
+                Assert.NotNull(firstOverlayElement);
+                var firstResults = WaitForAutomationElement(
+                    firstOverlayElement,
+                    new PropertyCondition(AutomationElement.NameProperty, "Search results"),
+                    TimeSpan.FromSeconds(12));
+                Assert.NotNull(firstResults);
+                var folderResult = WaitForAutomationElement(
+                    firstResults,
+                    new PropertyCondition(AutomationElement.NameProperty, folderQuery),
+                    TimeSpan.FromSeconds(20));
+                Assert.NotNull(folderResult);
+
+                // Enter confirms the folder result and navigates the current Explorer window.
+                SendVirtualKey(0x0D);
+                Assert.True(
+                    WaitUntil(
+                        () => !IsWindowVisible(firstOverlay)
+                            && EnumerateExplorerWindows().Any(window =>
+                                window.Handle == explorerWindow.Handle
+                                && PathsEqual(window.FolderPath, childDirectory.FullName)),
+                        TimeSpan.FromSeconds(12)),
+                    "Enter did not jump the existing Explorer window into the searched folder and dismiss the overlay.");
+                Assert.DoesNotContain(
+                    EnumerateExplorerWindows(),
+                    window => !existingExplorerHandles.Contains(window.Handle)
+                        && window.Handle != explorerWindow.Handle
+                        && PathsEqual(window.FolderPath, childDirectory.FullName));
+
+                // Backspace must return to the parent. Production handles this by
+                // programmatically navigating parent when Shell focus is not on the
+                // items view — do not soft-pass with NavigateToFolderAsync here.
+                Assert.True(TryActivateWindow(explorerWindow.Handle));
+                Thread.Sleep(200);
+                SendVirtualKey(0x08);
+                Assert.True(
+                    WaitUntil(
+                        () => EnumerateExplorerWindows().Any(window =>
+                            window.Handle == explorerWindow.Handle
+                            && PathsEqual(window.FolderPath, directory.Path)),
+                        TimeSpan.FromSeconds(10)),
+                    "Backspace after Explorer type-to-search jump did not return to the parent folder.");
+
+                // Second type-to-search must reopen the overlay after parent navigation.
+                Assert.True(TryActivateWindow(explorerWindow.Handle));
+                Thread.Sleep(200);
+                var reopenQuery = "seed";
+                SendVirtualKeyText(reopenQuery);
+
+                var secondOverlay = WaitForTopLevelWindow(
+                    appProcess.Id,
+                    "ListaryOpen Search",
+                    TimeSpan.FromSeconds(12));
+                Assert.NotEqual(IntPtr.Zero, secondOverlay);
+                Assert.True(
+                    IsWindowVisible(secondOverlay),
+                    "Type-to-search did not reopen after jump → parent navigation → typing.");
+                Assert.True(
+                    IsWindow(explorerWindow.Handle),
+                    "Explorer HWND must remain the same after jump/backspace follow-up typing.");
+
+                var secondOverlayElement = AutomationElement.FromHandle(secondOverlay);
+                Assert.NotNull(secondOverlayElement);
+                var secondQuery = WaitForAutomationElement(
+                    secondOverlayElement,
+                    new PropertyCondition(AutomationElement.NameProperty, "Search query"),
+                    TimeSpan.FromSeconds(8));
+                Assert.NotNull(secondQuery);
+                Assert.True(secondQuery.TryGetCurrentPattern(ValuePattern.Pattern, out var secondQueryValue));
+                Assert.Contains(
+                    reopenQuery,
+                    ((ValuePattern)secondQueryValue).Current.Value,
+                    StringComparison.OrdinalIgnoreCase);
+
+                var evidence = CaptureComposedEvidence(
+                    explorerWindow.Handle,
+                    secondOverlay,
+                    "29-packaged-explorer-follow-up-after-parent");
+                Assert.NotNull(evidence);
+
+                SendVirtualKey(0x1B);
+                Assert.True(
+                    WaitUntil(() => !IsWindowVisible(secondOverlay), TimeSpan.FromSeconds(8)),
+                    "Escape did not dismiss the reopened Explorer type-to-search overlay.");
+
+                Assert.Equal("Ok", control.Exchange(nonce + " Shutdown"));
+                shutdownSucceeded = appProcess.WaitForExit(15_000);
+                Assert.True(shutdownSucceeded, "The packaged app did not exit after Shutdown.");
+                Assert.Equal(0, appProcess.ExitCode);
+            }
+            finally
+            {
+                if (appProcess is { HasExited: false })
+                {
+                    if (!shutdownSucceeded && control is not null)
+                    {
+                        try
+                        {
+                            _ = control.Exchange(nonce + " Shutdown");
+                            shutdownSucceeded = appProcess.WaitForExit(10_000);
+                        }
+                        catch (Exception exception) when (exception is IOException or InvalidOperationException)
+                        {
+                        }
+                    }
+
+                    if (!appProcess.HasExited)
+                    {
+                        appProcess.Kill(entireProcessTree: true);
+                        _ = appProcess.WaitForExit(10_000);
+                    }
+                }
+
+                control?.Dispose();
+                appProcess?.Dispose();
+            }
+        });
+    }
+
     private static Task RunInStaAsync(Action action)
     {
         var completion = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
@@ -406,6 +738,180 @@ public sealed class RealExplorerIntegrationTests
         thread.SetApartmentState(ApartmentState.STA);
         thread.Start();
         return completion.Task;
+    }
+
+    /// <summary>
+    /// Minimal LL-hook harness for real-Explorer follow-up typing assertions.
+    /// </summary>
+    private sealed class RealExplorerFollowUpHookHarness : IDisposable
+    {
+        private const uint WmQuit = 0x0012;
+        private const uint PmNoRemove = 0x0000;
+        private readonly ManualResetEventSlim _ready = new();
+        private readonly Thread _thread;
+        private uint _threadId;
+        private int _disposed;
+        private Exception? _startupFailure;
+        private GlobalTextInputService? _service;
+
+        public RealExplorerFollowUpHookHarness()
+        {
+            _thread = new Thread(Run)
+            {
+                IsBackground = true,
+                Name = "ListaryOpen real Explorer follow-up hook"
+            };
+            _thread.Start();
+            if (!_ready.Wait(TimeSpan.FromSeconds(5)))
+            {
+                Dispose();
+                throw new TimeoutException("Real Explorer follow-up hook thread did not start.");
+            }
+
+            if (_startupFailure is not null)
+            {
+                Dispose();
+                throw new InvalidOperationException(
+                    "Real Explorer follow-up hook could not start.",
+                    _startupFailure);
+            }
+        }
+
+        public GlobalTextInputService Service =>
+            _service ?? throw new InvalidOperationException("Follow-up hook is not ready.");
+
+        public ConcurrentQueue<GlobalTextInputEventArgs> TextInputs { get; } = new();
+        public ConcurrentQueue<GlobalEditCommandInputEventArgs> EditCommands { get; } = new();
+
+        public void Dispose()
+        {
+            if (Interlocked.Exchange(ref _disposed, 1) != 0)
+            {
+                return;
+            }
+
+            try
+            {
+                if (_thread.IsAlive && _threadId != 0)
+                {
+                    _ = PostThreadMessage(_threadId, WmQuit, UIntPtr.Zero, IntPtr.Zero);
+                }
+
+                if (!_thread.Join(10_000))
+                {
+                    _service?.Dispose();
+                    if (_threadId != 0)
+                    {
+                        _ = PostThreadMessage(_threadId, WmQuit, UIntPtr.Zero, IntPtr.Zero);
+                    }
+
+                    _ = _thread.Join(2_000);
+                }
+            }
+            finally
+            {
+                _ready.Dispose();
+            }
+        }
+
+        private void Run()
+        {
+            try
+            {
+                _threadId = GetCurrentThreadId();
+                _ = PeekMessage(out _, IntPtr.Zero, 0, 0, PmNoRemove);
+                _service = new GlobalTextInputService(acceptInjectedInputForTesting: true);
+                _service.TextInput += (_, input) =>
+                {
+                    input.Handled = true;
+                    TextInputs.Enqueue(input);
+                };
+                _service.EditCommandPressed += (_, input) =>
+                {
+                    input.Handled = true;
+                    EditCommands.Enqueue(input);
+                };
+                _service.Start();
+            }
+            catch (Exception exception)
+            {
+                _service?.Dispose();
+                _startupFailure = exception;
+                try
+                {
+                    _ready.Set();
+                }
+                catch (ObjectDisposedException)
+                {
+                }
+
+                return;
+            }
+
+            try
+            {
+                _ready.Set();
+            }
+            catch (ObjectDisposedException)
+            {
+            }
+
+            try
+            {
+                while (GetMessage(out var message, IntPtr.Zero, 0, 0) > 0)
+                {
+                    _ = TranslateMessage(ref message);
+                    _ = DispatchMessage(ref message);
+                }
+            }
+            finally
+            {
+                _service?.Dispose();
+            }
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct NativeMessage
+        {
+            public IntPtr Hwnd;
+            public uint Message;
+            public UIntPtr WParam;
+            public IntPtr LParam;
+            public uint Time;
+            public int X;
+            public int Y;
+        }
+
+        [DllImport("user32.dll")]
+        private static extern bool PeekMessage(
+            out NativeMessage message,
+            IntPtr window,
+            uint min,
+            uint max,
+            uint remove);
+
+        [DllImport("user32.dll")]
+        private static extern int GetMessage(
+            out NativeMessage message,
+            IntPtr window,
+            uint min,
+            uint max);
+
+        [DllImport("user32.dll")]
+        private static extern bool TranslateMessage(ref NativeMessage message);
+
+        [DllImport("user32.dll")]
+        private static extern IntPtr DispatchMessage(ref NativeMessage message);
+
+        [DllImport("user32.dll")]
+        private static extern bool PostThreadMessage(
+            uint threadId,
+            uint message,
+            UIntPtr wParam,
+            IntPtr lParam);
+
+        [DllImport("kernel32.dll")]
+        private static extern uint GetCurrentThreadId();
     }
 
     private static bool IsCurrentProcessElevated()
@@ -1477,7 +1983,7 @@ public sealed class RealExplorerIntegrationTests
     [DllImport("user32.dll")]
     private static extern bool PrintWindow(IntPtr window, IntPtr deviceContext, uint flags);
 
-    [DllImport("user32.dll")]
+    [DllImport("gdi32.dll")]
     private static extern bool BitBlt(
         IntPtr destination,
         int xDestination,

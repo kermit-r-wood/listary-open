@@ -382,18 +382,19 @@ public sealed class WpfSmokeTests
                 quickSwitchBar.ActivateSelectedAsync().GetAwaiter().GetResult();
 #pragma warning restore xUnit1031
                 Assert.True(searchViewModel.IsQuickSwitchBarCollapsed);
+                Assert.True(
+                    quickSwitchBar.IsFollowUpTypingArmed,
+                    "Panel selection jump must arm follow-up typing like Ctrl+G.");
                 Assert.Equal(dialogWindow, Assert.Single(activatedAnchorWindows));
                 var captureAfterJump = WpfApp.ShouldCaptureOverlayInput(
-                    quickSwitchBar.IsDialogSearchExpanded,
+                    quickSwitchBar.IsDialogTextInputCaptureActive,
                     explorerQuickMenuOpen: false,
                     taskManagerSearchActive: false,
                     resultContextMenuOpen: false,
                     explorerTypeSearchActive: false);
-                Assert.False(captureAfterJump);
-                Assert.False(GlobalTextInputService.ShouldCaptureOverlayEscape(
-                    0x1B,
+                Assert.True(
                     captureAfterJump,
-                    hasCommandModifier: false));
+                    "Follow-up typing after a dialog jump must keep overlay text capture armed.");
                 Assert.True(quickSwitchBar.TryAppendDialogText("o", dialogWindow));
                 Assert.False(searchViewModel.IsQuickSwitchBarCollapsed);
                 Assert.True(quickSwitchBar.IsDialogSearchExpanded);

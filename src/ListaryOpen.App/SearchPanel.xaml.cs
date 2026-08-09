@@ -84,6 +84,12 @@ public partial class SearchPanel : Window
 
     internal event EventHandler? ExplorerSearchSessionEnded;
 
+    /// <summary>
+    /// Raised after a successful Explorer folder jump so the host can arm
+    /// follow-up type-to-search for the same window.
+    /// </summary>
+    internal event EventHandler<ExplorerFollowUpArming>? ExplorerFollowUpTypingRequested;
+
     internal event EventHandler? ResultContextMenuOpenStateChanged;
 
     internal bool IsResultContextMenuOpen => _resultContextMenuOpen;
@@ -1141,10 +1147,13 @@ public partial class SearchPanel : Window
     private async Task ActivateSelectedFromQuickSwitchAsync()
     {
         var explorerWindow = _explorerSearchWindow;
+        var wasExplorerTypeSearch = ViewModel.IsExplorerTypeSearchMode && explorerWindow != IntPtr.Zero;
+        var selected = ViewModel.SelectedResult;
+        var explorerFolderBeforeActivation = _explorerSearchFolder;
         var activated = await RunInteractionAsync(
             ViewModel,
             viewModel => viewModel.ActivateSelectedAsync(
-                viewModel.IsExplorerTypeSearchMode && explorerWindow != IntPtr.Zero
+                wasExplorerTypeSearch
                     ? (path, cancellationToken) =>
                         _explorerNavigationService.NavigateToFolderAsync(
                             explorerWindow,
@@ -1157,10 +1166,45 @@ public partial class SearchPanel : Window
             return;
         }
 
-        if (ViewModel.IsExplorerTypeSearchMode)
+        if (wasExplorerTypeSearch)
         {
             DismissExplorerSearch();
+            // Shell may reassign focus to the address/search edit after Navigate2
+            // and after our overlay hides. Re-assert the folder view and ask the
+            // host to arm follow-up type-to-search for the next printable key.
+            // Prefer the navigated directory when Enter jumped into a folder; for
+            // files keep the Explorer folder that was current before activation.
+            var followUpFolder = selected?.Record.IsDirectory == true
+                ? selected.Record.FullPath
+                : explorerFolderBeforeActivation;
+            PrepareExplorerHostForFollowUpTyping(explorerWindow, followUpFolder);
         }
+    }
+
+    /// <summary>
+    /// After an in-place Explorer folder jump, restore list focus and arm the
+    /// host so typing again reopens type-to-search even if focus briefly lands
+    /// on a native text control.
+    /// </summary>
+    internal void PrepareExplorerHostForFollowUpTyping(IntPtr explorerWindow, string? folderPath = null)
+    {
+        if (explorerWindow == IntPtr.Zero)
+        {
+            return;
+        }
+
+        _ = _explorerNavigationService.TryFocusFolderView(explorerWindow);
+        ExplorerFollowUpTypingRequested?.Invoke(
+            this,
+            new ExplorerFollowUpArming(explorerWindow, folderPath ?? string.Empty));
+
+        // Shell address-band focus often arrives a tick after Navigate2 returns.
+        Dispatcher.BeginInvoke(
+            System.Windows.Threading.DispatcherPriority.Background,
+            new Action(() => _ = _explorerNavigationService.TryFocusFolderView(explorerWindow)));
+        Dispatcher.BeginInvoke(
+            System.Windows.Threading.DispatcherPriority.ApplicationIdle,
+            new Action(() => _ = _explorerNavigationService.TryFocusFolderView(explorerWindow)));
     }
 
     internal void ConfirmSelectionFromHostInput() =>
@@ -1338,3 +1382,9 @@ internal enum SearchPanelPreviewKeyAction
     MoveSelectionDown,
     OpenSelectedMenu
 }
+
+/// <summary>
+/// Arms post-jump type-to-search for an Explorer window, carrying the folder that
+/// is currently shown so Backspace can navigate to its parent reliably.
+/// </summary>
+internal sealed record ExplorerFollowUpArming(IntPtr ExplorerWindow, string FolderPath);

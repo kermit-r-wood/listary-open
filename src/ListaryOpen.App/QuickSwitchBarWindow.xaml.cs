@@ -668,8 +668,14 @@ public partial class QuickSwitchBarWindow : Window
             return;
         }
 
-        ViewModel.ResetQuickSwitchQuery();
-        Collapse(restoreAnchorFocus: true);
+        // Match Ctrl+G: after a successful dialog folder jump, the next printable
+        // key must reopen Quick Switch even when the native file-name edit steals
+        // focus. Collapse alone disarms follow-up typing and leaves the user stuck.
+        PrepareForFollowUpTyping();
+        if (_anchorWindow != IntPtr.Zero)
+        {
+            _ = _activateAnchorWindow(_anchorWindow);
+        }
     }
 
     protected override void OnClosed(EventArgs e)

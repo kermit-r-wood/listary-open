@@ -1,6 +1,8 @@
+using ListaryOpen.Core.Indexing;
 using ListaryOpen.Core.Search;
 using ListaryOpen.Infrastructure.Indexing;
 using ListaryOpen.Infrastructure.Search;
+using ListaryOpen.Infrastructure.Search.NameTable;
 
 namespace ListaryOpen.Infrastructure.Tests.Indexing;
 
@@ -184,6 +186,64 @@ public sealed class ContinuousIndexingServiceTests
     }
 
     [Fact]
+    public async Task SpuriousDeleteWhilePathStillExistsIsIgnoredAndRefreshed()
+    {
+        var root = CreateTempDirectory();
+        await using var index = new NameTableSearchIndex();
+        try
+        {
+            using var service = CreateService(new NameTableLiveIndexChangeSink(index), root, TimeSpan.Zero);
+            service.Start(baselineReady: true);
+
+            var directory = Directory.CreateDirectory(Path.Combine(root, "listary_open_probe")).FullName;
+            var child = Path.Combine(directory, "child-unique-marker.txt");
+            await File.WriteAllTextAsync(child, "child");
+
+            Assert.True(service.TryEnqueueForTests(new FileChangeHint(FileChangeHintKind.Created, directory)));
+            await WaitUntilAsync(() => HasNameTablePathAsync(index, child));
+
+            // Path still exists on disk — a watcher false-delete must not wipe the tree.
+            Assert.True(service.TryEnqueueForTests(new FileChangeHint(FileChangeHintKind.Deleted, directory)));
+            await Task.Delay(150);
+
+            Assert.True(await HasNameTablePathAsync(index, directory));
+            Assert.True(await HasNameTablePathAsync(index, child));
+        }
+        finally
+        {
+            Directory.Delete(root, recursive: true);
+        }
+    }
+
+    [Fact]
+    public async Task ConfirmedDeleteRemovesDirectorySubtree()
+    {
+        var root = CreateTempDirectory();
+        await using var index = new NameTableSearchIndex();
+        try
+        {
+            using var service = CreateService(new NameTableLiveIndexChangeSink(index), root, TimeSpan.Zero);
+            service.Start(baselineReady: true);
+
+            var directory = Directory.CreateDirectory(Path.Combine(root, "listary_open_gone")).FullName;
+            var child = Path.Combine(directory, "child-gone-marker.txt");
+            await File.WriteAllTextAsync(child, "child");
+            Assert.True(service.TryEnqueueForTests(new FileChangeHint(FileChangeHintKind.Created, directory)));
+            await WaitUntilAsync(() => HasNameTablePathAsync(index, child));
+
+            Directory.Delete(directory, recursive: true);
+            Assert.True(service.TryEnqueueForTests(new FileChangeHint(FileChangeHintKind.Deleted, directory)));
+            await WaitUntilAsync(async () =>
+                !await HasNameTablePathAsync(index, directory) &&
+                !await HasNameTablePathAsync(index, child));
+        }
+        finally
+        {
+            Directory.Delete(root, recursive: true);
+        }
+    }
+
+    [Fact]
     public async Task AsyncPauseWaitsForInflightApplyAndBlocksFollowingBatches()
     {
         var root = CreateTempDirectory();
@@ -242,6 +302,12 @@ public sealed class ContinuousIndexingServiceTests
             result.Record.FullPath,
             path,
             StringComparison.OrdinalIgnoreCase));
+    }
+
+    private static Task<bool> HasNameTablePathAsync(NameTableSearchIndex index, string path)
+    {
+        var normalized = Path.TrimEndingDirectorySeparator(Path.GetFullPath(path));
+        return Task.FromResult(index.Engine.TryGetByPathKey(normalized, out var record) && record is not null);
     }
 
     private static async Task WaitUntilAsync(Func<bool> condition)

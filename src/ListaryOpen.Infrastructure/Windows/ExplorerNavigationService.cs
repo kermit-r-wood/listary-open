@@ -10,6 +10,12 @@ public interface IExplorerNavigationService
         IntPtr explorerWindow,
         string folderPath,
         CancellationToken cancellationToken = default);
+
+    /// <summary>
+    /// Moves keyboard focus back to the folder items view so type-to-search can
+    /// re-arm. Safe to call when navigation already succeeded.
+    /// </summary>
+    bool TryFocusFolderView(IntPtr explorerWindow);
 }
 
 /// <summary>
@@ -52,9 +58,18 @@ public sealed class ExplorerNavigationService : IExplorerNavigationService
             try
             {
                 var normalizedFolder = Path.TrimEndingDirectorySeparator(Path.GetFullPath(folderPath));
-                completion.TrySetResult(
-                    Directory.Exists(normalizedFolder) &&
-                    _navigationProvider.TryNavigateToFolder(explorerWindow, normalizedFolder));
+                if (!Directory.Exists(normalizedFolder) ||
+                    !_navigationProvider.TryNavigateToFolder(explorerWindow, normalizedFolder))
+                {
+                    completion.TrySetResult(false);
+                    return;
+                }
+
+                // Navigate2 frequently parks focus in the address/search edit.
+                // Restore the items view so the next printable key restarts
+                // type-to-search instead of editing the address bar.
+                _ = ExplorerFolderViewFocus.TryFocusFolderView(explorerWindow);
+                completion.TrySetResult(true);
             }
             catch (Exception exception) when (IsExpectedNavigationException(exception))
             {
@@ -73,6 +88,9 @@ public sealed class ExplorerNavigationService : IExplorerNavigationService
         navigationThread.Start();
         return completion.Task;
     }
+
+    public bool TryFocusFolderView(IntPtr explorerWindow) =>
+        ExplorerFolderViewFocus.TryFocusFolderView(explorerWindow);
 
     private static bool IsExpectedNavigationException(Exception exception) =>
         exception is ArgumentException
