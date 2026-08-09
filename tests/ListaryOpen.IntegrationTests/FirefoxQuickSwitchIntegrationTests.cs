@@ -28,7 +28,6 @@ public sealed class FirefoxQuickSwitchIntegrationTests
     private const byte VkMenu = 0x12;
     private const byte VkControl = 0x11;
     private const byte VkO = 0x4F;
-    private const byte VkEscape = 0x1B;
     private const byte VkTab = 0x09;
     private const byte VkReturn = 0x0D;
     private const uint KeyEventKeyUp = 0x0002;
@@ -211,10 +210,12 @@ public sealed class FirefoxQuickSwitchIntegrationTests
 
                 stage = "close jumped dialog without opening a file";
                 Assert.True(TryActivateWindow(dialog));
-                SendVirtualKey(VkEscape);
+                Assert.True(
+                    CancelDialog(dialog),
+                    "Firefox Ctrl+O dialog did not expose an invokable Cancel control.");
                 Assert.True(
                     WaitUntil(() => !IsWindow(dialog), TimeSpan.FromSeconds(5)),
-                    "Firefox Ctrl+O dialog did not close on Escape after jump verification.");
+                    "Firefox Ctrl+O dialog did not close after invoking Cancel.");
 
                 stage = "write Firefox evidence metadata";
                 WriteEvidenceMetadata(
@@ -688,10 +689,28 @@ public sealed class FirefoxQuickSwitchIntegrationTests
         return true;
     }
 
-    private static void SendVirtualKey(byte key)
+    private static bool CancelDialog(IntPtr dialog)
     {
-        keybd_event(key, 0, 0, UIntPtr.Zero);
-        keybd_event(key, 0, KeyEventKeyUp, UIntPtr.Zero);
+        try
+        {
+            var cancel = AutomationElement.FromHandle(dialog)?.FindFirst(
+                TreeScope.Descendants,
+                new AndCondition(
+                    new PropertyCondition(AutomationElement.AutomationIdProperty, "2"),
+                    new PropertyCondition(AutomationElement.ControlTypeProperty, ControlType.Button)));
+            if (cancel is null ||
+                !cancel.TryGetCurrentPattern(InvokePattern.Pattern, out var pattern))
+            {
+                return false;
+            }
+
+            Assert.IsType<InvokePattern>(pattern).Invoke();
+            return true;
+        }
+        catch (ElementNotAvailableException)
+        {
+            return !IsWindow(dialog);
+        }
     }
 
     private static void SendCtrlO()

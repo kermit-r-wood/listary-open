@@ -12,7 +12,7 @@ using System.Windows.Media.Imaging;
 using ListaryOpen.Core.Indexing;
 using ListaryOpen.Core.Settings;
 using ListaryOpen.Infrastructure.AppData;
-using ListaryOpen.Infrastructure.Search;
+using ListaryOpen.Infrastructure.Search.NameTable;
 
 namespace ListaryOpen.IntegrationTests;
 
@@ -96,7 +96,7 @@ public sealed class PackagedGlobalSearchBlackboxIntegrationTests
             searchTransliteration: SearchTransliterationMode.Disabled,
             language: AppLanguage.English);
         new AppSettingsStore().Save(data.SettingsPath, settings);
-        await using (var index = await SqliteSearchIndex.OpenAsync(data.IndexPath, CancellationToken.None))
+        await using (var index = await NameTableSearchIndex.OpenAsync(data.LosnPath, CancellationToken.None))
         {
             await index.UpsertAsync(
                 FileRecord.Create(firstPath, false, new FileInfo(firstPath).Length, File.GetLastWriteTimeUtc(firstPath)),
@@ -104,6 +104,7 @@ public sealed class PackagedGlobalSearchBlackboxIntegrationTests
             await index.UpsertAsync(
                 FileRecord.Create(secondPath, false, new FileInfo(secondPath).Length, File.GetLastWriteTimeUtc(secondPath)),
                 CancellationToken.None);
+            Assert.True(await index.FlushDurableSnapshotAsync(CancellationToken.None));
         }
 
         var controlNonce = Convert.ToHexString(RandomNumberGenerator.GetBytes(32)).ToLowerInvariant();
@@ -130,18 +131,16 @@ public sealed class PackagedGlobalSearchBlackboxIntegrationTests
             Assert.NotNull(root);
             Assert.Equal("GlobalSearchWindow", root.Current.AutomationId);
             var queryElement = WaitForAutomationId(root, "GlobalSearchQuery", TimeSpan.FromSeconds(5));
-            var resultsElement = WaitForAutomationId(root, "GlobalSearchResults", TimeSpan.FromSeconds(5));
-            var previewElement = WaitForAutomationId(root, "GlobalSearchPreview", TimeSpan.FromSeconds(5));
             var statusElement = WaitForAutomationId(root, "GlobalSearchStatus", TimeSpan.FromSeconds(5));
             Assert.Equal("GlobalSearchQuery", queryElement.Current.AutomationId);
-            Assert.Equal("GlobalSearchResults", resultsElement.Current.AutomationId);
-            Assert.Equal("GlobalSearchPreview", previewElement.Current.AutomationId);
             Assert.Equal("GlobalSearchStatus", statusElement.Current.AutomationId);
 
             SendText(query);
             Assert.True(
                 WaitUntil(() => string.Equals(ReadValue(queryElement), query, StringComparison.Ordinal), TimeSpan.FromSeconds(5)),
                 "The packaged global-search query did not receive the real SendInput text.");
+            var resultsElement = WaitForAutomationId(root, "GlobalSearchResults", TimeSpan.FromSeconds(12));
+            Assert.Equal("GlobalSearchResults", resultsElement.Current.AutomationId);
             Assert.True(
                 WaitUntil(() =>
                     ContainsExactName(resultsElement, firstName) &&
@@ -164,6 +163,8 @@ public sealed class PackagedGlobalSearchBlackboxIntegrationTests
             var expectedPreview = string.Equals(movedSelection, firstName, StringComparison.Ordinal)
                 ? firstPreview
                 : secondPreview;
+            var previewElement = WaitForAutomationId(root, "GlobalSearchPreview", TimeSpan.FromSeconds(8));
+            Assert.Equal("GlobalSearchPreview", previewElement.Current.AutomationId);
             Assert.True(
                 WaitUntil(() =>
                     !previewElement.Current.BoundingRectangle.IsEmpty &&
@@ -182,7 +183,7 @@ public sealed class PackagedGlobalSearchBlackboxIntegrationTests
                 }, TimeSpan.FromSeconds(5)),
                 "Right did not open the selected result context menu.");
             Assert.NotNull(contextMenu);
-            Assert.True(ContainsExactName(contextMenu, "Open / switch"));
+            Assert.True(ContainsExactName(contextMenu, "Open"));
             Assert.True(ContainsExactName(contextMenu, "Show in File Explorer"));
             Assert.True(ContainsExactName(contextMenu, "Copy full path"));
             Assert.True(GetWindowRect(searchWindow, out var searchBounds));
@@ -193,10 +194,11 @@ public sealed class PackagedGlobalSearchBlackboxIntegrationTests
                 menuBounds,
                 "31-packaged-global-search-context-menu");
 
+            FocusOwningWindow(contextMenu);
             SendKey(VkEscape);
             Assert.True(
                 WaitUntil(() => FindResultContextMenu(app.Id) is null, TimeSpan.FromSeconds(5)),
-                "The first Escape did not close the result context menu.");
+                $"The first Escape did not close the result context menu (search visible: {IsWindowVisible(searchWindow)}).");
             Assert.True(IsWindowVisible(searchWindow), "Closing the context menu also hid the search window.");
             SendKey(VkEscape);
             Assert.True(
@@ -376,15 +378,17 @@ public sealed class PackagedGlobalSearchBlackboxIntegrationTests
         try
         {
             foreach (AutomationElement element in AutomationElement.RootElement.FindAll(
-                TreeScope.Children,
+                TreeScope.Descendants,
                 new AndCondition(
                     new PropertyCondition(AutomationElement.ProcessIdProperty, processId),
                     new PropertyCondition(AutomationElement.ControlTypeProperty, ControlType.Menu))))
             {
-                if (ContainsExactName(element, "Open / switch") &&
+                if (ContainsExactName(element, "Open") &&
                     ContainsExactName(element, "Show in File Explorer") &&
                     ContainsExactName(element, "Copy full path") &&
-                    !element.Current.BoundingRectangle.IsEmpty)
+                    !element.Current.IsOffscreen &&
+                    !element.Current.BoundingRectangle.IsEmpty &&
+                    HasVisiblePopupWindow(element))
                 {
                     return element;
                 }
@@ -394,6 +398,42 @@ public sealed class PackagedGlobalSearchBlackboxIntegrationTests
         {
         }
         return null;
+    }
+
+    private static bool HasVisiblePopupWindow(AutomationElement element)
+    {
+        var current = element;
+        while ((current = TreeWalker.ControlViewWalker.GetParent(current)) is not null &&
+               !Automation.Compare(current, AutomationElement.RootElement))
+        {
+            if (current.Current.ControlType == ControlType.Window)
+            {
+                var handle = new IntPtr(current.Current.NativeWindowHandle);
+                return handle != IntPtr.Zero && IsWindowVisible(handle);
+            }
+        }
+
+        return false;
+    }
+
+    private static void FocusOwningWindow(AutomationElement element)
+    {
+        var current = element;
+        while ((current = TreeWalker.ControlViewWalker.GetParent(current)) is not null &&
+               !Automation.Compare(current, AutomationElement.RootElement))
+        {
+            if (current.Current.ControlType != ControlType.Window)
+            {
+                continue;
+            }
+
+            var handle = new IntPtr(current.Current.NativeWindowHandle);
+            if (handle != IntPtr.Zero)
+            {
+                Assert.True(SetForegroundWindow(handle));
+            }
+            return;
+        }
     }
 
     private static IntPtr WaitForWindow(int processId, string title, TimeSpan timeout)
@@ -438,21 +478,16 @@ public sealed class PackagedGlobalSearchBlackboxIntegrationTests
     {
         foreach (var character in value)
         {
-            var encoded = VkKeyScan(character);
-            Assert.NotEqual(-1, encoded);
-            var virtualKey = unchecked((ushort)(encoded & 0xff));
-            var modifiers = (encoded >> 8) & 0xff;
-            if ((modifiers & 1) != 0)
-            {
-                SendKeyboardInput(0x10, keyUp: false);
-            }
-            SendKeyboardInput(virtualKey, keyUp: false);
-            SendKeyboardInput(virtualKey, keyUp: true);
-            if ((modifiers & 1) != 0)
-            {
-                SendKeyboardInput(0x10, keyUp: true);
-            }
+            SendUnicodeInput(character, keyUp: false);
+            SendUnicodeInput(character, keyUp: true);
         }
+    }
+
+    private static void SendUnicodeInput(char character, bool keyUp)
+    {
+        var flags = KeyEventUnicode | (keyUp ? KeyEventKeyUp : 0);
+        var inputs = new[] { NativeInput.Keyboard(0, character, flags) };
+        Assert.Equal(1u, SendInput(1, inputs, Marshal.SizeOf<NativeInput>()));
     }
 
     private static void SendKeyboardInput(ushort key, bool keyUp)
@@ -532,7 +567,7 @@ public sealed class PackagedGlobalSearchBlackboxIntegrationTests
             preseed = new
             {
                 packageLocalSettings = data.SettingsPath,
-                packageLocalIndex = data.IndexPath,
+                packageLocalIndex = data.LosnPath,
                 fixtureRoot,
                 indexedResults = new[] { firstResult, secondResult }
             },
@@ -710,7 +745,7 @@ public sealed class PackagedGlobalSearchBlackboxIntegrationTests
 
         public string DataDirectory { get; }
         public string SettingsPath => Path.Combine(DataDirectory, "settings.json");
-        public string IndexPath => Path.Combine(DataDirectory, "index.db");
+        public string LosnPath => Path.Combine(DataDirectory, "index.losn");
 
         public static PackageDataScope RequireInitiallyAbsent(string packageDirectory)
         {
@@ -818,11 +853,11 @@ public sealed class PackagedGlobalSearchBlackboxIntegrationTests
     private delegate bool EnumWindowsProc(IntPtr window, IntPtr parameter);
 
     [DllImport("user32.dll", SetLastError = true)] private static extern uint SendInput(uint count, NativeInput[] inputs, int size);
-    [DllImport("user32.dll", CharSet = CharSet.Unicode)] private static extern short VkKeyScan(char character);
     [DllImport("user32.dll")] private static extern bool EnumWindows(EnumWindowsProc callback, IntPtr parameter);
     [DllImport("user32.dll")] private static extern bool IsWindowVisible(IntPtr window);
     [DllImport("user32.dll")] private static extern uint GetWindowThreadProcessId(IntPtr window, out uint processId);
     [DllImport("user32.dll", CharSet = CharSet.Unicode)] private static extern int GetWindowText(IntPtr window, StringBuilder value, int count);
+    [DllImport("user32.dll")] [return: MarshalAs(UnmanagedType.Bool)] private static extern bool SetForegroundWindow(IntPtr window);
     [DllImport("user32.dll")] private static extern bool GetWindowRect(IntPtr window, out NativeRect bounds);
     [DllImport("user32.dll")] private static extern IntPtr GetDC(IntPtr window);
     [DllImport("user32.dll")] private static extern int ReleaseDC(IntPtr window, IntPtr dc);

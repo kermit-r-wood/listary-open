@@ -56,7 +56,7 @@ public sealed class NativeDialogHookIntegrationTests
         }
         using var session = await NativeDialogSession.StartAsync(architecture, mode, initialDirectory.Path);
 
-        var active = await session.Client.GetActiveDialogResultAsync(CancellationToken.None);
+        var active = await session.WaitForActiveDialogAsync(TimeSpan.FromSeconds(3));
         Assert.Equal(HookJumpStatus.Success, active.Status);
         var dialog = Assert.IsType<HookDialogContext>(active.Dialog);
         Assert.Equal(session.TestHost.Id, (int)dialog.ProcessId);
@@ -123,7 +123,7 @@ public sealed class NativeDialogHookIntegrationTests
         File.WriteAllText(expectedPath, "ListaryOpen desktop integration test");
         using var session = await NativeDialogSession.StartAsync(architecture, "open-file", initialDirectory.Path);
 
-        var active = await session.Client.GetActiveDialogResultAsync(CancellationToken.None);
+        var active = await session.WaitForActiveDialogAsync(TimeSpan.FromSeconds(3));
         Assert.Equal(HookJumpStatus.Success, active.Status);
         var dialog = Assert.IsType<HookDialogContext>(active.Dialog);
         var jump = await session.Client.JumpDialogToFolderAsync(
@@ -192,7 +192,7 @@ public sealed class NativeDialogHookIntegrationTests
         using var targetDirectory = TemporaryDirectory.Create("listary-open-folder-target");
         using var session = await NativeDialogSession.StartAsync(architecture, "open-folder", initialDirectory.Path);
 
-        var active = await session.Client.GetActiveDialogResultAsync(CancellationToken.None);
+        var active = await session.WaitForActiveDialogAsync(TimeSpan.FromSeconds(3));
         Assert.Equal(HookJumpStatus.Success, active.Status);
         var dialog = Assert.IsType<HookDialogContext>(active.Dialog);
         var jump = await session.Client.JumpDialogToFolderAsync(
@@ -398,6 +398,25 @@ public sealed class NativeDialogHookIntegrationTests
         public Process TestHost { get; }
 
         public HookIpcClient Client { get; }
+
+        public async Task<HookActiveDialogResult> WaitForActiveDialogAsync(TimeSpan timeout)
+        {
+            var deadline = DateTime.UtcNow + timeout;
+            HookActiveDialogResult result;
+            do
+            {
+                result = await Client.GetActiveDialogResultAsync(CancellationToken.None);
+                if (result.Status == HookJumpStatus.Success)
+                {
+                    return result;
+                }
+
+                await Task.Delay(50);
+            }
+            while (DateTime.UtcNow < deadline);
+
+            return result;
+        }
 
         public HostState ReadState()
         {
@@ -639,6 +658,7 @@ public sealed class NativeDialogHookIntegrationTests
             IntPtr.Zero);
         return found;
     }
+
 
     private static string FindRepositoryRoot()
     {

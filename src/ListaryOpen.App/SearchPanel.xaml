@@ -179,6 +179,7 @@
             <ListBox.ContextMenu>
                 <ContextMenu StaysOpen="False"
                              Opened="ResultsContextMenu_Opened"
+                             PreviewKeyDown="ResultsContextMenu_PreviewKeyDown"
                              Closed="ResultsContextMenu_Closed">
                     <MenuItem x:Name="OpenResultMenuItem"
                               Header="Open / switch"

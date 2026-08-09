@@ -842,6 +842,13 @@ public partial class SearchPanel : Window
     protected override void OnDeactivated(EventArgs e)
     {
         base.OnDeactivated(e);
+        // A WPF context menu owns a separate popup window. Let that popup keep
+        // keyboard focus so Escape and menu navigation are delivered to it.
+        if (_resultContextMenuOpen)
+        {
+            return;
+        }
+
         if (Environment.TickCount64 < _suppressDeactivateDismissUntilTick)
         {
             if (IsVisible)
@@ -1105,8 +1112,17 @@ public partial class SearchPanel : Window
         item?.Focus();
         contextMenu.PlacementTarget = placementTarget ?? (UIElement?)item ?? ResultsList;
         contextMenu.Placement = placement;
+        // ContextMenu uses a separate popup HWND and deactivates this window.
+        // Mark it open first so OnDeactivated leaves the popup focused.
+        _resultContextMenuOpen = true;
         contextMenu.IsOpen = true;
-        return true;
+        if (contextMenu.IsOpen)
+        {
+            return true;
+        }
+
+        _resultContextMenuOpen = false;
+        return false;
     }
 
     private void ResultsContextMenu_Opened(object sender, RoutedEventArgs e)
@@ -1116,12 +1132,27 @@ public partial class SearchPanel : Window
         OpenResultMenuItem.Header = ViewModel.IsFolderSelectionMode
             ? "Switch to this folder"
             : "Open";
+        OpenResultMenuItem.Focus();
+        Keyboard.Focus(OpenResultMenuItem);
     }
 
     private void ResultsContextMenu_Closed(object sender, RoutedEventArgs e)
     {
         _resultContextMenuOpen = false;
         ResultContextMenuOpenStateChanged?.Invoke(this, EventArgs.Empty);
+    }
+
+    private void ResultsContextMenu_PreviewKeyDown(object sender, KeyEventArgs e)
+    {
+        if (e.Key != Key.Escape)
+        {
+            return;
+        }
+
+        e.Handled = true;
+        CloseResultContextMenu();
+        Activate();
+        QueryBox.Focus();
     }
 
     internal void CloseResultContextMenu()

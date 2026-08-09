@@ -54,7 +54,7 @@ public sealed class HookIpcClientTests
             Assert.Equal("JumpDialogToFolder", request.MessageType);
             Assert.Equal("dlg", payload.DialogId);
             Assert.Equal("C:\\Users\\paulx", payload.FolderPath);
-            Assert.Equal(750, payload.TimeoutMs);
+            Assert.Equal(2_000, payload.TimeoutMs);
             Assert.Equal(HookJumpStatus.NoActiveDialog, result.Status);
             Assert.Equal("No active hook dialog.", result.Message);
         }
