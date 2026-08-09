@@ -4,7 +4,6 @@ using System.Windows;
 [assembly:InternalsVisibleTo("ListaryOpen.Infrastructure.Tests")]
 [assembly:InternalsVisibleTo("ListaryOpen.UiPerformanceBenchmark")]
 [assembly: InternalsVisibleTo("ListaryOpen.PreviewHost")]
-[assembly:InternalsVisibleTo("ListaryOpen.VisualTests")]
 [assembly:InternalsVisibleTo("ListaryOpen.IntegrationTests")]
 
 [assembly:ThemeInfo(

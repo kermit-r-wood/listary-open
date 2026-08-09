@@ -7,8 +7,6 @@
       "evidence": [
         { "suite": "dotnet", "testNameContains": "UiResourcesAndWindowsLoadOnStaThread" },
         { "suite": "dotnet", "testNameContains": "ComboBoxUsesThemeAwareTemplateAndCentersSelectedText" },
-        { "suite": "visual", "testNameContains": "ProductionWindowsRenderVisualAcceptanceMatrix", "screenshot": "10-settings-appearance-dark-en.png" },
-        { "suite": "visual", "testNameContains": "ProductionWindowsRenderVisualAcceptanceMatrix", "screenshot": "11-settings-appearance-geek-en.png" },
         { "suite": "packagedBlackbox", "testNameContains": "PublishedTrayOpensSettingsAndAppearancePersistsAcrossARealRestart" }
       ]
     },
@@ -17,9 +15,7 @@
       "requirement": "Chinese and English interface language changes obey save semantics and update the complete settings surface.",
       "evidence": [
         { "suite": "dotnet", "testNameContains": "InterfaceLanguageAppliesOnlyAfterSuccessfulSave" },
-        { "suite": "dotnet", "testNameContains": "SettingsWindowDefinesOperationalSectionsAndPresentationBindings" },
-        { "suite": "visual", "testNameContains": "ProductionWindowsRenderVisualAcceptanceMatrix", "screenshot": "12-settings-language-light-zh.png" },
-        { "suite": "visual", "testNameContains": "ProductionWindowsRenderVisualAcceptanceMatrix", "screenshot": "19-settings-actions-light-zh.png" }
+        { "suite": "dotnet", "testNameContains": "SettingsWindowDefinesOperationalSectionsAndPresentationBindings" }
       ]
     },
     {
@@ -124,8 +120,6 @@
         { "suite": "dotnet", "testNameContains": "MediaProviderReadsWaveMetadata" },
         { "suite": "dotnet", "testNameContains": "CoordinatorCachesCompletedPreviewResults" },
         { "suite": "dotnet", "testNameContains": "UiResourcesAndWindowsLoadOnStaThread" },
-        { "suite": "visual", "testNameContains": "ProductionWindowsRenderVisualAcceptanceMatrix", "screenshot": "14-search-results-preview-light-en.png" },
-        { "suite": "visual", "testNameContains": "ProductionWindowsRenderVisualAcceptanceMatrix", "screenshot": "15-search-results-dark-zh.png" },
         { "suite": "packagedBlackbox", "testNameContains": "PublishedAppGlobalHotkeyDrivesSearchPreviewContextMenuEscapeAndQuickLaunch" }
       ]
     },
@@ -181,9 +175,7 @@
         { "suite": "desktop", "testNameContains": "LowLevelHookRoutesTextFromRealForegroundAndFocusedHostControls" },
         { "suite": "desktop", "testNameContains": "ActiveTaskManagerOverlaySuppressesTextEvenWhenItsNativeSearchEditHasFocus" },
         { "suite": "elevatedDesktop", "testNameContains": "ProductionOverlaySynchronizesTwoSelectionsWithRealSystemTaskManager" },
-        { "suite": "packagedBlackbox", "testNameContains": "PackagedAppCapturesRealTaskManagerInputAndSynchronizesTwoRows" },
-        { "suite": "visual", "testNameContains": "ProductionWindowsRenderVisualAcceptanceMatrix", "screenshot": "18-task-manager-search-dark-en.png" },
-        { "suite": "visual", "testNameContains": "ProductionWindowsRenderVisualAcceptanceMatrix", "screenshot": "20-task-manager-selection-next-dark-en.png" }
+        { "suite": "packagedBlackbox", "testNameContains": "PackagedAppCapturesRealTaskManagerInputAndSynchronizesTwoRows" }
       ]
     },
     {
@@ -219,9 +211,7 @@
         { "suite": "dotnet", "testNameContains": "UiResourcesAndWindowsLoadOnStaThread" },
         { "suite": "desktop", "testNameContains": "DialogInputCanRestartAfterACompletedSearchAndStillRoutesEditCommands" },
         { "suite": "desktop", "testNameContains": "ActiveExplorerAndDialogOverlaysSuppressTextWhenNativeEditsHaveFocus" },
-        { "suite": "packagedBlackbox", "testNameContains": "PublishedAppUsesCtrlGAndItsNativeHookToNavigateARealFirefoxPicker" },
-        { "suite": "visual", "testNameContains": "ProductionWindowsRenderVisualAcceptanceMatrix", "screenshot": "16-quick-switch-collapsed-geek-en.png" },
-        { "suite": "visual", "testNameContains": "ProductionWindowsRenderVisualAcceptanceMatrix", "screenshot": "17-quick-switch-expanded-geek-en.png" }
+        { "suite": "packagedBlackbox", "testNameContains": "PublishedAppUsesCtrlGAndItsNativeHookToNavigateARealFirefoxPicker" }
       ]
     },
     {

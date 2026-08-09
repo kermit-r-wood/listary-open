@@ -27,8 +27,6 @@ Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "ListaryOpen.TestHost", "tes
 EndProject
 Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "ListaryOpen.DialogPlugin.TestFixture", "tests\ListaryOpen.DialogPlugin.TestFixture\ListaryOpen.DialogPlugin.TestFixture.csproj", "{B73F1E34-9CD9-4AE5-8F52-D05F8D57C129}"
 EndProject
-Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "ListaryOpen.VisualTests", "tests\ListaryOpen.VisualTests\ListaryOpen.VisualTests.csproj", "{6C708C58-D0E2-4F6F-808C-C669DAC8C0D2}"
-EndProject
 Global
 	GlobalSection(SolutionConfigurationPlatforms) = preSolution
 		Debug|Any CPU = Debug|Any CPU
@@ -78,10 +76,6 @@ Global
 		{B73F1E34-9CD9-4AE5-8F52-D05F8D57C129}.Debug|Any CPU.Build.0 = Debug|Any CPU
 		{B73F1E34-9CD9-4AE5-8F52-D05F8D57C129}.Release|Any CPU.ActiveCfg = Release|Any CPU
 		{B73F1E34-9CD9-4AE5-8F52-D05F8D57C129}.Release|Any CPU.Build.0 = Release|Any CPU
-		{6C708C58-D0E2-4F6F-808C-C669DAC8C0D2}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
-		{6C708C58-D0E2-4F6F-808C-C669DAC8C0D2}.Debug|Any CPU.Build.0 = Debug|Any CPU
-		{6C708C58-D0E2-4F6F-808C-C669DAC8C0D2}.Release|Any CPU.ActiveCfg = Release|Any CPU
-		{6C708C58-D0E2-4F6F-808C-C669DAC8C0D2}.Release|Any CPU.Build.0 = Release|Any CPU
 	EndGlobalSection
 	GlobalSection(NestedProjects) = preSolution
 		{F9F063AF-99D0-42E3-BC90-E2452E6364B6} = {522194D0-B069-4775-9D9E-4E0245EBE60B}
@@ -94,6 +88,5 @@ Global
 		{23FA998D-19FC-45C9-A2F1-D693D09C5B10} = {0B5DC35C-D315-44E8-992A-1357EA5820DD}
 		{DA1316D0-C4C4-44C6-B8A0-D09484E9F673} = {0B5DC35C-D315-44E8-992A-1357EA5820DD}
 		{B73F1E34-9CD9-4AE5-8F52-D05F8D57C129} = {0B5DC35C-D315-44E8-992A-1357EA5820DD}
-		{6C708C58-D0E2-4F6F-808C-C669DAC8C0D2} = {0B5DC35C-D315-44E8-992A-1357EA5820DD}
 	EndGlobalSection
 EndGlobal

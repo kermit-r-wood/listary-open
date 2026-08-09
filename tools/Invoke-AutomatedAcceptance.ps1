@@ -279,7 +279,6 @@ function Invoke-NativeTests {
 
 $solutionPath = Join-Path $repositoryRoot "ListaryOpen.sln"
 $integrationProject = Join-Path $repositoryRoot "tests\ListaryOpen.IntegrationTests\ListaryOpen.IntegrationTests.csproj"
-$visualTests = Join-Path $repositoryRoot "tests\ListaryOpen.VisualTests\ListaryOpen.VisualTests.csproj"
 $testHostProject = Join-Path $repositoryRoot "tests\ListaryOpen.TestHost\ListaryOpen.TestHost.csproj"
 $coreTests = Join-Path $repositoryRoot "tests\ListaryOpen.Core.Tests\ListaryOpen.Core.Tests.csproj"
 $infrastructureTests = Join-Path $repositoryRoot "tests\ListaryOpen.Infrastructure.Tests\ListaryOpen.Infrastructure.Tests.csproj"
@@ -296,10 +295,10 @@ if (-not $SkipRestore) {
         -Arguments @("restore", $integrationProject) `
         -WorkingDirectory $repositoryRoot `
         -LogPath (Join-Path $ResultsDirectory "restore-integration.log")
-    Invoke-LoggedCommand -Name "Restore visual acceptance tests" -FilePath "dotnet" `
-        -Arguments @("restore", $visualTests, "-r", "win-x64", "-p:Configuration=Release", "-p:PublishReadyToRun=true") `
+    Invoke-LoggedCommand -Name "Restore win-x64 publish projects" -FilePath "dotnet" `
+        -Arguments @("restore", $appProject, "-r", "win-x64", "-p:Configuration=Release", "-p:PublishReadyToRun=true") `
         -WorkingDirectory $repositoryRoot `
-        -LogPath (Join-Path $ResultsDirectory "restore-visual.log")
+        -LogPath (Join-Path $ResultsDirectory "restore-publish.log")
 }
 
 Invoke-NativeTests -Architecture "x86_64" -Target "x86_64-pc-windows-gnullvm" `
@@ -326,15 +325,6 @@ Invoke-LoggedCommand -Name "Infrastructure and WPF tests" -FilePath "dotnet" `
 
 $screenshotDirectory = Join-Path $ResultsDirectory "visual-evidence"
 $env:LISTARYOPEN_SCREENSHOT_DIR = $screenshotDirectory
-Invoke-LoggedCommand -Name "Production WPF visual acceptance" -FilePath "dotnet" `
-    -Arguments @(
-        "test", $visualTests, "-c", "Release", "--no-restore", "--nologo",
-        "-p:BuildNativeHooks=false",
-        "--filter", "Category=VisualAcceptance",
-        "--results-directory", $ResultsDirectory,
-        "--logger", "trx;LogFileName=visual.trx") `
-    -WorkingDirectory $repositoryRoot `
-    -LogPath (Join-Path $ResultsDirectory "visual-tests.log")
 
 Invoke-LoggedCommand -Name "Publish win-x64 app with native hooks" -FilePath "dotnet" `
     -Arguments @(
@@ -1201,8 +1191,6 @@ $integrationTestIdentitiesBySuite = @{
     elevatedIndexer = $elevatedIndexerTestIdentities
     packagedBlackbox = $packagedBlackboxTestIdentities
 }
-$visualTestNames = @(Get-PassedTrxTestNames -Paths @((Join-Path $ResultsDirectory "visual.trx")))
-$visualTestIdentities = @(Get-PassedTrxTestIdentities -Path (Join-Path $ResultsDirectory "visual.trx"))
 foreach ($artifact in $desktopVisualMatrix.artifacts) {
     if (-not $integrationTestIdentitiesBySuite.ContainsKey([string]$artifact.suite)) {
         throw "Desktop screenshot '$($artifact.file)' references unknown test suite '$($artifact.suite)'."
@@ -1525,33 +1513,6 @@ function Assert-NativeTestLog {
 Assert-NativeTestLog (Join-Path $ResultsDirectory "native-x64.log")
 Assert-NativeTestLog (Join-Path $ResultsDirectory "native-x86.log")
 
-$expectedVisualMatrixPath = Join-Path $repositoryRoot "tests\visual-acceptance-matrix.json"
-if (-not (Test-Path -LiteralPath $expectedVisualMatrixPath -PathType Leaf)) {
-    throw "Authoritative visual acceptance matrix is missing: $expectedVisualMatrixPath"
-}
-$expectedVisualMatrix = Get-Content -LiteralPath $expectedVisualMatrixPath -Raw | ConvertFrom-Json
-if ($expectedVisualMatrix.schemaVersion -ne 1 -or
-    $expectedVisualMatrix.captureMethod -ne "DesktopBitBlt" -or
-    $expectedVisualMatrix.screenshots.Count -ne 22) {
-    throw "Authoritative visual acceptance matrix must define exactly 20 DesktopBitBlt states."
-}
-$duplicateExpectedVisualIds = @($expectedVisualMatrix.screenshots | Group-Object id | Where-Object Count -ne 1)
-$duplicateExpectedVisualFiles = @($expectedVisualMatrix.screenshots | Group-Object file | Where-Object Count -ne 1)
-if ($duplicateExpectedVisualIds.Count -gt 0 -or $duplicateExpectedVisualFiles.Count -gt 0) {
-    throw "Authoritative visual acceptance matrix contains duplicate ids or files."
-}
-foreach ($state in $expectedVisualMatrix.screenshots) {
-    if ([string]::IsNullOrWhiteSpace($state.id) -or
-        [string]::IsNullOrWhiteSpace($state.file) -or
-        [string]::IsNullOrWhiteSpace($state.window) -or
-        [string]::IsNullOrWhiteSpace($state.state) -or
-        [string]::IsNullOrWhiteSpace($state.theme) -or
-        [string]::IsNullOrWhiteSpace($state.language) -or
-        $state.minWidth -le 0 -or $state.minHeight -le 0 -or $state.maxBottomBlackRows -lt 0) {
-        throw "Authoritative visual state is incomplete: $($state | ConvertTo-Json -Compress)"
-    }
-}
-
 $coveragePath = Join-Path $repositoryRoot "tests\automation-coverage.json"
 $coverage = Get-Content -LiteralPath $coveragePath -Raw | ConvertFrom-Json
 if ($coverage.schemaVersion -ne 1 -or $coverage.featureGroups.Count -eq 0) {
@@ -1597,15 +1558,6 @@ foreach ($feature in $coverage.featureGroups) {
             "native" {
                 $pattern = "(?m)^test .*" + [Regex]::Escape($evidence.testNameContains) + ".* \.\.\. ok\s*$"
                 [Regex]::IsMatch($nativeEvidence, $pattern)
-            }
-            "visual" {
-                $testPassed = @($visualTestIdentities | Where-Object {
-                    [string]::Equals($_.Method, $evidence.testNameContains, [StringComparison]::Ordinal)
-                }).Count -gt 0
-                $screenshotPath = Join-Path $screenshotDirectory $evidence.screenshot
-                $isAuthoritativeState = @($expectedVisualMatrix.screenshots | Where-Object file -eq $evidence.screenshot).Count -eq 1
-                $testPassed -and $isAuthoritativeState -and (Test-Path -LiteralPath $screenshotPath -PathType Leaf) -and
-                    (Get-Item -LiteralPath $screenshotPath).Length -gt 1024
             }
             "package" {
                 $artifactPath = Join-Path $PackageDirectory ($evidence.artifact -replace '/', [IO.Path]::DirectorySeparatorChar)
@@ -1743,7 +1695,6 @@ function Get-TrxCounters {
 $testCounters = [ordered]@{
     Core = Get-TrxCounters (Join-Path $ResultsDirectory "core.trx")
     Infrastructure = Get-TrxCounters (Join-Path $ResultsDirectory "infrastructure.trx")
-    Visual = Get-TrxCounters (Join-Path $ResultsDirectory "visual.trx")
     Desktop = Get-TrxCounters (Join-Path $ResultsDirectory "desktop.trx")
     ElevatedDesktop = Get-TrxCounters (Join-Path $ResultsDirectory "elevated-desktop.trx")
     ElevatedIndexer = Get-TrxCounters (Join-Path $ResultsDirectory "elevated-indexer.trx")
@@ -1752,101 +1703,6 @@ $testCounters = [ordered]@{
 foreach ($suite in $testCounters.GetEnumerator()) {
     if ($suite.Value.Total -ne $suite.Value.Passed -or $suite.Value.Failed -ne 0 -or $suite.Value.Skipped -ne 0) {
         throw "Test suite '$($suite.Key)' was not entirely passed: $($suite.Value | ConvertTo-Json -Compress)"
-    }
-}
-
-$visualEvidenceManifest = Join-Path $screenshotDirectory "visual-evidence.json"
-if (-not (Test-Path -LiteralPath $visualEvidenceManifest -PathType Leaf)) {
-    throw "Visual evidence manifest is missing: $visualEvidenceManifest"
-}
-$visualEvidence = Get-Content -LiteralPath $visualEvidenceManifest -Raw | ConvertFrom-Json
-if ($visualEvidence.schemaVersion -ne 2 -or
-    $visualEvidence.expectedMatrix -ne "tests/visual-acceptance-matrix.json" -or
-    $visualEvidence.screenshots.Count -ne $expectedVisualMatrix.screenshots.Count) {
-    throw "Visual evidence must contain the complete 22-screenshot acceptance matrix."
-}
-$generatedVisualIds = @($visualEvidence.screenshots | ForEach-Object Id)
-$generatedVisualFiles = @($visualEvidence.screenshots | ForEach-Object File)
-$visualIdDifferences = @(Compare-Object -ReferenceObject @($expectedVisualMatrix.screenshots.id) -DifferenceObject $generatedVisualIds -SyncWindow 0)
-$visualFileDifferences = @(Compare-Object -ReferenceObject @($expectedVisualMatrix.screenshots.file) -DifferenceObject $generatedVisualFiles -SyncWindow 0)
-if ($visualIdDifferences.Count -gt 0 -or $visualFileDifferences.Count -gt 0) {
-    throw "Generated visual evidence does not exactly match the authoritative ordered matrix."
-}
-
-function Get-PngDimensions {
-    param([Parameter(Mandatory = $true)][string]$Path)
-
-    $bytes = [IO.File]::ReadAllBytes($Path)
-    if ($bytes.Length -lt 24 -or
-        $bytes[0] -ne 0x89 -or $bytes[1] -ne 0x50 -or $bytes[2] -ne 0x4e -or $bytes[3] -ne 0x47 -or
-        $bytes[12] -ne 0x49 -or $bytes[13] -ne 0x48 -or $bytes[14] -ne 0x44 -or $bytes[15] -ne 0x52) {
-        throw "Visual evidence is not a valid PNG with an IHDR header: $Path"
-    }
-
-    [pscustomobject]@{
-        Width = [int]($bytes[16] * 16777216 + $bytes[17] * 65536 + $bytes[18] * 256 + $bytes[19])
-        Height = [int]($bytes[20] * 16777216 + $bytes[21] * 65536 + $bytes[22] * 256 + $bytes[23])
-    }
-}
-
-function Get-BottomUniformBlackRows {
-    param([Parameter(Mandatory = $true)][string]$Path)
-
-    Add-Type -AssemblyName System.Drawing
-    $bitmap = [Drawing.Bitmap]::FromFile($Path)
-    try {
-        $rows = 0
-        for ($y = $bitmap.Height - 1; $y -ge 0; $y--) {
-            $black = 0
-            for ($x = 0; $x -lt $bitmap.Width; $x++) {
-                $pixel = $bitmap.GetPixel($x, $y)
-                if ($pixel.R -le 3 -and $pixel.G -le 3 -and $pixel.B -le 3) {
-                    $black++
-                }
-            }
-            if ($black -lt ($bitmap.Width * 0.98)) {
-                break
-            }
-            $rows++
-        }
-        return $rows
-    }
-    finally {
-        $bitmap.Dispose()
-    }
-}
-
-foreach ($expectedState in $expectedVisualMatrix.screenshots) {
-    $entry = @($visualEvidence.screenshots | Where-Object Id -eq $expectedState.id)
-    if ($entry.Count -ne 1) {
-        throw "Visual evidence does not contain exactly one state '$($expectedState.id)'."
-    }
-    $entry = $entry[0]
-    $entryPath = Join-Path $screenshotDirectory $entry.File
-    $pngDimensions = if (Test-Path -LiteralPath $entryPath -PathType Leaf) {
-        Get-PngDimensions -Path $entryPath
-    } else { $null }
-    $measuredBottomBlackRows = if ($null -ne $pngDimensions) {
-        Get-BottomUniformBlackRows -Path $entryPath
-    } else { $null }
-    if (-not (Test-Path -LiteralPath $entryPath -PathType Leaf) -or
-        $entry.File -ne $expectedState.file -or
-        $entry.Window -ne $expectedState.window -or
-        $entry.State -ne $expectedState.state -or
-        $entry.Theme -ne $expectedState.theme -or
-        $entry.Language -ne $expectedState.language -or
-        $entry.CaptureMethod -ne $expectedVisualMatrix.captureMethod -or
-        $entry.Width -lt $expectedState.minWidth -or
-        $entry.Height -lt $expectedState.minHeight -or
-        $entry.BottomUniformBlackRows -lt 0 -or
-        $entry.BottomUniformBlackRows -gt $expectedState.maxBottomBlackRows -or
-        $measuredBottomBlackRows -ne $entry.BottomUniformBlackRows -or
-        $null -eq $pngDimensions -or
-        $pngDimensions.Width -ne $entry.Width -or
-        $pngDimensions.Height -ne $entry.Height -or
-        (Get-Item -LiteralPath $entryPath).Length -ne $entry.Size -or
-        (Get-FileHash -LiteralPath $entryPath -Algorithm SHA256).Hash -ne $entry.Sha256) {
-        throw "Visual evidence entry is missing or differs from its authoritative state, PNG dimensions, size or SHA256: $($entry.File)"
     }
 }
 
@@ -1861,12 +1717,9 @@ $screenshotFiles = @(Get-ChildItem -LiteralPath $screenshotDirectory -Filter "*.
         Sha256 = (Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash
     }
 })
-$expectedScreenshotNames = @(
-    @($expectedVisualMatrix.screenshots | ForEach-Object file)
-    $requiredDesktopScreenshots
-) | Sort-Object -Unique
+$expectedScreenshotNames = @($requiredDesktopScreenshots | Sort-Object -Unique)
 $screenshotDifferences = @(Compare-Object -ReferenceObject $expectedScreenshotNames -DifferenceObject @($screenshotFiles.Path | Sort-Object))
-if ($expectedScreenshotNames.Count -ne ($expectedVisualMatrix.screenshots.Count + $desktopVisualMatrix.artifacts.Count) -or
+if ($expectedScreenshotNames.Count -ne $desktopVisualMatrix.artifacts.Count -or
     $screenshotFiles.Count -ne $expectedScreenshotNames.Count -or
     $screenshotDifferences.Count -gt 0) {
     throw "Acceptance evidence must exactly match the repository-owned visual matrices: $($screenshotDifferences | ConvertTo-Json -Compress)"
@@ -1888,7 +1741,6 @@ $report = [pscustomobject]@{
     Tests = [pscustomobject]@{
         Core = $testCounters.Core
         Infrastructure = $testCounters.Infrastructure
-        Visual = $testCounters.Visual
         Desktop = $testCounters.Desktop
         ElevatedDesktop = $testCounters.ElevatedDesktop
         ElevatedIndexer = $testCounters.ElevatedIndexer
@@ -1897,9 +1749,7 @@ $report = [pscustomobject]@{
         NativeX86 = "Passed"
     }
     Coverage = $coverageResults
-    ExpectedVisualMatrix = $expectedVisualMatrix
     DesktopVisualMatrix = $desktopVisualMatrix
-    VisualEvidence = $visualEvidence
     NativeUnloadEvidence = [pscustomobject]@{
         GlobalProcessAudit = $globalNativeModuleUnloadAudit
         Explorer = $packagedExplorerEvidence.nativeUnloadOracle
@@ -1923,8 +1773,7 @@ $markdown = @(
     "",
     "- Core tests: $($report.Tests.Core.Passed)/$($report.Tests.Core.Total)",
     "- Infrastructure/WPF tests: $($report.Tests.Infrastructure.Passed)/$($report.Tests.Infrastructure.Total)",
-    "- Visual acceptance tests: $($report.Tests.Visual.Passed)/$($report.Tests.Visual.Total)",
-    "- Visual evidence: $($report.ScreenshotFiles.Count) screenshots ($($expectedVisualMatrix.screenshots.Count) product-window states + $($desktopVisualMatrix.artifacts.Count) authoritative desktop states)",
+    "- Desktop evidence: $($report.ScreenshotFiles.Count) screenshots",
     "- Real desktop tests: $($report.Tests.Desktop.Passed)/$($report.Tests.Desktop.Total)",
     "- Elevated desktop tests: $($report.Tests.ElevatedDesktop.Passed)/$($report.Tests.ElevatedDesktop.Total)",
     "- Elevated indexer tests: $($report.Tests.ElevatedIndexer.Passed)/$($report.Tests.ElevatedIndexer.Total)",

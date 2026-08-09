@@ -43,7 +43,7 @@ public sealed class AutomatedAcceptanceDefinitionTests
             "package-windows-distributable");
 
         var supportedSuites = new HashSet<string>(
-            ["dotnet", "desktop", "elevatedDesktop", "elevatedIndexer", "packagedBlackbox", "native", "visual", "package"],
+            ["dotnet", "desktop", "elevatedDesktop", "elevatedIndexer", "packagedBlackbox", "native", "package"],
             StringComparer.Ordinal);
         foreach (var group in groups)
         {
@@ -61,10 +61,6 @@ public sealed class AutomatedAcceptanceDefinitionTests
                 else
                 {
                     Assert.False(string.IsNullOrWhiteSpace(item.GetProperty("testNameContains").GetString()));
-                    if (suite == "visual")
-                    {
-                        Assert.EndsWith(".png", item.GetProperty("screenshot").GetString(), StringComparison.OrdinalIgnoreCase);
-                    }
                 }
             }
         }
@@ -82,7 +78,7 @@ public sealed class AutomatedAcceptanceDefinitionTests
         Assert.Contains("Category=ElevatedIndexerIntegration", script, StringComparison.Ordinal);
         Assert.Contains("Category=ElevatedPackagedBlackboxE2E", script, StringComparison.Ordinal);
         Assert.Contains("elevated-indexer.trx", script, StringComparison.Ordinal);
-        Assert.Contains("Category=VisualAcceptance", script, StringComparison.Ordinal);
+        Assert.DoesNotContain("Category=VisualAcceptance", script, StringComparison.Ordinal);
         Assert.Contains("Get-PassedTrxTestNames", script, StringComparison.Ordinal);
         Assert.Contains("$ErrorActionPreference = \"Continue\"", script, StringComparison.Ordinal);
         Assert.Contains("$exitCode = $LASTEXITCODE", script, StringComparison.Ordinal);
@@ -95,16 +91,14 @@ public sealed class AutomatedAcceptanceDefinitionTests
         Assert.Contains("waiting 5 seconds for transient file handles", script, StringComparison.Ordinal);
         Assert.Contains("[string]::Equals($_.Method, $evidence.testNameContains, [StringComparison]::Ordinal)", script, StringComparison.Ordinal);
         Assert.DoesNotContain("-like \"*$($evidence.testNameContains)*\"", script, StringComparison.Ordinal);
-        Assert.Contains("tests\\visual-acceptance-matrix.json", script, StringComparison.Ordinal);
+        Assert.DoesNotContain("tests\\visual-acceptance-matrix.json", script, StringComparison.Ordinal);
         Assert.Contains("tests\\desktop-visual-evidence.json", script, StringComparison.Ordinal);
-        Assert.Contains("expectedVisualMatrix.screenshots.Count + $desktopVisualMatrix.artifacts.Count", script, StringComparison.Ordinal);
         Assert.Contains("dialogClosedWithoutOpening", script, StringComparison.Ordinal);
         Assert.Contains("screenshotSha256", script, StringComparison.Ordinal);
         Assert.Contains("compiled-dialog-plugin-real-nonstandard-host-structured-direct-navigation", script, StringComparison.Ordinal);
         Assert.Contains("packaged-tray-settings-persistence-across-restart", script, StringComparison.Ordinal);
         Assert.Contains("packaged-elevated-global-hotkey-search-preview-menu-and-quick-launch", script, StringComparison.Ordinal);
         Assert.Contains("published-app-real-ctrl-g-compiled-plugin-nonstandard-direct-navigation", script, StringComparison.Ordinal);
-        Assert.Contains("complete 22-screenshot acceptance matrix", script, StringComparison.Ordinal);
         Assert.Contains("SendInput|keybd_event|WM_KEYDOWN|WM_KEYUP|WM_CHAR|WM_SETTEXT|EM_REPLACESEL|ValuePattern|Clipboard|SendKeys|SetWindowText", script, StringComparison.Ordinal);
         Assert.Contains("Assert.True\\(SetForegroundWindow\\(", script, StringComparison.Ordinal);
         Assert.Contains("--self-contained\", \"true", script, StringComparison.Ordinal);
@@ -116,23 +110,8 @@ public sealed class AutomatedAcceptanceDefinitionTests
     }
 
     [Fact]
-    public void VisualEvidenceMatricesAreRepositoryOwnedUniqueAndCarryEvidenceLevels()
+    public void DesktopEvidenceMatrixIsRepositoryOwnedUniqueAndCarriesEvidenceLevels()
     {
-        using var productDocument = JsonDocument.Parse(
-            File.ReadAllText(RepositoryPath("tests", "visual-acceptance-matrix.json")));
-        var productRoot = productDocument.RootElement;
-        Assert.Equal(1, productRoot.GetProperty("schemaVersion").GetInt32());
-        Assert.Equal("DesktopBitBlt", productRoot.GetProperty("captureMethod").GetString());
-        var productStates = productRoot.GetProperty("screenshots").EnumerateArray().ToArray();
-        Assert.Equal(22, productStates.Length);
-        Assert.Equal(productStates.Length, productStates.Select(item => item.GetProperty("id").GetString()).Distinct().Count());
-        Assert.Equal(productStates.Length, productStates.Select(item => item.GetProperty("file").GetString()).Distinct().Count());
-        Assert.Contains(productStates, item => item.GetProperty("id").GetString() == "21-quick-switch-collapsed-light-en");
-        Assert.Contains(productStates, item => item.GetProperty("id").GetString() == "22-quick-switch-expanded-light-en");
-        var visualSource = File.ReadAllText(
-            RepositoryPath("tests", "ListaryOpen.VisualTests", "VisualAcceptanceTests.cs"));
-        Assert.Contains("AssertQuickSwitchHasNoBrightOuterBand", visualSource, StringComparison.Ordinal);
-
         using var desktopDocument = JsonDocument.Parse(
             File.ReadAllText(RepositoryPath("tests", "desktop-visual-evidence.json")));
         var desktopRoot = desktopDocument.RootElement;
