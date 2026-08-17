@@ -124,19 +124,26 @@ public sealed class PackagedFirefoxBlackboxIntegrationTests
                             loadedHookDllPath = NativeModuleTestSupport.FindModulePathByFileName(
                                 (int)dialogProcessId,
                                 "ListaryOpen.Hook.dll");
-                            loadedHookRuntimePath = NativeModuleTestSupport.FindModulePathByFileName(
+                            loadedHookRuntimePath = IsModuleLoaded(
                                 (int)dialogProcessId,
-                                "libunwind.dll");
-                            return loadedHookDllPath is not null;
+                                packageHookRuntimePath)
+                                    ? packageHookRuntimePath
+                                    : null;
+                            return loadedHookDllPath is not null && loadedHookRuntimePath is not null;
                         },
                         TimeSpan.FromSeconds(15)),
-                    "The staged hook DLL was not loaded into the Firefox file-dialog process.");
+                    "The packaged hook DLL and its adjacent runtime were not both loaded into the Firefox file-dialog process.");
                 var runtimeHookDllPath = Assert.IsType<string>(loadedHookDllPath);
-                Assert.False(string.Equals(
+                Assert.True(string.Equals(
                     Path.GetFullPath(packageHookDllPath),
                     Path.GetFullPath(runtimeHookDllPath),
-                    StringComparison.OrdinalIgnoreCase));
+                    StringComparison.OrdinalIgnoreCase),
+                    $"Firefox loaded the hook from an unexpected path: '{runtimeHookDllPath}'.");
                 Assert.Equal(hookDllSha256, Sha256(runtimeHookDllPath));
+                Assert.Equal(
+                    Path.GetFullPath(packageHookRuntimePath),
+                    Path.GetFullPath(Assert.IsType<string>(loadedHookRuntimePath)),
+                    ignoreCase: true);
 
                 var fileNameBefore = ReadFileNameEdit(dialog);
                 Assert.Equal(string.Empty, fileNameBefore);

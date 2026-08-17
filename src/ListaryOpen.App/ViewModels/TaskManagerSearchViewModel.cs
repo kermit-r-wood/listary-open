@@ -27,6 +27,8 @@ public sealed class TaskManagerSearchViewModel : INotifyPropertyChanged, IDispos
 
     public ObservableCollection<TaskManagerItem> Results { get; } = new();
 
+    internal int AvailableItemCount => _allItems.Count;
+
     public string QueryText
     {
         get => _queryText;

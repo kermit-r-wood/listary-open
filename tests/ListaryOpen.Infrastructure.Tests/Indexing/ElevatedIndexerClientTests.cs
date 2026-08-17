@@ -12,6 +12,16 @@ namespace ListaryOpen.Infrastructure.Tests.Indexing;
 
 public sealed class ElevatedIndexerClientTests
 {
+    [Fact]
+    public void ExplicitHelperUsesItsOwnTrustedTempDirectory()
+    {
+        var helperPath = Path.Combine("C:\\Published", "ListaryOpen.Indexer.Elevated.exe");
+
+        var tempDirectory = ElevatedIndexerClient.ResolveHelperTempDirectory(helperPath);
+
+        Assert.Equal(Path.Combine("C:\\Published", "data", "tmp"), tempDirectory);
+    }
+
     private static readonly SemaphoreSlim TraceGate = new(1, 1);
 
     [Fact]

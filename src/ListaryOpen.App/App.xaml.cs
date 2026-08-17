@@ -37,6 +37,7 @@ public partial class App : Application
     private ExplorerObservationScheduler? _explorerObservationScheduler;
     private FallbackIndexProvider? _fallbackIndexProvider;
     private GlobalTextInputService? _globalTextInputService;
+    private GlobalTextInputThread? _globalTextInputThread;
     private IHookQuickSwitchBridge? _hookQuickSwitchBridge;
     private ExplorerTracker? _explorerTracker;
     private ExplorerQuickMenu? _explorerQuickMenu;
@@ -80,6 +81,8 @@ public partial class App : Application
     private bool _explorerActivationRefreshPending;
     private IntPtr _lastObservedForegroundWindow;
     private IntPtr _activeDialogQuickSwitchInputWindow;
+    private IntPtr _activeDialogQuickSwitchTextInputWindow;
+    private IntPtr _activeQuickSwitchWindow;
 
     internal static bool IsShuttingDown =>
         Current?.Dispatcher.HasShutdownStarted == true ||
@@ -183,6 +186,8 @@ public partial class App : Application
             _globalTextInputService.ResultShortcutPressed -= OnGlobalResultShortcutPressed;
             _globalTextInputService.ExplorerMenuGesturePressed -= OnExplorerMenuGesturePressed;
             _globalTextInputService.FollowUpHostBackspacePassthrough -= OnFollowUpHostBackspacePassthrough;
+            _globalTextInputThread?.Dispose();
+            _globalTextInputThread = null;
             _globalTextInputService.Dispose();
         }
 
@@ -200,6 +205,8 @@ public partial class App : Application
         }
 
         Interlocked.Exchange(ref _activeDialogQuickSwitchInputWindow, IntPtr.Zero);
+        Interlocked.Exchange(ref _activeDialogQuickSwitchTextInputWindow, IntPtr.Zero);
+        Interlocked.Exchange(ref _activeQuickSwitchWindow, IntPtr.Zero);
 
         if (_taskManagerSearchWindow is not null)
         {
@@ -1155,7 +1162,8 @@ public partial class App : Application
             _globalTextInputService.ExplorerMenuGesturePressed += OnExplorerMenuGesturePressed;
             _globalTextInputService.FollowUpHostBackspacePassthrough += OnFollowUpHostBackspacePassthrough;
             _globalTextInputService.CaptureExplorerMenuInput = true;
-            _globalTextInputService.Start();
+            _globalTextInputThread = new GlobalTextInputThread(_globalTextInputService);
+            _globalTextInputThread.Start();
         }
         catch (Exception exception) when (exception is Win32Exception or InvalidOperationException)
         {
@@ -1171,6 +1179,8 @@ public partial class App : Application
                 _globalTextInputService.ResultShortcutPressed -= OnGlobalResultShortcutPressed;
                 _globalTextInputService.ExplorerMenuGesturePressed -= OnExplorerMenuGesturePressed;
                 _globalTextInputService.FollowUpHostBackspacePassthrough -= OnFollowUpHostBackspacePassthrough;
+                _globalTextInputThread?.Dispose();
+                _globalTextInputThread = null;
                 _globalTextInputService.Dispose();
                 _globalTextInputService = null;
             }
@@ -1192,6 +1202,20 @@ public partial class App : Application
         input.Handled = ShouldConsumeGlobalTextInput(input.Host)
             || _globalTextInputService?.CaptureOverlayInput == true
             || _globalTextInputService?.CaptureFollowUpTextInput == true;
+
+        // Explorer can move focus into its native search edit immediately after
+        // the first printable key, before the dispatcher has shown our overlay.
+        // Arm capture synchronously for subsequent keys while leaving this first
+        // key unhandled, so a fast typing burst cannot lose its second character.
+        if (input.Host == GlobalTextInputHost.Explorer &&
+            input.ForegroundWindow != IntPtr.Zero &&
+            _globalTextInputService is { } textInputService &&
+            !textInputService.IsOverlayOrFollowUpTextCaptureActive)
+        {
+            textInputService.OverlayTextInputWindow = input.ForegroundWindow;
+            textInputService.CaptureFollowUpTextInput = true;
+            textInputService.YieldHostSearchBoxToNativeInput = false;
+        }
 
         var scheduleDrain = false;
         lock (_globalTextInputQueueGate)
@@ -1513,6 +1537,10 @@ public partial class App : Application
             return;
         }
 
+        // Capture the exact result at keypress time. A pending search refresh can
+        // replace SelectedResult before this callback reaches the UI dispatcher.
+        var capturedExplorerResult = _searchPanel?.SelectedResultForHostInput;
+
         Dispatcher.BeginInvoke(new Action(() =>
         {
             var currentPanel = _searchPanel;
@@ -1521,7 +1549,7 @@ public partial class App : Application
                 currentPanel?.IsVisible == true &&
                 currentPanel.IsExplorerTypeSearchActive)
             {
-                currentPanel.ConfirmSelectionFromHostInput();
+                currentPanel.ConfirmSelectionFromHostInput(capturedExplorerResult);
             }
             else if (_explorerNavigationCapture.IsCurrent(capturedSession) &&
                 _lastTaskManagerSearchWindow == capturedSession.ExplorerWindow &&
@@ -1629,6 +1657,16 @@ public partial class App : Application
         if (input.Host == GlobalTextInputHost.Dialog)
         {
             _quickSwitchBar?.TryAppendDialogText(input.Text, input.ForegroundWindow);
+            return;
+        }
+
+        // Once the first Explorer character has requested a shell refresh, every
+        // later character in that burst must wait behind it. Letting a later key
+        // activate from a newly available snapshot reorders the first key to the
+        // end when the original refresh continuation eventually replays it.
+        if (_explorerActivationRefreshPending)
+        {
+            QueueExplorerActivationAfterRefresh(input);
             return;
         }
 
@@ -1746,6 +1784,11 @@ public partial class App : Application
         {
             ActivateOrAppendExplorerTypeSearchFromSnapshot(input);
         }
+
+        if (_searchPanel?.IsExplorerTypeSearchActive != true)
+        {
+            RefreshOverlayInputCapture();
+        }
     }
 
     private void ActivateOrAppendExplorerTypeSearchFromSnapshot(GlobalTextInputEventArgs input) =>
@@ -1839,17 +1882,25 @@ public partial class App : Application
         if (string.IsNullOrWhiteSpace(parentFolder))
         {
             // Fall back to list focus so a subsequent Shell Backspace can work.
-            ArmExplorerFollowUpTyping(explorerWindow);
             Dispatcher.BeginInvoke(
                 DispatcherPriority.Background,
-                new Action(() => RestoreExplorerFolderViewFocus(explorerWindow)));
+                new Action(() =>
+                {
+                    ArmExplorerFollowUpTyping(explorerWindow);
+                    RestoreExplorerFolderViewFocus(explorerWindow);
+                }));
             return;
         }
 
         input.Handled = true;
-        _explorerFollowUpFolderPath = parentFolder;
-        ArmExplorerFollowUpTyping(explorerWindow);
-        _ = NavigateExplorerFollowUpParentAsync(explorerWindow, parentFolder);
+        Dispatcher.BeginInvoke(
+            DispatcherPriority.Input,
+            new Action(() =>
+            {
+                _explorerFollowUpFolderPath = parentFolder;
+                ArmExplorerFollowUpTyping(explorerWindow);
+                _ = NavigateExplorerFollowUpParentAsync(explorerWindow, parentFolder);
+            }));
     }
 
     private string? TryGetExplorerFollowUpParentFolder(IntPtr explorerWindow)
@@ -1992,6 +2043,8 @@ public partial class App : Application
             ? _quickSwitchBar.AnchorWindow
             : IntPtr.Zero;
         Interlocked.Exchange(ref _activeDialogQuickSwitchInputWindow, dialogCommandInputWindow);
+        Interlocked.Exchange(ref _activeDialogQuickSwitchTextInputWindow, dialogTextInputWindow);
+        Interlocked.Exchange(ref _activeQuickSwitchWindow, _quickSwitchBar?.WindowHandle ?? IntPtr.Zero);
         if (_globalTextInputService is not null)
         {
             var taskManagerInputWindow =
@@ -2053,20 +2106,21 @@ public partial class App : Application
         return ShouldHandleDialogQuickSwitchInput(
                 foregroundWindow,
                 dialogInputWindow,
-                _quickSwitchBar?.WindowHandle ?? IntPtr.Zero)
+                Interlocked.CompareExchange(ref _activeQuickSwitchWindow, IntPtr.Zero, IntPtr.Zero))
             ? dialogInputWindow
             : IntPtr.Zero;
     }
 
     private IntPtr TryCaptureDialogTextInput(IntPtr foregroundWindow)
     {
-        var dialogInputWindow = _quickSwitchBar?.IsDialogTextInputCaptureActive == true
-            ? _quickSwitchBar.AnchorWindow
-            : IntPtr.Zero;
+        var dialogInputWindow = Interlocked.CompareExchange(
+            ref _activeDialogQuickSwitchTextInputWindow,
+            IntPtr.Zero,
+            IntPtr.Zero);
         return ShouldHandleDialogQuickSwitchInput(
                 foregroundWindow,
                 dialogInputWindow,
-                _quickSwitchBar?.WindowHandle ?? IntPtr.Zero)
+                Interlocked.CompareExchange(ref _activeQuickSwitchWindow, IntPtr.Zero, IntPtr.Zero))
             ? dialogInputWindow
             : IntPtr.Zero;
     }

@@ -46,6 +46,7 @@ internal static class DesktopWindowActivator
                     0,
                     SetWindowPosNoMove | SetWindowPosNoSize | SetWindowPosShowWindow);
                 _ = SetForegroundWindow(window);
+                TryActivateWithAttachedInput(window);
 
                 if (TryGetSafeNonClientPoint(window, out var activationPoint)
                     && SetCursorPos(activationPoint.X, activationPoint.Y)
@@ -89,6 +90,46 @@ internal static class DesktopWindowActivator
             if (cursorCaptured)
             {
                 _ = SetCursorPos(originalCursor.X, originalCursor.Y);
+            }
+        }
+    }
+
+    private static void TryActivateWithAttachedInput(IntPtr window)
+    {
+        var currentThread = GetCurrentThreadId();
+        var targetThread = GetWindowThreadProcessId(window, out _);
+        var foreground = GetForegroundWindow();
+        var foregroundThread = foreground == IntPtr.Zero
+            ? 0
+            : GetWindowThreadProcessId(foreground, out _);
+        var attachedToForeground = false;
+        var attachedToTarget = false;
+        try
+        {
+            if (foregroundThread != 0 && foregroundThread != currentThread)
+            {
+                attachedToForeground = AttachThreadInput(currentThread, foregroundThread, true);
+            }
+
+            if (targetThread != 0 && targetThread != currentThread && targetThread != foregroundThread)
+            {
+                attachedToTarget = AttachThreadInput(currentThread, targetThread, true);
+            }
+
+            _ = BringWindowToTop(window);
+            _ = SetActiveWindow(window);
+            _ = SetForegroundWindow(window);
+        }
+        finally
+        {
+            if (attachedToTarget)
+            {
+                _ = AttachThreadInput(currentThread, targetThread, false);
+            }
+
+            if (attachedToForeground)
+            {
+                _ = AttachThreadInput(currentThread, foregroundThread, false);
             }
         }
     }
@@ -247,6 +288,23 @@ internal static class DesktopWindowActivator
 
     [DllImport("user32.dll")]
     private static extern IntPtr GetForegroundWindow();
+
+    [DllImport("kernel32.dll")]
+    private static extern uint GetCurrentThreadId();
+
+    [DllImport("user32.dll")]
+    private static extern uint GetWindowThreadProcessId(IntPtr window, out uint processId);
+
+    [DllImport("user32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool AttachThreadInput(uint attachThread, uint attachToThread, bool attach);
+
+    [DllImport("user32.dll")]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool BringWindowToTop(IntPtr window);
+
+    [DllImport("user32.dll")]
+    private static extern IntPtr SetActiveWindow(IntPtr window);
 
     [DllImport("user32.dll")]
     [return: MarshalAs(UnmanagedType.Bool)]

@@ -115,7 +115,7 @@ public sealed class ElevatedIndexerClient : IElevatedIndexerClient, IDisposable
             CreateElevatedProcess,
             IsCurrentProcessElevated,
             null,
-            AppDataPaths.CreateDefault().IndexerTempDirectory,
+            ResolveHelperTempDirectory(helperPath),
             useStickyUacWorker: true)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(helperPath);
@@ -128,7 +128,7 @@ public sealed class ElevatedIndexerClient : IElevatedIndexerClient, IDisposable
             CreateElevatedProcess,
             isProcessElevated,
             null,
-            AppDataPaths.CreateDefault().IndexerTempDirectory,
+            ResolveHelperTempDirectory(helperPath),
             useStickyUacWorker: true)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(helperPath);
@@ -1275,6 +1275,18 @@ public sealed class ElevatedIndexerClient : IElevatedIndexerClient, IDisposable
     private static string ResolveDefaultHelperPath()
     {
         return ResolveDefaultHelperPath(AppContext.BaseDirectory);
+    }
+
+    internal static string ResolveHelperTempDirectory(string helperPath)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(helperPath);
+        var helperDirectory = Path.GetDirectoryName(Path.GetFullPath(helperPath));
+        if (string.IsNullOrWhiteSpace(helperDirectory))
+        {
+            throw new ArgumentException("The elevated indexer helper path has no parent directory.", nameof(helperPath));
+        }
+
+        return AppDataPaths.CreateUnderProgramDirectory(helperDirectory).IndexerTempDirectory;
     }
 
     internal static string ResolveDefaultHelperPath(string baseDirectory)

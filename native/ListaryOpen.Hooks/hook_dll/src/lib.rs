@@ -10,70 +10,35 @@ use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 use windows_sys::Win32::Foundation::{
-    CloseHandle, LocalFree, BOOL, HANDLE, HMODULE, HWND, INVALID_HANDLE_VALUE, LPARAM, LRESULT,
-    TRUE, WPARAM,
+    CloseHandle, LocalFree, HANDLE, HMODULE, HWND, INVALID_HANDLE_VALUE, LPARAM, LRESULT, TRUE,
+    WPARAM,
 };
 use windows_sys::Win32::System::DataExchange::COPYDATASTRUCT;
 use windows_sys::Win32::System::Diagnostics::ToolHelp::{
-    CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W, TH32CS_SNAPPROCESS,
+    CreateToolhelp32Snapshot, Module32FirstW, Module32NextW, Process32FirstW, Process32NextW,
+    MODULEENTRY32W, PROCESSENTRY32W, TH32CS_SNAPMODULE, TH32CS_SNAPMODULE32, TH32CS_SNAPPROCESS,
 };
 use windows_sys::Win32::System::Memory::{
-    VirtualQuery, MEMORY_BASIC_INFORMATION, MEM_COMMIT, PAGE_GUARD, PAGE_NOACCESS,
+    VirtualAllocEx, VirtualFreeEx, VirtualQuery, MEMORY_BASIC_INFORMATION, MEM_COMMIT, MEM_RELEASE,
+    MEM_RESERVE, PAGE_GUARD, PAGE_NOACCESS,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    CallNextHookEx, EnumChildWindows, GetAncestor, GetClassNameW, GetDlgCtrlID,
-    GetWindowTextLengthW, GetWindowTextW, GetWindowThreadProcessId, PostThreadMessageW,
-    SendMessageW, SetWindowsHookExW, UnhookWindowsHookEx, CWPSTRUCT, GA_ROOT, HHOOK,
-    WH_GETMESSAGE, WM_COPYDATA, WM_KEYDOWN, WM_KEYUP, WM_NULL, WM_SETTEXT,
+    CallNextHookEx, GetAncestor, GetClassNameW, GetWindowTextLengthW, GetWindowTextW,
+    GetWindowThreadProcessId, KillTimer, SendMessageW, SetTimer, CWPSTRUCT, GA_ROOT, WM_COPYDATA,
 };
 
-/// Toolbar address-band edit used by modern common file dialogs (Chrome/Firefox/etc.).
-const ADDRESS_BAR_EDIT_CONTROL_ID: i32 = 41477;
-const VK_RETURN_KEY: WPARAM = 0x0D;
 const BFFM_SETSELECTIONW: u32 = 0x0400 + 103;
 const BFFM_GETSELECTIONW: u32 = 0x0400 + 102;
-/// Legacy common-dialog folder query; may be unavailable on Vista+ item dialogs.
-const CDM_GETFOLDERPATH: u32 = 0x0400 + 102;
 const FOLDER_PATH_BUFFER_LEN: usize = 32_768;
 const CLSCTX_INPROC_SERVER: u32 = 0x1;
 const SIGDN_FILESYSPATH: u32 = 0x8005_8000;
 const PAGE_READWRITE: u32 = 0x04;
 const FILE_MAP_READ: u32 = 0x0004;
 const FILE_MAP_WRITE: u32 = 0x0002;
-const CREATE_SUSPENDED: u32 = 0x0000_0004;
 const COINIT_APARTMENTTHREADED: u32 = 0x2;
-const CAPTURE_WORKER_IDLE: u8 = 0;
-const CAPTURE_WORKER_PENDING: u8 = 1;
-const CAPTURE_WORKER_SUCCEEDED: u8 = 2;
-
-#[repr(C)]
-struct SecurityAttributes {
-    length: u32,
-    security_descriptor: *mut c_void,
-    inherit_handle: BOOL,
-}
-
-#[repr(C)]
-struct StartupInfoW {
-    cb: u32,
-    reserved: *mut u16,
-    desktop: *mut u16,
-    title: *mut u16,
-    x: u32,
-    y: u32,
-    x_size: u32,
-    y_size: u32,
-    x_count_chars: u32,
-    y_count_chars: u32,
-    fill_attribute: u32,
-    flags: u32,
-    show_window: u16,
-    reserved2_size: u16,
-    reserved2: *mut u8,
-    std_input: HANDLE,
-    std_output: HANDLE,
-    std_error: HANDLE,
-}
+const RPC_E_CHANGED_MODE: i32 = 0x8001_0106u32 as i32;
+const CREATE_SUSPENDED: u32 = 0x0000_0004;
+const REMOTE_INITIALIZATION_TIMEOUT_MS: u32 = 5_000;
 
 #[repr(C)]
 struct ProcessInformation {
@@ -94,6 +59,31 @@ struct UnicodeString {
     length: u16,
     maximum_length: u16,
     buffer: *const u16,
+}
+
+#[repr(C)]
+struct ProcessBasicInformation {
+    reserved1: *mut c_void,
+    peb_base_address: *mut c_void,
+    reserved2: [*mut c_void; 2],
+    unique_process_id: usize,
+    inherited_from_unique_process_id: usize,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct RemoteFirefoxInitialization {
+    authorization: PreloadAuthorization,
+    host_handle: usize,
+}
+
+#[repr(C)]
+struct LdrDllLoadedNotificationData {
+    flags: u32,
+    full_dll_name: *const UnicodeString,
+    base_dll_name: *const UnicodeString,
+    dll_base: *mut c_void,
+    size_of_image: u32,
 }
 
 #[repr(C)]
@@ -135,6 +125,28 @@ const IID_ISHELL_ITEM: Guid = Guid {
     data3: 0x42EE,
     data4: [0xBC, 0x55, 0xA1, 0xE2, 0x61, 0xC3, 0x7B, 0xFE],
 };
+const CLSID_STD_GLOBAL_INTERFACE_TABLE: Guid = Guid {
+    data1: 0x00000323,
+    data2: 0,
+    data3: 0,
+    data4: [0xC0, 0, 0, 0, 0, 0, 0, 0x46],
+};
+const IID_IGLOBAL_INTERFACE_TABLE: Guid = Guid {
+    data1: 0x00000146,
+    data2: 0,
+    data3: 0,
+    data4: [0xC0, 0, 0, 0, 0, 0, 0, 0x46],
+};
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct SharedDialogCapture {
+    token: u64,
+    generation: u32,
+    process_id: u32,
+    git_cookie: u32,
+    thread_id: u32,
+}
 
 #[link(name = "ole32")]
 extern "system" {
@@ -165,8 +177,8 @@ extern "system" {
 extern "system" {
     fn GetCurrentProcessId() -> u32;
     fn GetCurrentThreadId() -> u32;
-    fn GetProcessIdOfThread(thread: HANDLE) -> u32;
-    fn GetThreadId(thread: HANDLE) -> u32;
+    fn GetEnvironmentVariableW(name: *const u16, value: *mut u16, size: u32) -> u32;
+    fn SetEnvironmentVariableW(name: *const u16, value: *const u16) -> i32;
     fn GetCurrentProcess() -> HANDLE;
     fn GetModuleHandleExW(flags: u32, module_name: *const u16, module: *mut *mut c_void) -> i32;
     fn GetModuleHandleW(module_name: *const u16) -> HMODULE;
@@ -215,11 +227,54 @@ extern "system" {
         path: *mut u16,
         size: *mut u32,
     ) -> i32;
+    fn CreateProcessW(
+        application_name: *const u16,
+        command_line: *mut u16,
+        process_attributes: *const c_void,
+        thread_attributes: *const c_void,
+        inherit_handles: i32,
+        creation_flags: u32,
+        environment: *const c_void,
+        current_directory: *const u16,
+        startup_information: *const c_void,
+        process_information: *mut ProcessInformation,
+    ) -> i32;
+    fn CreateProcessAsUserW(
+        token: HANDLE,
+        application_name: *const u16,
+        command_line: *mut u16,
+        process_attributes: *const c_void,
+        thread_attributes: *const c_void,
+        inherit_handles: i32,
+        creation_flags: u32,
+        environment: *const c_void,
+        current_directory: *const u16,
+        startup_information: *const c_void,
+        process_information: *mut ProcessInformation,
+    ) -> i32;
     fn VirtualProtect(
         address: *mut c_void,
         size: usize,
         protection: u32,
         old_protection: *mut u32,
+    ) -> i32;
+    fn GetProcAddress(module: HMODULE, name: *const u8) -> *mut c_void;
+    fn CreateRemoteThread(
+        process: HANDLE,
+        thread_attributes: *const c_void,
+        stack_size: usize,
+        start_address: *const c_void,
+        parameter: *const c_void,
+        creation_flags: u32,
+        thread_id: *mut u32,
+    ) -> HANDLE;
+    fn GetExitCodeThread(thread: HANDLE, exit_code: *mut u32) -> i32;
+    fn WriteProcessMemory(
+        process: HANDLE,
+        base_address: *mut c_void,
+        buffer: *const c_void,
+        size: usize,
+        written: *mut usize,
     ) -> i32;
 }
 
@@ -238,18 +293,20 @@ static FILE_DIALOGS: OnceLock<Mutex<Vec<(usize, u32)>>> = OnceLock::new();
 static FILE_DIALOG_SHOW_VTABLES: OnceLock<Mutex<Vec<(usize, usize)>>> = OnceLock::new();
 static CAPTURED_DIALOG_CLASSES: AtomicU8 = AtomicU8::new(0);
 static INSTALLING_DIALOG_CAPTURE: AtomicBool = AtomicBool::new(false);
-static CAPTURE_WORKER_STATE: AtomicU8 = AtomicU8::new(CAPTURE_WORKER_IDLE);
 static CAPTURE_SHUTDOWN_REQUESTED: AtomicBool = AtomicBool::new(false);
 static CAPTURE_RESTORE_LOCK: Mutex<()> = Mutex::new(());
 static CAPTURE_LIFECYCLE_STARTED: AtomicBool = AtomicBool::new(false);
 static PRELOAD_ARMED_THREADS: OnceLock<Mutex<Vec<(u32, u32)>>> = OnceLock::new();
+static PENDING_CAPTURE_TIMERS: OnceLock<Mutex<Vec<(u32, u32, usize)>>> = OnceLock::new();
+static SHARED_DIALOG_CAPTURES: OnceLock<Mutex<Vec<u32>>> = OnceLock::new();
 static CAPTURE_LIFECYCLE_LOCK: Mutex<()> = Mutex::new(());
 static ACTIVE_CAPTURED_SHOWS: AtomicUsize = AtomicUsize::new(0);
 static PENDING_CLEANUP_ACK: OnceLock<Mutex<Option<(usize, u64, usize)>>> = OnceLock::new();
 static ACTIVE_PRELOAD_AUTHORIZATION: Mutex<Option<PreloadAuthorization>> = Mutex::new(None);
-static FIREFOX_RESUME_THREAD_PATCHES: Mutex<Vec<(usize, usize)>> = Mutex::new(Vec::new());
+static FIREFOX_SPAWN_API_PATCHES: Mutex<Vec<(usize, usize, usize)>> = Mutex::new(Vec::new());
 static FIREFOX_CO_CREATE_INSTANCE_ORIGINAL: AtomicUsize = AtomicUsize::new(0);
 static FIREFOX_CO_CREATE_INSTANCE_PATCH: Mutex<Option<(usize, usize)>> = Mutex::new(None);
+static FIREFOX_DLL_NOTIFICATION_COOKIE: Mutex<Option<usize>> = Mutex::new(None);
 static SPAWN_PROOF_MAPPINGS: OnceLock<Mutex<Vec<usize>>> = OnceLock::new();
 
 struct ActiveCapturedShow;
@@ -267,15 +324,98 @@ impl Drop for ActiveCapturedShow {
     }
 }
 
+struct ComInitialization {
+    uninitialize: bool,
+}
+
+impl ComInitialization {
+    fn enter() -> Option<Self> {
+        let result = unsafe { CoInitializeEx(std::ptr::null_mut(), COINIT_APARTMENTTHREADED) };
+        if result >= 0 {
+            Some(Self { uninitialize: true })
+        } else if result == RPC_E_CHANGED_MODE {
+            // COM is already initialized in a different apartment model. GIT
+            // still returns a proxy valid for that existing apartment.
+            Some(Self {
+                uninitialize: false,
+            })
+        } else {
+            None
+        }
+    }
+}
+
+impl Drop for ComInitialization {
+    fn drop(&mut self) {
+        if self.uninitialize {
+            unsafe { CoUninitialize() };
+        }
+    }
+}
+
+struct CapturedDialogReference {
+    pointer: *mut c_void,
+    release: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SharedDialogCaptureError {
+    CaptureMissing,
+    PayloadInvalid,
+    AuthorizationMismatch,
+    GlobalTableUnavailable,
+    InterfaceUnavailable,
+}
+
+impl CapturedDialogReference {
+    fn borrowed(pointer: usize) -> Self {
+        Self {
+            pointer: pointer as *mut c_void,
+            release: false,
+        }
+    }
+
+    fn owned(pointer: *mut c_void) -> Self {
+        Self {
+            pointer,
+            release: true,
+        }
+    }
+}
+
+impl Drop for CapturedDialogReference {
+    fn drop(&mut self) {
+        if self.release {
+            unsafe { release_interface(self.pointer) };
+        }
+    }
+}
+
 fn ensure_capture_lifecycle_started(authorization: PreloadAuthorization) -> bool {
+    ensure_capture_lifecycle_started_with_host(authorization, std::ptr::null_mut())
+}
+
+fn ensure_capture_lifecycle_started_with_host(
+    authorization: PreloadAuthorization,
+    provided_host: HANDLE,
+) -> bool {
     if CAPTURE_LIFECYCLE_STARTED.load(Ordering::Acquire) {
+        if !provided_host.is_null() {
+            unsafe { CloseHandle(provided_host) };
+        }
         return active_authorization() == Some(authorization)
             && !CAPTURE_SHUTDOWN_REQUESTED.load(Ordering::Acquire);
     }
     let Ok(_lifecycle_guard) = CAPTURE_LIFECYCLE_LOCK.lock() else {
+        if !provided_host.is_null() {
+            unsafe { CloseHandle(provided_host) };
+        }
         return false;
     };
     if CAPTURE_LIFECYCLE_STARTED.load(Ordering::Acquire) {
+        if !provided_host.is_null() {
+            unsafe { CloseHandle(provided_host) };
+        }
         return active_authorization() == Some(authorization)
             && !CAPTURE_SHUTDOWN_REQUESTED.load(Ordering::Acquire);
     }
@@ -291,11 +431,18 @@ fn ensure_capture_lifecycle_started(authorization: PreloadAuthorization) -> bool
         )
     } == 0
     {
+        if !provided_host.is_null() {
+            unsafe { CloseHandle(provided_host) };
+        }
         return false;
     }
-    let host = spawn_preload_host_handle(authorization).unwrap_or_else(|| unsafe {
-        OpenProcess(PROCESS_SYNCHRONIZE, 0, authorization.host_process_id)
-    });
+    let host = if provided_host.is_null() {
+        spawn_preload_host_handle(authorization).unwrap_or_else(|| unsafe {
+            OpenProcess(PROCESS_SYNCHRONIZE, 0, authorization.host_process_id)
+        })
+    } else {
+        provided_host
+    };
     if host.is_null() {
         unsafe { FreeLibrary(module) };
         return false;
@@ -401,7 +548,7 @@ fn capture_lifecycle_watcher(
                     unsafe { CloseHandle(host) };
                     host = next_host;
                     authorization = next_authorization;
-                    reset_capture_worker_after_cleanup();
+                    reset_capture_state_after_cleanup();
                     if let Ok(mut active) = ACTIVE_PRELOAD_AUTHORIZATION.lock() {
                         *active = Some(next_authorization);
                     }
@@ -415,7 +562,7 @@ fn capture_lifecycle_watcher(
             if let Ok(mut active) = ACTIVE_PRELOAD_AUTHORIZATION.lock() {
                 *active = None;
             }
-            reset_capture_worker_after_cleanup();
+            reset_capture_state_after_cleanup();
             CAPTURE_LIFECYCLE_STARTED.store(false, Ordering::Release);
             CAPTURE_SHUTDOWN_REQUESTED.store(false, Ordering::Release);
             unsafe { FreeLibraryAndExitThread(module, 0) };
@@ -423,27 +570,7 @@ fn capture_lifecycle_watcher(
     }
 }
 
-fn try_begin_capture_worker(state: &AtomicU8) -> bool {
-    state
-        .compare_exchange(
-            CAPTURE_WORKER_IDLE,
-            CAPTURE_WORKER_PENDING,
-            Ordering::AcqRel,
-            Ordering::Acquire,
-        )
-        .is_ok()
-}
-
-fn capture_worker_succeeded(state: &AtomicU8) -> bool {
-    state.load(Ordering::Acquire) == CAPTURE_WORKER_SUCCEEDED
-}
-
-fn reset_capture_worker(state: &AtomicU8) {
-    state.store(CAPTURE_WORKER_IDLE, Ordering::Release);
-}
-
-fn reset_capture_worker_after_cleanup() {
-    reset_capture_worker(&CAPTURE_WORKER_STATE);
+fn reset_capture_state_after_cleanup() {
     if let Some(armed) = PRELOAD_ARMED_THREADS.get() {
         if let Ok(mut armed) = armed.lock() {
             armed.clear();
@@ -471,75 +598,110 @@ fn mark_preload_callback_armed(authorization: PreloadAuthorization) {
     }
 }
 
-fn ensure_direct_dialog_capture_worker_started() -> bool {
-    if capture_worker_succeeded(&CAPTURE_WORKER_STATE) {
+fn schedule_direct_dialog_capture(authorization: PreloadAuthorization) -> bool {
+    if CAPTURE_SHUTDOWN_REQUESTED.load(Ordering::Acquire) || preload_callback_armed(authorization) {
+        return false;
+    }
+    let thread_id = unsafe { GetCurrentThreadId() };
+    let timers = PENDING_CAPTURE_TIMERS.get_or_init(|| Mutex::new(Vec::new()));
+    let Ok(mut timers) = timers.lock() else {
+        return false;
+    };
+    if timers
+        .iter()
+        .any(|timer| timer.0 == authorization.generation && timer.1 == thread_id)
+    {
         return true;
     }
-    if CAPTURE_SHUTDOWN_REQUESTED.load(Ordering::Acquire)
-        || !try_begin_capture_worker(&CAPTURE_WORKER_STATE)
-    {
-        return capture_worker_succeeded(&CAPTURE_WORKER_STATE);
+
+    // SetTimer defers COM activation until normal message dispatch resumes on
+    // this exact UI thread. Calling CoCreateInstance from a hook callback is
+    // re-entrant and creating the objects on a separate STA can patch only a
+    // proxy/apartment-specific vtable instead of the dialog's real vtable.
+    let timer_id = unsafe {
+        SetTimer(
+            std::ptr::null_mut(),
+            0,
+            1,
+            Some(direct_dialog_capture_timer_callback),
+        )
+    };
+    if timer_id == 0 {
+        return false;
     }
 
-    if std::thread::Builder::new()
-        .name("listary-dialog-capture-sta".to_string())
-        .spawn(run_direct_dialog_capture_worker)
-        .is_err()
-    {
-        CAPTURE_WORKER_STATE.store(CAPTURE_WORKER_IDLE, Ordering::Release);
-    }
-    capture_worker_succeeded(&CAPTURE_WORKER_STATE)
+    // Hold the DLL lifecycle open from scheduling until the timer callback
+    // starts. If a blocked target thread never dispatches the timer, leaking
+    // this reference is safer than unloading code still registered with USER32.
+    ACTIVE_CAPTURED_SHOWS.fetch_add(1, Ordering::AcqRel);
+    timers.push((authorization.generation, thread_id, timer_id));
+    true
 }
 
-fn run_direct_dialog_capture_worker() {
-    // This guard prevents the lifecycle thread from unloading the DLL while
-    // this Rust worker is executing code from it.
-    let _active_worker = ActiveCapturedShow::enter();
+unsafe extern "system" fn direct_dialog_capture_timer_callback(
+    _window: HWND,
+    _message: u32,
+    timer_id: usize,
+    _time: u32,
+) {
+    let _active_callback = ActiveCapturedShow::enter();
+    unsafe { KillTimer(std::ptr::null_mut(), timer_id) };
+    let thread_id = unsafe { GetCurrentThreadId() };
+    let generation = PENDING_CAPTURE_TIMERS
+        .get()
+        .and_then(|timers| timers.lock().ok())
+        .and_then(|mut timers| {
+            timers
+                .iter()
+                .position(|timer| timer.1 == thread_id && timer.2 == timer_id)
+                .map(|index| timers.remove(index).0)
+        });
+    let Some(generation) = generation else {
+        return;
+    };
+    ACTIVE_CAPTURED_SHOWS.fetch_sub(1, Ordering::AcqRel);
+
+    let Some(authorization) = active_or_preload_authorization().filter(|authorization| {
+        authorization.generation == generation
+            && !CAPTURE_SHUTDOWN_REQUESTED.load(Ordering::Acquire)
+    }) else {
+        return;
+    };
     let initialized =
         unsafe { CoInitializeEx(std::ptr::null_mut(), COINIT_APARTMENTTHREADED) } >= 0;
-    if !initialized {
-        CAPTURE_WORKER_STATE.store(CAPTURE_WORKER_IDLE, Ordering::Release);
-        return;
+    let installed = initialized && ensure_direct_dialog_capture_installed();
+    if initialized {
+        unsafe { CoUninitialize() };
     }
-
-    while !CAPTURE_SHUTDOWN_REQUESTED.load(Ordering::Acquire) {
-        if ensure_direct_dialog_capture_installed() {
-            CAPTURE_WORKER_STATE.store(CAPTURE_WORKER_SUCCEEDED, Ordering::Release);
-            break;
+    if installed {
+        if current_thread_has_spawn_preload_authorization(authorization) {
+            report_spawn_preload_success(authorization);
+        } else {
+            report_preload_success(authorization);
         }
-        std::thread::sleep(Duration::from_millis(10));
-    }
-    unsafe { CoUninitialize() };
-    if CAPTURE_SHUTDOWN_REQUESTED.load(Ordering::Acquire)
-        && !capture_worker_succeeded(&CAPTURE_WORKER_STATE)
-    {
-        CAPTURE_WORKER_STATE.store(CAPTURE_WORKER_IDLE, Ordering::Release);
+        mark_preload_callback_armed(authorization);
+    } else {
+        let _ = schedule_direct_dialog_capture(authorization);
     }
 }
 
 fn ensure_direct_dialog_capture_installed() -> bool {
     if CAPTURE_SHUTDOWN_REQUESTED.load(Ordering::Acquire)
-        || CAPTURED_DIALOG_CLASSES.load(Ordering::Acquire) == 0b11
         || INSTALLING_DIALOG_CAPTURE.swap(true, Ordering::AcqRel)
     {
-        return CAPTURED_DIALOG_CLASSES.load(Ordering::Acquire) == 0b11;
+        return false;
     }
     if CAPTURE_SHUTDOWN_REQUESTED.load(Ordering::Acquire) {
         INSTALLING_DIALOG_CAPTURE.store(false, Ordering::Release);
         return false;
     }
-    unsafe {
-        install_file_dialog_show_capture(&CLSID_FILE_OPEN_DIALOG, 0b01);
-        install_file_dialog_show_capture(&CLSID_FILE_SAVE_DIALOG, 0b10);
-    }
+    let open_installed = unsafe { install_file_dialog_show_capture(&CLSID_FILE_OPEN_DIALOG, 0b01) };
+    let save_installed = unsafe { install_file_dialog_show_capture(&CLSID_FILE_SAVE_DIALOG, 0b10) };
     INSTALLING_DIALOG_CAPTURE.store(false, Ordering::Release);
-    CAPTURED_DIALOG_CLASSES.load(Ordering::Acquire) == 0b11
+    open_installed && save_installed
 }
 
-unsafe fn install_file_dialog_show_capture(clsid: &Guid, class_bit: u8) {
-    if CAPTURED_DIALOG_CLASSES.load(Ordering::Acquire) & class_bit != 0 {
-        return;
-    }
+unsafe fn install_file_dialog_show_capture(clsid: &Guid, class_bit: u8) -> bool {
     let mut dialog = std::ptr::null_mut();
     if unsafe {
         CoCreateInstance(
@@ -552,28 +714,31 @@ unsafe fn install_file_dialog_show_capture(clsid: &Guid, class_bit: u8) {
     } < 0
         || dialog.is_null()
     {
-        return;
+        return false;
     }
 
-    unsafe { capture_file_dialog_show_vtable(dialog, class_bit) };
+    let installed = unsafe { capture_file_dialog_show_vtable(dialog, class_bit) };
     unsafe { release_interface(dialog) };
+    installed
 }
 
 unsafe fn capture_file_dialog_show_vtable(dialog: *mut c_void, class_bit: u8) -> bool {
     if dialog.is_null() || CAPTURE_SHUTDOWN_REQUESTED.load(Ordering::Acquire) {
         return false;
     }
-    if CAPTURED_DIALOG_CLASSES.load(Ordering::Acquire) & class_bit != 0 {
-        return true;
-    }
     let vtable = unsafe { *(dialog as *const *mut *mut c_void) };
     let show_slot = unsafe { vtable.add(3) } as *mut usize;
     let replacement = captured_file_dialog_show as *const () as usize;
     let current = unsafe { *show_slot };
     let captures = FILE_DIALOG_SHOW_VTABLES.get_or_init(|| Mutex::new(Vec::new()));
+    let mut installed = false;
     if let Ok(mut captures) = captures.lock() {
-        if current == replacement || captures.iter().any(|capture| capture.0 == vtable as usize) {
+        if captures.iter().any(|capture| capture.0 == vtable as usize) {
             CAPTURED_DIALOG_CLASSES.fetch_or(class_bit, Ordering::Release);
+            installed = current == replacement;
+        } else if current == replacement {
+            // A replacement without its original slot cannot be called safely.
+            // Do not claim this apartment is armed if our capture table lacks it.
         } else {
             let mut old_protection = 0u32;
             if unsafe {
@@ -597,10 +762,11 @@ unsafe fn capture_file_dialog_show_vtable(dialog: *mut c_void, class_bit: u8) ->
                         &mut ignored,
                     )
                 };
+                installed = true;
             }
         }
     }
-    CAPTURED_DIALOG_CLASSES.load(Ordering::Acquire) & class_bit != 0
+    installed
 }
 
 unsafe extern "system" fn captured_file_dialog_show(dialog: *mut c_void, owner: HWND) -> i32 {
@@ -614,7 +780,6 @@ unsafe extern "system" fn captured_file_dialog_show(dialog: *mut c_void, owner: 
     if CAPTURE_SHUTDOWN_REQUESTED.load(Ordering::Acquire) {
         return -2_147_467_259; // E_UNEXPECTED
     }
-    mark_spawn_proof_captured_show();
     let vtable = unsafe { *(dialog as *const *const *const c_void) } as usize;
     let original = FILE_DIALOG_SHOW_VTABLES
         .get()
@@ -633,11 +798,201 @@ unsafe extern "system" fn captured_file_dialog_show(dialog: *mut c_void, owner: 
     // the shell implementation is entering its modal state.
     unsafe { add_ref_interface(dialog) };
     remember_file_dialog(dialog);
+    let shared_capture_ready = remember_shared_dialog_capture(dialog);
+    if shared_capture_ready || !current_process_is_firefox_child() {
+        mark_spawn_proof_captured_show();
+    }
     let original: unsafe extern "system" fn(*mut c_void, HWND) -> i32 =
         unsafe { std::mem::transmute(original) };
     let result = unsafe { original(dialog, owner) };
     forget_file_dialog_on_current_thread(dialog);
     result
+}
+
+fn shared_dialog_capture_name() -> String {
+    let architecture = if usize::BITS == 64 { "x64" } else { "x86" };
+    format!("LISTARYOPEN_ACTIVE_DIALOG_{architecture}")
+}
+
+fn encode_shared_dialog_capture(capture: SharedDialogCapture) -> String {
+    format!(
+        "{:016X}:{:08X}:{:08X}:{:08X}:{:08X}",
+        capture.token,
+        capture.generation,
+        capture.process_id,
+        capture.git_cookie,
+        capture.thread_id
+    )
+}
+
+fn decode_shared_dialog_capture(value: &str) -> Option<SharedDialogCapture> {
+    let mut fields = value.split(':');
+    let capture = SharedDialogCapture {
+        token: u64::from_str_radix(fields.next()?, 16).ok()?,
+        generation: u32::from_str_radix(fields.next()?, 16).ok()?,
+        process_id: u32::from_str_radix(fields.next()?, 16).ok()?,
+        git_cookie: u32::from_str_radix(fields.next()?, 16).ok()?,
+        thread_id: u32::from_str_radix(fields.next()?, 16).ok()?,
+    };
+    fields.next().is_none().then_some(capture)
+}
+
+unsafe fn create_global_interface_table() -> Option<*mut c_void> {
+    let mut table = std::ptr::null_mut();
+    let result = unsafe {
+        CoCreateInstance(
+            &CLSID_STD_GLOBAL_INTERFACE_TABLE,
+            std::ptr::null_mut(),
+            CLSCTX_INPROC_SERVER,
+            &IID_IGLOBAL_INTERFACE_TABLE,
+            &mut table,
+        )
+    };
+    (result >= 0 && !table.is_null()).then_some(table)
+}
+
+unsafe fn register_interface_in_global(table: *mut c_void, dialog: *mut c_void) -> Option<u32> {
+    let register: unsafe extern "system" fn(
+        *mut c_void,
+        *mut c_void,
+        *const Guid,
+        *mut u32,
+    ) -> i32 = unsafe { interface_method(table, 3) };
+    let mut cookie = 0u32;
+    (unsafe { register(table, dialog, &IID_IFILE_DIALOG, &mut cookie) } >= 0 && cookie != 0)
+        .then_some(cookie)
+}
+
+unsafe fn revoke_interface_from_global(table: *mut c_void, cookie: u32) -> bool {
+    let revoke: unsafe extern "system" fn(*mut c_void, u32) -> i32 =
+        unsafe { interface_method(table, 4) };
+    (unsafe { revoke(table, cookie) }) >= 0
+}
+
+unsafe fn get_interface_from_global(table: *mut c_void, cookie: u32) -> Option<*mut c_void> {
+    let get: unsafe extern "system" fn(*mut c_void, u32, *const Guid, *mut *mut c_void) -> i32 =
+        unsafe { interface_method(table, 5) };
+    let mut dialog = std::ptr::null_mut();
+    (unsafe { get(table, cookie, &IID_IFILE_DIALOG, &mut dialog) } >= 0 && !dialog.is_null())
+        .then_some(dialog)
+}
+
+fn remember_shared_dialog_capture(dialog: *mut c_void) -> bool {
+    let Some(authorization) = active_or_preload_authorization() else {
+        return false;
+    };
+    let Some(table) = (unsafe { create_global_interface_table() }) else {
+        return false;
+    };
+    let Some(cookie) = (unsafe { register_interface_in_global(table, dialog) }) else {
+        unsafe { release_interface(table) };
+        return false;
+    };
+    let capture = SharedDialogCapture {
+        token: authorization.token,
+        generation: authorization.generation,
+        process_id: unsafe { GetCurrentProcessId() },
+        git_cookie: cookie,
+        thread_id: unsafe { GetCurrentThreadId() },
+    };
+    let variable_name = to_wide_null(&shared_dialog_capture_name());
+    let variable_value = to_wide_null(&encode_shared_dialog_capture(capture));
+    let published =
+        unsafe { SetEnvironmentVariableW(variable_name.as_ptr(), variable_value.as_ptr()) != 0 };
+    let retained = if published {
+        if let Ok(mut captures) = SHARED_DIALOG_CAPTURES
+            .get_or_init(|| Mutex::new(Vec::new()))
+            .lock()
+        {
+            captures.push(cookie);
+            true
+        } else {
+            false
+        }
+    } else {
+        false
+    };
+    if !retained {
+        let _ = unsafe { revoke_interface_from_global(table, cookie) };
+        if published {
+            unsafe { SetEnvironmentVariableW(variable_name.as_ptr(), std::ptr::null()) };
+        }
+    }
+    unsafe { release_interface(table) };
+    retained
+}
+
+fn acquire_shared_dialog_capture() -> Result<CapturedDialogReference, SharedDialogCaptureError> {
+    let variable_name = to_wide_null(&shared_dialog_capture_name());
+    let mut variable_value = [0u16; 256];
+    let length = unsafe {
+        GetEnvironmentVariableW(
+            variable_name.as_ptr(),
+            variable_value.as_mut_ptr(),
+            variable_value.len() as u32,
+        )
+    };
+    if length == 0 {
+        return Err(SharedDialogCaptureError::CaptureMissing);
+    }
+    if length as usize >= variable_value.len() {
+        return Err(SharedDialogCaptureError::PayloadInvalid);
+    }
+    let capture = decode_shared_dialog_capture(&String::from_utf16_lossy(
+        &variable_value[..length as usize],
+    ))
+    .ok_or(SharedDialogCaptureError::PayloadInvalid)?;
+    let authorized = {
+        let authorized = active_authorization()
+            .into_iter()
+            .chain(preload_authorization())
+            .any(|authorization| {
+                capture.token == authorization.token
+                    && capture.generation == authorization.generation
+            });
+        authorized
+            && capture.process_id == unsafe { GetCurrentProcessId() }
+            && capture.git_cookie != 0
+    };
+    if !authorized {
+        return Err(SharedDialogCaptureError::AuthorizationMismatch);
+    }
+    let table = unsafe { create_global_interface_table() }
+        .ok_or(SharedDialogCaptureError::GlobalTableUnavailable)?;
+    let dialog = unsafe { get_interface_from_global(table, capture.git_cookie) };
+    unsafe { release_interface(table) };
+    dialog
+        .map(CapturedDialogReference::owned)
+        .ok_or(SharedDialogCaptureError::InterfaceUnavailable)
+}
+
+fn revoke_shared_dialog_captures() -> bool {
+    if ACTIVE_CAPTURED_SHOWS.load(Ordering::Acquire) != 0 {
+        return false;
+    }
+    let Some(captures) = SHARED_DIALOG_CAPTURES.get() else {
+        return true;
+    };
+    let Ok(mut captures) = captures.lock() else {
+        return false;
+    };
+    if captures.is_empty() {
+        return true;
+    }
+    let _com = ComInitialization::enter();
+    let table = unsafe { create_global_interface_table() };
+    let mut revoked = true;
+    for cookie in captures.drain(..) {
+        if let Some(table) = table {
+            revoked &= unsafe { revoke_interface_from_global(table, cookie) };
+        }
+    }
+    let variable_name = to_wide_null(&shared_dialog_capture_name());
+    unsafe { SetEnvironmentVariableW(variable_name.as_ptr(), std::ptr::null()) };
+    if let Some(table) = table {
+        unsafe { release_interface(table) };
+    }
+    revoked
 }
 
 fn forget_file_dialog_on_current_thread(dialog: *mut c_void) {
@@ -692,6 +1047,7 @@ fn restore_file_dialog_show_captures() -> bool {
     }
     let firefox_plugins_restored =
         restore_firefox_spawn_plugin() && restore_firefox_dialog_factory_plugin();
+    let shared_dialogs_revoked = revoke_shared_dialog_captures();
 
     let replacement = captured_file_dialog_show as *const () as usize;
     let restored = FILE_DIALOG_SHOW_VTABLES
@@ -742,19 +1098,18 @@ fn restore_file_dialog_show_captures() -> bool {
         CAPTURED_DIALOG_CLASSES.store(0, Ordering::Release);
         release_current_thread_dialogs();
     }
-    restored && firefox_plugins_restored
+    restored && firefox_plugins_restored && shared_dialogs_revoked
 }
 
 fn restore_firefox_spawn_plugin() -> bool {
-    let Ok(mut patches) = FIREFOX_RESUME_THREAD_PATCHES.lock() else {
+    let Ok(mut patches) = FIREFOX_SPAWN_API_PATCHES.lock() else {
         return false;
     };
     if patches.is_empty() {
         return true;
     }
-    let replacement = captured_firefox_resume_thread as *const () as usize;
     let mut failed = Vec::new();
-    for (slot, original) in patches.drain(..) {
+    for (slot, original, replacement) in patches.drain(..) {
         let slot_pointer = slot as *mut usize;
         let Some(current) = readable_pointer(slot_pointer as *const c_void) else {
             continue;
@@ -763,7 +1118,7 @@ fn restore_firefox_spawn_plugin() -> bool {
             continue;
         }
         if current != replacement {
-            failed.push((slot, original));
+            failed.push((slot, original, replacement));
             continue;
         }
         let mut old_protection = 0u32;
@@ -776,7 +1131,7 @@ fn restore_firefox_spawn_plugin() -> bool {
             )
         } == 0
         {
-            failed.push((slot, original));
+            failed.push((slot, original, replacement));
             continue;
         }
         unsafe { *slot_pointer = original };
@@ -790,7 +1145,7 @@ fn restore_firefox_spawn_plugin() -> bool {
             )
         } == 0
         {
-            failed.push((slot, original));
+            failed.push((slot, original, replacement));
         }
     }
     *patches = failed;
@@ -803,6 +1158,9 @@ fn restore_firefox_spawn_plugin() -> bool {
 }
 
 fn restore_firefox_dialog_factory_plugin() -> bool {
+    if !unregister_firefox_dll_notification() {
+        return false;
+    }
     let Ok(mut patch) = FIREFOX_CO_CREATE_INSTANCE_PATCH.lock() else {
         return false;
     };
@@ -875,16 +1233,6 @@ fn retain_spawn_proof_mapping(mapping: HANDLE) {
     } else {
         unsafe { CloseHandle(mapping) };
     }
-}
-
-unsafe fn fail_and_retain_spawn_proof(view: *const c_void, mapping: HANDLE) -> bool {
-    if !view.is_null() {
-        let proof = view as *mut SpawnProof;
-        unsafe { std::ptr::write_volatile(&mut (*proof).status, SPAWN_PROOF_FAILED) };
-        unsafe { UnmapViewOfFile(view) };
-    }
-    retain_spawn_proof_mapping(mapping);
-    false
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -960,12 +1308,20 @@ fn find_file_dialog_for_window(hwnd: HWND) -> Option<usize> {
     // also accept a same-root match from another thread (browser hosts).
     let mut found_current_thread = None;
     let mut found_any_thread = None;
+    let mut sole_current_thread_dialog = None;
+    let mut current_thread_dialog_count = 0usize;
     let current_thread_id = unsafe { GetCurrentThreadId() };
     dialogs.retain(|stored| {
         let dialog = stored.0 as *mut c_void;
+        if stored.1 == current_thread_id {
+            current_thread_dialog_count += 1;
+            sole_current_thread_dialog = Some(stored.0);
+        }
         let Some(ole_window) = (unsafe { query_interface(dialog, &IID_IOLE_WINDOW) }) else {
-            unsafe { release_interface(dialog) };
-            return false;
+            // Firefox can transiently reject IOleWindow while its native picker
+            // is already modal. The retained IFileDialog remains valid until
+            // captured Show returns, so keep it as a same-thread candidate.
+            return true;
         };
         let mut dialog_hwnd: HWND = std::ptr::null_mut();
         let get_window: unsafe extern "system" fn(*mut c_void, *mut HWND) -> i32 =
@@ -973,8 +1329,7 @@ fn find_file_dialog_for_window(hwnd: HWND) -> Option<usize> {
         let result = unsafe { get_window(ole_window, &mut dialog_hwnd) };
         unsafe { release_interface(ole_window) };
         if result < 0 || dialog_hwnd.is_null() {
-            unsafe { release_interface(dialog) };
-            false
+            true
         } else {
             if dialog_window_matches(dialog_hwnd, hwnd) {
                 if stored.1 == current_thread_id {
@@ -986,7 +1341,11 @@ fn find_file_dialog_for_window(hwnd: HWND) -> Option<usize> {
             true
         }
     });
-    found_current_thread.or(found_any_thread)
+    found_current_thread.or(found_any_thread).or_else(|| {
+        (current_thread_dialog_count == 1)
+            .then_some(sole_current_thread_dialog)
+            .flatten()
+    })
 }
 
 fn dialog_window_matches(dialog_hwnd: HWND, target_hwnd: HWND) -> bool {
@@ -1057,7 +1416,7 @@ pub unsafe extern "system" fn ListaryOpenHookProc(
         if let Some(authorization) = active_or_preload_authorization() {
             if ensure_capture_lifecycle_started(authorization) {
                 if !current_process_is_firefox_child() {
-                    let _ = ensure_direct_dialog_capture_worker_started();
+                    let _ = schedule_direct_dialog_capture(authorization);
                 }
             }
         }
@@ -1359,87 +1718,114 @@ fn ensure_firefox_spawn_plugin_installed(authorization: PreloadAuthorization) ->
     {
         return false;
     }
-    let Ok(mut patches) = FIREFOX_RESUME_THREAD_PATCHES.lock() else {
+    let Ok(mut patches) = FIREFOX_SPAWN_API_PATCHES.lock() else {
         return false;
     };
-    let replacement = captured_firefox_resume_thread as *const () as usize;
-    let mut required_module_mask = 0u8;
-    let mut patched_module_mask = 0u8;
-    for (index, (module, required)) in modules.into_iter().enumerate() {
-        if required {
-            required_module_mask |= 1 << index;
-        }
+    let targets = [
+        (
+            "CreateProcessW",
+            captured_firefox_create_process as *const () as usize,
+            true,
+        ),
+        (
+            "CreateProcessAsUserW",
+            captured_firefox_create_process_as_user as *const () as usize,
+            true,
+        ),
+    ];
+    let mut creation_api_patched = false;
+    for (module, _) in modules {
         if module.is_null() {
             continue;
         }
-        let Some(slot) = (unsafe { find_import_address_slot(module, "ResumeThread") }) else {
-            if required {
-                return false;
+        for (import_name, replacement, creation_api) in targets {
+            let Some(slot) = (unsafe { find_import_address_slot(module, import_name) }) else {
+                continue;
+            };
+            match unsafe { patch_firefox_spawn_api_slot(slot, replacement, &mut patches) } {
+                Ok(()) => creation_api_patched |= creation_api,
+                Err(()) => {
+                    // A discovered import must remain ours for the entire
+                    // authorized session; silently losing it would make the
+                    // before-resume proof untrustworthy.
+                    return false;
+                }
             }
-            continue;
-        };
-        if patches
-            .iter()
-            .any(|(existing, _)| *existing == slot as usize)
-        {
-            if unsafe { *slot } != replacement {
-                return false;
-            }
-            patched_module_mask |= 1 << index;
-            continue;
         }
-        let original = unsafe { *slot };
-        if original == 0 || original == replacement {
-            return false;
-        }
-        let mut old_protection = 0u32;
-        if unsafe {
-            VirtualProtect(
-                slot.cast(),
-                std::mem::size_of::<usize>(),
-                PAGE_READWRITE,
-                &mut old_protection,
-            )
-        } == 0
-        {
-            break;
-        }
-        unsafe { *slot = replacement };
-        let mut ignored = 0u32;
-        if unsafe {
-            VirtualProtect(
-                slot.cast(),
-                std::mem::size_of::<usize>(),
-                old_protection,
-                &mut ignored,
-            )
-        } == 0
-        {
-            unsafe { *slot = original };
-            return false;
-        }
-        patches.push((slot as usize, original));
-        patched_module_mask |= 1 << index;
     }
-    patched_module_mask & required_module_mask == required_module_mask
-        && active_authorization() == Some(authorization)
+    creation_api_patched && active_authorization() == Some(authorization)
+}
+
+unsafe fn patch_firefox_spawn_api_slot(
+    slot: *mut usize,
+    replacement: usize,
+    patches: &mut Vec<(usize, usize, usize)>,
+) -> Result<(), ()> {
+    if let Some((_, original, existing_replacement)) = patches
+        .iter()
+        .find(|(existing, _, _)| *existing == slot as usize)
+    {
+        return if *existing_replacement == replacement && unsafe { *slot } == replacement {
+            Ok(())
+        } else {
+            let _ = original;
+            Err(())
+        };
+    }
+    let original = unsafe { *slot };
+    if original == 0 || original == replacement {
+        return Err(());
+    }
+    let mut old_protection = 0u32;
+    if unsafe {
+        VirtualProtect(
+            slot.cast(),
+            std::mem::size_of::<usize>(),
+            PAGE_READWRITE,
+            &mut old_protection,
+        )
+    } == 0
+    {
+        return Err(());
+    }
+    unsafe { *slot = replacement };
+    let mut ignored = 0u32;
+    if unsafe {
+        VirtualProtect(
+            slot.cast(),
+            std::mem::size_of::<usize>(),
+            old_protection,
+            &mut ignored,
+        )
+    } == 0
+    {
+        unsafe { *slot = original };
+        return Err(());
+    }
+    patches.push((slot as usize, original, replacement));
+    Ok(())
 }
 
 fn ensure_firefox_dialog_factory_plugin_installed(authorization: PreloadAuthorization) -> bool {
-    if !current_process_is_firefox_child()
-        || !current_thread_has_spawn_preload_authorization(authorization)
-    {
+    if !current_process_is_firefox_file_dialog_utility() {
         return false;
     }
+    let xul = unsafe { GetModuleHandleW(to_wide_null("xul.dll").as_ptr()) };
+    if xul.is_null() {
+        return false;
+    }
+    install_firefox_dialog_factory_plugin(xul, authorization)
+}
+
+fn install_firefox_dialog_factory_plugin(
+    xul: HMODULE,
+    authorization: PreloadAuthorization,
+) -> bool {
     let Ok(mut patch) = FIREFOX_CO_CREATE_INSTANCE_PATCH.lock() else {
         return false;
     };
     if patch.is_some() && FIREFOX_CO_CREATE_INSTANCE_ORIGINAL.load(Ordering::Acquire) != 0 {
         return true;
-    }
-    let xul = unsafe { GetModuleHandleW(to_wide_null("xul.dll").as_ptr()) };
-    if xul.is_null() {
-        return false;
     }
     let Some(slot) = (unsafe { find_import_address_slot(xul, "CoCreateInstance") }) else {
         return false;
@@ -1478,6 +1864,101 @@ fn ensure_firefox_dialog_factory_plugin_installed(authorization: PreloadAuthoriz
     }
     *patch = Some((slot as usize, original));
     active_authorization() == Some(authorization)
+}
+
+unsafe extern "system" fn firefox_dll_notification(
+    reason: u32,
+    data: *const c_void,
+    _context: *mut c_void,
+) {
+    const LDR_DLL_NOTIFICATION_REASON_LOADED: u32 = 1;
+    if reason != LDR_DLL_NOTIFICATION_REASON_LOADED || data.is_null() {
+        return;
+    }
+    let loaded = unsafe { &*(data as *const LdrDllLoadedNotificationData) };
+    if loaded.base_dll_name.is_null() || loaded.dll_base.is_null() {
+        return;
+    }
+    let name = unsafe { &*loaded.base_dll_name };
+    if name.buffer.is_null() || name.length == 0 {
+        return;
+    }
+    let units = unsafe { std::slice::from_raw_parts(name.buffer, usize::from(name.length) / 2) };
+    if !String::from_utf16_lossy(units).eq_ignore_ascii_case("xul.dll") {
+        return;
+    }
+    if let Some(authorization) = active_authorization() {
+        let _ = install_firefox_dialog_factory_plugin(loaded.dll_base as HMODULE, authorization);
+    }
+}
+
+unsafe fn register_dll_notification(cookie: *mut *mut c_void) -> i32 {
+    type Callback = unsafe extern "system" fn(u32, *const c_void, *mut c_void);
+    type Register =
+        unsafe extern "system" fn(u32, Option<Callback>, *mut c_void, *mut *mut c_void) -> i32;
+    let ntdll = unsafe { GetModuleHandleW(to_wide_null("ntdll.dll").as_ptr()) };
+    if ntdll.is_null() {
+        return -1;
+    }
+    let address = unsafe { GetProcAddress(ntdll, b"LdrRegisterDllNotification\0".as_ptr()) };
+    if address.is_null() {
+        return -1;
+    }
+    let register: Register = unsafe { std::mem::transmute(address) };
+    unsafe {
+        register(
+            0,
+            Some(firefox_dll_notification),
+            std::ptr::null_mut(),
+            cookie,
+        )
+    }
+}
+
+unsafe fn unregister_dll_notification(cookie: *mut c_void) -> i32 {
+    type Unregister = unsafe extern "system" fn(*mut c_void) -> i32;
+    let ntdll = unsafe { GetModuleHandleW(to_wide_null("ntdll.dll").as_ptr()) };
+    if ntdll.is_null() {
+        return -1;
+    }
+    let address = unsafe { GetProcAddress(ntdll, b"LdrUnregisterDllNotification\0".as_ptr()) };
+    if address.is_null() {
+        return -1;
+    }
+    let unregister: Unregister = unsafe { std::mem::transmute(address) };
+    unsafe { unregister(cookie) }
+}
+
+fn ensure_firefox_dll_notification_registered(authorization: PreloadAuthorization) -> bool {
+    let Ok(mut registered) = FIREFOX_DLL_NOTIFICATION_COOKIE.lock() else {
+        return false;
+    };
+    if registered.is_some() {
+        return active_authorization() == Some(authorization);
+    }
+    let mut cookie = std::ptr::null_mut();
+    if unsafe { register_dll_notification(&mut cookie) } < 0 || cookie.is_null() {
+        return false;
+    }
+    *registered = Some(cookie as usize);
+    drop(registered);
+
+    let xul = unsafe { GetModuleHandleW(to_wide_null("xul.dll").as_ptr()) };
+    xul.is_null() || install_firefox_dialog_factory_plugin(xul, authorization)
+}
+
+fn unregister_firefox_dll_notification() -> bool {
+    let Ok(mut registered) = FIREFOX_DLL_NOTIFICATION_COOKIE.lock() else {
+        return false;
+    };
+    let Some(cookie) = registered.take() else {
+        return true;
+    };
+    if unsafe { unregister_dll_notification(cookie as *mut c_void) } < 0 {
+        *registered = Some(cookie);
+        return false;
+    }
+    true
 }
 
 unsafe extern "system" fn captured_co_create_instance(
@@ -1527,6 +2008,17 @@ fn current_process_is_firefox() -> bool {
 
 fn current_process_is_firefox_child() -> bool {
     current_process_is_firefox() && current_firefox_parent_process_id().is_some()
+}
+
+fn current_process_is_firefox_file_dialog_utility() -> bool {
+    if !current_process_is_firefox() {
+        return false;
+    }
+    let arguments = process_command_line_arguments(unsafe { GetCurrentProcess() });
+    let Some(parent_process_id) = firefox_parent_process_id(&arguments) else {
+        return false;
+    };
+    is_firefox_file_dialog_spawn("", &arguments, parent_process_id)
 }
 
 fn current_firefox_parent_process_id() -> Option<u32> {
@@ -1700,19 +2192,24 @@ fn is_firefox_file_dialog_spawn(
                 .then_some(pair[1].as_str())
         })
     };
-    executable
-        .rsplit(['\\', '/'])
-        .next()
-        .is_some_and(|name| name.eq_ignore_ascii_case("firefox.exe"))
+    firefox_executable_matches(executable)
         && arguments
             .iter()
             .any(|value| value.eq_ignore_ascii_case("-contentproc"))
-        && value_after("-sandboxingKind") == Some("4")
         && value_after("-parentPid").and_then(|value| value.parse::<u32>().ok())
             == Some(parent_process_id)
         && arguments
             .iter()
             .any(|value| value.eq_ignore_ascii_case("utility"))
+}
+
+fn firefox_executable_matches(executable: &str) -> bool {
+    executable
+        .trim()
+        .trim_matches('"')
+        .rsplit(['\\', '/'])
+        .next()
+        .is_some_and(|name| name.eq_ignore_ascii_case("firefox.exe"))
 }
 
 unsafe fn command_line_arguments(command_line: *const u16) -> Vec<String> {
@@ -1731,51 +2228,128 @@ unsafe fn command_line_arguments(command_line: *const u16) -> Vec<String> {
     arguments
 }
 
-unsafe extern "system" fn captured_firefox_resume_thread(thread: HANDLE) -> u32 {
-    let _active_spawn_callback = ActiveCapturedShow::enter();
-    let process_id = unsafe { GetProcessIdOfThread(thread) };
-    let thread_id = unsafe { GetThreadId(thread) };
-    const PROCESS_DUP_HANDLE: u32 = 0x0040;
-    const PROCESS_QUERY_LIMITED_INFORMATION: u32 = 0x1000;
-    let process = unsafe {
-        OpenProcess(
-            PROCESS_DUP_HANDLE | PROCESS_QUERY_LIMITED_INFORMATION,
-            0,
-            process_id,
-        )
-    };
-    if process.is_null() || process_id == 0 || thread_id == 0 {
-        if !process.is_null() {
-            unsafe { CloseHandle(process) };
-        }
-        return unsafe { ResumeThread(thread) };
-    }
-    let information = ProcessInformation {
-        process,
-        thread,
-        process_id,
-        thread_id,
-    };
-    let parent_process_id = unsafe { GetCurrentProcessId() };
-    if spawned_child_identity_matches(&information, parent_process_id)
-        && active_or_preload_authorization().is_some_and(|authorization| unsafe {
-            prepare_spawned_firefox_utility(&information, authorization)
-        })
-    {
-        // The hook and proof are installed while Firefox still owns the
-        // original suspend count. Its ResumeThread call remains authoritative.
-    }
-    unsafe { CloseHandle(process) };
-    unsafe { ResumeThread(thread) }
+fn firefox_file_dialog_creation_requested(
+    application_name: *const u16,
+    command_line: *const u16,
+) -> bool {
+    let application_name = unsafe { read_utf16_z(application_name, 32_768) };
+    let arguments = unsafe { command_line_arguments(command_line) };
+    is_firefox_file_dialog_spawn(&application_name, &arguments, unsafe {
+        GetCurrentProcessId()
+    })
 }
 
-fn process_image_path(process: HANDLE) -> String {
-    let mut path = [0u16; 32_768];
-    let mut length = path.len() as u32;
-    if unsafe { QueryFullProcessImageNameW(process, 0, path.as_mut_ptr(), &mut length) } == 0 {
-        return String::new();
+fn firefox_precapture_creation_flags(creation_flags: u32, precapture: bool) -> (u32, bool) {
+    if !precapture {
+        return (creation_flags, false);
     }
-    String::from_utf16_lossy(&path[..length as usize])
+    (
+        creation_flags | CREATE_SUSPENDED,
+        creation_flags & CREATE_SUSPENDED == 0,
+    )
+}
+
+unsafe fn prepare_created_firefox_utility(
+    process_information: *mut ProcessInformation,
+    authorization: PreloadAuthorization,
+) {
+    if process_information.is_null() {
+        return;
+    }
+    let information = unsafe { &*process_information };
+    let parent_process_id = unsafe { GetCurrentProcessId() };
+    let arguments = process_command_line_arguments(information.process);
+    if spawned_child_identity_matches(information, parent_process_id)
+        && is_firefox_file_dialog_spawn("", &arguments, parent_process_id)
+    {
+        let _ = unsafe { prepare_spawned_firefox_utility(information, authorization) };
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+unsafe extern "system" fn captured_firefox_create_process(
+    application_name: *const u16,
+    command_line: *mut u16,
+    process_attributes: *const c_void,
+    thread_attributes: *const c_void,
+    inherit_handles: i32,
+    creation_flags: u32,
+    environment: *const c_void,
+    current_directory: *const u16,
+    startup_information: *const c_void,
+    process_information: *mut ProcessInformation,
+) -> i32 {
+    let _active_spawn_callback = ActiveCapturedShow::enter();
+    let authorization = active_or_preload_authorization();
+    let precapture = authorization.is_some()
+        && firefox_file_dialog_creation_requested(application_name, command_line);
+    let (effective_flags, added_suspension) =
+        firefox_precapture_creation_flags(creation_flags, precapture);
+    let result = unsafe {
+        CreateProcessW(
+            application_name,
+            command_line,
+            process_attributes,
+            thread_attributes,
+            inherit_handles,
+            effective_flags,
+            environment,
+            current_directory,
+            startup_information,
+            process_information,
+        )
+    };
+    if result != 0 && precapture {
+        unsafe { prepare_created_firefox_utility(process_information, authorization.unwrap()) };
+        if added_suspension && !process_information.is_null() {
+            unsafe { ResumeThread((*process_information).thread) };
+        }
+    }
+    result
+}
+
+#[allow(clippy::too_many_arguments)]
+unsafe extern "system" fn captured_firefox_create_process_as_user(
+    token: HANDLE,
+    application_name: *const u16,
+    command_line: *mut u16,
+    process_attributes: *const c_void,
+    thread_attributes: *const c_void,
+    inherit_handles: i32,
+    creation_flags: u32,
+    environment: *const c_void,
+    current_directory: *const u16,
+    startup_information: *const c_void,
+    process_information: *mut ProcessInformation,
+) -> i32 {
+    let _active_spawn_callback = ActiveCapturedShow::enter();
+    let authorization = active_or_preload_authorization();
+    let precapture = authorization.is_some()
+        && firefox_file_dialog_creation_requested(application_name, command_line);
+    let (effective_flags, added_suspension) =
+        firefox_precapture_creation_flags(creation_flags, precapture);
+    let result = unsafe {
+        CreateProcessAsUserW(
+            token,
+            application_name,
+            command_line,
+            process_attributes,
+            thread_attributes,
+            inherit_handles,
+            effective_flags,
+            environment,
+            current_directory,
+            startup_information,
+            process_information,
+        )
+    };
+    if result != 0 && precapture {
+        unsafe { prepare_created_firefox_utility(process_information, authorization.unwrap()) };
+        if added_suspension && !process_information.is_null() {
+            unsafe { ResumeThread((*process_information).thread) };
+        }
+    }
+    result
 }
 
 fn process_command_line_arguments(process: HANDLE) -> Vec<String> {
@@ -1848,23 +2422,492 @@ fn spawned_child_identity_matches(
         return false;
     }
 
-    let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) };
-    if snapshot == INVALID_HANDLE_VALUE {
+    let mut basic: ProcessBasicInformation = unsafe { std::mem::zeroed() };
+    let mut returned = 0u32;
+    (unsafe {
+        NtQueryInformationProcess(
+            information.process,
+            0,
+            (&mut basic as *mut ProcessBasicInformation).cast(),
+            std::mem::size_of::<ProcessBasicInformation>() as u32,
+            &mut returned,
+        )
+    }) >= 0
+        && basic.unique_process_id == information.process_id as usize
+        && basic.inherited_from_unique_process_id == expected_parent_process_id as usize
+}
+
+fn module_name(units: &[u16]) -> String {
+    let length = units
+        .iter()
+        .position(|unit| *unit == 0)
+        .unwrap_or(units.len());
+    String::from_utf16_lossy(&units[..length])
+}
+
+fn find_remote_module_base(process_id: u32, expected_name: &str) -> Option<usize> {
+    for _ in 0..8 {
+        let snapshot = unsafe {
+            CreateToolhelp32Snapshot(TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32, process_id)
+        };
+        if snapshot == INVALID_HANDLE_VALUE {
+            std::thread::yield_now();
+            continue;
+        }
+        let mut module: MODULEENTRY32W = unsafe { std::mem::zeroed() };
+        module.dwSize = std::mem::size_of::<MODULEENTRY32W>() as u32;
+        let mut has_module = unsafe { Module32FirstW(snapshot, &mut module) } != 0;
+        while has_module {
+            if module_name(&module.szModule).eq_ignore_ascii_case(expected_name) {
+                let base = module.modBaseAddr as usize;
+                unsafe { CloseHandle(snapshot) };
+                return Some(base);
+            }
+            has_module = unsafe { Module32NextW(snapshot, &mut module) } != 0;
+        }
+        unsafe { CloseHandle(snapshot) };
+        std::thread::yield_now();
+    }
+    None
+}
+
+fn find_remote_module_base_by_path(process_id: u32, expected_path: &str) -> Option<usize> {
+    for _ in 0..8 {
+        let snapshot = unsafe {
+            CreateToolhelp32Snapshot(TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32, process_id)
+        };
+        if snapshot == INVALID_HANDLE_VALUE {
+            std::thread::yield_now();
+            continue;
+        }
+        let mut module: MODULEENTRY32W = unsafe { std::mem::zeroed() };
+        module.dwSize = std::mem::size_of::<MODULEENTRY32W>() as u32;
+        let mut has_module = unsafe { Module32FirstW(snapshot, &mut module) } != 0;
+        while has_module {
+            let loaded_path = module_name(&module.szExePath);
+            if folder_paths_match(&loaded_path, expected_path) {
+                let base = module.modBaseAddr as usize;
+                unsafe { CloseHandle(snapshot) };
+                return Some(base);
+            }
+            has_module = unsafe { Module32NextW(snapshot, &mut module) } != 0;
+        }
+        unsafe { CloseHandle(snapshot) };
+        std::thread::yield_now();
+    }
+    None
+}
+
+fn adjacent_hook_runtime_path(hook_path: &str) -> Option<String> {
+    let parent = std::path::Path::new(hook_path).parent()?;
+    Some(parent.join("libunwind.dll").to_string_lossy().into_owned())
+}
+
+fn local_module_and_path(address: *const c_void) -> Option<(HMODULE, String)> {
+    const FROM_ADDRESS: u32 = 0x0000_0004;
+    let mut module = std::ptr::null_mut();
+    if unsafe { GetModuleHandleExW(FROM_ADDRESS, address.cast(), &mut module) } == 0 {
+        return None;
+    }
+    let mut path = [0u16; 32_768];
+    let length = unsafe { GetModuleFileNameW(module, path.as_mut_ptr(), path.len() as u32) };
+    if length == 0 || length as usize >= path.len() {
+        unsafe { FreeLibrary(module) };
+        return None;
+    }
+    Some((module, String::from_utf16_lossy(&path[..length as usize])))
+}
+
+fn remote_function_address(process_id: u32, function: *const c_void) -> Option<*const c_void> {
+    let (local_module, module_path) = local_module_and_path(function)?;
+    let module_name = module_path.rsplit(['\\', '/']).next()?.to_string();
+    let offset = (function as usize).checked_sub(local_module as usize)?;
+    unsafe { FreeLibrary(local_module) };
+    let remote_module = find_remote_module_base(process_id, &module_name)?;
+    Some((remote_module + offset) as *const c_void)
+}
+
+unsafe fn write_remote_value<T>(process: HANDLE, value: &T) -> Option<*mut c_void> {
+    let size = std::mem::size_of::<T>();
+    let remote = unsafe {
+        VirtualAllocEx(
+            process,
+            std::ptr::null(),
+            size,
+            MEM_COMMIT | MEM_RESERVE,
+            PAGE_READWRITE,
+        )
+    };
+    if remote.is_null() {
+        return None;
+    }
+    let mut written = 0usize;
+    if unsafe {
+        WriteProcessMemory(
+            process,
+            remote,
+            (value as *const T).cast(),
+            size,
+            &mut written,
+        )
+    } == 0
+        || written != size
+    {
+        unsafe { VirtualFreeEx(process, remote, 0, MEM_RELEASE) };
+        return None;
+    }
+    Some(remote)
+}
+
+unsafe fn write_remote_slice<T>(process: HANDLE, values: &[T]) -> Option<*mut c_void> {
+    let size = std::mem::size_of_val(values);
+    if size == 0 {
+        return None;
+    }
+    let remote = unsafe {
+        VirtualAllocEx(
+            process,
+            std::ptr::null(),
+            size,
+            MEM_COMMIT | MEM_RESERVE,
+            PAGE_READWRITE,
+        )
+    };
+    if remote.is_null() {
+        return None;
+    }
+    let mut written = 0usize;
+    if unsafe { WriteProcessMemory(process, remote, values.as_ptr().cast(), size, &mut written) }
+        == 0
+        || written != size
+    {
+        unsafe { VirtualFreeEx(process, remote, 0, MEM_RELEASE) };
+        return None;
+    }
+    Some(remote)
+}
+
+unsafe fn run_remote_thread(
+    process: HANDLE,
+    start_address: *const c_void,
+    parameter: *const c_void,
+) -> Option<u32> {
+    let thread = unsafe {
+        CreateRemoteThread(
+            process,
+            std::ptr::null(),
+            0,
+            start_address,
+            parameter,
+            0,
+            std::ptr::null_mut(),
+        )
+    };
+    if thread.is_null() {
+        return None;
+    }
+    const WAIT_OBJECT_0: u32 = 0;
+    let completed =
+        unsafe { WaitForSingleObject(thread, REMOTE_INITIALIZATION_TIMEOUT_MS) } == WAIT_OBJECT_0;
+    let mut exit_code = 0u32;
+    let read_exit = completed && unsafe { GetExitCodeThread(thread, &mut exit_code) } != 0;
+    unsafe { CloseHandle(thread) };
+    read_exit.then_some(exit_code)
+}
+
+unsafe fn duplicate_host_handle_into_child(
+    child_process: HANDLE,
+    authorization: PreloadAuthorization,
+) -> Option<HANDLE> {
+    const PROCESS_SYNCHRONIZE: u32 = 0x0010_0000;
+    let host = unsafe { OpenProcess(PROCESS_SYNCHRONIZE, 0, authorization.host_process_id) };
+    if host.is_null() {
+        return None;
+    }
+    let mut child_host = std::ptr::null_mut();
+    let duplicated = unsafe {
+        DuplicateHandle(
+            GetCurrentProcess(),
+            host,
+            child_process,
+            &mut child_host,
+            PROCESS_SYNCHRONIZE,
+            0,
+            0,
+        )
+    } != 0;
+    unsafe { CloseHandle(host) };
+    duplicated.then_some(child_host)
+}
+
+unsafe fn close_remote_handle(process: HANDLE, remote_handle: HANDLE) {
+    if remote_handle.is_null() {
+        return;
+    }
+    const DUPLICATE_CLOSE_SOURCE: u32 = 0x0000_0001;
+    const DUPLICATE_SAME_ACCESS: u32 = 0x0000_0002;
+    let mut local_handle = std::ptr::null_mut();
+    if unsafe {
+        DuplicateHandle(
+            process,
+            remote_handle,
+            GetCurrentProcess(),
+            &mut local_handle,
+            0,
+            0,
+            DUPLICATE_CLOSE_SOURCE | DUPLICATE_SAME_ACCESS,
+        )
+    } != 0
+        && !local_handle.is_null()
+    {
+        unsafe { CloseHandle(local_handle) };
+    }
+}
+
+unsafe fn unload_remote_module(process: HANDLE, process_id: u32, module: usize) {
+    let kernel32 = unsafe { GetModuleHandleW(to_wide_null("kernel32.dll").as_ptr()) };
+    if kernel32.is_null() {
+        return;
+    }
+    let free_library = unsafe { GetProcAddress(kernel32, b"FreeLibrary\0".as_ptr()) };
+    if free_library.is_null() {
+        return;
+    }
+    let remote_free_library =
+        remote_function_address(process_id, free_library).unwrap_or(free_library);
+    let _ = unsafe { run_remote_thread(process, remote_free_library, module as *const c_void) };
+}
+
+unsafe fn load_remote_library(
+    process: HANDLE,
+    remote_load_library: *const c_void,
+    path: &str,
+) -> bool {
+    let wide_path = to_wide_null(path);
+    let Some(remote_path) = (unsafe { write_remote_slice(process, &wide_path) }) else {
+        return false;
+    };
+    let result = unsafe { run_remote_thread(process, remote_load_library, remote_path) };
+    unsafe { VirtualFreeEx(process, remote_path, 0, MEM_RELEASE) };
+    result.is_some_and(|module| module != 0)
+}
+
+unsafe fn inject_firefox_utility_before_resume(
+    information: &ProcessInformation,
+    authorization: PreloadAuthorization,
+) -> bool {
+    let (hook_module, hook_path) = match local_module_and_path(
+        ListaryOpenInitializeFirefoxUtility as *const () as *const c_void,
+    ) {
+        Some(module) => module,
+        None => return false,
+    };
+    let hook_name = match hook_path.rsplit(['\\', '/']).next() {
+        Some(name) => name.to_string(),
+        None => {
+            unsafe { FreeLibrary(hook_module) };
+            return false;
+        }
+    };
+    let runtime_path = match adjacent_hook_runtime_path(&hook_path) {
+        Some(path) => path,
+        None => {
+            unsafe { FreeLibrary(hook_module) };
+            return false;
+        }
+    };
+    let runtime_name = match runtime_path.rsplit(['\\', '/']).next() {
+        Some(name) => name.to_string(),
+        None => {
+            unsafe { FreeLibrary(hook_module) };
+            return false;
+        }
+    };
+
+    let kernel32 = unsafe { GetModuleHandleW(to_wide_null("kernel32.dll").as_ptr()) };
+    let load_library = if kernel32.is_null() {
+        std::ptr::null_mut()
+    } else {
+        unsafe { GetProcAddress(kernel32, b"LoadLibraryW\0".as_ptr()) }
+    };
+    let remote_load_library = (!load_library.is_null()).then(|| {
+        remote_function_address(information.process_id, load_library)
+            // Windows maps the shared system DLL image at one session-wide
+            // address for same-architecture processes. A just-created,
+            // suspended process can precede Toolhelp's module-list snapshot,
+            // so the already resolved shared address is the safe bootstrap.
+            .unwrap_or(load_library)
+    });
+    let Some(remote_load_library) = remote_load_library else {
+        unsafe { FreeLibrary(hook_module) };
+        return false;
+    };
+
+    // A newly-created Firefox utility process does not use the Hook.dll
+    // directory when resolving imports for a remote LoadLibraryW call. Load the
+    // adjacent packaged runtime by its full path first so Hook.dll cannot bind
+    // to a developer-toolchain copy found through PATH (or fail on a clean PC).
+    if !unsafe { load_remote_library(information.process, remote_load_library, &runtime_path) } {
+        unsafe { FreeLibrary(hook_module) };
         return false;
     }
-    let mut entry: PROCESSENTRY32W = unsafe { std::mem::zeroed() };
-    entry.dwSize = std::mem::size_of::<PROCESSENTRY32W>() as u32;
-    let mut found = false;
-    let mut has_process = unsafe { Process32FirstW(snapshot, &mut entry) } != 0;
-    while has_process {
-        if entry.th32ProcessID == information.process_id {
-            found = entry.th32ParentProcessID == expected_parent_process_id;
-            break;
+    let Some(remote_runtime_module) =
+        find_remote_module_base_by_path(information.process_id, &runtime_path)
+    else {
+        if let Some(module) = find_remote_module_base(information.process_id, &runtime_name) {
+            unsafe { unload_remote_module(information.process, information.process_id, module) };
         }
-        has_process = unsafe { Process32NextW(snapshot, &mut entry) } != 0;
+        unsafe { FreeLibrary(hook_module) };
+        return false;
+    };
+
+    if !unsafe { load_remote_library(information.process, remote_load_library, &hook_path) } {
+        unsafe {
+            unload_remote_module(
+                information.process,
+                information.process_id,
+                remote_runtime_module,
+            );
+            FreeLibrary(hook_module);
+        }
+        return false;
     }
-    unsafe { CloseHandle(snapshot) };
-    found
+
+    let Some(remote_hook_module) = find_remote_module_base(information.process_id, &hook_name)
+    else {
+        unsafe {
+            unload_remote_module(
+                information.process,
+                information.process_id,
+                remote_runtime_module,
+            );
+            FreeLibrary(hook_module);
+        }
+        return false;
+    };
+    // Hook.dll now owns its dependency reference. Balance only the explicit
+    // bootstrap reference so normal Hook.dll teardown also unloads the runtime.
+    unsafe {
+        unload_remote_module(
+            information.process,
+            information.process_id,
+            remote_runtime_module,
+        )
+    };
+    let initializer_offset =
+        ListaryOpenInitializeFirefoxUtility as *const () as usize - hook_module as usize;
+    let remote_initializer = (remote_hook_module + initializer_offset) as *const c_void;
+    unsafe { FreeLibrary(hook_module) };
+
+    let Some(child_host) =
+        (unsafe { duplicate_host_handle_into_child(information.process, authorization) })
+    else {
+        unsafe {
+            unload_remote_module(
+                information.process,
+                information.process_id,
+                remote_hook_module,
+            )
+        };
+        return false;
+    };
+    let initialization = RemoteFirefoxInitialization {
+        authorization,
+        host_handle: child_host as usize,
+    };
+    let Some(remote_initialization) =
+        (unsafe { write_remote_value(information.process, &initialization) })
+    else {
+        unsafe {
+            close_remote_handle(information.process, child_host);
+            unload_remote_module(
+                information.process,
+                information.process_id,
+                remote_hook_module,
+            );
+        }
+        return false;
+    };
+    let initialization_result = unsafe {
+        run_remote_thread(
+            information.process,
+            remote_initializer,
+            remote_initialization,
+        )
+    };
+    let initialized = initialization_result == Some(1);
+    unsafe { VirtualFreeEx(information.process, remote_initialization, 0, MEM_RELEASE) };
+    if !initialized {
+        unsafe {
+            unload_remote_module(
+                information.process,
+                information.process_id,
+                remote_hook_module,
+            )
+        };
+    }
+    initialized
+}
+
+#[no_mangle]
+pub unsafe extern "system" fn ListaryOpenInitializeFirefoxUtility(context: *mut c_void) -> u32 {
+    if context.is_null() {
+        return 0;
+    }
+    let initialization = unsafe { *(context as *const RemoteFirefoxInitialization) };
+    if !current_process_is_firefox_file_dialog_utility()
+        || initialization.authorization.token == 0
+        || initialization.authorization.generation == 0
+        || initialization.host_handle == 0
+    {
+        if initialization.host_handle != 0 {
+            unsafe { CloseHandle(initialization.host_handle as HANDLE) };
+        }
+        return 0;
+    }
+    if let Ok(mut active) = ACTIVE_PRELOAD_AUTHORIZATION.lock() {
+        *active = Some(initialization.authorization);
+    } else {
+        unsafe { CloseHandle(initialization.host_handle as HANDLE) };
+        return 0;
+    }
+    CAPTURE_SHUTDOWN_REQUESTED.store(false, Ordering::Release);
+    if !ensure_firefox_dll_notification_registered(initialization.authorization) {
+        if let Ok(mut active) = ACTIVE_PRELOAD_AUTHORIZATION.lock() {
+            *active = None;
+        }
+        unsafe { CloseHandle(initialization.host_handle as HANDLE) };
+        return 0;
+    }
+    if !ensure_capture_lifecycle_started_with_host(
+        initialization.authorization,
+        initialization.host_handle as HANDLE,
+    ) {
+        let _ = unregister_firefox_dll_notification();
+        if let Ok(mut active) = ACTIVE_PRELOAD_AUTHORIZATION.lock() {
+            *active = None;
+        }
+        return 0;
+    }
+
+    // LoadLibraryW supplied the bootstrap reference. The lifecycle watcher now
+    // owns an independent reference, so hand the bootstrap reference back
+    // before this remote initialization thread exits.
+    const FROM_ADDRESS: u32 = 0x0000_0004;
+    const UNCHANGED_REFCOUNT: u32 = 0x0000_0002;
+    let mut module = std::ptr::null_mut();
+    if unsafe {
+        GetModuleHandleExW(
+            FROM_ADDRESS | UNCHANGED_REFCOUNT,
+            ListaryOpenInitializeFirefoxUtility as *const () as *const u16,
+            &mut module,
+        )
+    } != 0
+        && !module.is_null()
+    {
+        unsafe { FreeLibrary(module) };
+    }
+    1
 }
 
 unsafe fn prepare_spawned_firefox_utility(
@@ -1905,8 +2948,9 @@ unsafe fn prepare_spawned_firefox_utility(
         unsafe { CloseHandle(proof_mapping) };
         return false;
     }
+    let proof = proof_view as *mut SpawnProof;
     unsafe {
-        *(proof_view as *mut SpawnProof) = SpawnProof {
+        *proof = SpawnProof {
             token: authorization.token,
             child_creation_time,
             generation: authorization.generation,
@@ -1918,183 +2962,20 @@ unsafe fn prepare_spawned_firefox_utility(
             captured_show_observed: 0,
         };
     }
-    let ack_name = to_wide_null(&spawn_preload_acknowledgement_name(
-        information.process_id,
-        information.thread_id,
-        authorization.generation,
-    ));
-    let ack_mapping = unsafe {
-        CreateFileMappingW(
-            INVALID_HANDLE_VALUE,
-            std::ptr::null(),
-            PAGE_READWRITE,
-            0,
-            std::mem::size_of::<PreloadAcknowledgement>() as u32,
-            ack_name.as_ptr(),
-        )
-    };
-    if ack_mapping.is_null() {
-        return unsafe { fail_and_retain_spawn_proof(proof_view, proof_mapping) };
-    }
-    let ack_view = unsafe {
-        MapViewOfFile(
-            ack_mapping,
-            FILE_MAP_READ | FILE_MAP_WRITE,
-            0,
-            0,
-            std::mem::size_of::<PreloadAcknowledgement>(),
-        )
-    };
-    if ack_view.is_null() {
-        unsafe { CloseHandle(ack_mapping) };
-        return unsafe { fail_and_retain_spawn_proof(proof_view, proof_mapping) };
-    }
-    unsafe {
-        const PROCESS_SYNCHRONIZE: u32 = 0x0010_0000;
-        let host = OpenProcess(PROCESS_SYNCHRONIZE, 0, authorization.host_process_id);
-        let mut child_host = std::ptr::null_mut();
-        if host.is_null()
-            || DuplicateHandle(
-                GetCurrentProcess(),
-                host,
-                information.process,
-                &mut child_host,
-                PROCESS_SYNCHRONIZE,
-                0,
-                0,
-            ) == 0
-        {
-            if !host.is_null() {
-                CloseHandle(host);
-            }
-            UnmapViewOfFile(ack_view);
-            CloseHandle(ack_mapping);
-            return fail_and_retain_spawn_proof(proof_view, proof_mapping);
-        }
-        CloseHandle(host);
-        *(ack_view as *mut PreloadAcknowledgement) = PreloadAcknowledgement {
-            token: authorization.token,
-            status: 0,
-            host_handle: child_host as usize,
-        }
-    };
-    let mut module = std::ptr::null_mut();
-    const FROM_ADDRESS: u32 = 0x0000_0004;
-    if unsafe {
-        GetModuleHandleExW(
-            FROM_ADDRESS,
-            ListaryOpenPreloadHookProc as *const () as *const u16,
-            &mut module,
-        )
-    } == 0
-    {
-        unsafe {
-            UnmapViewOfFile(ack_view);
-            CloseHandle(ack_mapping)
-        };
-        return unsafe { fail_and_retain_spawn_proof(proof_view, proof_mapping) };
-    }
-    let hook: HHOOK = unsafe {
-        SetWindowsHookExW(
-            WH_GETMESSAGE,
-            Some(ListaryOpenPreloadHookProc),
-            module,
-            information.thread_id,
-        )
-    };
-    unsafe { FreeLibrary(module) };
-    if hook.is_null() {
-        unsafe {
-            UnmapViewOfFile(ack_view);
-            CloseHandle(ack_mapping)
-        };
-        return unsafe { fail_and_retain_spawn_proof(proof_view, proof_mapping) };
-    }
+    let initialized = unsafe { inject_firefox_utility_before_resume(information, authorization) };
     unsafe {
         std::ptr::write_volatile(
-            &mut (*(proof_view as *mut SpawnProof)).installed_before_resume,
-            1,
+            &mut (*proof).installed_before_resume,
+            u32::from(initialized),
         );
+        std::ptr::write_volatile(
+            &mut (*proof).status,
+            completed_spawn_proof_status(initialized),
+        );
+        UnmapViewOfFile(proof_view);
     }
-
-    // Reserve an active callback count before spawning so the lifecycle cannot
-    // unload this module in the gap before the watcher thread starts running.
-    let active_watcher = ActiveCapturedShow::enter();
-    let thread_id = information.thread_id;
-    let token = authorization.token;
-    let hook_address = hook as usize;
-    let ack_mapping_address = ack_mapping as usize;
-    let ack_view_address = ack_view as usize;
-    let proof_mapping_address = proof_mapping as usize;
-    let proof_view_address = proof_view as usize;
-    let watcher = std::thread::Builder::new()
-        .name("listary-firefox-spawn-proof".to_string())
-        .spawn(move || {
-            watch_spawned_firefox_utility(
-                thread_id,
-                token,
-                hook_address,
-                ack_mapping_address,
-                ack_view_address,
-                proof_mapping_address,
-                proof_view_address,
-                active_watcher,
-            )
-        });
-    if watcher.is_err() {
-        unsafe {
-            UnhookWindowsHookEx(hook);
-            UnmapViewOfFile(ack_view);
-            CloseHandle(ack_mapping);
-        };
-        return unsafe { fail_and_retain_spawn_proof(proof_view, proof_mapping) };
-    }
-
-    // Firefox's sandbox broker retains the original suspend count. The
-    // intercepted ResumeThread call continues only after this function has
-    // installed the exact-thread preload hook and durable proof.
-    true
-}
-
-#[allow(clippy::too_many_arguments)]
-fn watch_spawned_firefox_utility(
-    thread_id: u32,
-    token: u64,
-    hook: usize,
-    ack_mapping: usize,
-    ack_view: usize,
-    proof_mapping: usize,
-    proof_view: usize,
-    _active_watcher: ActiveCapturedShow,
-) {
-    let deadline = Instant::now() + Duration::from_secs(5);
-    let mut success = false;
-    while !CAPTURE_SHUTDOWN_REQUESTED.load(Ordering::Acquire) && Instant::now() < deadline {
-        unsafe { PostThreadMessageW(thread_id, WM_NULL, 0, 0) };
-        let acknowledgement =
-            unsafe { std::ptr::read_volatile(ack_view as *const PreloadAcknowledgement) };
-        if acknowledgement.token == token && acknowledgement.status == PRELOAD_ACK_SUCCESS {
-            success = true;
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(5));
-    }
-    let proof = proof_view as *mut SpawnProof;
-    unsafe {
-        std::ptr::write_volatile(&mut (*proof).status, completed_spawn_proof_status(success));
-        UnhookWindowsHookEx(hook as HHOOK);
-        UnmapViewOfFile(ack_view as *const c_void);
-        CloseHandle(ack_mapping as HANDLE);
-        UnmapViewOfFile(proof_view as *const c_void);
-    }
-    if let Ok(mut mappings) = SPAWN_PROOF_MAPPINGS
-        .get_or_init(|| Mutex::new(Vec::new()))
-        .lock()
-    {
-        mappings.push(proof_mapping);
-    } else {
-        unsafe { CloseHandle(proof_mapping as HANDLE) };
-    }
+    retain_spawn_proof_mapping(proof_mapping);
+    initialized
 }
 
 fn completed_spawn_proof_status(success: bool) -> u32 {
@@ -2127,27 +3008,34 @@ pub unsafe extern "system" fn ListaryOpenPreloadHookProc(
                 && ensure_capture_lifecycle_started(authorization)
             {
                 let firefox_child = current_process_is_firefox_child();
-                if firefox_child && current_thread_has_spawn_preload_authorization(authorization) {
+                if firefox_child && current_process_is_firefox_file_dialog_utility() {
                     if ensure_firefox_dialog_factory_plugin_installed(authorization) {
-                        // This exact primary thread was suspended by the
-                        // authorized Firefox parent. Arming xul's dialog
-                        // factory IAT is sufficient before process resume;
-                        // real dialog objects are captured by the wrapper.
-                        report_spawn_preload_success(authorization);
+                        // A newly spawned utility reports through its
+                        // parent-created mapping. An existing utility reports
+                        // through HookHost's ordinary preload mapping. Both
+                        // paths arm the factory before any dialog is observed.
+                        if current_thread_has_spawn_preload_authorization(authorization) {
+                            report_spawn_preload_success(authorization);
+                        } else {
+                            report_preload_success(authorization);
+                        }
                         mark_preload_callback_armed(authorization);
                     }
-                } else if !firefox_child
-                    && if current_process_is_firefox() {
-                        ensure_firefox_spawn_plugin_installed(authorization)
-                    } else {
-                        ensure_direct_dialog_capture_worker_started()
-                    }
-                {
-                    // The acknowledgement is deliberately emitted by this
-                    // original hooked thread, after the independent STA worker
-                    // has finished. Pending work is never reported as failure.
+                } else if firefox_child {
+                    // Other Firefox children never receive the dialog-factory
+                    // patch. Acknowledge the bounded process-family preload so
+                    // HookHost can retire their temporary thread hooks.
                     report_preload_success(authorization);
                     mark_preload_callback_armed(authorization);
+                } else if !firefox_child && current_process_is_firefox() {
+                    if ensure_firefox_spawn_plugin_installed(authorization) {
+                        report_preload_success(authorization);
+                        mark_preload_callback_armed(authorization);
+                    }
+                } else if !firefox_child {
+                    // The target-thread timer reports success only after both
+                    // dialog classes have been captured in this STA.
+                    let _ = schedule_direct_dialog_capture(authorization);
                 }
             }
         }
@@ -2156,11 +3044,7 @@ pub unsafe extern "system" fn ListaryOpenPreloadHookProc(
 }
 
 fn is_supported_dialog(hwnd: HWND) -> bool {
-    is_supported_dialog_from_probe(
-        class_name(hwnd),
-        || window_text(hwnd),
-        || false,
-    )
+    is_supported_dialog_from_probe(class_name(hwnd), || window_text(hwnd), || false)
 }
 
 fn is_supported_dialog_from_probe<T, A>(
@@ -2436,7 +3320,22 @@ fn decode_jump_copydata_payload(dw_data: usize, bytes: &[u8]) -> Option<JumpComm
 }
 
 fn navigate_dialog_to_folder(hwnd: HWND, folder_path: &str) -> JumpAckStatus {
-    if let Some(dialog) = find_file_dialog_for_window(hwnd) {
+    let mut _com_initialization = None;
+    let mut shared_capture_error = None;
+    let dialog = find_file_dialog_for_window(hwnd)
+        .map(CapturedDialogReference::borrowed)
+        .or_else(|| {
+            _com_initialization = ComInitialization::enter();
+            _com_initialization.as_ref()?;
+            match acquire_shared_dialog_capture() {
+                Ok(dialog) => Some(dialog),
+                Err(error) => {
+                    shared_capture_error = Some(error);
+                    None
+                }
+            }
+        });
+    if let Some(dialog) = dialog {
         let wide_path = to_wide_null(folder_path);
         let mut shell_item = std::ptr::null_mut();
         let create_result = unsafe {
@@ -2452,8 +3351,8 @@ fn navigate_dialog_to_folder(hwnd: HWND, folder_path: &str) -> JumpAckStatus {
         }
 
         let set_folder: unsafe extern "system" fn(*mut c_void, *mut c_void) -> i32 =
-            unsafe { interface_method(dialog as *mut c_void, 12) };
-        let set_result = unsafe { set_folder(dialog as *mut c_void, shell_item) };
+            unsafe { interface_method(dialog.pointer, 12) };
+        let set_result = unsafe { set_folder(dialog.pointer, shell_item) };
         unsafe { release_interface(shell_item) };
         if set_result < 0 {
             return JumpAckStatus::Failed;
@@ -2463,87 +3362,17 @@ fn navigate_dialog_to_folder(hwnd: HWND, folder_path: &str) -> JumpAckStatus {
         // shell implementations publish GetFolder only after this WM_COPYDATA
         // callback returns to their modal loop. Desktop acceptance then accepts a
         // sentinel in the target folder to verify the actual navigation outcome.
-        let _deferred_readback = verify_file_dialog_folder(dialog as *mut c_void, folder_path);
+        let _deferred_readback = verify_file_dialog_folder(dialog.pointer, folder_path);
         return JumpAckStatus::Success;
     }
-
-    // Late-installed hooks (common for Chrome / Firefox when Show was not
-    // captured) still own a standard address band. Prefer that over rejecting
-    // the jump as unsupported; browse-for-folder remains the last resort.
-    navigate_standard_dialog_address_to_folder(hwnd, folder_path)
-}
-
-fn navigate_standard_dialog_address_to_folder(hwnd: HWND, folder_path: &str) -> JumpAckStatus {
-    let Some(path_edit) = find_navigation_edit_control(hwnd) else {
-        return navigate_browse_for_folder_dialog_to_folder(hwnd, folder_path);
-    };
-    let wide_path = to_wide_null(folder_path);
-    if unsafe { SendMessageW(path_edit, WM_SETTEXT, 0, wide_path.as_ptr() as LPARAM) } == 0 {
+    if shared_capture_error != Some(SharedDialogCaptureError::CaptureMissing) {
         return JumpAckStatus::Failed;
     }
-    unsafe {
-        SendMessageW(path_edit, WM_KEYDOWN, VK_RETURN_KEY, 0);
-        SendMessageW(path_edit, WM_KEYUP, VK_RETURN_KEY, 0);
-    }
 
-    // Prefer CDM_GETFOLDERPATH when the legacy common-dialog path answers. Vista+
-    // item dialogs often leave it empty even after a successful address-band
-    // jump; treat a completed SetText+Enter as Success in that case so Chrome
-    // and Firefox late-hook jumps are not rejected.
-    match current_standard_dialog_folder(hwnd) {
-        Some(current_folder) => jump_status_for_verified_folder(Some(&current_folder), folder_path),
-        None => JumpAckStatus::Success,
-    }
-}
-
-fn current_standard_dialog_folder(hwnd: HWND) -> Option<String> {
-    let mut folder_path = vec![0u16; FOLDER_PATH_BUFFER_LEN];
-    let result = unsafe {
-        SendMessageW(
-            hwnd,
-            CDM_GETFOLDERPATH,
-            folder_path.len(),
-            folder_path.as_mut_ptr() as LPARAM,
-        )
-    };
-    (result > 0)
-        .then(|| wide_null_to_string(&folder_path))
-        .filter(|path| !path.is_empty())
-}
-
-struct AddressControlSearch {
-    found_hwnd: HWND,
-}
-
-fn find_navigation_edit_control(hwnd: HWND) -> Option<HWND> {
-    let mut search = AddressControlSearch {
-        found_hwnd: std::ptr::null_mut(),
-    };
-    unsafe {
-        EnumChildWindows(
-            hwnd,
-            Some(enum_address_edit_control_proc),
-            (&mut search as *mut AddressControlSearch) as LPARAM,
-        );
-    }
-    (!search.found_hwnd.is_null()).then_some(search.found_hwnd)
-}
-
-unsafe extern "system" fn enum_address_edit_control_proc(hwnd: HWND, l_param: LPARAM) -> BOOL {
-    if l_param == 0 {
-        return TRUE;
-    }
-    if unsafe { GetDlgCtrlID(hwnd) } != ADDRESS_BAR_EDIT_CONTROL_ID {
-        return TRUE;
-    }
-    let Some(class_name) = class_name(hwnd) else {
-        return TRUE;
-    };
-    if class_name.eq_ignore_ascii_case("Edit") {
-        unsafe { (*(l_param as *mut AddressControlSearch)).found_hwnd = hwnd };
-        return 0;
-    }
-    TRUE
+    // Modern dialogs must have been captured through IFileDialog before Show.
+    // The only non-COM contract retained here is the native selection message
+    // defined by the legacy browse-for-folder dialog itself.
+    navigate_browse_for_folder_dialog_to_folder(hwnd, folder_path)
 }
 
 fn verify_file_dialog_folder(dialog: *mut c_void, target_folder: &str) -> JumpAckStatus {
@@ -2724,10 +3553,42 @@ mod tests {
     }
 
     #[test]
-    fn firefox_spawn_proof_transitions_from_pending_to_watcher_success() {
+    fn firefox_spawn_proof_transitions_from_pending_to_precapture_success() {
         assert_eq!(SPAWN_PROOF_PENDING, 0);
         assert_eq!(SPAWN_PROOF_SUCCESS, completed_spawn_proof_status(true));
         assert_eq!(SPAWN_PROOF_FAILED, completed_spawn_proof_status(false));
+    }
+
+    #[test]
+    fn firefox_precapture_adds_and_balances_only_its_own_suspend_count() {
+        assert_eq!(
+            (CREATE_SUSPENDED, true),
+            firefox_precapture_creation_flags(0, true)
+        );
+        assert_eq!(
+            (CREATE_SUSPENDED, false),
+            firefox_precapture_creation_flags(CREATE_SUSPENDED, true)
+        );
+        assert_eq!(
+            (0x20, false),
+            firefox_precapture_creation_flags(0x20, false)
+        );
+    }
+
+    #[test]
+    fn shared_dialog_capture_payload_round_trips_all_authorization_fields() {
+        let expected = SharedDialogCapture {
+            token: 0xFEDC_BA98_7654_3210,
+            generation: 77,
+            process_id: 1234,
+            git_cookie: 99,
+            thread_id: 4321,
+        };
+        assert_eq!(
+            Some(expected),
+            decode_shared_dialog_capture(&encode_shared_dialog_capture(expected))
+        );
+        assert_eq!(None, decode_shared_dialog_capture("invalid"));
     }
 
     #[test]
@@ -2735,35 +3596,41 @@ mod tests {
         let preparation = include_str!("lib.rs")
             .split("unsafe fn prepare_spawned_firefox_utility")
             .nth(1)
-            .and_then(|tail| tail.split("fn watch_spawned_firefox_utility").next())
+            .and_then(|tail| tail.split("fn completed_spawn_proof_status").next())
             .unwrap();
         assert!(!preparation.contains("while "));
         assert!(!preparation.contains("thread::sleep"));
-        assert!(preparation.contains("ResumeThread"));
-        assert!(preparation.contains("listary-firefox-spawn-proof"));
+        assert!(preparation.contains("inject_firefox_utility_before_resume"));
+        assert!(preparation.contains("installed_before_resume"));
+        let create_process_wrapper = include_str!("lib.rs")
+            .split("captured_firefox_create_process(")
+            .nth(1)
+            .and_then(|tail| tail.split("captured_firefox_create_process_as_user").next())
+            .unwrap();
+        assert!(create_process_wrapper.contains("prepare_created_firefox_utility"));
+        assert!(create_process_wrapper.contains("ResumeThread"));
     }
 
     #[test]
-    fn capture_worker_pending_becomes_success_without_a_failure_ack() {
-        let state = AtomicU8::new(CAPTURE_WORKER_IDLE);
-        assert!(try_begin_capture_worker(&state));
-        assert_eq!(CAPTURE_WORKER_PENDING, state.load(Ordering::Acquire));
-        assert!(!capture_worker_succeeded(&state));
-
-        state.store(CAPTURE_WORKER_SUCCEEDED, Ordering::Release);
-        assert!(capture_worker_succeeded(&state));
+    fn capture_timer_reports_no_failure_ack_while_work_is_pending() {
         let forbidden_failure_status = ["PRELOAD_ACK_", "FAILED"].concat();
         assert!(!include_str!("lib.rs").contains(&forbidden_failure_status));
     }
 
     #[test]
-    fn capture_worker_is_single_start_and_cleanup_makes_it_restartable() {
-        let state = AtomicU8::new(CAPTURE_WORKER_IDLE);
-        assert!(try_begin_capture_worker(&state));
-        assert!(!try_begin_capture_worker(&state));
-
-        reset_capture_worker(&state);
-        assert!(try_begin_capture_worker(&state));
+    fn direct_capture_is_deferred_to_the_originating_ui_thread() {
+        let source = include_str!("lib.rs");
+        let scheduler = source
+            .split("fn schedule_direct_dialog_capture")
+            .nth(1)
+            .and_then(|tail| {
+                tail.split("fn ensure_direct_dialog_capture_installed")
+                    .next()
+            })
+            .unwrap();
+        assert!(scheduler.contains("SetTimer"));
+        assert!(scheduler.contains("direct_dialog_capture_timer_callback"));
+        assert!(scheduler.contains("CoInitializeEx"));
     }
 
     #[test]
@@ -2792,9 +3659,22 @@ mod tests {
         ];
         assert!(is_firefox_file_dialog_spawn("", &arguments, 26492));
         assert!(!is_firefox_file_dialog_spawn("", &arguments, 26493));
-        let mut wrong_kind = arguments.clone();
-        wrong_kind[3] = "2".to_string();
-        assert!(!is_firefox_file_dialog_spawn("", &wrong_kind, 26492));
+        for sandbox_kind in ["0", "1", "2", "4"] {
+            let mut current_version = arguments.clone();
+            current_version[3] = sandbox_kind.to_string();
+            assert!(is_firefox_file_dialog_spawn("", &current_version, 26492));
+        }
+        let mut non_utility = arguments.clone();
+        non_utility[8] = "socket".to_string();
+        assert!(!is_firefox_file_dialog_spawn("", &non_utility, 26492));
+    }
+
+    #[test]
+    fn firefox_precapture_runtime_is_resolved_beside_the_hook_dll() {
+        assert_eq!(
+            Some(r"C:\ListaryOpen\hooks\x64\libunwind.dll".to_string()),
+            adjacent_hook_runtime_path(r"C:\ListaryOpen\hooks\x64\ListaryOpen.Hook.dll")
+        );
     }
 
     #[test]
@@ -2947,9 +3827,7 @@ mod tests {
     }
 
     #[test]
-    fn navigation_without_file_dialog_prefers_address_band_before_browse_for_folder() {
-        // Guard the product path for Chrome/Firefox late hooks: COM first, then
-        // address band (control 41477), then legacy browse-for-folder only.
+    fn navigation_without_file_dialog_uses_only_the_legacy_folder_dialog_contract() {
         let source = include_str!("lib.rs");
         let navigate = source
             .split("fn navigate_dialog_to_folder")
@@ -2957,20 +3835,7 @@ mod tests {
             .and_then(|tail| tail.split("fn verify_file_dialog_folder").next())
             .expect("navigate_dialog_to_folder body");
         assert!(navigate.contains("find_file_dialog_for_window"));
-        assert!(navigate.contains("navigate_standard_dialog_address_to_folder"));
         assert!(navigate.contains("navigate_browse_for_folder_dialog_to_folder"));
-        assert!(navigate.contains("ADDRESS_BAR_EDIT_CONTROL_ID")
-            || source.contains("ADDRESS_BAR_EDIT_CONTROL_ID: i32 = 41477"));
-        let address_pos = navigate
-            .find("navigate_standard_dialog_address_to_folder")
-            .expect("address fallback");
-        let browse_pos = navigate
-            .find("navigate_browse_for_folder_dialog_to_folder")
-            .expect("browse fallback");
-        assert!(
-            address_pos < browse_pos,
-            "address-band fallback must run before browse-for-folder"
-        );
     }
 
     #[test]

@@ -34,7 +34,7 @@
       "evidence": [
         { "suite": "dotnet", "testNameContains": "DefaultAppManifestRequestsAdministratorOnceAtStartup" },
         { "suite": "dotnet", "testNameContains": "EnableNtfsFastIndexingOnStartupEnablesClientWithoutRequestingImmediateReindex" },
-        { "suite": "dotnet", "testNameContains": "EnableNtfsFastIndexingOnStartupDoesNotEnableUacWhenProcessIsNotElevated" },
+        { "suite": "dotnet", "testNameContains": "EnableNtfsFastIndexingOnStartupArmsUacWhenProcessIsNotElevated" },
         { "suite": "dotnet", "testNameContains": "EnableSkipsRunAsWhenParentProcessIsAlreadyElevated" },
         { "suite": "dotnet", "testNameContains": "CreateUacWorkerIsSingleElevationEntryPointForIndexerSession" },
         { "suite": "dotnet", "testNameContains": "StickyUacSessionStartsWorkerOnlyOnceForMultipleCommands" }

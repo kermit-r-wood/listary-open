@@ -1,4 +1,3 @@
-using System.Diagnostics;
 using System.IO;
 
 namespace ListaryOpen.Infrastructure.Hooks;
@@ -31,44 +30,12 @@ public sealed class HookHostPaths : IDisposable
     public static HookHostPaths CreateDefault()
     {
         var programDirectory = Path.GetFullPath(AppContext.BaseDirectory);
-        if (!Directory.Exists(Path.Combine(programDirectory, "hooks")))
-        {
-            return new HookHostPaths(programDirectory);
-        }
-
-        var runtimeRoots = new List<string>();
-        var localAppData = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
-        if (!string.IsNullOrWhiteSpace(localAppData))
-        {
-            runtimeRoots.Add(Path.Combine(
-                localAppData,
-                "ListaryOpen",
-                "runtime-hooks"));
-        }
-
-        runtimeRoots.Add(Path.Combine(Path.GetTempPath(), "ListaryOpen", "runtime-hooks"));
-
-        foreach (var runtimeRoot in runtimeRoots.Distinct(StringComparer.OrdinalIgnoreCase))
-        {
-            try
-            {
-                return CreateRuntimeCopy(programDirectory, runtimeRoot);
-            }
-            catch (Exception exception) when (exception is IOException
-                                               or UnauthorizedAccessException
-                                               or NotSupportedException)
-            {
-                Trace.TraceWarning(
-                    "Could not stage native hook files in '{0}': {1}",
-                    runtimeRoot,
-                    exception.Message);
-            }
-        }
-
-        // Hooks remain available in unusual environments where neither per-user
-        // runtime location is writable. Normal packaged runs never inject these
-        // source paths because one of the staging locations is user-writable.
-        Trace.TraceWarning("Native hooks are running from the program directory because staging failed.");
+        // Inject from the installed/published code directory. Firefox's sandbox
+        // rejects hook DLLs copied to a new per-user AppData session directory,
+        // even when those bytes are identical to the installed DLL. A stable code
+        // path also lets Windows resolve the adjacent native runtime consistently.
+        // Authenticated HookHost shutdown unloads the DLL before application exit,
+        // so the distributable remains replaceable after a graceful shutdown.
         return new HookHostPaths(programDirectory);
     }
 

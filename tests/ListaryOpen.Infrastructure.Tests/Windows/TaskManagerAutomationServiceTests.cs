@@ -49,6 +49,21 @@ public sealed class TaskManagerAutomationServiceTests
         Assert.Same(item, provider.Item);
     }
 
+    [Fact]
+    public void ConfirmedSelectionSurvivesTaskManagerRerenderingAfterActivation()
+    {
+        using var provider = new RecordingTaskManagerProvider(failuresBeforeSuccess: 5);
+        using var service = new TaskManagerAutomationService(provider, TimeSpan.Zero);
+        var item = new TaskManagerItem("row-confirmed", "Windows Explorer", string.Empty);
+
+        service.QueueSelectItem(new IntPtr(42), item, activate: true);
+
+        Assert.True(provider.SelectionReceived.Wait(TimeSpan.FromSeconds(2)));
+        Assert.Equal(6, provider.AttemptCount);
+        Assert.True(provider.Activate);
+        Assert.Same(item, provider.Item);
+    }
+
     private sealed class RecordingTaskManagerProvider(int failuresBeforeSuccess = 0) : ITaskManagerAutomationProvider, IDisposable
     {
         public ManualResetEventSlim SelectionReceived { get; } = new();

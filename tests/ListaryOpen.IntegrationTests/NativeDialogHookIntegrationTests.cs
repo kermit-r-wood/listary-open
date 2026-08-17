@@ -501,7 +501,8 @@ public sealed class NativeDialogHookIntegrationTests
                     await WaitUntilAsync(
                         () => client.ProbeHealthAsync(CancellationToken.None).GetAwaiter().GetResult().Status == HookJumpStatus.Success,
                         TimeSpan.FromSeconds(20)),
-                    "Native hook host did not become healthy.");
+                    $"Native hook host did not become healthy. HostExited={hookHost.HasExited}; " +
+                    $"ExitCode={(hookHost.HasExited ? hookHost.ExitCode : -1)}; Pipe={pipeName}; Dll={hookDllPath}");
                 Assert.True(
                     await WaitUntilAsync(
                         () => IsModuleLoaded(testHost.Id, hookDllPath),

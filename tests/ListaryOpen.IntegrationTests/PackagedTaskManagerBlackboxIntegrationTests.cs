@@ -167,7 +167,7 @@ public sealed class PackagedTaskManagerBlackboxIntegrationTests
                 var overlayRoot = AutomationElement.FromHandle(overlayHandle);
                 Assert.NotNull(overlayRoot);
                 var queryElement = WaitForAutomationElement(
-                    overlayRoot,
+                    overlayHandle,
                     new PropertyCondition(
                         AutomationElement.AutomationIdProperty,
                         "TaskManagerSearchQuery"),
@@ -176,7 +176,7 @@ public sealed class PackagedTaskManagerBlackboxIntegrationTests
                 Assert.True(queryElement.TryGetCurrentPattern(ValuePattern.Pattern, out var queryPatternObject));
                 Assert.Equal(query, ((ValuePattern)queryPatternObject).Current.Value);
                 var resultsElement = WaitForAutomationElement(
-                    overlayRoot,
+                    overlayHandle,
                     new PropertyCondition(
                         AutomationElement.AutomationIdProperty,
                         "TaskManagerSearchResults"),
@@ -184,7 +184,7 @@ public sealed class PackagedTaskManagerBlackboxIntegrationTests
                 Assert.NotNull(resultsElement);
 
                 var initialOverlaySelection = WaitForOverlaySelection(
-                    resultsElement,
+                    overlayHandle,
                     previousRuntimeId: null,
                     TimeSpan.FromSeconds(8));
                 Assert.NotNull(initialOverlaySelection);
@@ -198,7 +198,7 @@ public sealed class PackagedTaskManagerBlackboxIntegrationTests
 
                 SendVirtualKey(VkDown);
                 var movedOverlaySelection = WaitForOverlaySelection(
-                    resultsElement,
+                    overlayHandle,
                     initialOverlaySelection.RuntimeId,
                     TimeSpan.FromSeconds(8));
                 Assert.NotNull(movedOverlaySelection);
@@ -597,7 +597,10 @@ public sealed class PackagedTaskManagerBlackboxIntegrationTests
     {
         for (var index = 0; index < value.Length; index++)
         {
-            if (value[index] is >= 'a' and <= 'z' or >= 'A' and <= 'Z' or >= '0' and <= '9')
+            // Validate name search with stable text. CPU/memory digits in Task
+            // Manager accessibility labels can change between the oracle and app
+            // snapshots and leave an otherwise healthy overlay with no matches.
+            if (char.IsLetter(value[index]))
             {
                 yield return char.ToLowerInvariant(value[index]).ToString();
             }
@@ -661,7 +664,7 @@ public sealed class PackagedTaskManagerBlackboxIntegrationTests
     }
 
     private static SelectionIdentity? WaitForOverlaySelection(
-        AutomationElement results,
+        IntPtr overlayWindow,
         string? previousRuntimeId,
         TimeSpan timeout)
     {
@@ -671,6 +674,17 @@ public sealed class PackagedTaskManagerBlackboxIntegrationTests
             {
                 try
                 {
+                    var root = AutomationElement.FromHandle(overlayWindow);
+                    var results = root?.FindFirst(
+                        TreeScope.Descendants,
+                        new PropertyCondition(
+                            AutomationElement.AutomationIdProperty,
+                            "TaskManagerSearchResults"));
+                    if (results is null)
+                    {
+                        return false;
+                    }
+
                     if (!results.TryGetCurrentPattern(SelectionPattern.Pattern, out var patternObject))
                     {
                         return false;
@@ -880,7 +894,7 @@ public sealed class PackagedTaskManagerBlackboxIntegrationTests
     }
 
     private static AutomationElement? WaitForAutomationElement(
-        AutomationElement root,
+        IntPtr rootWindow,
         System.Windows.Automation.Condition condition,
         TimeSpan timeout)
     {
@@ -890,6 +904,12 @@ public sealed class PackagedTaskManagerBlackboxIntegrationTests
             {
                 try
                 {
+                    var root = AutomationElement.FromHandle(rootWindow);
+                    if (root is null)
+                    {
+                        return false;
+                    }
+
                     result = root.FindFirst(TreeScope.Descendants, condition);
                     return result is not null;
                 }

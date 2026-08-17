@@ -558,6 +558,23 @@ public sealed class ExplorerTypeSearchTests
                 new IntPtr(overlayWindow)));
     }
 
+    [Theory]
+    [InlineData(true, false, true)]
+    [InlineData(true, true, false)]
+    [InlineData(false, false, false)]
+    [InlineData(false, true, false)]
+    public void SuppressedDeactivationNeverStealsFocusFromExplorer(
+        bool isVisible,
+        bool hasExplorerSearchSession,
+        bool expected)
+    {
+        Assert.Equal(
+            expected,
+            SearchPanel.ShouldRestoreFocusAfterSuppressedDeactivation(
+                isVisible,
+                hasExplorerSearchSession));
+    }
+
     [Fact]
     public void NavigationFromSameExplorerIsRoutedToVisibleOverlay()
     {

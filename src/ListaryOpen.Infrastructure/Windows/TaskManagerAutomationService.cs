@@ -28,8 +28,9 @@ public sealed class TaskManagerAutomationService : ITaskManagerAutomationService
     // Keep selection synchronization immediate. Task Manager runtime IDs are volatile,
     // and the host row should track every keyboard or pointer selection change.
     private static readonly TimeSpan DefaultDebounceDelay = TimeSpan.Zero;
-    private static readonly TimeSpan SelectionRetryDelay = TimeSpan.FromMilliseconds(45);
-    private const int SelectionAttemptCount = 3;
+    private static readonly TimeSpan SelectionRetryDelay = TimeSpan.FromMilliseconds(100);
+    private const int PreviewSelectionAttemptCount = 3;
+    private const int ConfirmedSelectionAttemptCount = 12;
     private readonly ITaskManagerAutomationProvider _provider;
     private readonly TimeSpan _debounceDelay;
     private readonly object _gate = new();
@@ -204,14 +205,17 @@ public sealed class TaskManagerAutomationService : ITaskManagerAutomationService
 
             try
             {
-                for (var attempt = 0; attempt < SelectionAttemptCount; attempt++)
+                var attemptCount = request.Activate
+                    ? ConfirmedSelectionAttemptCount
+                    : PreviewSelectionAttemptCount;
+                for (var attempt = 0; attempt < attemptCount; attempt++)
                 {
                     if (_provider.TrySelectItem(request.TaskManagerWindow, request.Item, request.Activate))
                     {
                         break;
                     }
 
-                    if (attempt + 1 >= SelectionAttemptCount || IsSelectionSuperseded(request))
+                    if (attempt + 1 >= attemptCount || IsSelectionSuperseded(request))
                     {
                         break;
                     }
@@ -310,17 +314,20 @@ internal sealed class UiAutomationTaskManagerProvider : ITaskManagerAutomationPr
     {
         try
         {
+            if (activate)
+            {
+                _ = SetForegroundWindow(taskManagerWindow);
+                Thread.Sleep(ForegroundActivationDelay);
+            }
+
+            // Activating modern WinUI Task Manager can recreate its visible row
+            // elements. Resolve the root and target only after activation so we
+            // never select through a stale UI Automation element.
             var root = AutomationElement.FromHandle(taskManagerWindow);
             var element = FindBestMatch(root, item);
             if (element is null)
             {
                 return false;
-            }
-
-            if (activate)
-            {
-                _ = SetForegroundWindow(taskManagerWindow);
-                Thread.Sleep(ForegroundActivationDelay);
             }
 
             if (element.TryGetCurrentPattern(ScrollItemPattern.Pattern, out var scrollPatternObject) &&

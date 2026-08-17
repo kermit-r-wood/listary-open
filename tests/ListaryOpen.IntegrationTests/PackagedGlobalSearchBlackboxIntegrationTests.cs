@@ -430,7 +430,9 @@ public sealed class PackagedGlobalSearchBlackboxIntegrationTests
             var handle = new IntPtr(current.Current.NativeWindowHandle);
             if (handle != IntPtr.Zero)
             {
-                Assert.True(SetForegroundWindow(handle));
+                Assert.True(
+                    DesktopWindowActivator.TryActivate(handle, TimeSpan.FromSeconds(5)),
+                    "The owning window did not become the actual foreground window.");
             }
             return;
         }
@@ -857,7 +859,6 @@ public sealed class PackagedGlobalSearchBlackboxIntegrationTests
     [DllImport("user32.dll")] private static extern bool IsWindowVisible(IntPtr window);
     [DllImport("user32.dll")] private static extern uint GetWindowThreadProcessId(IntPtr window, out uint processId);
     [DllImport("user32.dll", CharSet = CharSet.Unicode)] private static extern int GetWindowText(IntPtr window, StringBuilder value, int count);
-    [DllImport("user32.dll")] [return: MarshalAs(UnmanagedType.Bool)] private static extern bool SetForegroundWindow(IntPtr window);
     [DllImport("user32.dll")] private static extern bool GetWindowRect(IntPtr window, out NativeRect bounds);
     [DllImport("user32.dll")] private static extern IntPtr GetDC(IntPtr window);
     [DllImport("user32.dll")] private static extern int ReleaseDC(IntPtr window, IntPtr dc);

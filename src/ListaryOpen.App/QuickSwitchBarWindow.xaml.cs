@@ -15,6 +15,11 @@ namespace ListaryOpen.App;
 public partial class QuickSwitchBarWindow : Window
 {
     private const double ChromeMargin = 8;
+    private const uint SwpNoSize = 0x0001;
+    private const uint SwpNoMove = 0x0002;
+    private const uint SwpNoActivate = 0x0010;
+    private const uint SwpShowWindow = 0x0040;
+    private static readonly IntPtr HwndTopmost = new(-1);
     private readonly Func<IntPtr, bool> _activateAnchorWindow;
     private IntPtr _anchorWindow;
     private IntPtr _windowHandle;
@@ -675,7 +680,32 @@ public partial class QuickSwitchBarWindow : Window
         if (_anchorWindow != IntPtr.Zero)
         {
             _ = _activateAnchorWindow(_anchorWindow);
+            // Native file dialogs can raise their whole owner chain when
+            // SetFolder completes. WPF does not issue another z-order update
+            // when Topmost is already true, leaving the attached bar visible
+            // in state but behind Firefox/Explorer. Reassert only the z-order;
+            // SWP_NOACTIVATE keeps keyboard focus in the dialog so the next
+            // printable key is still captured as follow-up Quick Switch input.
+            RaiseAboveAnchorWithoutActivation();
         }
+    }
+
+    private void RaiseAboveAnchorWithoutActivation()
+    {
+        if (_windowHandle == IntPtr.Zero)
+        {
+            return;
+        }
+
+        Topmost = true;
+        _ = SetWindowPos(
+            _windowHandle,
+            HwndTopmost,
+            0,
+            0,
+            0,
+            0,
+            SwpNoMove | SwpNoSize | SwpNoActivate | SwpShowWindow);
     }
 
     protected override void OnClosed(EventArgs e)
@@ -738,5 +768,16 @@ public partial class QuickSwitchBarWindow : Window
     [DllImport("user32.dll")]
     [return: MarshalAs(UnmanagedType.Bool)]
     private static extern bool SetForegroundWindow(IntPtr windowHandle);
+
+    [DllImport("user32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool SetWindowPos(
+        IntPtr windowHandle,
+        IntPtr insertAfter,
+        int x,
+        int y,
+        int width,
+        int height,
+        uint flags);
 
 }

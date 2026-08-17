@@ -329,14 +329,18 @@ public sealed class RealExplorerIntegrationTests
             Assert.DoesNotContain(explorerWindow.Handle, existingExplorerHandles);
             using var explorerCleanup = new OwnedExplorerWindow(explorerWindow.Handle, directory.Path);
 
+            Assert.True(ShowWindow(explorerWindow.Handle, SwRestore));
+            Assert.True(
+                TryActivateWindow(explorerWindow.Handle),
+                "The Explorer setup window could not be activated before the physical selection click.");
             var controlElement = WaitForMarkerElement(explorerWindow.Handle, Path.GetFileName(controlPath));
             Assert.NotNull(controlElement);
-            ClickAutomationElement(controlElement);
             Assert.True(
-                WaitUntil(
-                    () => ReadSelectedPaths(explorerWindow.Handle, directory.Path)
-                        .Any(path => PathsEqual(path, controlPath)),
-                    TimeSpan.FromSeconds(5)),
+                SelectExplorerItemWithPhysicalClick(
+                    explorerWindow.Handle,
+                    directory.Path,
+                    controlPath,
+                    TimeSpan.FromSeconds(10)),
                 "The physical setup click did not select the control item in Explorer's item view.");
 
             var nonce = Convert.ToHexString(RandomNumberGenerator.GetBytes(32)).ToLowerInvariant();
@@ -362,17 +366,16 @@ public sealed class RealExplorerIntegrationTests
                 Assert.Equal("Ok", control.Exchange(nonce + " AllowInjectedInput"));
 
                 Assert.True(ShowWindow(explorerWindow.Handle, SwRestore));
-                Assert.True(TryActivateWindow(explorerWindow.Handle));
-                ClickAutomationElement(controlElement);
                 Assert.True(
-                    WaitUntil(
-                        () => GetForegroundWindow() == explorerWindow.Handle &&
-                            ReadSelectedPaths(explorerWindow.Handle, directory.Path)
-                                .Any(path => PathsEqual(path, controlPath)),
-                        TimeSpan.FromSeconds(5)),
+                    SelectExplorerItemWithPhysicalClick(
+                        explorerWindow.Handle,
+                        directory.Path,
+                        controlPath,
+                        TimeSpan.FromSeconds(10)) &&
+                    GetForegroundWindow() == explorerWindow.Handle,
                     "Explorer's real item view was not the foreground input surface before SendInput.");
 
-                SendVirtualKeyText(query);
+                SendVirtualKeyText(query, explorerWindow.Handle);
 
                 var overlayHandle = WaitForTopLevelWindow(
                     appProcess.Id,
@@ -547,9 +550,13 @@ public sealed class RealExplorerIntegrationTests
             Assert.DoesNotContain(explorerWindow.Handle, existingExplorerHandles);
             using var explorerCleanup = new OwnedExplorerWindow(explorerWindow.Handle, directory.Path);
 
-            var seedElement = WaitForMarkerElement(explorerWindow.Handle, Path.GetFileName(seedFile));
-            Assert.NotNull(seedElement);
-            ClickAutomationElement(seedElement);
+            Assert.True(
+                SelectExplorerItemWithPhysicalClick(
+                    explorerWindow.Handle,
+                    directory.Path,
+                    seedFile,
+                    TimeSpan.FromSeconds(5)),
+                "Explorer seed item could not be physically selected before app startup.");
 
             var nonce = Convert.ToHexString(RandomNumberGenerator.GetBytes(32)).ToLowerInvariant();
             Process? appProcess = null;
@@ -575,20 +582,22 @@ public sealed class RealExplorerIntegrationTests
 
                 // Wait for the unique folder to become searchable (startup indexing).
                 Assert.True(
-                    WaitUntil(
-                        () =>
-                        {
-                            Assert.True(TryActivateWindow(explorerWindow.Handle));
-                            ClickAutomationElement(seedElement);
-                            return GetForegroundWindow() == explorerWindow.Handle;
-                        },
+                    SelectExplorerItemWithPhysicalClick(
+                        explorerWindow.Handle,
+                        directory.Path,
+                        seedFile,
                         TimeSpan.FromSeconds(5)),
                     "Explorer item view was not ready before the first type-to-search.");
 
                 // First type-to-search: open overlay on the child folder name.
-                Assert.True(TryActivateWindow(explorerWindow.Handle));
-                ClickAutomationElement(seedElement);
-                SendVirtualKeyText(folderQuery);
+                Assert.True(
+                    SelectExplorerItemWithPhysicalClick(
+                        explorerWindow.Handle,
+                        directory.Path,
+                        seedFile,
+                        TimeSpan.FromSeconds(5)),
+                    "Explorer seed item lost selection before the first type-to-search.");
+                SendVirtualKeyText(folderQuery, explorerWindow.Handle);
 
                 var firstOverlay = WaitForTopLevelWindow(
                     appProcess.Id,
@@ -644,7 +653,7 @@ public sealed class RealExplorerIntegrationTests
                 Assert.True(TryActivateWindow(explorerWindow.Handle));
                 Thread.Sleep(200);
                 var reopenQuery = "seed";
-                SendVirtualKeyText(reopenQuery);
+                SendVirtualKeyText(reopenQuery, explorerWindow.Handle);
 
                 var secondOverlay = WaitForTopLevelWindow(
                     appProcess.Id,
@@ -954,11 +963,33 @@ public sealed class RealExplorerIntegrationTests
 
     private static void ClickAutomationElement(AutomationElement element)
     {
-        var bounds = element.Current.BoundingRectangle;
-        Assert.False(bounds.IsEmpty, $"Automation element '{element.Current.Name}' has no clickable bounds.");
+        Assert.True(TryClickAutomationElement(element), $"Automation element '{element.Current.Name}' could not be clicked.");
+    }
+
+    private static bool TryClickAutomationElement(AutomationElement element)
+    {
+        Rect bounds;
+        try
+        {
+            bounds = element.Current.BoundingRectangle;
+        }
+        catch (ElementNotAvailableException)
+        {
+            return false;
+        }
+
+        if (bounds.IsEmpty)
+        {
+            return false;
+        }
+
         var x = checked((int)Math.Round(bounds.Left + (bounds.Width / 2)));
         var y = checked((int)Math.Round(bounds.Top + (bounds.Height / 2)));
-        Assert.True(SetCursorPos(x, y));
+        if (!SetCursorPos(x, y))
+        {
+            return false;
+        }
+
         var inputs = new[]
         {
             new NativeInput
@@ -978,21 +1009,58 @@ public sealed class RealExplorerIntegrationTests
                 }
             }
         };
-        Assert.Equal(
-            (uint)inputs.Length,
-            SendInput((uint)inputs.Length, inputs, Marshal.SizeOf<NativeInput>()));
+        return SendInput((uint)inputs.Length, inputs, Marshal.SizeOf<NativeInput>()) == (uint)inputs.Length;
     }
 
-    private static void SendVirtualKeyText(string text)
+    private static bool SelectExplorerItemWithPhysicalClick(
+        IntPtr explorerWindow,
+        string currentFolder,
+        string itemPath,
+        TimeSpan timeout)
     {
-        foreach (var character in text)
+        var markerName = Path.GetFileName(itemPath);
+        var stopwatch = Stopwatch.StartNew();
+        while (stopwatch.Elapsed < timeout)
         {
+            _ = ShowWindow(explorerWindow, SwRestore);
+            if (TryActivateWindow(explorerWindow))
+            {
+                var marker = FindMarkerElement(explorerWindow, markerName);
+                if (marker is not null &&
+                    TryClickAutomationElement(marker) &&
+                    WaitUntil(
+                        () => GetForegroundWindow() == explorerWindow &&
+                            ReadSelectedPaths(explorerWindow, currentFolder)
+                                .Any(path => PathsEqual(path, itemPath)),
+                        TimeSpan.FromMilliseconds(750)))
+                {
+                    return true;
+                }
+            }
+
+            Thread.Sleep(100);
+        }
+
+        return false;
+    }
+
+    private static void SendVirtualKeyText(string text, IntPtr expectedForegroundWindow = default)
+    {
+        for (var index = 0; index < text.Length; index++)
+        {
+            var character = text[index];
             var key = VkKeyScan(character);
             Assert.NotEqual(-1, key);
             var virtualKey = unchecked((ushort)(key & 0xFF));
             var modifierState = (key >> 8) & 0xFF;
             Assert.Equal(0, modifierState);
             SendVirtualKey(virtualKey);
+            if (expectedForegroundWindow != IntPtr.Zero)
+            {
+                Assert.True(
+                    GetForegroundWindow() == expectedForegroundWindow,
+                    $"Foreground focus left Explorer after input character {index + 1}/{text.Length} ('{character}').");
+            }
         }
     }
 
@@ -1272,23 +1340,28 @@ public sealed class RealExplorerIntegrationTests
         return WaitUntil(
             () =>
             {
-                try
-                {
-                    match = AutomationElement.FromHandle(explorerHandle)?
-                        .FindAll(TreeScope.Descendants, System.Windows.Automation.Condition.TrueCondition)
-                        .Cast<AutomationElement>()
-                        .FirstOrDefault(element =>
-                            string.Equals(element.Current.Name, markerName, StringComparison.OrdinalIgnoreCase));
-                    return match is not null;
-                }
-                catch (ElementNotAvailableException)
-                {
-                    return false;
-                }
+                match = FindMarkerElement(explorerHandle, markerName);
+                return match is not null;
             },
             TimeSpan.FromSeconds(8))
             ? match
             : null;
+    }
+
+    private static AutomationElement? FindMarkerElement(IntPtr explorerHandle, string markerName)
+    {
+        try
+        {
+            return AutomationElement.FromHandle(explorerHandle)?
+                .FindAll(TreeScope.Descendants, System.Windows.Automation.Condition.TrueCondition)
+                .Cast<AutomationElement>()
+                .FirstOrDefault(element =>
+                    string.Equals(element.Current.Name, markerName, StringComparison.OrdinalIgnoreCase));
+        }
+        catch (ElementNotAvailableException)
+        {
+            return null;
+        }
     }
 
     private static string? CaptureEvidence(IntPtr window, string name)

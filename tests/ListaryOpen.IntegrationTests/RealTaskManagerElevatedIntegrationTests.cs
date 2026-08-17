@@ -68,9 +68,8 @@ public sealed class RealTaskManagerElevatedIntegrationTests
                 Assert.Equal("Taskmgr", GetWindowProcessName(taskManagerHandle), ignoreCase: true);
                 _ = ShowWindow(taskManagerHandle, SwRestore);
                 Assert.True(IsWindowVisible(taskManagerHandle), "The real Task Manager window is not visible.");
-                _ = SetForegroundWindow(taskManagerHandle);
                 Assert.True(
-                    WaitUntil(() => GetForegroundWindow() == taskManagerHandle, TimeSpan.FromSeconds(5)),
+                    DesktopWindowActivator.TryActivate(taskManagerHandle, TimeSpan.FromSeconds(5)),
                     "The real Task Manager window did not become foreground.");
 
                 _ = GetWindowThreadProcessId(taskManagerHandle, out var taskManagerProcessId);
@@ -127,7 +126,9 @@ public sealed class RealTaskManagerElevatedIntegrationTests
                 var viewModel = Assert.IsType<TaskManagerSearchViewModel>(overlay.DataContext);
                 Assert.True(
                     PumpUntil(() => viewModel.Results.Count >= 2 && viewModel.SelectedItem is not null, TimeSpan.FromSeconds(12)),
-                    $"The production overlay did not publish two real results for query '{query}'.");
+                    $"The production overlay did not publish two real results for query '{query}': " +
+                    $"available={viewModel.AvailableItemCount}, matches={viewModel.Results.Count}, " +
+                    $"active={overlay.IsTaskManagerSearchActive}, status='{viewModel.StatusText}'.");
                 Assert.True(overlay.IsTaskManagerSearchActive);
                 Assert.Equal(taskManagerHandle, overlay.TaskManagerWindow);
 
@@ -226,7 +227,10 @@ public sealed class RealTaskManagerElevatedIntegrationTests
         thread.SetApartmentState(ApartmentState.STA);
         thread.Start();
 
-        Assert.True(thread.Join(TimeSpan.FromSeconds(45)), $"Real Task Manager E2E timed out at '{stage}'.");
+        // Page preparation can legitimately consume about 41 seconds while it
+        // probes every supported Task Manager page. Leave enough time for the
+        // subsequent overlay, selection, screenshot, and confirmation checks.
+        Assert.True(thread.Join(TimeSpan.FromSeconds(90)), $"Real Task Manager E2E timed out at '{stage}'.");
         Assert.True(completed);
         if (failure is not null)
         {
@@ -342,7 +346,11 @@ public sealed class RealTaskManagerElevatedIntegrationTests
 
     private static IEnumerable<string> CandidateQueries(string value)
     {
-        var normalized = new string(value.Where(char.IsLetterOrDigit).ToArray());
+        // Prefer real name text over volatile CPU/memory digits embedded in
+        // accessibility labels. Numeric one-character queries can lose every
+        // match between the setup snapshot and the overlay snapshot as usage
+        // values refresh, which does not exercise Task Manager name search.
+        var normalized = new string(value.Where(char.IsLetter).ToArray());
         for (var length = 1; length <= Math.Min(4, normalized.Length); length++)
         {
             for (var start = 0; start + length <= normalized.Length; start++)

@@ -757,6 +757,43 @@ public sealed class SearchPanelViewModelTests
     }
 
     [Fact]
+    public async Task ExplorerConfirmActivatesTheResultCapturedAtKeypressAfterSelectionChanges()
+    {
+        var firstFolder = Directory.CreateTempSubdirectory("listary-open-explorer-confirm-first-");
+        var secondFolder = Directory.CreateTempSubdirectory("listary-open-explorer-confirm-second-");
+        try
+        {
+            var first = CreateResult(firstFolder.FullName, isDirectory: true);
+            var second = CreateResult(secondFolder.FullName, isDirectory: true);
+            var index = new RecordingSearchIndex([first, second]);
+            var navigatedPaths = new List<string>();
+            var viewModel = new SearchPanelViewModel(index);
+
+            await viewModel.ActivateExplorerSearchAsync("listary-open", firstFolder.Parent!.FullName);
+            viewModel.SetResultsForTesting([first, second]);
+            viewModel.SelectedResult = first;
+            var capturedAtKeypress = viewModel.SelectedResult;
+
+            // Simulate a delayed index refresh changing the live selection before
+            // the UI dispatcher handles the already-consumed Enter key.
+            viewModel.SelectedResult = second;
+            var activated = await viewModel.ActivateSelectedAsync(capturedAtKeypress, (path, _) =>
+            {
+                navigatedPaths.Add(path);
+                return Task.FromResult(true);
+            });
+
+            Assert.True(activated);
+            Assert.Equal([firstFolder.FullName], navigatedPaths);
+        }
+        finally
+        {
+            firstFolder.Delete(recursive: true);
+            secondFolder.Delete(recursive: true);
+        }
+    }
+
+    [Fact]
     public async Task RefreshSelectsFirstResultWhenPreviousSelectionNoLongerExists()
     {
         var first = CreateResult("C:\\Docs\\Invoice.xlsx", isDirectory: false);

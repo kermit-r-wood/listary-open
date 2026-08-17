@@ -94,6 +94,7 @@ public sealed class HookHostProcessFactoryTests
             elevated: false);
 
         Assert.Equal("C:\\Program Files\\ListaryOpen\\hooks\\x64\\ListaryOpen.HookHost.exe", startInfo.FileName);
+        Assert.Equal("C:\\Program Files\\ListaryOpen\\hooks\\x64", startInfo.WorkingDirectory);
         Assert.False(startInfo.UseShellExecute);
         Assert.Equal(string.Empty, startInfo.Verb);
         Assert.True(startInfo.CreateNoWindow);
@@ -121,6 +122,7 @@ public sealed class HookHostProcessFactoryTests
             elevated: true);
 
         Assert.Equal("C:\\Program Files\\ListaryOpen\\hooks\\x86\\ListaryOpen.HookHost.exe", startInfo.FileName);
+        Assert.Equal("C:\\Program Files\\ListaryOpen\\hooks\\x86", startInfo.WorkingDirectory);
         Assert.True(startInfo.UseShellExecute);
         Assert.Equal("runas", startInfo.Verb);
         Assert.Equal(ProcessWindowStyle.Hidden, startInfo.WindowStyle);

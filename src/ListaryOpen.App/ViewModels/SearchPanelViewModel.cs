@@ -468,10 +468,20 @@ public sealed class SearchPanelViewModel : INotifyPropertyChanged
 
     public Task<bool> ActivateSelectedAsync() => ActivateSelectedAsync(explorerFolderActivation: null);
 
+    internal Task<bool> ActivateSelectedAsync(
+        Func<string, CancellationToken, Task<bool>>? explorerFolderActivation) =>
+        ActivateSelectedAsync(SelectedResult, explorerFolderActivation);
+
+    /// <summary>
+    /// Activates the immutable result captured when the user confirmed. Search
+    /// refreshes may replace <see cref="SelectedResult"/> while an Enter event is
+    /// crossing from the hook thread to the UI dispatcher.
+    /// </summary>
     internal async Task<bool> ActivateSelectedAsync(
+        SearchResult? selected,
         Func<string, CancellationToken, Task<bool>>? explorerFolderActivation)
     {
-        var selected = TryGetCurrentSelectedResult();
+        selected = TryGetCurrentResult(selected);
         if (selected is null)
         {
             return false;
@@ -1459,8 +1469,10 @@ public sealed class SearchPanelViewModel : INotifyPropertyChanged
     }
 
     private SearchResult? TryGetCurrentSelectedResult()
+        => TryGetCurrentResult(SelectedResult);
+
+    private SearchResult? TryGetCurrentResult(SearchResult? selected)
     {
-        var selected = SelectedResult;
         if (selected is null)
         {
             StatusText = "Select a result first.";

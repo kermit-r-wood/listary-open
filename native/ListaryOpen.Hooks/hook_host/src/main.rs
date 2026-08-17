@@ -14,7 +14,7 @@ use std::ffi::c_void;
 use std::io;
 use std::process::{Child, Command};
 use std::ptr::{null, null_mut};
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, Ordering};
 use std::sync::{mpsc, Arc, Condvar, Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -48,8 +48,9 @@ use windows_sys::Win32::System::SystemInformation::{
     IMAGE_FILE_MACHINE_UNKNOWN,
 };
 use windows_sys::Win32::System::Threading::{
-    GetCurrentProcess, IsWow64Process2, OpenProcess, OpenProcessToken, QueryFullProcessImageNameW,
-    WaitForSingleObject, INFINITE, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE,
+    GetCurrentProcess, GetCurrentThreadId, IsWow64Process2, OpenProcess, OpenProcessToken,
+    QueryFullProcessImageNameW, WaitForSingleObject, INFINITE, PROCESS_QUERY_LIMITED_INFORMATION,
+    PROCESS_SYNCHRONIZE,
 };
 use windows_sys::Win32::UI::Accessibility::{SetWinEventHook, UnhookWinEvent, HWINEVENTHOOK};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
@@ -74,7 +75,6 @@ const HOOK_PRELOAD_RESCAN_INTERVAL: Duration = Duration::from_millis(25);
 const HOOK_EVENT_BURST_RESCAN_INTERVAL: Duration = Duration::from_millis(100);
 const HOOK_TARGET_SESSION_RESCAN_INTERVAL: Duration = Duration::from_millis(100);
 const HOOK_PRELOAD_BURST_DURATION: Duration = Duration::from_secs(1);
-const HOOK_SHUTDOWN_POLL_INTERVAL: Duration = Duration::from_millis(50);
 const HOOK_UNLOAD_QUEUE_TURN_GRACE: Duration = Duration::from_millis(50);
 const ACK_WINDOW_CLASS: &str = "ListaryOpenHookAckWindow";
 const ACK_STARTUP_ACCEPT_TIMEOUT: Duration = Duration::from_secs(2);
@@ -122,8 +122,40 @@ static NEXT_COMMAND_ID: AtomicU64 = AtomicU64::new(1);
 static HOOK_RUNTIME_STATUS: AtomicU8 = AtomicU8::new(HookRuntimeStatus::Starting as u8);
 static DIALOG_SCAN_REQUESTED: AtomicBool = AtomicBool::new(false);
 
+fn dialog_scan_processes() -> &'static Mutex<HashSet<u32>> {
+    static PROCESSES: OnceLock<Mutex<HashSet<u32>>> = OnceLock::new();
+    PROCESSES.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+fn request_dialog_scan_for_process(process_id: u32) {
+    let mut processes = dialog_scan_processes()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    insert_bounded_dialog_scan_process(&mut processes, process_id);
+}
+
+fn insert_bounded_dialog_scan_process(processes: &mut HashSet<u32>, process_id: u32) -> bool {
+    // Foreground/dialog events are drained on the hook thread. Bound the set so
+    // a hostile event storm cannot create unbounded work before the next drain.
+    process_id != 0
+        && (processes.contains(&process_id) || processes.len() < 32)
+        && processes.insert(process_id)
+}
+
+fn take_dialog_scan_processes() -> HashSet<u32> {
+    let mut processes = dialog_scan_processes()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    std::mem::take(&mut *processes)
+}
+
 fn confirmed_spawn_proofs() -> &'static Mutex<HashMap<u32, SpawnProof>> {
     static PROOFS: OnceLock<Mutex<HashMap<u32, SpawnProof>>> = OnceLock::new();
+    PROOFS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn confirmed_preload_proofs() -> &'static Mutex<HashMap<u32, u64>> {
+    static PROOFS: OnceLock<Mutex<HashMap<u32, u64>>> = OnceLock::new();
     PROOFS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
@@ -240,6 +272,7 @@ fn start_parent_monitor(parent_process_id: u32, hook_shutdown: Arc<HookShutdown>
 
 struct HookShutdown {
     requested: AtomicBool,
+    hook_thread_id: AtomicU32,
     complete: Mutex<bool>,
     complete_signal: Condvar,
 }
@@ -248,6 +281,7 @@ impl HookShutdown {
     fn new() -> Self {
         Self {
             requested: AtomicBool::new(false),
+            hook_thread_id: AtomicU32::new(0),
             complete: Mutex::new(false),
             complete_signal: Condvar::new(),
         }
@@ -259,6 +293,27 @@ impl HookShutdown {
 
     fn request(&self) {
         self.requested.store(true, Ordering::Release);
+        let thread_id = self.hook_thread_id.load(Ordering::Acquire);
+        if thread_id != 0 {
+            // Wake MsgWaitForMultipleObjectsEx immediately. Polling an atomic
+            // every 50 ms kept both architecture hosts hot for their entire
+            // lifetime even when no window activity occurred.
+            unsafe {
+                PostThreadMessageW(thread_id, WM_QUIT, 0, 0);
+            }
+        }
+    }
+
+    fn register_current_hook_thread(&self) {
+        self.hook_thread_id
+            .store(unsafe { GetCurrentThreadId() }, Ordering::Release);
+        if self.is_requested() {
+            self.request();
+        }
+    }
+
+    fn unregister_current_hook_thread(&self) {
+        self.hook_thread_id.store(0, Ordering::Release);
     }
 
     fn mark_complete(&self) {
@@ -369,7 +424,11 @@ where
 fn start_child_hosts(launches: Vec<ChildHostLaunch>, session: &HostSession) -> Vec<Child> {
     let mut children = Vec::new();
     for launch in launches {
-        match Command::new(&launch.host_exe_path)
+        let mut command = Command::new(&launch.host_exe_path);
+        if let Some(architecture_directory) = std::path::Path::new(&launch.host_exe_path).parent() {
+            command.current_dir(architecture_directory);
+        }
+        command
             .arg("--pipe")
             .arg(&launch.pipe_name)
             .arg("--dll")
@@ -377,9 +436,8 @@ fn start_child_hosts(launches: Vec<ChildHostLaunch>, session: &HostSession) -> V
             .arg("--parent-pid")
             .arg(session.parent_process_id.to_string())
             .arg("--secret")
-            .arg(&session.secret)
-            .spawn()
-        {
+            .arg(&session.secret);
+        match command.spawn() {
             Ok(child) => children.push(child),
             Err(error) => eprintln!(
                 "Hook host failed to launch child host '{}': {error}",
@@ -425,7 +483,7 @@ fn run_hook_thread(
 ) {
     match HookState::new(dll_path, preload_process_id, cleanup_authorization_token) {
         Ok(mut hook_state) => {
-            hook_state.install_new_dialog_hooks();
+            hook_state.install_new_dialog_hooks(&HashSet::new());
             let scan_events = DialogScanEvents::install();
             set_hook_runtime_status(hook_state.runtime_status());
             hook_loop(hook_state, scan_events.is_active(), hook_shutdown);
@@ -451,6 +509,12 @@ fn hook_runtime_status() -> HookRuntimeStatus {
 }
 
 fn hook_loop(mut hook_state: HookState, event_scan_active: bool, hook_shutdown: &HookShutdown) {
+    // Establish this thread's message queue before exposing its ID to shutdown
+    // requesters, so PostThreadMessageW cannot race queue creation.
+    if !pump_pending_messages() {
+        return;
+    }
+    hook_shutdown.register_current_hook_thread();
     let rescan_interval = rescan_interval(event_scan_active);
     // HookState already performed one complete startup scan before entering the
     // loop. Do not manufacture a high-frequency burst until a real foreground
@@ -467,11 +531,12 @@ fn hook_loop(mut hook_state: HookState, event_scan_active: bool, hook_shutdown: 
         }
 
         let scan_requested = DIALOG_SCAN_REQUESTED.swap(false, Ordering::AcqRel);
+        let requested_processes = take_dialog_scan_processes();
         if scan_requested {
             preload_burst_until = Instant::now() + HOOK_PRELOAD_BURST_DURATION;
         }
         if scan_requested || Instant::now() >= next_scan {
-            hook_state.install_new_dialog_hooks();
+            hook_state.install_new_dialog_hooks(&requested_processes);
             let runtime_status = hook_state.runtime_status();
             set_hook_runtime_status(runtime_status);
             next_scan = Instant::now()
@@ -484,11 +549,7 @@ fn hook_loop(mut hook_state: HookState, event_scan_active: bool, hook_shutdown: 
                 );
         }
 
-        let timeout = wait_timeout_millis(
-            next_scan
-                .saturating_duration_since(Instant::now())
-                .min(HOOK_SHUTDOWN_POLL_INTERVAL),
-        );
+        let timeout = wait_timeout_millis(next_scan.saturating_duration_since(Instant::now()));
         let wait_result = unsafe {
             MsgWaitForMultipleObjectsEx(0, null(), timeout, QS_ALLINPUT, MWMO_INPUTAVAILABLE)
         };
@@ -499,6 +560,7 @@ fn hook_loop(mut hook_state: HookState, event_scan_active: bool, hook_shutdown: 
             debug_assert!(wait_result == WAIT_OBJECT_0 || wait_result == WAIT_TIMEOUT);
         }
     }
+    hook_shutdown.unregister_current_hook_thread();
 }
 
 fn rescan_interval(event_scan_active: bool) -> Duration {
@@ -587,12 +649,20 @@ impl Drop for DialogScanEvents {
 unsafe extern "system" fn dialog_scan_event(
     _hook: HWINEVENTHOOK,
     _event: u32,
-    _window: HWND,
+    window: HWND,
     _object_id: i32,
     _child_id: i32,
     _event_thread: u32,
     _event_time: u32,
 ) {
+    if !window.is_null() {
+        let root = unsafe { GetAncestor(window, GA_ROOT) };
+        let target = if root.is_null() { window } else { root };
+        let mut process_id = 0u32;
+        if unsafe { GetWindowThreadProcessId(target, &mut process_id) } != 0 {
+            request_dialog_scan_for_process(process_id);
+        }
+    }
     DIALOG_SCAN_REQUESTED.store(true, Ordering::Release);
 }
 
@@ -618,6 +688,8 @@ struct HookState {
     preload_hook_proc: DialogHookProc,
     hooked_threads: HashSet<HookThreadKey>,
     preloaded_threads: HashSet<HookThreadKey>,
+    logged_hook_install_failures: HashSet<HookThreadKey>,
+    logged_preload_install_failures: HashSet<HookThreadKey>,
     logged_mobaxterm_threads: HashSet<u32>,
     hooks: HashMap<HookThreadKey, HHOOK>,
     preload_hooks: HashMap<HookThreadKey, HHOOK>,
@@ -658,6 +730,8 @@ impl HookState {
             preload_hook_proc,
             hooked_threads: HashSet::new(),
             preloaded_threads: HashSet::new(),
+            logged_hook_install_failures: HashSet::new(),
+            logged_preload_install_failures: HashSet::new(),
             logged_mobaxterm_threads: HashSet::new(),
             hooks: HashMap::new(),
             preload_hooks: HashMap::new(),
@@ -674,9 +748,14 @@ impl HookState {
         Ok(state)
     }
 
-    fn install_new_dialog_hooks(&mut self) {
+    fn install_new_dialog_hooks(&mut self, requested_processes: &HashSet<u32>) {
+        let mut automatic_processes = HashSet::new();
         if self.preload_process_id.is_none() {
             if let Some(process_id) = foreground_root_process_id() {
+                automatic_processes.insert(process_id);
+            }
+            automatic_processes.extend(requested_processes.iter().copied());
+            for process_id in automatic_processes.iter().copied() {
                 self.allow_preload_process_session(process_id);
             }
         }
@@ -700,18 +779,11 @@ impl HookState {
             .iter()
             .map(|thread| thread.process_id)
             .collect::<HashSet<_>>();
-        let explicit_preload_threads = if self
-            .preload_process_id
-            .is_some_and(|process_id| process_name(process_id).eq_ignore_ascii_case("firefox"))
-        {
-            explicit_session_threads
-                .iter()
-                .copied()
-                .filter(|thread| Some(thread.process_id) == self.preload_process_id)
-                .collect::<HashSet<_>>()
-        } else {
-            explicit_session_threads.clone()
-        };
+        // Firefox keeps sandboxed utility children alive and can reuse one for
+        // a later file picker. Arm the whole same-executable process family at
+        // explicit-start time so an already-running dialog utility receives
+        // its IFileDialog factory capture before Ctrl+O creates the dialog.
+        let explicit_preload_threads = explicit_session_threads.clone();
         let observed_dialog_threads = dialogs
             .iter()
             .filter(|dialog| {
@@ -726,9 +798,11 @@ impl HookState {
             .collect::<HashSet<_>>();
         let mut threads = observed_dialog_threads.clone();
         if self.preload_process_id.is_none() {
-            match discover_foreground_process_threads() {
-                Ok(preload_threads) => threads.extend(preload_threads),
-                Err(error) => eprintln!("Hook host foreground preload discovery failed: {error}"),
+            for process_id in automatic_processes {
+                threads.extend(discover_automatic_process_threads(
+                    process_id,
+                    host_architecture(),
+                ));
             }
         }
         threads.extend(explicit_preload_threads);
@@ -738,6 +812,8 @@ impl HookState {
             .copied()
             .collect::<HashSet<_>>();
         threads.extend(live_hook_thread_keys(&previously_hooked));
+        self.logged_preload_install_failures
+            .retain(|thread| threads.contains(thread));
         self.lifecycle_threads.extend(threads.iter().copied());
         for process_id in threads
             .iter()
@@ -810,10 +886,8 @@ impl HookState {
         for thread in unhooked_threads(&threads, &self.preloaded_threads)
             .into_iter()
             .filter(|thread| {
-                !process_has_confirmed_precapture(
-                    thread.process_id,
-                    &self.preload_confirmed_threads,
-                ) && !has_confirmed_spawn_proof(thread.process_id)
+                !self.preload_confirmed_threads.contains(thread)
+                    && !has_confirmed_spawn_proof(thread.process_id)
             })
         {
             match install_thread_hook(
@@ -823,13 +897,22 @@ impl HookState {
                 WH_GETMESSAGE,
             ) {
                 Ok(hook) => {
+                    self.logged_preload_install_failures.remove(&thread);
                     self.preloaded_threads.insert(thread);
                     self.preload_hooks.insert(thread, hook);
                 }
-                Err(error) => eprintln!(
-                    "Hook host failed to install preload hook for thread {}: {error}",
-                    thread.thread_id
-                ),
+                Err(error) => {
+                    // Threads without a message queue commonly return ERROR_INVALID_PARAMETER
+                    // until they become UI threads. Keep retrying, but log only the first failure
+                    // per live thread so a 25 ms Firefox preload loop cannot flood stderr or burn
+                    // CPU formatting hundreds of identical diagnostics.
+                    if self.logged_preload_install_failures.insert(thread) {
+                        eprintln!(
+                            "Hook host failed to install preload hook for process {} thread {}: {error}",
+                            thread.process_id, thread.thread_id
+                        );
+                    }
+                }
             }
         }
         let pending_preload_threads = self
@@ -883,7 +966,9 @@ impl HookState {
                         observed_dialog_processes.contains(&thread.process_id),
                     )
                 {
-                    self.preload_confirmed_threads.insert(*thread);
+                    if self.preload_confirmed_threads.insert(*thread) {
+                        record_confirmed_preload_proof(thread.process_id);
+                    }
                 }
             }
             if posted_preload_threads
@@ -904,6 +989,8 @@ impl HookState {
         for hook in pruned_hooks {
             unhook_thread_hook(hook);
         }
+        self.logged_hook_install_failures
+            .retain(|thread| observed_dialog_threads.contains(thread));
 
         for thread in unhooked_threads(&observed_dialog_threads, &self.hooked_threads) {
             match install_thread_hook(
@@ -913,6 +1000,7 @@ impl HookState {
                 WH_CALLWNDPROC,
             ) {
                 Ok(hook) => {
+                    self.logged_hook_install_failures.remove(&thread);
                     self.hooked_threads.insert(thread);
                     self.hooks.insert(thread, hook);
                     eprintln!(
@@ -920,10 +1008,14 @@ impl HookState {
                         thread.process_id, thread.thread_id
                     );
                 }
-                Err(error) => eprintln!(
-                    "Hook host failed to hook thread {}: {error}",
-                    thread.thread_id
-                ),
+                Err(error) => {
+                    if self.logged_hook_install_failures.insert(thread) {
+                        eprintln!(
+                            "Hook host failed to hook process {} thread {}: {error}",
+                            thread.process_id, thread.thread_id
+                        );
+                    }
+                }
             }
         }
 
@@ -960,16 +1052,14 @@ impl HookState {
     }
 
     fn retire_confirmed_preload_hooks(&mut self) {
-        let confirmed_processes = self
-            .preload_confirmed_threads
-            .iter()
-            .map(|thread| thread.process_id)
-            .collect::<HashSet<_>>();
         let retired_threads = self
             .preloaded_threads
             .iter()
             .copied()
-            .filter(|thread| confirmed_processes.contains(&thread.process_id))
+            // Direct IFileDialog vtables are apartment-specific. One UI
+            // thread completing its timer must not retire another thread's
+            // hook while that thread still owns a pending timer callback.
+            .filter(|thread| self.preload_confirmed_threads.contains(thread))
             .collect::<Vec<_>>();
         for thread in retired_threads {
             self.preloaded_threads.remove(&thread);
@@ -1000,10 +1090,15 @@ impl HookState {
             return;
         };
         self.allow_preload_process(root_process_id);
-        if self.preload_process_id == Some(process_id) && process_id != root_process_id {
+        if process_id != root_process_id
+            && (self.preload_process_id == Some(process_id)
+                || is_firefox_process_name(&process_name(process_id)))
+        {
             // Firefox can hand the browser window from a short-lived launcher
-            // to another firefox.exe process.  Bind explicit preload to that
-            // actual window owner as well as the transient same-name root.
+            // to another firefox.exe process. Bind both explicit and automatic
+            // preload to the actual window owner as well as the transient
+            // same-name root. If the launcher exits before the hook callback,
+            // the DLL can still resolve authorization by its current PID.
             self.allow_preload_process(process_id);
         }
     }
@@ -1113,6 +1208,28 @@ fn discover_process_session_threads(
     let threads = discover_threads_from_snapshot(snapshot, &process_ids);
     unsafe { CloseHandle(snapshot) };
     threads
+}
+
+fn discover_automatic_process_threads(
+    seed_process_id: u32,
+    expected_architecture: &str,
+) -> HashSet<HookThreadKey> {
+    let session_threads = discover_process_session_threads(seed_process_id, expected_architecture);
+    if is_firefox_process_name(&process_name(seed_process_id)) {
+        // Firefox may create/reuse its sandboxed file-dialog utility on a
+        // thread without a browser top-level window. Its dedicated pre-resume
+        // path therefore still needs the complete same-executable session.
+        return session_threads;
+    }
+
+    // Generic desktop programs create IFileDialog from a UI apartment. Avoid
+    // installing timers in worker threads that have a message queue but no
+    // top-level window: those callbacks are irrelevant and may never dispatch,
+    // which delays native DLL unload after ListaryOpen exits.
+    session_threads
+        .into_iter()
+        .filter(|thread| top_level_window_for_thread(thread.thread_id).is_some())
+        .collect()
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1338,6 +1455,33 @@ fn has_confirmed_spawn_proof(process_id: u32) -> bool {
     valid
 }
 
+fn record_confirmed_preload_proof(process_id: u32) {
+    let Some(creation_time) = process_creation_time(process_id) else {
+        return;
+    };
+    confirmed_preload_proofs()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .insert(process_id, creation_time);
+}
+
+fn has_confirmed_preload_proof(process_id: u32) -> bool {
+    let mut proofs = confirmed_preload_proofs()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let valid = proofs.get(&process_id).is_some_and(|creation_time| {
+        preload_proof_matches(*creation_time, process_creation_time(process_id))
+    });
+    if !valid {
+        proofs.remove(&process_id);
+    }
+    valid
+}
+
+fn preload_proof_matches(recorded_creation_time: u64, current_creation_time: Option<u64>) -> bool {
+    current_creation_time == Some(recorded_creation_time)
+}
+
 fn create_preload_acknowledgement(
     thread: HookThreadKey,
     authorization_token: u64,
@@ -1496,16 +1640,6 @@ fn live_hook_thread_keys(candidates: &HashSet<HookThreadKey>) -> HashSet<HookThr
     live.intersection(candidates).copied().collect()
 }
 
-fn discover_foreground_process_threads() -> io::Result<HashSet<HookThreadKey>> {
-    let Some(foreground_process_id) = foreground_root_process_id() else {
-        return Ok(HashSet::new());
-    };
-    Ok(discover_process_session_threads(
-        foreground_process_id,
-        host_architecture(),
-    ))
-}
-
 fn foreground_root_process_id() -> Option<u32> {
     let foreground = unsafe { GetForegroundWindow() };
     if foreground.is_null() {
@@ -1578,6 +1712,10 @@ impl Drop for HookState {
             drive_hook_threads_after_unhook,
         );
         confirmed_spawn_proofs()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clear();
+        confirmed_preload_proofs()
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clear();
@@ -1984,13 +2122,20 @@ unsafe extern "system" fn enum_windows_proc(hwnd: HWND, l_param: LPARAM) -> BOOL
 }
 
 fn firefox_child_dialog_requires_spawn_proof(dialog: &ObservedDialog) -> bool {
-    dialog
-        .process_name
-        .trim()
-        .trim_end_matches(".exe")
-        .eq_ignore_ascii_case("firefox")
+    is_firefox_process_name(&dialog.process_name)
         && process_session_root_id(dialog.process_id)
             .is_some_and(|root_process_id| root_process_id != dialog.process_id)
+}
+
+fn is_firefox_process_name(process_name: &str) -> bool {
+    let name = process_name.trim();
+    let bytes = name.as_bytes();
+    let stem = if bytes.len() >= 4 && bytes[bytes.len() - 4..].eq_ignore_ascii_case(b".exe") {
+        &name[..name.len() - 4]
+    } else {
+        name
+    };
+    stem.eq_ignore_ascii_case("firefox")
 }
 
 fn firefox_dialog_precapture_ready(requires_spawn_proof: bool, has_spawn_proof: bool) -> bool {
@@ -2426,6 +2571,18 @@ fn active_dialog_response() -> String {
     }
 
     let firefox_file_dialog_utility = firefox_child_dialog_requires_spawn_proof(&dialog);
+    let spawn_precapture_confirmed = has_confirmed_spawn_proof(dialog.process_id);
+    let preload_confirmed_before_dialog = spawn_precapture_confirmed
+        || (!firefox_file_dialog_utility && has_confirmed_preload_proof(dialog.process_id));
+    if !firefox_dialog_precapture_ready(
+        firefox_file_dialog_utility,
+        preload_confirmed_before_dialog,
+    ) {
+        return command_reply(
+            "NoActiveDialog",
+            "Firefox file-dialog utility was not armed before the dialog was shown.",
+        );
+    }
     let payload = ActiveDialogPayload {
         dialog_id: dialog.dialog_id,
         window_handle: dialog.window_handle as usize,
@@ -2435,7 +2592,7 @@ fn active_dialog_response() -> String {
         process_name: dialog.process_name,
         class_name: dialog.class_name,
         title: dialog.title,
-        preload_confirmed_before_dialog: has_confirmed_spawn_proof(dialog.process_id),
+        preload_confirmed_before_dialog,
         firefox_file_dialog_utility,
     };
 
@@ -3533,6 +3690,13 @@ mod tests {
     }
 
     #[test]
+    fn direct_preload_proof_rejects_a_reused_process_id() {
+        assert!(preload_proof_matches(77, Some(77)));
+        assert!(!preload_proof_matches(77, Some(78)));
+        assert!(!preload_proof_matches(77, None));
+    }
+
+    #[test]
     fn spawn_proof_diagnostic_identifies_each_fail_closed_gate() {
         let proof = SpawnProof {
             token: 0x1234,
@@ -3585,6 +3749,28 @@ mod tests {
         assert!(firefox_dialog_precapture_ready(false, true));
         assert!(firefox_dialog_precapture_ready(true, true));
         assert!(!firefox_dialog_precapture_ready(true, false));
+    }
+
+    #[test]
+    fn firefox_process_name_accepts_executable_suffix_and_case() {
+        assert!(is_firefox_process_name("firefox"));
+        assert!(is_firefox_process_name("firefox.exe"));
+        assert!(is_firefox_process_name(" FIREFOX.EXE "));
+        assert!(!is_firefox_process_name("firefox-helper.exe"));
+    }
+
+    #[test]
+    fn dialog_event_process_queue_is_deduplicated_and_bounded() {
+        let mut processes = HashSet::new();
+        assert!(!insert_bounded_dialog_scan_process(&mut processes, 0));
+        assert!(insert_bounded_dialog_scan_process(&mut processes, 42));
+        assert!(!insert_bounded_dialog_scan_process(&mut processes, 42));
+        for process_id in 1..=31 {
+            processes.insert(1_000 + process_id);
+        }
+        assert_eq!(32, processes.len());
+        assert!(!insert_bounded_dialog_scan_process(&mut processes, 99));
+        assert_eq!(32, processes.len());
     }
 
     #[test]

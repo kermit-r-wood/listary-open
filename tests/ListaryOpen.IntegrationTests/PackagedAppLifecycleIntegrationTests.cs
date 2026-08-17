@@ -477,7 +477,8 @@ public sealed class PackagedAppLifecycleIntegrationTests
             processId,
             new AndCondition(
                 new PropertyCondition(AutomationElement.ControlTypeProperty, ControlType.ListItem),
-                new PropertyCondition(AutomationElement.NameProperty, "Geek")),
+                new PropertyCondition(AutomationElement.NameProperty, "Geek"),
+                new PropertyCondition(AutomationElement.IsSelectionItemPatternAvailableProperty, true)),
             TimeSpan.FromSeconds(5));
         Assert.NotNull(geekItem);
         Assert.True(geekItem.TryGetCurrentPattern(SelectionItemPattern.Pattern, out var selectionItemPattern));
@@ -861,7 +862,7 @@ public sealed class PackagedAppLifecycleIntegrationTests
             restartedProcessId,
             trayOracle = new
             {
-                discovery = "EnumWindows-owner-pid plus Shell_NotifyIconGetRect(hwnd,uID=0)",
+                discovery = "top-level-and-HWND_MESSAGE-owner-pid plus successful Shell_NotifyIconGetRect(hwnd,uID=0)",
                 firstInstance = firstTrayIcon,
                 restartedInstance = restartedTrayIcon,
                 settingsOpenInteraction = "registered-notification-owner WM_USER+0 / WM_LBUTTONDBLCLK callback"
@@ -900,34 +901,90 @@ public sealed class PackagedAppLifecycleIntegrationTests
 
     private static TrayIconSnapshot FindSingleRegisteredTrayIcon(int processId)
     {
-        var matches = new List<TrayIconSnapshot>();
-        _ = EnumWindows((window, parameter) =>
+        var stopwatch = Stopwatch.StartNew();
+        IReadOnlyList<TrayIconSnapshot> matches;
+        IReadOnlyList<string> observations = Array.Empty<string>();
+        do
         {
-            _ = GetWindowThreadProcessId(window, out var ownerProcessId);
-            if (ownerProcessId == unchecked((uint)processId) &&
-                TryReadRegisteredTrayIcon(window, out var bounds))
+            var current = new List<TrayIconSnapshot>();
+            var currentObservations = new List<string>();
+            void ObserveWindow(IntPtr window)
             {
-                matches.Add(new TrayIconSnapshot(
-                    window.ToInt64(),
-                    IconId: 0,
-                    ReadWindowText(window),
-                    ReadWindowClass(window),
-                    new EvidenceRect(
-                        bounds.Left,
-                        bounds.Top,
-                        bounds.Right - bounds.Left,
-                        bounds.Bottom - bounds.Top)));
+                _ = GetWindowThreadProcessId(window, out var ownerProcessId);
+                if (ownerProcessId != unchecked((uint)processId))
+                {
+                    return;
+                }
+
+                var ownerClass = ReadWindowClass(window);
+                var registered = TryReadRegisteredTrayIcon(window, out var bounds);
+                currentObservations.Add(
+                    $"0x{window.ToInt64():X}:{ownerClass}:{ReadWindowText(window)}:registered={registered}");
+                if (registered)
+                {
+                    current.Add(new TrayIconSnapshot(
+                        window.ToInt64(),
+                        IconId: 0,
+                        ReadWindowText(window),
+                        ownerClass,
+                        new EvidenceRect(
+                            bounds.Left,
+                            bounds.Top,
+                            bounds.Right - bounds.Left,
+                            bounds.Bottom - bounds.Top)));
+                }
             }
 
-            return true;
-        }, IntPtr.Zero);
+            _ = EnumWindows((window, parameter) =>
+            {
+                ObserveWindow(window);
 
-        return Assert.Single(matches);
+                return true;
+            }, IntPtr.Zero);
+
+            // Hardcodet uses an HWND_MESSAGE callback sink on current Windows
+            // builds. EnumWindows intentionally omits message-only windows.
+            var messageOnlyParent = new IntPtr(-3);
+            var messageWindow = IntPtr.Zero;
+            while ((messageWindow = FindWindowEx(
+                       messageOnlyParent,
+                       messageWindow,
+                       lpClassName: null,
+                       lpWindowName: null)) != IntPtr.Zero)
+            {
+                ObserveWindow(messageWindow);
+            }
+
+            matches = current;
+            observations = currentObservations;
+            if (matches.Count == 1)
+            {
+                return matches[0];
+            }
+
+            if (Thread.CurrentThread.GetApartmentState() == ApartmentState.STA)
+            {
+                var frame = new DispatcherFrame();
+                Dispatcher.CurrentDispatcher.BeginInvoke(
+                    DispatcherPriority.Background,
+                    new Action(() => frame.Continue = false));
+                Dispatcher.PushFrame(frame);
+            }
+            Thread.Sleep(100);
+        }
+        while (stopwatch.Elapsed < TimeSpan.FromSeconds(10));
+
+        Assert.True(
+            matches.Count == 1,
+            $"Expected one registered tray icon for process {processId}; found {matches.Count}. " +
+            $"Owned windows: {string.Join(" | ", observations)}");
+        return matches[0];
     }
 
     private static void AssertRegisteredTrayIcon(TrayIconSnapshot trayIcon)
     {
         Assert.True(IsWindow(new IntPtr(trayIcon.Handle)), "The tray callback owner window no longer exists.");
+        Assert.StartsWith("WPFTaskbarIcon_", ReadWindowClass(new IntPtr(trayIcon.Handle)), StringComparison.Ordinal);
         Assert.True(
             TryReadRegisteredTrayIcon(new IntPtr(trayIcon.Handle), out var bounds),
             "Shell_NotifyIconGetRect no longer recognized the packaged app's notification icon.");
@@ -944,7 +1001,10 @@ public sealed class PackagedAppLifecycleIntegrationTests
             IconGuid = Guid.Empty
         };
         var result = Shell_NotifyIconGetRect(ref identifier, out bounds);
-        return result == 0 && bounds.Right > bounds.Left && bounds.Bottom > bounds.Top;
+        // Shell_NotifyIconGetRect returns an HRESULT. S_FALSE (1) is still a
+        // successful result and is commonly returned for an icon in the overflow
+        // area; Windows supplies its real non-empty bounds in that case.
+        return result >= 0 && bounds.Right > bounds.Left && bounds.Bottom > bounds.Top;
     }
 
     private sealed class E2ePipeClient : IDisposable
@@ -1311,6 +1371,13 @@ public sealed class PackagedAppLifecycleIntegrationTests
     [DllImport("user32.dll")]
     [return: MarshalAs(UnmanagedType.Bool)]
     private static extern bool EnumWindows(EnumWindowsCallback callback, IntPtr parameter);
+
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+    private static extern IntPtr FindWindowEx(
+        IntPtr parentWindow,
+        IntPtr childAfter,
+        string? lpClassName,
+        string? lpWindowName);
 
     [DllImport("user32.dll")]
     private static extern uint GetWindowThreadProcessId(IntPtr window, out uint processId);

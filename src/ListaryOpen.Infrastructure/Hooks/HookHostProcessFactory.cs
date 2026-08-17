@@ -1,5 +1,6 @@
 using System.ComponentModel;
 using System.Diagnostics;
+using System.IO;
 
 namespace ListaryOpen.Infrastructure.Hooks;
 
@@ -69,6 +70,11 @@ public class HookHostProcessFactory
         var startInfo = new ProcessStartInfo
         {
             FileName = hostExePath,
+            // The native hook depends on libunwind.dll beside HookHost/Hook.dll.
+            // SetWindowsHookEx loads the hook in the target process and can report
+            // ERROR_MOD_NOT_FOUND unless the architecture folder is the launch
+            // directory used to resolve that adjacent runtime dependency.
+            WorkingDirectory = Path.GetDirectoryName(Path.GetFullPath(hostExePath))!,
             UseShellExecute = elevated,
             CreateNoWindow = true,
             WindowStyle = ProcessWindowStyle.Hidden

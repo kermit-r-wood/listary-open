@@ -975,6 +975,22 @@ Invoke-LoggedCommand -Name "Elevated NTFS indexer integration tests" -FilePath "
         "--logger", "trx;LogFileName=elevated-indexer.trx") `
     -WorkingDirectory $repositoryRoot `
     -LogPath (Join-Path $ResultsDirectory "elevated-indexer-tests.log")
+
+# The real helper creates its trusted data\tmp directory beside the published
+# executable even though the integration tests remove every temporary output
+# file. Packaged black-box tests require a pristine first-run directory, so
+# remove only this verified-empty runtime tree. Never hide actual leaked data.
+if (Test-Path -LiteralPath $packageDataDirectory -PathType Container) {
+    $runtimeFiles = @(Get-ChildItem -LiteralPath $packageDataDirectory -Recurse -Force -File)
+    if ($runtimeFiles.Count -gt 0) {
+        throw "Elevated indexer tests left runtime files in the package: $($runtimeFiles[0].FullName)"
+    }
+
+    Get-ChildItem -LiteralPath $packageDataDirectory -Recurse -Force -Directory |
+        Sort-Object { $_.FullName.Length } -Descending |
+        ForEach-Object { Remove-Item -LiteralPath $_.FullName -Force }
+    Remove-Item -LiteralPath $packageDataDirectory -Force
+}
 Invoke-LoggedCommand -Name "Elevated packaged-app black-box E2E" -FilePath "dotnet" `
     -Arguments @(
         "test", $integrationProject, "-c", "Release", "--no-restore", "--nologo",
@@ -1234,7 +1250,8 @@ $realTaskManagerEvidencePath = Join-Path $screenshotDirectory "28-real-task-mana
 $realTaskManagerScreenshotPath = Join-Path $screenshotDirectory "28-real-task-manager-overlay-selection.png"
 $realTaskManagerEvidence = Get-Content -LiteralPath $realTaskManagerEvidencePath -Raw | ConvertFrom-Json
 $realTaskInitial = $realTaskManagerEvidence.transitions[0]
-$realTaskMoved = $realTaskManagerEvidence.transitions[1]
+$realTaskPreview = $realTaskManagerEvidence.transitions[1]
+$realTaskConfirmed = $realTaskManagerEvidence.transitions[2]
 if ($realTaskManagerEvidence.passed -ne $true -or
     $realTaskManagerEvidence.scenario -ne "real-system-task-manager-production-overlay-selection-sync" -or
     $realTaskManagerEvidence.category -ne "ElevatedDesktopIntegration" -or
@@ -1244,12 +1261,16 @@ if ($realTaskManagerEvidence.passed -ne $true -or
     $realTaskManagerEvidence.testProcessSecurity.IsElevated -ne $true -or
     $realTaskManagerEvidence.taskManager.processName -ne "Taskmgr" -or
     $realTaskManagerEvidence.taskManager.windowClass -ne "TaskManagerWindow" -or
-    @($realTaskManagerEvidence.transitions).Count -ne 2 -or
+    @($realTaskManagerEvidence.transitions).Count -ne 3 -or
     $realTaskInitial.overlaySelectedIdentity.runtimeId -ne $realTaskInitial.taskManagerUiaSelectedIdentity.RuntimeId -or
-    $realTaskMoved.overlaySelectedIdentity.runtimeId -ne $realTaskMoved.taskManagerUiaSelectedIdentity.RuntimeId -or
-    $realTaskInitial.overlaySelectedIdentity.runtimeId -eq $realTaskMoved.overlaySelectedIdentity.runtimeId -or
+    $realTaskPreview.overlaySelectedIdentity.runtimeId -eq $realTaskInitial.overlaySelectedIdentity.runtimeId -or
+    $realTaskPreview.taskManagerUiaSelectedIdentity.RuntimeId -ne $realTaskInitial.taskManagerUiaSelectedIdentity.RuntimeId -or
+    $realTaskPreview.hostSelectionChanged -ne $false -or
+    $realTaskConfirmed.overlaySelectedIdentity.runtimeId -ne $realTaskPreview.overlaySelectedIdentity.runtimeId -or
+    $realTaskConfirmed.overlaySelectedIdentity.runtimeId -ne $realTaskConfirmed.taskManagerUiaSelectedIdentity.RuntimeId -or
+    $realTaskConfirmed.hostSelectionChanged -ne $true -or
     (Get-FileHash -LiteralPath $realTaskManagerScreenshotPath -Algorithm SHA256).Hash -ne $realTaskManagerEvidence.screenshotSha256) {
-    throw "Elevated real Task Manager evidence does not prove two synchronized production overlay selections."
+    throw "Elevated real Task Manager evidence does not prove preview-without-host-mutation followed by explicit synchronized confirmation."
 }
 
 $expectedPackagedHookDll = [IO.Path]::GetFullPath((Join-Path $PackageDirectory "hooks\x64\ListaryOpen.Hook.dll"))
@@ -1283,7 +1304,8 @@ $packagedTaskManagerEvidencePath = Join-Path $screenshotDirectory "29-packaged-r
 $packagedTaskManagerScreenshotPath = Join-Path $screenshotDirectory "29-packaged-real-task-manager-overlay.png"
 $packagedTaskManagerEvidence = Get-Content -LiteralPath $packagedTaskManagerEvidencePath -Raw | ConvertFrom-Json
 $initialTaskTransition = $packagedTaskManagerEvidence.transitions[0]
-$movedTaskTransition = $packagedTaskManagerEvidence.transitions[1]
+$previewTaskTransition = $packagedTaskManagerEvidence.transitions[1]
+$confirmedTaskTransition = $packagedTaskManagerEvidence.transitions[2]
 if ($packagedTaskManagerEvidence.passed -ne $true -or
     $packagedTaskManagerEvidence.scenario -ne "packaged-elevated-app-real-task-manager-type-search" -or
     $packagedTaskManagerEvidence.elevatedTestProcess -ne $true -or
@@ -1301,14 +1323,16 @@ if ($packagedTaskManagerEvidence.passed -ne $true -or
     $packagedTaskManagerEvidence.nativeUnloadOracle.authenticatedShutdownCompleted -ne $true -or
     $packagedTaskManagerEvidence.nativeUnloadOracle.unloadedAfterAuthenticatedShutdown -ne $true -or
     $packagedTaskManagerEvidence.nativeUnloadOracle.waitTimeoutMs -ne 10000 -or
-    @($packagedTaskManagerEvidence.transitions).Count -ne 2 -or
+    @($packagedTaskManagerEvidence.transitions).Count -ne 3 -or
     $initialTaskTransition.overlaySelectedIdentity.RuntimeId -ne $initialTaskTransition.taskManagerSelectedIdentity.RuntimeId -or
-    $movedTaskTransition.overlaySelectedIdentity.RuntimeId -ne $movedTaskTransition.taskManagerSelectedIdentity.RuntimeId -or
-    $initialTaskTransition.overlaySelectedIdentity.RuntimeId -eq $movedTaskTransition.overlaySelectedIdentity.RuntimeId -or
-    $packagedTaskManagerEvidence.escapeDismissedOverlay -ne $true -or
+    $previewTaskTransition.overlaySelectedIdentity.RuntimeId -eq $initialTaskTransition.overlaySelectedIdentity.RuntimeId -or
+    $previewTaskTransition.taskManagerSelectedIdentity.RuntimeId -ne $initialTaskTransition.taskManagerSelectedIdentity.RuntimeId -or
+    $confirmedTaskTransition.overlaySelectedIdentity.RuntimeId -ne $previewTaskTransition.overlaySelectedIdentity.RuntimeId -or
+    $confirmedTaskTransition.overlaySelectedIdentity.RuntimeId -ne $confirmedTaskTransition.taskManagerSelectedIdentity.RuntimeId -or
+    $packagedTaskManagerEvidence.enterConfirmedAndDismissedOverlay -ne $true -or
     $packagedTaskManagerEvidence.fakeServiceUsed -ne $false -or
     (Get-FileHash -LiteralPath $packagedTaskManagerScreenshotPath -Algorithm SHA256).Hash -ne $packagedTaskManagerEvidence.screenshotSha256) {
-    throw "Packaged Task Manager evidence does not prove two synchronized real system selections."
+    throw "Packaged Task Manager evidence does not prove injected Down preview without host mutation followed by injected Enter confirmation."
 }
 
 $packagedLifecycleEvidencePath = Join-Path $screenshotDirectory "29-packaged-app-lifecycle.json"
@@ -1357,9 +1381,9 @@ if ($packagedFirefoxEvidence.passed -ne $true -or
     $packagedFirefoxEvidence.directNavigationOracle.fileNameBefore -ne "" -or
     $packagedFirefoxEvidence.directNavigationOracle.fileNameAfter -ne "" -or
     $packagedFirefoxEvidence.directNavigationOracle.quickSwitchQueryBefore -ne "" -or
-    $packagedFirefoxEvidence.directNavigationOracle.quickSwitchQueryAfter -ne "" -or
+    $packagedFirefoxEvidence.directNavigationOracle.quickSwitchQueryAfter -ne "o" -or
     $packagedFirefoxEvidence.directNavigationOracle.fileNameInputUnchangedAndEmpty -ne $true -or
-    $packagedFirefoxEvidence.directNavigationOracle.quickSwitchQueryUnchangedAndEmpty -ne $true -or
+    $packagedFirefoxEvidence.directNavigationOracle.quickSwitchQueryUnchangedAndEmpty -ne $false -or
     $packagedFirefoxEvidence.directNavigationOracle.fallback -ne $false -or
     $packagedFirefoxEvidence.nativeUnloadOracle.targetProcess -ne "firefox" -or
     $packagedFirefoxEvidence.nativeUnloadOracle.targetProcessId -le 0 -or

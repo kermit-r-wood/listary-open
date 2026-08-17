@@ -5,6 +5,22 @@ namespace ListaryOpen.Infrastructure.Tests.Hooks;
 public sealed class HookHostPathsTests
 {
     [Fact]
+    public void CreateDefaultUsesStableProgramDirectoryHookPaths()
+    {
+        using var paths = HookHostPaths.CreateDefault();
+
+        var x64 = paths.ForArchitecture(HookArchitecture.X64);
+
+        Assert.Equal(
+            Path.Combine(Path.GetFullPath(AppContext.BaseDirectory), "hooks", "x64"),
+            x64.DirectoryPath);
+        Assert.DoesNotContain(
+            $"{Path.DirectorySeparatorChar}runtime-hooks{Path.DirectorySeparatorChar}",
+            x64.DirectoryPath,
+            StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
     public void ForArchitectureUsesProgramDirectoryHooksSubfolder()
     {
         var root = Path.Combine(Path.GetTempPath(), "listary-open-hook-paths-" + Guid.NewGuid());

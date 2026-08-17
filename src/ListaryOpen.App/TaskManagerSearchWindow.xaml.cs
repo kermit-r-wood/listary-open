@@ -13,6 +13,8 @@ namespace ListaryOpen.App;
 
 public partial class TaskManagerSearchWindow : Window
 {
+    private const int InitialSnapshotAttemptCount = 4;
+    private static readonly TimeSpan InitialSnapshotRetryDelay = TimeSpan.FromMilliseconds(125);
     private readonly ITaskManagerAutomationService _automationService;
     private CancellationTokenSource? _snapshotCancellation;
     private IntPtr _taskManagerWindow;
@@ -56,23 +58,43 @@ public partial class TaskManagerSearchWindow : Window
         var version = Interlocked.Increment(ref _activationVersion);
         _taskManagerWindow = taskManagerWindow;
         ViewModel.QueryText = initialQuery;
-        // Show/Activate briefly fights Task Manager for focus; don't dismiss mid-activation.
+        // Keep Task Manager foreground while the overlay is opened from global input.
+        // Modern WinUI Task Manager can clear/recreate its selected row when another
+        // top-level window activates. The low-level input capture already routes text,
+        // arrows, editing commands, and Enter to this overlay, so stealing activation is
+        // both unnecessary and harmful to selection/focus continuity.
         _suppressDeactivateDismissUntilTick = Environment.TickCount64 + 500;
-        ShowActivated = true;
+        ShowActivated = false;
         Show();
         PositionAtWindowBottomRight(taskManagerWindow);
         ApplyBorderlessWindowChrome();
-        Activate();
-        FocusQueryAtEnd();
+        TaskQueryBox.Select(TaskQueryBox.Text.Length, 0);
         // Keep Topmost so the overlay stays above elevated Task Manager chrome.
         Topmost = true;
 
         try
         {
-            var items = await _automationService.GetItemsAsync(taskManagerWindow, _snapshotCancellation.Token);
-            if (version == _activationVersion && taskManagerWindow == _taskManagerWindow)
+            for (var attempt = 0; attempt < InitialSnapshotAttemptCount; attempt++)
             {
+                var items = await _automationService.GetItemsAsync(taskManagerWindow, _snapshotCancellation.Token);
+                if (version != _activationVersion || taskManagerWindow != _taskManagerWindow)
+                {
+                    return;
+                }
+
                 ViewModel.SetItems(items);
+                if (ContainsQueryMatch(items, ViewModel.QueryText) ||
+                    attempt + 1 >= InitialSnapshotAttemptCount)
+                {
+                    return;
+                }
+
+                // Modern Task Manager continuously replaces its WinUI row tree.
+                // A traversal during that hand-off can yield an empty snapshot even
+                // though the same page is populated immediately before and after.
+                // Retry only the no-match startup case; successful searches keep the
+                // single-snapshot fast path.
+                await Task.Delay(InitialSnapshotRetryDelay, _snapshotCancellation.Token);
             }
         }
         catch (OperationCanceledException)
@@ -87,6 +109,9 @@ public partial class TaskManagerSearchWindow : Window
             }
         }
     }
+
+    private static bool ContainsQueryMatch(IReadOnlyList<TaskManagerItem> items, string query) =>
+        items.Any(item => !double.IsNegativeInfinity(TaskManagerSearchViewModel.MatchScore(item, query)));
 
     internal void AppendText(string text)
     {
@@ -104,7 +129,11 @@ public partial class TaskManagerSearchWindow : Window
                 ViewModel.QueryText += text;
             }
 
-            FocusQueryAtEnd();
+            // Text arrived through the low-level global input route while Task
+            // Manager intentionally remains foreground. Updating WPF keyboard
+            // focus here would reactivate this overlay on the second character
+            // and make Task Manager rebuild/lose its selected row.
+            TaskQueryBox.Select(TaskQueryBox.Text.Length, 0);
         }
     }
 
@@ -309,13 +338,9 @@ public partial class TaskManagerSearchWindow : Window
         {
             if (Environment.TickCount64 < _suppressDeactivateDismissUntilTick)
             {
-                // Re-assert focus while the overlay is still activating.
-                if (IsVisible && _taskManagerWindow != IntPtr.Zero)
-                {
-                    Activate();
-                    FocusQueryAtEnd();
-                }
-
+                // ShowActivated=false deliberately leaves Task Manager in front.
+                // Ignore the transient WPF deactivation notification without
+                // reactivating this window and disturbing the selected host row.
                 return;
             }
 

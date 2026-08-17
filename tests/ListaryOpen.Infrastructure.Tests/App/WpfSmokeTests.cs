@@ -32,6 +32,7 @@ public sealed class WpfSmokeTests
             SearchPanel? searchPanel = null;
             QuickSwitchBarWindow? quickSwitchBar = null;
             TaskManagerSearchWindow? taskManagerSearchWindow = null;
+            TaskManagerSearchWindow? taskManagerRetryWindow = null;
             Window? layoutProbeWindow = null;
 
             try
@@ -39,6 +40,8 @@ public sealed class WpfSmokeTests
                 Volatile.Write(ref stage, "initializing application");
                 application = new WpfApp();
                 application.InitializeComponent();
+                SynchronizationContext.SetSynchronizationContext(
+                    new DispatcherSynchronizationContext(Dispatcher.CurrentDispatcher));
 
                 Assert.NotNull(application.FindResource("Brush.AppBackground"));
                 Assert.NotNull(application.FindResource("Brush.Surface"));
@@ -235,11 +238,14 @@ public sealed class WpfSmokeTests
                 var explorerWindow = new IntPtr(42);
                 searchPanel.ActivateExplorerSearch("o", Environment.CurrentDirectory, explorerWindow);
                 Assert.False(searchPanel.ShowInTaskbar);
+                Assert.False(searchPanel.ShowActivated);
+                Assert.False(queryBox.IsKeyboardFocusWithin);
                 Assert.Equal("o", queryBox.Text);
                 Assert.Equal(queryBox.Text.Length, queryBox.CaretIndex);
                 Assert.Equal(0, queryBox.SelectionLength);
 
                 searchPanel.AppendExplorerSearchText("p");
+                Assert.False(queryBox.IsKeyboardFocusWithin);
                 Assert.Equal("op", queryBox.Text);
                 Assert.Equal(queryBox.Text.Length, queryBox.CaretIndex);
                 Assert.Equal(0, queryBox.SelectionLength);
@@ -439,6 +445,8 @@ public sealed class WpfSmokeTests
                 taskManagerSearchWindow.ActivateSearch("fire", new IntPtr(126));
                 var taskQueryBox = Assert.IsType<TextBox>(taskManagerSearchWindow.FindName("TaskQueryBox"));
                 var taskSearchViewModel = Assert.IsType<TaskManagerSearchViewModel>(taskManagerSearchWindow.DataContext);
+                Assert.False(taskManagerSearchWindow.ShowActivated);
+                Assert.False(taskQueryBox.IsKeyboardFocusWithin);
                 Assert.True(taskManagerSearchWindow.IsTaskManagerSearchActive);
                 Assert.Equal("fire", taskQueryBox.Text);
                 Assert.Equal(taskQueryBox.Text.Length, taskQueryBox.CaretIndex);
@@ -455,6 +463,7 @@ public sealed class WpfSmokeTests
                 Assert.Equal(taskQueryBox.Text.Length, taskQueryBox.SelectionLength);
                 taskManagerSearchWindow.AppendText("1pass");
                 Assert.Equal("1pass", taskQueryBox.Text);
+                Assert.False(taskQueryBox.IsKeyboardFocusWithin);
                 taskManagerSearchWindow.ExecuteEditCommand(GlobalEditCommand.Backspace);
                 Assert.Equal("1pas", taskQueryBox.Text);
                 taskManagerSearchWindow.AppendText("😀");
@@ -470,6 +479,24 @@ public sealed class WpfSmokeTests
                 Assert.NotNull(taskManagerAutomation.SelectedItem);
                 Assert.Equal("Firefox", taskManagerAutomation.SelectedItem!.Name);
                 Assert.True(taskManagerAutomation.ActivateSelection);
+
+                var retryingTaskManagerAutomation = new SequencedTaskManagerAutomationService(
+                [
+                    [],
+                    [
+                        new TaskManagerItem("firefox-retry", "Firefox", "firefox.exe"),
+                        new TaskManagerItem("firebird-retry", "Firebird", "firebird.exe")
+                    ]
+                ]);
+                taskManagerRetryWindow = new TaskManagerSearchWindow(retryingTaskManagerAutomation);
+                taskManagerRetryWindow.ActivateSearch("fire", new IntPtr(127));
+                var retryViewModel = Assert.IsType<TaskManagerSearchViewModel>(taskManagerRetryWindow.DataContext);
+                Assert.True(
+                    WaitForDispatcherCondition(
+                        () => retryViewModel.Results.Count == 2 && retryViewModel.SelectedItem is not null,
+                        TimeSpan.FromSeconds(3)),
+                    "Task Manager search did not recover from a transient empty WinUI row snapshot.");
+                Assert.Equal(2, retryingTaskManagerAutomation.GetItemsCallCount);
 
                 var quickMenu = new ExplorerQuickMenu(() => { }, _ => { });
                 quickMenu.Show(
@@ -500,6 +527,7 @@ public sealed class WpfSmokeTests
                 // the production close-to-tray handlers allow each HWND to close.
                 application?.Dispatcher.BeginInvokeShutdown(DispatcherPriority.Send);
                 layoutProbeWindow?.Close();
+                taskManagerRetryWindow?.Close();
                 taskManagerSearchWindow?.Close();
                 quickSwitchBar?.Close();
                 searchPanel?.Close();
@@ -588,6 +616,36 @@ public sealed class WpfSmokeTests
         }
 
         public void CancelPending() => CancelPendingCount++;
+
+        public void Dispose()
+        {
+        }
+    }
+
+    private sealed class SequencedTaskManagerAutomationService(
+        IReadOnlyList<IReadOnlyList<TaskManagerItem>> snapshots) : ITaskManagerAutomationService
+    {
+        private int _nextSnapshot;
+
+        public int GetItemsCallCount { get; private set; }
+
+        public Task<IReadOnlyList<TaskManagerItem>> GetItemsAsync(
+            IntPtr taskManagerWindow,
+            CancellationToken cancellationToken)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            GetItemsCallCount++;
+            var index = Math.Min(_nextSnapshot++, snapshots.Count - 1);
+            return Task.FromResult(snapshots[index]);
+        }
+
+        public void QueueSelectItem(IntPtr taskManagerWindow, TaskManagerItem item, bool activate = false)
+        {
+        }
+
+        public void CancelPending()
+        {
+        }
 
         public void Dispose()
         {

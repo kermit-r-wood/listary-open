@@ -34,6 +34,7 @@ public partial class SearchPanel : Window
     private bool _searchFiltersAllowed;
     private int _resultLayoutUpdateVersion;
     private bool _resultContextMenuOpen;
+    private SearchResult? _selectedExplorerResultForHostInput;
     /// <summary>Last user-placed (or last applied) position for compact global search, in WPF DIPs.</summary>
     private Point? _compactGlobalSearchPosition;
     /// <summary>Ignore hide-on-deactivate while the panel is still being shown/focused.</summary>
@@ -94,6 +95,14 @@ public partial class SearchPanel : Window
 
     internal bool IsResultContextMenuOpen => _resultContextMenuOpen;
 
+    /// <summary>
+    /// Immutable selection snapshot published by the UI thread for the global
+    /// keyboard-hook thread. Never read WPF or ObservableCollection state from
+    /// the hook thread while forwarding Enter.
+    /// </summary>
+    internal SearchResult? SelectedResultForHostInput =>
+        Volatile.Read(ref _selectedExplorerResultForHostInput);
+
     public void ActivateSearch()
     {
         EndExplorerSearchSession();
@@ -112,6 +121,7 @@ public partial class SearchPanel : Window
 
     public void ActivateExplorerSearch(string initialQuery, string currentFolder, IntPtr explorerWindow)
     {
+        Volatile.Write(ref _selectedExplorerResultForHostInput, null);
         _isCompactGlobalSearch = false;
         _explorerSearchWindow = explorerWindow;
         _explorerSearchFolder = currentFolder;
@@ -137,6 +147,7 @@ public partial class SearchPanel : Window
     private void EndExplorerSearchSession()
     {
         var hadExplorerSession = _explorerSearchWindow != IntPtr.Zero || ViewModel.IsExplorerTypeSearchMode;
+        Volatile.Write(ref _selectedExplorerResultForHostInput, null);
         _explorerSelectionService.CancelPending();
         _explorerSearchWindow = IntPtr.Zero;
         _explorerSearchFolder = null;
@@ -204,7 +215,7 @@ public partial class SearchPanel : Window
                 ViewModel.QueryText += text;
             }
 
-            FocusQueryAtEnd();
+            MoveQueryCaretToEnd();
         }
     }
 
@@ -334,11 +345,15 @@ public partial class SearchPanel : Window
         Width = 560 + 20;
         Height = 360 + 20;
         SuppressDeactivateDismiss();
-        ShowActivated = true;
+        // Keep Explorer as the foreground input owner for the complete typing
+        // burst. Switching focus to WPF between injected/physical keystrokes
+        // creates a hand-off window where neither the Explorer hook nor the
+        // query TextBox receives a key. A user click can still activate this
+        // window normally after it has been shown.
+        ShowActivated = false;
         Show();
         PositionAtWindowBottomRight(explorerWindow);
-        Activate();
-        FocusQueryAtEnd();
+        MoveQueryCaretToEnd();
     }
 
     private void ShowCompactGlobalSearch()
@@ -483,6 +498,11 @@ public partial class SearchPanel : Window
     private void FocusQueryAtEnd()
     {
         QueryBox.Focus();
+        MoveQueryCaretToEnd();
+    }
+
+    private void MoveQueryCaretToEnd()
+    {
         QueryBox.Select(QueryBox.Text.Length, 0);
     }
 
@@ -560,6 +580,11 @@ public partial class SearchPanel : Window
 
         if (string.Equals(e.PropertyName, nameof(SearchPanelViewModel.SelectedResult), StringComparison.Ordinal))
         {
+            Volatile.Write(
+                ref _selectedExplorerResultForHostInput,
+                ViewModel.IsExplorerTypeSearchMode && _explorerSearchWindow != IntPtr.Zero
+                    ? ViewModel.SelectedResult
+                    : null);
             SyncSelectedResultToExplorer();
             _ = PreviewPane.ShowPreviewAsync(
                 PreviewPane.Visibility == Visibility.Visible ? ViewModel.SelectedResult?.Record : null);
@@ -851,11 +876,13 @@ public partial class SearchPanel : Window
 
         if (Environment.TickCount64 < _suppressDeactivateDismissUntilTick)
         {
-            if (IsVisible)
+            var hasExplorerSearchSession =
+                ViewModel.IsExplorerTypeSearchMode || _explorerSearchWindow != IntPtr.Zero;
+            if (ShouldRestoreFocusAfterSuppressedDeactivation(IsVisible, hasExplorerSearchSession))
             {
                 Topmost = true;
                 Activate();
-                if (ViewModel.IsExplorerTypeSearchMode || _isCompactGlobalSearch)
+                if (_isCompactGlobalSearch)
                 {
                     FocusQueryAtEnd();
                 }
@@ -913,6 +940,16 @@ public partial class SearchPanel : Window
             }
         }));
     }
+
+    /// <summary>
+    /// Explorer type-to-search deliberately leaves Explorer in the foreground.
+    /// Reactivating this window during the initial deactivation grace period
+    /// creates a one-key hand-off gap between the global hook and the WPF edit.
+    /// </summary>
+    internal static bool ShouldRestoreFocusAfterSuppressedDeactivation(
+        bool isVisible,
+        bool hasExplorerSearchSession) =>
+        isVisible && !hasExplorerSearchSession;
 
     internal static bool ShouldDismissExplorerSearchAfterDeactivation(
         bool isVisible,
@@ -1176,14 +1213,17 @@ public partial class SearchPanel : Window
     }
 
     private async Task ActivateSelectedFromQuickSwitchAsync()
+        => await ActivateSelectedFromQuickSwitchAsync(ViewModel.SelectedResult);
+
+    private async Task ActivateSelectedFromQuickSwitchAsync(SearchResult? selected)
     {
         var explorerWindow = _explorerSearchWindow;
         var wasExplorerTypeSearch = ViewModel.IsExplorerTypeSearchMode && explorerWindow != IntPtr.Zero;
-        var selected = ViewModel.SelectedResult;
         var explorerFolderBeforeActivation = _explorerSearchFolder;
         var activated = await RunInteractionAsync(
             ViewModel,
             viewModel => viewModel.ActivateSelectedAsync(
+                selected,
                 wasExplorerTypeSearch
                     ? (path, cancellationToken) =>
                         _explorerNavigationService.NavigateToFolderAsync(
@@ -1239,7 +1279,10 @@ public partial class SearchPanel : Window
     }
 
     internal void ConfirmSelectionFromHostInput() =>
-        _ = ActivateSelectedFromQuickSwitchAsync();
+        _ = ActivateSelectedFromQuickSwitchAsync(ViewModel.SelectedResult);
+
+    internal void ConfirmSelectionFromHostInput(SearchResult? selectedResult) =>
+        _ = ActivateSelectedFromQuickSwitchAsync(selectedResult);
 
     private void RevealResultMenuItem_Click(object sender, RoutedEventArgs e)
     {

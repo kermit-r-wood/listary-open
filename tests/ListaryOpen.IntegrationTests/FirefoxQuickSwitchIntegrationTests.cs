@@ -114,6 +114,9 @@ public sealed class FirefoxQuickSwitchIntegrationTests
                     capturedDialog.FirefoxFileDialogUtility,
                     $"Firefox file-dialog PID {dialogProcessId} was not classified as the authorized sandboxingKind 4 Firefox utility process.");
                 Assert.True(
+                    capturedDialog.PreloadConfirmedBeforeDialog,
+                    $"Firefox file-dialog PID {dialogProcessId} was not armed before the native picker was shown.");
+                Assert.True(
                     nativeHook.IsHookDllLoaded((int)dialogProcessId),
                     "The native hook DLL was not loaded into Firefox's picker process.");
 
@@ -202,11 +205,11 @@ public sealed class FirefoxQuickSwitchIntegrationTests
                         Math.Abs(quickBounds.Bottom - dialogBounds.Top)),
                     0,
                     16);
-                AssertQuickSwitchIsUnoccluded(dialogBounds, quickBounds, quickSwitchHandle);
                 var screenshotPath = CaptureComposedEvidence(
                     dialogBounds,
                     quickBounds,
                     "26-firefox-quick-switch-composited");
+                AssertQuickSwitchIsUnoccluded(dialogBounds, quickBounds, quickSwitchHandle);
 
                 stage = "close jumped dialog without opening a file";
                 Assert.True(TryActivateWindow(dialog));
@@ -506,7 +509,15 @@ public sealed class FirefoxQuickSwitchIntegrationTests
         foreach (var x in sampleXs)
         {
             var visibleWindow = GetAncestor(WindowFromPoint(new NativePoint(x, y)), 2);
-            Assert.Equal(quickSwitchHandle, visibleWindow);
+            Assert.True(
+                quickSwitchHandle == visibleWindow,
+                $"Quick Switch was occluded at ({x},{y}). " +
+                $"Expected=0x{quickSwitchHandle.ToInt64():X}; " +
+                $"actual=0x{visibleWindow.ToInt64():X}; " +
+                $"actualClass='{GetClassName(visibleWindow)}'; " +
+                $"actualProcess='{GetProcessName(visibleWindow)}'; " +
+                $"actualTitle='{GetWindowTitle(visibleWindow)}'; " +
+                $"foreground=0x{GetForegroundWindow().ToInt64():X}.");
         }
     }
 
@@ -963,6 +974,8 @@ public sealed class FirefoxQuickSwitchIntegrationTests
                 FileName = hostPath,
                 UseShellExecute = false,
                 CreateNoWindow = true,
+                RedirectStandardOutput = true,
+                RedirectStandardError = true,
                 WorkingDirectory = Path.GetDirectoryName(hostPath)!
             };
             foreach (var argument in new[]
@@ -979,6 +992,8 @@ public sealed class FirefoxQuickSwitchIntegrationTests
 
             Assert.True(TryActivateWindow(applicationWindow));
             var host = Process.Start(start) ?? throw new InvalidOperationException("Could not start the native Firefox hook host.");
+            var hostOutput = host.StandardOutput.ReadToEndAsync();
+            var hostErrors = host.StandardError.ReadToEndAsync();
             var client = new HookIpcClient(
                 pipeName,
                 TimeSpan.FromSeconds(2),
@@ -1026,7 +1041,7 @@ public sealed class FirefoxQuickSwitchIntegrationTests
                     observedProcessIds,
                     preloadedProcessIds);
             }
-            catch
+            catch (Exception error)
             {
                 bridge?.Dispose();
                 if (bridge is null)
@@ -1035,9 +1050,25 @@ public sealed class FirefoxQuickSwitchIntegrationTests
                 }
                 try { if (!host.HasExited) host.Kill(entireProcessTree: true); }
                 catch { }
+                try { await host.WaitForExitAsync(); }
+                catch { }
+                var output = await hostOutput;
+                var errors = await hostErrors;
                 host.Dispose();
-                throw;
+                throw new InvalidOperationException(
+                    $"Native Firefox hook host diagnostics: stdout='{BoundHostDiagnostics(output)}', " +
+                    $"stderr='{BoundHostDiagnostics(errors)}'.",
+                    error);
             }
+        }
+
+        private static string BoundHostDiagnostics(string value)
+        {
+            const int maxCharacters = 8_192;
+            var trimmed = value.Trim();
+            return trimmed.Length <= maxCharacters
+                ? trimmed
+                : $"[truncated {trimmed.Length - maxCharacters} chars]...{trimmed[^maxCharacters..]}";
         }
 
         public async Task<HookDialogContext> CaptureDialogAsync(IntPtr expectedDialog)
